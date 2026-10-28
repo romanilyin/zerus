@@ -1,5 +1,5 @@
 name: Focused desktop GUI qualification
-run-name: Desktop GUI qualification (${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }})
+run-name: Desktop GUI qualification (${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }})
 on:
   push:
     branches: [validation/whitewh-gui-2026-10-28]
@@ -19,7 +19,7 @@ permissions:
 cache-mode: read
 jobs:
   arch:
-    if: ${{ (inputs.platform || 'arch') == 'all' || (inputs.platform || 'arch') == 'arch' }}
+    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'arch' }}
     name: Arch desktop GUI
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -38,11 +38,11 @@ jobs:
         run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
           persist-credentials: false
       - name: Verify exact source
         env:
-          SOURCE_REF: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
@@ -73,29 +73,58 @@ jobs:
           path: artifacts/test-results
           retention-days: 7
   mac-desktop:
-    if: ${{ (inputs.platform || 'arch') == 'all' || (inputs.platform || 'arch') == 'macos' }}
-    name: macOS desktop GUI
+    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'macos' }}
+    name: macOS desktop, CLI and native compatibility
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
+      CARGO_TERM_COLOR: always
+      ZERUS_PYTHON_JOBS: 6
+      SOURCE_COMMIT: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
       CCACHE_MAXSIZE: 100M
       CMAKE_GENERATOR: Ninja
       ZERUS_BUILD_JOBS: 3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
           persist-credentials: false
       - name: Verify exact source
+        id: verify
         env:
-          SOURCE_REF: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
           mkdir -p artifacts/test-results
           printf "%s\n" "$SOURCE_REF" > artifacts/test-results/source-commit.txt
-      - run: brew install cmake ninja qt qtmultimedia ccache
+      - name: macOS GUI and CLI dependencies
+        run: brew install cmake ninja qt qtmultimedia ccache tmux python
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        id: node
+        with:
+          node-version: '24'
+      - name: Select stable Rust
+        id: rust-toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore Rust cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}complete
+          restore-keys: |
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}debug
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
       - name: Restore ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -106,15 +135,26 @@ jobs:
         run: bash scripts/ci/gui.sh build
       - name: Offscreen Qt suites
         run: bash scripts/ci/gui.sh test
-      - name: Retain desktop test logs
+      - name: CLI unit, integration and release build
+        id: cli
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' && steps.node.outcome == 'success' && steps.rust-toolchain.outcome == 'success' }}
+        run: |
+          bash scripts/ci/cli.sh all
+          shasum -a 256 target/debug/hgs > artifacts/test-results/native-hgs.sha256
+      - name: Keyless latest Codex, Claude Code and OpenCode compatibility
+        if: ${{ !cancelled() && steps.cli.outcome == 'success' }}
+        run: |
+          shasum -a 256 -c artifacts/test-results/native-hgs.sha256
+          python3 scripts/ci/agent-compatibility.py --hgs "$GITHUB_WORKSPACE/target/debug/hgs"
+      - name: Retain macOS test logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mac-desktop-results
+          name: mac-combined-results
           path: artifacts/test-results
           retention-days: 7
   windows-desktop:
-    if: ${{ (inputs.platform || 'arch') == 'all' || (inputs.platform || 'arch') == 'windows' }}
+    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'windows' }}
     name: Windows desktop GUI
     runs-on: windows-2025
     timeout-minutes: 90
@@ -130,11 +170,11 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
           persist-credentials: false
       - name: Verify exact source
         env:
-          SOURCE_REF: ${{ inputs.ref || '34ee18e83eb6b2105a572a1f175b3c7caa0b6880' }}
+          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
