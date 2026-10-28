@@ -1,5 +1,5 @@
 name: Focused desktop GUI qualification
-run-name: Desktop GUI qualification (${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }})
+run-name: Desktop GUI qualification (${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }})
 on:
   push:
     branches: [validation/whitewh-gui-2026-10-28]
@@ -14,12 +14,17 @@ on:
         type: choice
         options: [all, arch, macos, windows]
         default: all
+      macos_runner:
+        description: Standard GitHub-hosted macOS runner
+        type: choice
+        options: [macos-15, macos-26]
+        default: macos-15
 permissions:
   contents: read
 cache-mode: read
 jobs:
   arch:
-    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'arch' }}
+    if: ${{ (inputs.platform || 'macos') == 'all' || (inputs.platform || 'macos') == 'arch' }}
     name: Arch desktop GUI
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -38,11 +43,11 @@ jobs:
         run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          ref: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
           persist-credentials: false
       - name: Verify exact source
         env:
-          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          SOURCE_REF: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
@@ -73,32 +78,33 @@ jobs:
           path: artifacts/test-results
           retention-days: 7
   mac-desktop:
-    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'macos' }}
+    if: ${{ (inputs.platform || 'macos') == 'all' || (inputs.platform || 'macos') == 'macos' }}
     name: macOS desktop, CLI and native compatibility
-    runs-on: macos-15
+    runs-on: ${{ inputs.macos_runner == 'macos-15' && 'macos-15' || 'macos-26' }}
     timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
       CARGO_TERM_COLOR: always
       ZERUS_PYTHON_JOBS: 6
-      SOURCE_COMMIT: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+      SOURCE_COMMIT: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
       CCACHE_MAXSIZE: 100M
       CMAKE_GENERATOR: Ninja
       ZERUS_BUILD_JOBS: 3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          ref: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
           persist-credentials: false
       - name: Verify exact source
         id: verify
         env:
-          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          SOURCE_REF: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
           mkdir -p artifacts/test-results
           printf "%s\n" "$SOURCE_REF" > artifacts/test-results/source-commit.txt
+          { sw_vers; printf 'Architecture: '; uname -m; } > artifacts/test-results/runner-platform.txt
       - name: macOS GUI and CLI dependencies
         run: brew install cmake ninja qt qtmultimedia ccache tmux python
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -154,14 +160,16 @@ jobs:
           path: artifacts/test-results
           retention-days: 7
   windows-desktop:
-    if: ${{ (inputs.platform || 'all') == 'all' || (inputs.platform || 'all') == 'windows' }}
-    name: Windows desktop GUI
+    if: ${{ (inputs.platform || 'macos') == 'all' || (inputs.platform || 'macos') == 'windows' }}
+    name: Windows desktop GUI and portable package
     runs-on: windows-2025
     timeout-minutes: 90
     defaults:
       run:
         shell: bash
     env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
       ZERUS_BUILD_JOBS: 4
       CCACHE_DEPEND: 1
       CCACHE_MAXSIZE: 500M
@@ -170,11 +178,11 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          ref: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
           persist-credentials: false
       - name: Verify exact source
         env:
-          SOURCE_REF: ${{ inputs.ref || '67602da4961b16fdb107feb483b2e1298df33040' }}
+          SOURCE_REF: ${{ inputs.ref || '318c395be673013c2478180f537d34bb73202dc5' }}
         run: |
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_REF"
@@ -216,10 +224,42 @@ jobs:
         run: bash scripts/ci/gui.sh build </dev/null
       - name: Offscreen Qt suites
         run: bash scripts/ci/gui.sh test </dev/null
-      - name: Retain desktop test logs
+      - name: Select Rust toolchains
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup toolchain install 1.99.1 --profile minimal
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore Rust cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Build portable CLI and connector from this source
+        run: |
+          cargo fetch --locked
+          cargo +1.99.1 fetch --locked --manifest-path services/mobile/connector/Cargo.toml
+          cargo build --release --locked </dev/null 2>&1 | tee artifacts/test-results/portable-cli-build.log
+          cargo +1.99.1 build --locked --release --manifest-path services/mobile/connector/Cargo.toml --target-dir target </dev/null 2>&1 | tee artifacts/test-results/portable-connector-build.log
+      - name: Pinned ConPTY pair
+        run: python scripts/fetch-conpty.py --output "$RUNNER_TEMP/conpty" </dev/null
+      - name: Portable zip from this source
+        run: |
+          python scripts/package-windows.py --cli target/release/hgs.exe --gui .ci-build/gui/hgs-tray.exe \
+            --connector target/release/zerus-mobile-connector.exe --conpty "$RUNNER_TEMP/conpty" --output artifacts/zerus-windows-x86_64.zip </dev/null 2>&1 | tee artifacts/test-results/package.log
+          python scripts/check-windows-portable.py artifacts/zerus-windows-x86_64.zip --run --selftest \
+            </dev/null 2>&1 | tee artifacts/test-results/portable.log
+          sha256sum target/release/hgs.exe target/release/zerus-mobile-connector.exe .ci-build/gui/hgs-tray.exe artifacts/zerus-windows-x86_64.zip > artifacts/test-results/portable-sha256.txt
+      - name: Retain portable package and desktop logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: windows-desktop-results
-          path: artifacts/test-results
+          name: windows-portable-qualification
+          path: artifacts
           retention-days: 7
+          compression-level: 0
