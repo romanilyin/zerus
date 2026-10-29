@@ -3,9 +3,9 @@ run-name: CI ${{ inputs.ref || github.ref_name }} (${{ github.event_name }})
 
 on:
   push:
-    branches: [main]
+    branches: [main, romanilyin/main]
   pull_request:
-    branches: [main]
+    branches: [main, romanilyin/main]
   workflow_dispatch:
     inputs:
       ref:

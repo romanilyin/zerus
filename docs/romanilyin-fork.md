@@ -7,8 +7,8 @@ The initial source is WhiteWh's `whitewh/main` commit
 Existing copyright notices, application identifiers, state directories and
 conversation identities are preserved.
 
-The October 28, 2026 integration merges WhiteWh's `whitewh/main` through
-`bf2d05dee9ef92a353255e20e9bc9bea8c3c4063` with ordinary Git ancestry. It retains
+The October 29, 2026 integration merges WhiteWh's `whitewh/main` through
+`8e7622f71e269d1cb2fea806657475f1e999f53a`, after the merge of [PR #5](https://github.com/WhiteWh/zerus/pull/5), with ordinary Git ancestry. It retains
 the fork's Windows/WSL transport, explicit path identity, existing OpenCode
 bindings and external workstreams alongside the incoming teams, tasks, watch
 protocol, desktop client and mobile changes. Automatic and manual fork update
@@ -19,7 +19,9 @@ merge does not import another fork's task database or replace local deployments.
 
 ## Scope
 
-- Require PowerShell 7 Core for native Windows shell operations.
+- Prefer PowerShell 7 Core for native Windows shell operations, with Windows
+  PowerShell 5.1 fallback when `HGS_PWSH` is unset; an explicit override remains
+  authoritative.
 - Represent lexical path identity separately from physical filesystem access.
 - Pin CanonicalPath release `2026.10.24-1` to source commit
   `50b390675a146874b1555f361e491d1efeb393a7` and the Cargo lockfile.
@@ -45,7 +47,8 @@ fork. A source checkpoint is not a signed release or a full platform qualificati
 ## Source and task history
 
 `origin` points to this repository, `whitewh` to WhiteWh/zerus and `upstream` to
-ufna/zerus. Changes use ordinary commits and fast-forward pushes. Task history
+ufna/zerus. Development continues on `romanilyin/main`; `main` is the upstream
+integration checkpoint. Changes use ordinary commits and fast-forward pushes. Task history
 uses the existing Beads workflow, with synchronization directed at this fork.
 Build logs and local deployment settings stay in ignored directories.
 
@@ -66,7 +69,7 @@ migration or stable release is implied.
 
 ## Fork CI coverage
 
-Every push to this fork selects Windows qualification in addition to the
+Pushes to `main` or `romanilyin/main` in this fork select Windows qualification in addition to the
 inherited Linux, Arch, macOS and shared checks. Manual platform selection and
 PR path selection remain available. The extra coverage uses the existing
 credential-free Windows jobs, read-only caches and pinned dependencies; it does

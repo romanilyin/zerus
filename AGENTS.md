@@ -266,11 +266,13 @@ Mirror substantive instruction changes in `AGENTS.md` and `CLAUDE.md`.
 
 ## Roman Ilyin fork
 
-This fork develops on `main`, starting from WhiteWh's `whitewh/main` commit
+This fork develops on `romanilyin/main`; `main` is the integration checkpoint
+for merges from WhiteWh's `whitewh/main`. The fork started from commit
 `f31086364f0964c4910a861c385baec904c39b0f`. `origin` is
 `romanilyin/zerus`; `whitewh` and `upstream` are read-only source remotes.
 Preserve upstream attribution, application identifiers and session identities.
-The fork scope is PowerShell 7 Core, explicit canonical path identity and local
+The fork scope includes PowerShell 7 Core preference with Windows PowerShell 5.1
+fallback when `HGS_PWSH` is unset, explicit canonical path identity and local
 Windows-to-WSL transport for an existing OpenCode 2 service.
 Use synthetic examples and keep deployment settings outside the public tree.
 

@@ -24,7 +24,7 @@
   <a href="https://opencode.ai/"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&amp;sz=64" alt="" width="16" valign="middle" /> OpenCode</kbd></a>
 </p>
 
-> **Roman Ilyin fork:** based on [WhiteWh's `whitewh/main`](https://github.com/WhiteWh/zerus/tree/whitewh/main).
+> **Roman Ilyin fork:** development continues on [`romanilyin/main`](https://github.com/romanilyin/zerus/tree/romanilyin/main); `main` is the integration checkpoint for [WhiteWh's `whitewh/main`](https://github.com/WhiteWh/zerus/tree/whitewh/main).
 > Development focuses on PowerShell 7 Core, explicit Windows/WSL path identity,
 > and a local WSL connection to an existing OpenCode 2 service.
 > See [fork scope and provenance](docs/romanilyin-fork.md) before using upstream installation links.
