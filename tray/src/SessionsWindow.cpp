@@ -53,6 +53,7 @@
 #include "SessionLeads.h"
 #include "WorkingLine.h"
 #include "HeldInputBar.h"
+#include "TerminalDraftBar.h"
 #include "MediaViewer.h"
 #include "NewSessionDialog.h"
 #include "SessionCreationController.h"
@@ -1149,6 +1150,10 @@ SessionsWindow::SessionsWindow(const QString &hgsPath, QWidget *parent)
     m_workingLine = new WorkingLine; inputColumn->addWidget(m_workingLine);
     // U35: messages hgs holds until the agent takes the previous one, above the field.
     m_heldBar = new HeldInputBar; m_heldBar->setObjectName("sessionHeldInputs"); inputColumn->addWidget(m_heldBar);
+    // Text left in the agent's Terminal input holds every send: show it here.
+    m_terminalDraft = new TerminalDraftBar(&m_client); m_terminalDraft->setObjectName("sessionTerminalDraft"); inputColumn->addWidget(m_terminalDraft);
+    m_terminalDraft->openTerminal = [this] { if (const auto *entry = selected()) openSessionTerminal(entry->host, entry->session.name); };
+    m_terminalDraft->submitted = [this] { inspect(); };
     m_heldBar->cancel = [this](const QString &id, const QString &text) {
         const auto *entry = selected(); if (!entry) return;
         m_heldCancels.insert(m_client.requestCancelHeld(entry->host, entry->session.name, id), {entry->key, text});
@@ -4087,7 +4092,11 @@ void SessionsWindow::inspect()
     // which is the default, the card never showed them).
     const bool tasksCard=m_inspector&&m_inspector->isVisible()&&m_inspector->isOpen(InspectorCards::Tasks);
     const int processInterval=m_detailTabs->currentWidget()==m_processes?ProcessSettings::activeMs():ProcessSettings::backgroundMs();
-    const bool processes=(ProcessSettings::enabled()||tasksCard) && (!m_processPollAge.isValid() || m_processPollAge.elapsed()>=processInterval);
+    // The first read of a newly selected session skips processes: reading them
+    // takes 1 to 8 s on Windows, and Activity waited for it (owner, 2026-10-28:
+    // switching took about 4 s). The next poll reads them.
+    const bool processes=!m_details.isEmpty() && (ProcessSettings::enabled()||tasksCard)
+        && (!m_processPollAge.isValid() || m_processPollAge.elapsed()>=processInterval);
     // A live event stream brings Activity as it happens (EventStream.h); only
     // the process section is still polled, at its own interval.
     auto *streams = EventStreams::instance();
@@ -4391,6 +4400,11 @@ void SessionsWindow::renderHeld()
             if (!listed.contains(value.toObject().value("request_id").toString())) held.append(value);
     m_heldBar->setColors(QColor(m_fg), QColor(m_muted), QColor(m_border), QColor(m_surface));
     m_heldBar->setHeld(held, entry ? IdentityBadges::providerName(entry->session.cmd) : QString());
+    // Messages waiting for an agent that is not working: a Terminal draft may hold them.
+    m_terminalDraft->setColors(QColor(m_fg), QColor(m_muted), QColor(m_border), QColor(m_surface));
+    m_terminalDraft->setSession(entry ? entry->host : QString(), entry ? entry->session.name : QString(),
+                                entry ? m_details.value("run_id").toString() : QString(), entry ? m_details.value("conversation_id").toString() : QString());
+    if (!held.isEmpty() && m_details.value("activity").toString() != QLatin1String("busy")) m_terminalDraft->check(true);
 }
 
 void SessionsWindow::openSessionTerminal(const QString &host, const QString &name)
@@ -6009,6 +6023,7 @@ void SessionsWindow::finishMessage(quint64 request, bool ok, const QJsonObject &
     const QString detail = uncertain ? tr("Delivery is not confirmed. Check Terminal before retrying. %1").arg(error) : error;
     m_composer->deliveryFinished(pending.key, ok, detail, uncertain);
     pushSendFinished(request, ok, uncertain);
+    if (!ok && !uncertain && pending.key == m_selectedKey && error.contains(QStringLiteral("has a draft"))) m_terminalDraft->check();
     auto &messages = m_localMessages[pending.key];
     // U35: a held message shows in the queued line, not as a sent card.
     if (ok && receipt.value("status") == "queued") {

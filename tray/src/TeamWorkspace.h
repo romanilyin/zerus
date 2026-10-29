@@ -1,4 +1,5 @@
 #pragma once
+#include <QElapsedTimer>
 #include <QHash>
 #include <QPoint>
 #include <QPointer>
@@ -95,7 +96,9 @@ private:
     void attentionRows(const Teams::Team &team, QVBoxLayout *into);
     // N7: Answer on a permission item: the member's Allow / Deny box, or its
     // command on the clipboard when this hgs sends no box.
-    void answerAttention(const QString &teamId, const QString &member, const QString &command);
+    // attempts: a member's box not shown yet is looked for again (fork CI).
+    void answerAttention(const QString &teamId, const QString &member, const QString &command, int attempts = 10,
+                         const QString &question = {}, const QString &hash = {}, quint64 generation = 0);
     // A planning, running or paused team takes a settings change (ops.rs settings).
     static bool settingsOpen(const Teams::Team &team)
     {
@@ -174,6 +177,12 @@ private:
     QList<Computer> m_computers;
     QString m_team, m_view = QStringLiteral("graph"), m_filter = QStringLiteral("all"), m_focus;
     QString m_error;
+    // Answer focused this exact question's Allow; rebuilds in the next few
+    // seconds focus it again, even when the focus was already lost.
+    QString m_answerTeam, m_answerMember, m_answerQuestion, m_answerHash;
+    QElapsedTimer m_answerAt;
+    quint64 m_answerGeneration = 0;
+    bool m_answerRendering = false;
     bool m_dark = true, m_pending = false, m_feedOpen = false, m_inboxOpen = false, m_fit = true;
     // G9: one phase decision is in flight at a time; a second click on a header
     // before the answer arrives sends nothing. After an answer, that phase stays

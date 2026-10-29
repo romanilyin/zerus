@@ -640,6 +640,8 @@ private slots:
     void catalogEditorKeepsTheFieldsItDoesNotEdit();
     void ownerActionsCarryNoAgentMarkers();
     void permissionAttentionNamesTheMemberAndAnswers();
+    void permissionAttentionFocusKeepsItsContext_data();
+    void permissionAttentionFocusKeepsItsContext();
     void leadAnswersAMembersSubagentRequest();
     void sendBackFormBelongsToItsTeamAndPhase();
     void catalogRoleChoosesAccountModelAndComputer();
@@ -707,6 +709,7 @@ private slots:
     void designerQuestionIsAnsweredInTheWindow();
     void coordinatorQueuesASecondMessageWithCancel();
     void coordinatorTakesPastedImagesAndFiles();
+    void terminalDraftIsShownAndSentFromTheConversation();
     void catalogEditorMarksManualEdits();
     void boardScrollsInsteadOfSqueezingColumns();
     void planningBoardScrollsInsteadOfSqueezingColumns();
@@ -823,6 +826,10 @@ elif a[:2]==['team','draft']:
  else:print(json.dumps({'status':'ok'}))
 elif a[:2]==['account','ls']:print(json.dumps({'profiles':[{'id':'native-claude','provider':'claude','label':'Default','account_status':{'status':'ok'}},
  {'id':'work','provider':'claude','label':'Claude work','account_status':{'status':'signed_out'}}]}))
+elif a[:2]==['account','model-settings']:
+ models={'native-claude':[{'id':'opus'},{'id':'sonnet'},{'id':'haiku'}],
+         'native-kimi':[{'id':'kimi-code/kimi-for-coding'},{'id':'kimi-code/k3.1-pro'}]}
+ print(json.dumps({'account_id':a[2],'models':models.get(a[2],[])}))
 else:print(json.dumps({'status':'ok','version':4,'request_id':body.get('request_id')}))
 )PY"));
 }
@@ -1661,6 +1668,10 @@ void TestTeamsUi::catalogRoleChoosesAccountModelAndComputer()
     QCOMPARE(lead["computer"].toString(), QStringLiteral("devbox"));
     QCOMPARE(lead["machines"].toArray(), (QJsonArray{"devbox", "laptop"}));
     QCOMPARE(lead.value("account").toString(), QString());
+
+    auto *agent = editor.findChild<QComboBox *>("teamRoleAgent");
+    agent->setCurrentIndex(agent->findData("kimi")); emit agent->activated(agent->currentIndex());
+    QTRY_VERIFY(editor.findChild<QComboBox *>("teamRoleModel")->findText("kimi-code/k3.1-pro") >= 0);
 }
 
 void TestTeamsUi::designerDraftIsKeptThenApplied()
@@ -2708,6 +2719,84 @@ void TestTeamsUi::permissionAttentionNamesTheMemberAndAnswers()
     QVERIFY(changes.raised.isEmpty()); QCOMPARE(changes.cleared.size(), 1);
 }
 
+// Answer can outlive a hidden box or a lost focus, but never the owner's
+// next focus choice, a team switch, or the exact question it was clicked for.
+void TestTeamsUi::permissionAttentionFocusKeepsItsContext_data()
+{
+    QTest::addColumn<QString>("change");
+    for (const auto &change : {"lost-focus", "another-input", "retry-same", "retry-input", "retry-team-switch",
+                               "retry-question", "retry-hash", "retry-box-team"})
+        QTest::newRow(change) << QString::fromLatin1(change);
+}
+
+void TestTeamsUi::permissionAttentionFocusKeepsItsContext()
+{
+    QFETCH(QString, change);
+    auto fixture = phasedTeam();
+    auto members = fixture["members"].toArray(); auto backend = members[1].toObject();
+    backend["question"] = memberQuestionFixture(); members[1] = backend; fixture["members"] = members;
+    fixture["attention"] = QJsonArray{QJsonObject{{"kind", "permission"}, {"member", "Backend"},
+        {"summary", "Backend waits for your answer"}, {"command", "hgs team answer"}}};
+    setTeam(fixture);
+    HgsClient client(FakeCli::program(script()));
+    TeamController controller(&client);
+    TeamPanel panel(&controller);
+    TeamWorkspace workspace(&controller, &panel);
+    workspace.setLive(live); workspace.resize(1300, 900); workspace.show();
+    controller.refresh(); workspace.showTeam("team-1");
+    QTRY_VERIFY(workspace.findChild<QPushButton *>("teamAttentionAnswer")
+                && workspace.findChild<QPushButton *>("teamMemberPermissionAllow"));
+    workspace.activateWindow(); QVERIFY(QTest::qWaitForWindowActive(&workspace));
+    // Freeze the loaded fixture: these cases control exactly when a rebuild
+    // happens, rather than letting an unrelated initial poll replace the box.
+    QObject::disconnect(&controller, nullptr, &workspace, nullptr);
+    QCoreApplication::processEvents(); workspace.render();
+    // Outside the rebuilt Members subtree: its focus choice survives a render.
+    QLineEdit other(&workspace); other.setGeometry(10, 10, 150, 24); other.show();
+    const auto allow = [&] { return workspace.findChild<QPushButton *>("teamMemberPermissionAllow"); };
+    if (!change.startsWith("retry-")) {
+        workspace.findChild<QPushButton *>("teamAttentionAnswer")->click();
+        QTRY_COMPARE(QApplication::focusWidget(), static_cast<QWidget *>(allow()));
+        if (change == "another-input") {
+            other.setFocus(Qt::OtherFocusReason);
+            QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(&other));
+            workspace.render();
+            QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(&other));
+            // Cancellation persists even if that field subsequently loses focus.
+            other.clearFocus(); workspace.render();
+            QVERIFY(QApplication::focusWidget() != allow());
+        } else {
+            allow()->clearFocus();
+            QVERIFY(!QApplication::focusWidget());
+            workspace.render();
+            QTRY_COMPARE(QApplication::focusWidget(), static_cast<QWidget *>(allow()));
+        }
+        return;
+    }
+    // Queue the retry without depending on a slow process or a race with a
+    // poll: the exact rendered box exists, but is temporarily hidden.
+    other.setFocus(Qt::OtherFocusReason);
+    auto *box = workspace.findChild<QFrame *>("teamMemberPermission");
+    QVERIFY(box); box->hide();
+    workspace.findChild<QPushButton *>("teamAttentionAnswer")->click();
+    if (change == "retry-question") box->setProperty("question", "another-question");
+    if (change == "retry-hash") box->setProperty("questionHash", "another-hash");
+    if (change == "retry-box-team") box->setProperty("team", "another-team");
+    if (change == "retry-team-switch") {
+        workspace.showTeam("another-team"); workspace.showTeam("team-1");
+    }
+    box->show();
+    if (change == "retry-input") { other.clearFocus(); other.setFocus(Qt::OtherFocusReason); }
+    if (change == "retry-same") {
+        QTRY_COMPARE(QApplication::focusWidget(), static_cast<QWidget *>(allow()));
+    } else {
+        // The one queued attempt runs at 100 ms; no callback may take focus.
+        QTest::qWait(150);
+        QVERIFY(QApplication::focusWidget() != allow());
+        QCOMPARE(calls(script(), "answer").size(), 0);
+    }
+}
+
 void TestTeamsUi::leadLoadViewsShowInTheDesktop()
 {
     auto load = phasedTeam();
@@ -3380,7 +3469,8 @@ void TestTeamsUi::boardColumnsKeepTheirScroll()
     controller.refresh();
     panel.showTeam("team-1");
     workspace.showTeam("team-1");
-    QTRY_VERIFY(workspace.findChild<QWidget *>("teamWorkspaceView"));
+    // The first team read took 6.6 s on a loaded computer.
+    QTRY_VERIFY_WITH_TIMEOUT(workspace.findChild<QWidget *>("teamWorkspaceView"), 30000);
     const auto showBoard = [&workspace] {
         for (auto *b : workspace.findChild<QWidget *>("teamWorkspaceView")->findChildren<QPushButton *>()) if (b->property("segment") == "board") { b->click(); break; }
     };
@@ -5430,12 +5520,21 @@ void TestTeamsUi::catalogHeaderRevertDraftAndBanners()
     QTRY_COMPARE(calls(script(), "catalog decide").size(), 1);
     QCOMPARE(calls(script(), "catalog decide").first()["proposal"].toString(), QStringLiteral("p1"));
     QCOMPARE(calls(script(), "catalog decide").first()["decision"].toString(), QStringLiteral("keep"));
+    // The fixture logs the decision before it saves the draft. On a loaded
+    // runner that save came after the catalog below and put version 3 back,
+    // so the banner never showed (fork builds 88 and 95): wait for the save.
+    QTRY_VERIFY_WITH_TIMEOUT(([&] {
+        QFile saved(script() + ".catalog");
+        if (!saved.open(QIODevice::ReadOnly)) return false;
+        const auto proposals = QJsonDocument::fromJson(saved.readAll()).object()["draft"].toObject()["proposals"].toArray();
+        return !proposals.isEmpty() && proposals[0].toObject()["state"].toString() == QStringLiteral("kept");
+    })(), 30000);
     // The catalog moved on after the draft: Apply is off; redo or discard.
     auto moved = catalog(); auto inner = moved["catalog"].toObject(); inner["version"] = 4; moved["catalog"] = inner;
-    { QFile c(script() + ".catalog"); QVERIFY(c.open(QIODevice::WriteOnly)); c.write(QJsonDocument(moved).toJson(QJsonDocument::Compact)); }
+    QVERIFY(FakeCli::replace(script() + ".catalog", QJsonDocument(moved).toJson(QJsonDocument::Compact)));
     controller.refreshCatalog();
     // The fixture's catalog read takes more than QTRY's 5 s on a loaded Windows runner.
-    QTRY_COMPARE_WITH_TIMEOUT(draft.findChild<QLabel *>("teamCatalogBannerTitle")->text(), QStringLiteral("Draft is out of date — Apply is off"), 15000);
+    QTRY_COMPARE_WITH_TIMEOUT(draft.findChild<QLabel *>("teamCatalogBannerTitle")->text(), QStringLiteral("Draft is out of date — Apply is off"), 30000);
     QVERIFY(draft.findChild<QFrame *>("teamCatalogBanner")->isVisible());
     QVERIFY(!draft.findChild<QPushButton *>("teamDesignerApply")->isEnabled());
     shot(&draft, "ux-9-draft-stale-dark");
@@ -5913,6 +6012,73 @@ else:print('{}')
     QVERIFY(sends().first()["text"].toString().contains("[Image #1]"));
     // Sent: the field and the files clear.
     QTRY_VERIFY(input->toPlainText().isEmpty()); QTRY_VERIFY(!files->isVisible());
+}
+
+// Owner, 2026-10-28: with text in the agent's Terminal input no window could
+// send. The refusal shows that draft with Send it, which presses Enter in
+// Terminal only for the draft shown; the owner's own message stays.
+void TestTeamsUi::terminalDraftIsShownAndSentFromTheConversation()
+{
+    QTemporaryDir dir; QVERIFY(dir.isValid());
+    const QString program = dir.filePath("hgs");
+    QVERIFY(FakeCli::install(program, R"PY(#!/usr/bin/env python3
+import json,os,sys
+a=sys.argv[1:]
+if a and a[0].startswith('@'):a=a[1:]
+here=__file__
+draft=os.path.exists(here+'.draft')
+if a[:1]==['inspect']:
+ print(json.dumps({'name':a[1],'run_id':'run-1','conversation_id':'conv-1','runtime_state':'live','process_state':'running',
+  'activity':'idle','phase':'idle','cursor':0,'events':[]}))
+elif a[:1]==['send']:
+ body=json.load(sys.stdin)
+ if draft:
+  sys.stderr.write('hgs: terminal has a draft, dialog, or unrecognized prompt; open Terminal and return to an empty agent prompt\n');sys.exit(1)
+ print(json.dumps({'request_id':body['request_id'],'name':a[1],'run_id':'run-1','conversation_id':'conv-1','status':'submitted','text':body['text']}))
+elif a[:1]==['terminal']:
+ body=json.load(sys.stdin)
+ open(here+'.terminal','a').write(json.dumps(body)+'\n')
+ base={'request_id':body['request_id'],'name':a[1],'run_id':'run-1','conversation_id':'conv-1'}
+ if body['action']=='draft':
+  print(json.dumps(dict(base,status='draft',draft_supported=True,draft='fix the build' if draft else None,draft_hash='a'*64)))
+ else:
+  os.remove(here+'.draft');print(json.dumps(dict(base,status='submitted')))
+else:print('{}')
+)PY"));
+    QFile(program + ".draft").open(QIODevice::WriteOnly);
+    TeamConversation::setPollInterval(100);
+    const auto restore = qScopeGuard([] { TeamConversation::setPollInterval(2000); });
+    HgsClient client(FakeCli::program(program));
+    TeamConversation conversation(&client);
+    QString opened;
+    conversation.openTerminal = [&](const QString &host, const QString &name) { opened = host + '|' + name; };
+    conversation.setSession({}, "claude/checkout/lead");
+    conversation.resize(560, 420); conversation.show();
+    auto *input = conversation.findChild<QPlainTextEdit *>("teamConversationInput");
+    auto *sendButton = conversation.findChild<QPushButton *>("teamConversationSend");
+    auto *bar = conversation.findChild<QFrame *>("teamConversationTerminalDraft");
+    QVERIFY(bar); QVERIFY(!bar->isVisible());
+    QTRY_VERIFY(sendButton->isEnabled());
+    QTest::qWait(300);   // the first read of the session
+    input->setPlainText("Also re-run the migrations"); sendButton->click();
+    QTRY_VERIFY(bar->isVisible());
+    QVERIFY(bar->findChild<QLabel *>("terminalDraftText")->text().contains("fix the build"));
+    QCOMPARE(input->toPlainText(), QString("Also re-run the migrations"));
+    bar->findChild<QPushButton *>("terminalDraftOpen")->click();
+    QCOMPARE(opened, QString("|claude/checkout/lead"));
+    bar->findChild<QPushButton *>("terminalDraftSend")->click();
+    QTRY_VERIFY(!bar->isVisible());
+    QList<QJsonObject> calls; QFile file(program + ".terminal"); QVERIFY(file.open(QIODevice::ReadOnly));
+    for (const auto &line : file.readAll().split('\n')) if (!line.isEmpty()) calls << QJsonDocument::fromJson(line).object();
+    QCOMPARE(calls.size(), 2);
+    QCOMPARE(calls[0]["action"].toString(), QString("draft"));
+    QCOMPARE(calls[1]["action"].toString(), QString("submit_draft"));
+    QCOMPARE(calls[1]["draft_hash"].toString(), QString(64, 'a'));
+    QCOMPARE(calls[1]["expected_run_id"].toString(), QString("run-1"));
+    // The owner's message is still there and now goes.
+    QCOMPARE(input->toPlainText(), QString("Also re-run the migrations"));
+    sendButton->click();
+    QTRY_VERIFY(input->toPlainText().isEmpty());
 }
 
 void TestTeamsUi::coordinatorQueuesASecondMessageWithCancel()
@@ -8092,16 +8258,23 @@ void TestTeamsUi::leadAnswersAMembersSubagentRequest()
     auto *allow = workspace.findChild<QPushButton *>("teamMemberPermissionAllow");
     QCOMPARE(allow->text(), QStringLiteral("Allow all"));
     QVERIFY(allow->isEnabled());
+    QTRY_VERIFY(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")->isVisible());
     // The attention strip's Answer brings the lead to the same box.
     workspace.activateWindow(); QVERIFY(QTest::qWaitForWindowActive(&workspace));
     workspace.findChild<QPushButton *>("teamAttentionAnswer")->click();
-    QTRY_COMPARE(QApplication::focusWidget(), static_cast<QWidget *>(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")));
+    // The window's focus: the application's is empty whenever the window is
+    // briefly inactive on a loaded runner (fork builds 93 and 98).
+    QTRY_COMPARE(workspace.focusWidget(), static_cast<QWidget *>(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")));
     // A status/feed refresh can arrive immediately after Answer. Rebuild
     // deterministically: the new button for this request keeps keyboard focus.
     const QPointer<QPushButton> oldAllow = workspace.findChild<QPushButton *>("teamMemberPermissionAllow");
     workspace.render();
     QVERIFY(workspace.findChild<QPushButton *>("teamMemberPermissionAllow") != oldAllow.data());
-    QTRY_COMPARE(QApplication::focusWidget(), static_cast<QWidget *>(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")));
+    QTRY_COMPARE(workspace.focusWidget(), static_cast<QWidget *>(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")));
+    // Lost before a rebuild, it comes back to the same question's Allow.
+    workspace.findChild<QPushButton *>("teamMemberPermissionAllow")->clearFocus();
+    workspace.render();
+    QTRY_COMPARE(workspace.focusWidget(), static_cast<QWidget *>(workspace.findChild<QPushButton *>("teamMemberPermissionAllow")));
     shot(&workspace, "u19-lead-subagents-three-dark");
     workspace.setTheme(false); lightShot(&workspace, "u19-lead-subagents-three-light"); darkPalette(); workspace.setTheme(true);
     QTRY_VERIFY(workspace.findChild<QPushButton *>("teamMemberPermissionAllow"));
