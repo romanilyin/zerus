@@ -396,6 +396,15 @@ device submitted the voice message. See [the contract](../../../docs/voice-messa
   a completed row 5 seconds after the phone has read its terminal receipt
   (`result_read`) or 60 seconds after completion, so file bytes are carried,
   not kept. Submission requires the computer to advertise the operation.
+  `send_receipt` is an additive Rust-only READ for exact ordinary-send outcome
+  recovery. Its frozen intent and distinct intent/native digests are specified
+  in the [connector contract](../connector/README.md). It requires the selected
+  computer to advertise `send_receipt`, uses the shared read quota and a new
+  partial `send_receipt_reads_v1` retention index, and expires terminal results
+  after one hour. Existing read-index predicates and mutation tombstones stay
+  unchanged. v1 validates the exact intent; v2 carries it under authenticated
+  encryption with the signed Read class. Neither transport submits the original
+  send again. Phone recovery remains a separate integration.
   `remove_queued` (OpenCode) is a session mutation with a durable request
   identity, like `forget`: exact `expected_run_id`, nonempty
   `expected_conversation_id` and one `message_id`, `msg_` followed by 1–124
@@ -903,3 +912,42 @@ and `session_project_assignment_v1` gate clients; older peers stay disabled.
 The separate `project_assignment_history_v1` index is created on upgrade without
 changing legacy read-index predicates or mutation UUID tombstones. See
 [the exact scope, bounded paging and no-replay contract](../../../docs/mobile-session-projects.md).
+
+### Negotiated native send outcomes
+
+API v1 additionally offers `send_outcome` (mutation) and
+`send_outcome_receipt` (read). Both require the corresponding target connector
+capability. The connector advertises them only after verifying the native
+`native-send-outcome-v2`, `delivery-receipt-v1`, session-ID selector and
+`mobile-peer-send-outcome-v2` help markers along the guarded call path. Retained
+connectors and phones continue using `send` and its existing receipt semantics.
+
+Before submission, the phone freezes a schema-2 binding of the original UUID,
+computer, machine, session ID, original name, provider, run, conversation,
+native encoding and SHA-256 of the exact original native stdin. The binding's
+canonical JSON hash is `binding_sha256`. The mutation wrapper has `schema`,
+`request_id`, `binding`, `binding_sha256` and the unchanged ordinary-send
+`payload`. Attachments stay in that payload; neither their bytes nor message
+text are repeated in the bounded binding or outcome. The read wrapper omits
+`payload` and uses a separate transport UUID. Its binding still names the
+original mutation UUID. `vectors/send_outcome/outcomes.json` is the shared
+wire contract, including both native encodings and attachment sends.
+
+The native send runs once through ordinary send admission and the selected
+session-ID guard. A closed schema-2 `not_offered` / `native_input_lock` packet
+can cross a nonzero process exit only for the exact negotiated command. Every
+identity and the original native digest must match the frozen binding. Positive
+acknowledgements use the existing bounded original-receipt read for the same
+binding. The connector returns the bounded binding, its hash, status and proof;
+only this exact negative records a failed mutation with a typed NotOffered
+result. Timeouts, foreign or incomplete packets and unknown original receipts
+remain uncertain. Native diagnostics, exit codes and absence are never proof.
+
+The read is authenticated as Read in encrypted transport and retains its own
+journal identity. It never updates, retries or reposts the original mutation.
+Legacy transport keeps the same API-v1 receipt states and durable journal
+schema. New reads use a separate indexed one-hour retention class; no existing
+index predicate or mutation tombstone is changed. A late result cannot overwrite
+an already uncertain relay receipt. A phone may recover proof with a read, or
+explicitly discard/edit/send a new UUID; neither recovery nor reconnect sends
+message input.

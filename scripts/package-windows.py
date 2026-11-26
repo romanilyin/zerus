@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Bundle the tested hgs.exe and hgs-tray.exe into the Windows portable zip.
+"""Bundle tested hgs, lore, the Tauri desktop and connector into the Windows zip.
 
-windeployqt adds the Qt runtime, vswhere locates the app-local MSVC runtime,
-the pinned ConPTY pair (conpty.dll and OpenConsole.exe, scripts/conpty_pair.py)
-goes next to hgs.exe, and the notices that make the bundle redistributable are
-copied next to them. Nothing is compiled here: the executables are the exact
-files the Windows CI job has just tested.
+The app-local MSVC runtime and pinned ConPTY pair accompany the unchanged
+binaries. WebView2 uses the installed Evergreen runtime; Qt is never deployed.
 """
 import argparse
 import fork_identity
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,22 +21,16 @@ import tomllib
 import zipfile
 
 import conpty_pair
+from lore_dependency import lore_version
 from release_common import require
-from windows_portable import TOP, inspect, missing_license_texts
+from windows_portable import TOP, inspect
+
+# WhiteWh fork, task #65: the fork's releases and the feed its desktop reads.
+FORK_REPOSITORY = "WhiteWh/zerus"
+FORK_RELEASES = "https://github.com/WhiteWh/zerus/releases/"
 
 ROOT = Path(__file__).resolve().parents[1]
 CRT_REQUIRED = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
-
-
-def qt_version(qt_root):
-    """The exact Qt release, read from its CMake package version file."""
-    for name in ("Qt6CoreConfigVersionImpl.cmake", "Qt6CoreConfigVersion.cmake"):
-        path = qt_root / "lib" / "cmake" / "Qt6Core" / name
-        if path.is_file():
-            match = re.search(r'set\(PACKAGE_VERSION "(\d+\.\d+\.\d+)"\)', path.read_text(encoding="utf-8"))
-            if match:
-                return match[1]
-    raise SystemExit(f"Cannot determine the Qt version under {qt_root}.")
 
 
 def visual_studio():
@@ -76,6 +68,47 @@ def copy(source, destination):
     shutil.copyfile(source, destination)
 
 
+# WhiteWh fork (zerus-y0cj): the standalone executor package that
+# scripts/build-artifact-executor.py writes, unpacked beside hgs.exe.
+EXECUTOR_TOP = "hgs-executor-windows-x86_64/"
+EXECUTOR_LIMIT = 256 * 1024 * 1024
+
+
+def add_executor(package, stage):
+    """hgs-executor.exe next to hgs.exe, its linked notices under licenses/executor
+    and its README and examples under executor/; returns its build identity."""
+    require(package.is_file() and not package.is_symlink(), f"Missing executor package: {package}")
+    placed = {}
+    with zipfile.ZipFile(package) as archive:
+        entries = archive.infolist()
+        require(0 < len(entries) <= 1000 and sum(e.file_size for e in entries) <= EXECUTOR_LIMIT,
+                "Unexpected executor package size")
+        for entry in entries:
+            name = entry.filename
+            require(name.startswith(EXECUTOR_TOP) and not entry.is_dir() and ".." not in name.split("/")
+                    and "\\" not in name, f"Unsafe executor package entry: {name!r}")
+            relative = name[len(EXECUTOR_TOP):]
+            if relative == "hgs-executor.exe":
+                target = stage / "hgs-executor.exe"
+            elif relative.startswith("licenses/"):
+                target = stage / "licenses/executor" / relative[len("licenses/"):]
+            elif relative == "README.md" or relative.startswith("examples/"):
+                target = stage / "executor" / relative
+            else:
+                raise ValueError(f"Unexpected executor package entry: {name!r}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = archive.read(entry)
+            target.write_bytes(data)
+            placed[relative] = hashlib.sha256(data).hexdigest()
+    attestation = json.loads((stage / "licenses/executor/build.json").read_text(encoding="utf-8"))
+    require(placed.get("hgs-executor.exe") == attestation.get("binary_sha256"),
+            "hgs-executor.exe differs from its build attestation")
+    require(placed.get("licenses/inventory.json") == attestation.get("inventory_sha256"),
+            "The executor's license inventory differs from its build attestation")
+    return {"binary": "hgs-executor.exe", "binary_sha256": attestation["binary_sha256"],
+            "source_sha256": attestation["source_sha256"], "desync_revision": attestation["desync_revision"]}
+
+
 def source_commit():
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
@@ -91,7 +124,7 @@ def source_time():
 def write_zip(stage, output, date_time):
     """Sorted, '/'-separated regular files under one top-level folder."""
     files = []
-    for path in sorted(stage.rglob("*")):
+    for path in sorted(stage.rglob("*"), key=lambda item: item.relative_to(stage).as_posix()):
         require(not path.is_symlink(), f"Symlinks cannot be bundled: {path}")
         if path.is_file():
             files.append(path)
@@ -109,31 +142,48 @@ def write_zip(stage, output, date_time):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cli", type=Path, required=True, help="tested hgs.exe")
+    parser.add_argument("--lore", type=Path, required=True, help="tested lore.exe (task 128 subprocess)")
     parser.add_argument("--connector", type=Path, required=True, help="tested zerus-mobile-connector.exe")
     parser.add_argument("--gui", type=Path, required=True, help="tested hgs-tray.exe")
     # WhiteWh fork: a relay for this computer alone (docs/fork-updates.md).
     parser.add_argument("--mobile-relay", type=Path, help="tested zerus-relay.exe")
     parser.add_argument("--output", type=Path, required=True, help="zip to write")
-    parser.add_argument("--qt-root", type=Path, default=os.environ.get("QT_ROOT_DIR"),
-                        help="Qt installation, e.g. .../6.10.3/msvc2022_64 [default: $QT_ROOT_DIR]")
-    parser.add_argument("--windeployqt", type=Path, help="[default: <qt-root>/bin/windeployqt.exe]")
     parser.add_argument("--crt-dir", type=Path, help="Microsoft.VC14*.CRT folder [default: found with vswhere]")
     parser.add_argument("--rust-licenses", type=Path,
                         help="notices from scripts/collect-licenses.py [default: collected for this host target]")
+    parser.add_argument("--frontend-licenses", type=Path, help="collected production frontend notices")
     parser.add_argument("--conpty", type=Path,
                         help="folder with the pinned conpty.dll and OpenConsole.exe from scripts/fetch-conpty.py "
                              "[default: fetched from nuget.org]")
+    # WhiteWh fork, task #65 (owner, 2026-11-06): the fork's zip names its fork
+    # build and feed (the values its hgs-tray.exe embeds). Task #388 (owner,
+    # 2026-11-08, "forget Qt"): it ships only the Tauri desktop; the one-release
+    # Qt fallback (qt/zerus-qt.exe) is gone.
+    parser.add_argument("--fork", action="store_true",
+                        help="a WhiteWh fork zip: fork identity in build-info.json and the fork README section")
+    parser.add_argument("--fork-build", default=os.environ.get("ZERUS_FORK_BUILD", ""),
+                        help="the fork build number [default: $ZERUS_FORK_BUILD; empty for an experimental build]")
+    parser.add_argument("--fork-feed", default=os.environ.get("ZERUS_FORK_FEED_URL", ""),
+                        help="the fork feed [default: $ZERUS_FORK_FEED_URL]")
+    parser.add_argument("--executor", type=Path,
+                        help="fork only: the standalone hgs-executor-windows-x86_64.zip to ship beside hgs.exe")
     args = parser.parse_args()
-    require(args.qt_root is not None and args.qt_root.is_dir(), "Pass --qt-root or set QT_ROOT_DIR.")
     require(args.output.suffix == ".zip", "The output must be a .zip file.")
-    qt_root = args.qt_root.resolve()
-    windeployqt = args.windeployqt or qt_root / "bin" / "windeployqt.exe"
     crt = args.crt_dir or crt_directory(visual_studio())
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     cli_version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     manifest = {"product": "Zerus", "version": version, "cli_version": cli_version, "platform": "Windows",
-                "architecture": "x86_64", "qt_version": qt_version(qt_root), "native_agents_bundled": False, "mobile_connector_bundled": True,
+                "architecture": "x86_64", "desktop": "tauri", "webview2_runtime": "evergreen", "native_agents_bundled": False, "mobile_connector_bundled": True,
+                "lore_version": lore_version(ROOT),
                 "source_commit": source_commit()}
+    if args.fork:
+        build = args.fork_build.strip()
+        feed = args.fork_feed.strip()
+        require(build == "" or build.isdigit() and int(build) > 0, "The fork build is a positive number or empty.")
+        require(feed == "" or feed.startswith(FORK_RELEASES), f"The fork feed is a release asset of {FORK_REPOSITORY}.")
+        require(bool(build) == bool(feed), "A fork build has both a build number and a feed, or neither (experimental).")
+        manifest["fork"] = {"repository": FORK_REPOSITORY, "build": int(build) if build else None, "feed": feed}
+    require(not args.executor or args.fork, "Only a fork zip ships the artifact executor.")
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="zerus-windows-") as temporary:
@@ -147,31 +197,13 @@ def main():
         else:
             pair = conpty_pair.fetch(Path(temporary) / "conpty")
         copy(args.cli, stage / "hgs.exe")
+        copy(args.lore, stage / "lore.exe")
         copy(args.gui, stage / "hgs-tray.exe")
         copy(args.connector, stage / "zerus-mobile-connector.exe")
         if args.mobile_relay:
             copy(args.mobile_relay, stage / "zerus-relay.exe")
-        # Qt libraries, plugins and translations. The SVG image and icon plugins
-        # are loaded at run time only, so windeployqt cannot infer them from
-        # imports. QML debugging and TUIO touch plugins are not used; the NMEA
-        # position plugin needs Qt Serial Port, which is not shipped. The compiler
-        # runtime is copied as DLLs below instead of windeployqt's vc_redist
-        # installer. The Mesa software OpenGL fallback, which the bundled notices
-        # do not cover, is left out.
-        # Microsoft's Direct3D shader compilers stay out as well: Windows 10 1903
-        # and later include D3DCompiler_47.dll, and the notices do not cover the
-        # Windows SDK's DXC (dxcompiler.dll, dxil.dll) either.
-        subprocess.run([str(windeployqt), "--release", "--no-compiler-runtime", "--no-opengl-sw",
-                        "--no-system-d3d-compiler", "--no-system-dxc-compiler",
-                        "--include-plugins", "qsvg,qsvgicon", "--skip-plugin-types", "qmltooling,generic",
-                        "--exclude-plugins", "qtposition_nmea", str(stage / "hgs-tray.exe")], check=True)
-        # windeployqt also copies the ICU that Qt6Core imports from PATH: the build
-        # machine's System32 copy, which is a forwarder to icu.dll on current
-        # Windows. Qt6Core uses the system ICU instead; never redistribute it.
-        for path in sorted(stage.glob("*.dll")):
-            if path.name.lower().startswith("icu"):
-                print(f"Leaving out {path.name}, a Windows system library.")
-                path.unlink()
+        if args.executor:
+            manifest["artifact_executor"] = add_executor(args.executor.resolve(), stage)
         for dll in sorted(crt.glob("*.dll")):
             copy(dll, stage / dll.name)
         missing = [name for name in CRT_REQUIRED if not (stage / name).is_file()]
@@ -181,9 +213,6 @@ def main():
         for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
             copy(ROOT / name, stage / name)
         licenses = stage / "licenses"
-        copy(ROOT / "tray/vendor/libvterm/LICENSE", licenses / "libvterm-LICENSE")
-        copy(ROOT / "tray/vendor/md4c/LICENSE.md", licenses / "md4c-LICENSE")
-        copy(ROOT / "tray/vendor/qrcodegen/LICENSE", licenses / "qrcodegen-LICENSE")
         copy(ROOT / "docs/licenses/codex-LICENSE.txt", licenses / "codex-LICENSE.txt")
         copy(ROOT / "docs/licenses/conpty-LICENSE.txt", licenses / "conpty-LICENSE.txt")
         copy(ROOT / "docs/licenses/conpty-NOTICE.md", licenses / "conpty-NOTICE.md")
@@ -194,28 +223,30 @@ def main():
             relay = ["--manifest-path", str(ROOT / "services/mobile/relay/Cargo.toml")] if args.mobile_relay else []
             subprocess.run([sys.executable, str(ROOT / "scripts/collect-licenses.py"), str(licenses / "rust"),
                             "--manifest-path", str(ROOT / "Cargo.toml"),
-                            "--manifest-path", str(ROOT / "services/mobile/connector/Cargo.toml"), *relay],
+                            "--manifest-path", str(ROOT / "services/mobile/connector/Cargo.toml"),
+                            "--manifest-path", str(ROOT / "crates/lore-bin/Cargo.toml"), *relay],
                            cwd=ROOT, check=True)
-        for text in sorted((ROOT / "packaging/windows/licenses").glob("*.txt")):
-            copy(text, licenses / "qt" / text.name)
-        # Qt ships SPDX documents per module. Source SBOMs are not needed.
-        sboms = sorted(path for path in (qt_root / "sbom").glob("*.spdx") if not path.name.endswith(".source.spdx"))
-        names = {path.name for path in sboms}
-        require(f"qtbase-{manifest['qt_version']}.spdx" in names and
-                f"qtmultimedia-{manifest['qt_version']}.spdx" in names,
-                "The Qt installation lacks its SBOM notices; review Qt licensing before distribution.")
-        for sbom in sboms:
-            copy(sbom, licenses / "qt" / "sbom" / sbom.name)
-        # The documents name licenses by identifier; each needs its text here.
-        texts = {path.stem for path in (licenses / "qt").glob("*.txt")}
-        missing = missing_license_texts({sbom.name: sbom.read_text(encoding="utf-8") for sbom in sboms}, texts)
-        require(not missing, "Qt SPDX documents name licenses without a text in packaging/windows/licenses: "
-                + ", ".join(missing))
+            subprocess.run([sys.executable, str(ROOT / "scripts/collect-licenses.py"), str(licenses / "rust/desktop"),
+                            "--manifest-path", str(ROOT / "client/src-tauri/Cargo.toml"),
+                            "--manifest-features", f"{ROOT / 'client/src-tauri/Cargo.toml'}=video"],
+                           cwd=ROOT, check=True)
+        require((licenses / "rust/desktop/inventory.json").is_file(), "Collect Tauri dependency license texts first.")
+        if args.frontend_licenses:
+            require((args.frontend_licenses / "inventory.json").is_file(), "Collect frontend dependency license texts first.")
+            shutil.copytree(args.frontend_licenses, licenses / "frontend")
+        else:
+            subprocess.run([sys.executable, str(ROOT / "client/scripts/collect-notices.py"),
+                            str(licenses / "frontend")], cwd=ROOT, check=True)
         readme = (ROOT / "packaging/windows/README.txt").read_text(encoding="utf-8")
-        for key in ("version", "cli_version", "qt_version", "source_commit"):
+        for key in ("version", "cli_version", "source_commit"):
             readme = readme.replace(f"@{key.upper()}@", manifest[key])
-        readme = readme.replace("@QT_SERIES@", ".".join(manifest["qt_version"].split(".")[:2]))
         readme = readme.replace("@CONPTY_VERSION@", conpty_pair.PIN["version"])
+        if args.fork:
+            fork = (ROOT / "packaging/windows/README-fork.txt").read_text(encoding="utf-8")
+            build = manifest["fork"]["build"]
+            fork = fork.replace("@FORK_BUILD@", str(build) if build else "none (experimental build)")
+            fork = fork.replace("@FORK_FEED@", manifest["fork"]["feed"] or "none (experimental build)")
+            readme = readme.rstrip("\n") + "\n\n" + fork
         require(not re.search(r"@[A-Z_]+@", readme), "Unreplaced placeholder in the Windows README.")
         # Notepad and other Windows tools expect CRLF in a plain-text README.
         (stage / "README.txt").write_bytes(readme.replace("\n", "\r\n").encode("utf-8"))
@@ -229,15 +260,24 @@ def main():
         def identity(program, arguments):
             return json.loads(subprocess.check_output([str(program), *arguments], cwd=identity_home,
                               env=identity_env, timeout=30).decode("utf-8"))
-        fork = (ROOT / "FORK_VERSION").read_text(encoding="utf-8").strip()
-        cli_build = fork_identity.cli_identity(identity(stage / "hgs.exe", ["version", "--json"]),
-                                              manifest["source_commit"], fork, "windows")
-        gui_build = fork_identity.gui_identity(identity(stage / "hgs-tray.exe", ["--build-info"]),
-                                              manifest["source_commit"], fork)
-        require(cli_build["version"] == cli_version and gui_build["version"] == version,
-                "Staged binary base versions differ from this source")
-        manifest.update(distribution=fork_identity.DISTRIBUTION, fork_version=fork,
-                        fork_channel="candidate", cli_build=cli_build, gui_build=gui_build)
+        if args.fork:
+            gui_build = identity(stage / "hgs-tray.exe", ["--build-info"])
+            require(not gui_build.get("distribution"), "WhiteWh packaging cannot claim another distribution's desktop")
+            require(gui_build.get("sourceCommit") == manifest["source_commit"]
+                    and gui_build.get("sourceDirty") is False, "WhiteWh desktop source identity differs from this package")
+            require(gui_build.get("forkBuild") == manifest["fork"]["build"]
+                    and gui_build.get("forkFeed", "") == manifest["fork"]["feed"],
+                    "WhiteWh desktop build/feed identity differs from this package")
+        elif (ROOT / "FORK_VERSION").is_file():
+            fork = (ROOT / "FORK_VERSION").read_text(encoding="utf-8").strip()
+            cli_build = fork_identity.cli_identity(identity(stage / "hgs.exe", ["version", "--json"]),
+                                                  manifest["source_commit"], fork, "windows")
+            gui_build = fork_identity.gui_identity(identity(stage / "hgs-tray.exe", ["--build-info"]),
+                                                  manifest["source_commit"], fork)
+            require(cli_build["version"] == cli_version and gui_build["version"] == version,
+                    "Staged binary base versions differ from this source")
+            manifest.update(distribution=fork_identity.DISTRIBUTION, fork_version=fork,
+                            fork_channel="candidate", cli_build=cli_build, gui_build=gui_build)
         (stage / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         partial = output.with_name(output.name + ".partial")
         partial.unlink(missing_ok=True)
@@ -249,8 +289,9 @@ def main():
             partial.unlink(missing_ok=True)
             raise
     os.replace(partial, output)
+    fork = f", fork build {manifest['fork']['build']}" if args.fork else ""
     print(f"Wrote {output} ({output.stat().st_size} bytes) for Zerus {version}, hgs {cli_version}, "
-          f"Qt {manifest['qt_version']}, commit {manifest['source_commit']}.")
+          f"Tauri/WebView2 Evergreen{fork}, commit {manifest['source_commit']}.")
 
 
 if __name__ == "__main__":
@@ -258,3 +299,4 @@ if __name__ == "__main__":
         main()
     except ValueError as error:
         raise SystemExit(f"package-windows: {error}") from None
+

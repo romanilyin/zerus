@@ -35,35 +35,49 @@ whose fixes were taken separately.
 
 ## Local checks
 
+A change runs only the tests it touches: `hgs test affected` names them with
+their time from `.zerus/tests.toml` and `.zerus/test-map.json`. Never run a
+full suite by hand; the full run happens before a release, after the owner
+hears its estimate and confirms. Tests are cut into small areas, never
+dropped, and a new test that repeats an existing one becomes a case of a table
+test. See `hgs guide team-tests` and the "Test discipline" section of
+`docs/reference.md`.
+
+For an exact-commit Arch preflight before pushing, use the isolated
+[local Linux runner](docs/local-ci.md). It reads that commit's CI bodies,
+continues independent checks after failures, and lists omitted jobs explicitly.
+
 ```sh
 python3 scripts/ci/check-source.py
 python3 -m unittest discover -s tests -p 'test_*publication.py'
 bash scripts/ci/cli.sh
-bash scripts/ci/gui.sh
+(cd client && npm ci && npm run check && npm test)
 ```
+
+For base advances and store-version work, run the maintained
+[local Teams native4 compatibility checks](docs/testing-teams-base.md). They
+separate real predecessor/current interoperability from SQL fault-seam guards.
+
+After editing `client/src/i18n.next-ru.json`, run
+`python3 client/scripts/generate-i18n-catalog.py`. It sorts the supplement and
+refreshes the generated catalog; `--check` verifies both without writing.
 
 The CLI script clears inherited `HGS_*` session/account context, runs Rust unit
 tests and terminal smoke tests, then runs the Python integration test classes in
 parallel fresh processes and builds a release binary. Classes larger than twelve
 tests run as several jobs unless they share a class fixture, slowest first by
 the previous local run, or else by `scripts/ci/python-durations.json`. The
-desktop script builds with `BUILD_TESTING=ON` and runs the complete Qt suite
-headlessly in parallel (`build` or `test` runs only that half). Each suite
-registered with `zerus_add_test` also writes per-function JUnit results to
-`artifacts/test-results/qt-functions/`. `test_sessionswindow` runs as ten
-shards of its test functions and of the data rows of its slowest functions,
-balanced by the durations in `tray/tests/qt-shard-durations.txt`; tests that
-file does not list go by a hash of their name, and every shard fails unless
-each function and row runs in exactly one shard. `scripts/ci/qt-shard-seed.py`
-rebuilds the file from the `qt-functions` results of the CI desktop jobs. Tray
-sources compile once, into the `hgs-tray-*` static libraries that the
-application and the suites link: a new suite links the lowest library that
-covers its code instead of listing `tray/src` files, which fails configuration.
-`ZERUS_TEST_JOBS` sets both test parallelisms (defaults: at most 16 Python and
-8 Qt jobs, never more than the CPU count; `1` runs them one after another);
+desktop is the Tauri client (`client/`); task #28 removed the Qt desktop, its
+CMake build and its QtTest suites.
+`ZERUS_TEST_JOBS` sets the test parallelism (default: at most 16 Python jobs,
+never more than the CPU count; `1` runs them one after another);
 `ZERUS_PYTHON_JOBS` overrides it for the Python classes. Test logs and Python
 job durations live in ignored `artifacts/test-results/`. Set
-`ZERUS_BUILD_JOBS` to limit desktop build parallelism. Zerus tracks the newest
+`ZERUS_BUILD_JOBS` to limit desktop build parallelism. The Tauri host's drive-folder integration tests run the actual CLI from the
+same source: build it with `cargo +1.99.1 build --locked --bin hgs` and set
+`HGS_TEST_BIN` to that binary's absolute path; `scripts/ci/client-native.sh`
+does both in its own target directory.
+Zerus tracks the newest
 stable Rust: `rust-version` and the toolchain pinned in CI follow the latest
 stable release, and raising them is routine maintenance. Run
 `cargo +1.99.1 test --locked` for that pinned toolchain.
@@ -77,6 +91,18 @@ On Linux, the three worktree modules run through `scripts/ci/worktree-tests.py`
 in a fresh PID/mount namespace, including their live process blockers and private
 tmux servers. Production cleanup retains folders when a host process cannot be
 inspected, so a shared host cannot establish the positive removal controls.
+On an active desktop, protected same-user processes can correctly make a direct
+worktree test report `processes_unavailable`. For local real-Git fixtures, map the
+current UID into a private process namespace so permission tests remain active
+and the fixture sees only its own processes:
+
+```sh
+export HGS_TEST_BIN="$PWD/target/debug/hgs"
+(cd tests && env -u HGS_SESSION -u HGS_RUN_ID \
+  unshare --user --map-current-user --pid --fork --mount-proc --kill-child=KILL \
+  python3 -m unittest -v test_worktrees)
+```
+
 Local isolation requires `unshare` and `setpriv`; hosted disposable runners use
 passwordless sudo only for namespace creation, then run fixtures as the original
 user with no capabilities or supplementary groups. A real nondumpable child
@@ -103,33 +129,9 @@ scope for VM disposal. Owner Macs and other hosts refuse account creation before
 allocation or sudo; local macOS checks continue under the current user. No test is
 excluded and the production guard remains strict.
 
-`check-source.py` keeps the desktop's Unix children from inheriting its descriptors
-([ChildProcess.h](tray/src/ChildProcess.h)): in `tray/src` it rejects
-`QProcess::startDetached()` and `QProcess::execute()`, and every `QProcess` must go to
-`ChildProcess::inheritStdioOnly()`, directly or through a function that passes its
-parameter there, in the function that creates it (for a member, a constructor of its
-class) and before it starts.
-`CHILD_PROCESS_EXEMPT` in the script names the files that may start children
-otherwise, each with its reason.
-
-The desktop parses JSON only through [JsonParse.h](tray/src/JsonParse.h), off
-the GUI thread: `hgs` output in a `ProcessRunner` prepare step, other data
-through `ProcessRunner::post` or an existing worker, and QSettings values
-through [SettingsJson.h](tray/src/SettingsJson.h), which the tray parses before
-its windows exist and whose writers record what they store
-(`SettingsJson::store`). The GUI thread has no exception: owner decision,
-2026-10-27, the list of files allowed to parse small values there was empty at
-the end of M2, so `JsonParse::local()` is gone. A value the GUI thread needs at
-once is prepared before it is read, or kept in a form that needs no parse, such
-as a `QDataStream` for drag data that stays in the process. `check-source.py`
-rejects `QJsonDocument::fromJson` and `QCborValue::fromCbor` in `tray/src`
-outside `JsonParse.cpp`, and any `JsonParse::local()` call.
-Every Qt suite runs with `ZERUS_GUI_THREAD_CHECKS=fatal`, so a parse on the GUI
-thread, or a GUI-thread read of a JSON setting nobody parsed, aborts the test
-with its call site. A GUI suite that checks a parser directly calls it through
-`offGuiThread()` (`tray/tests/support/OffGuiThread.h`); one that stores a JSON
-setting for a widget to read uses `SettingsJson::store`, or `SettingsJson::warm`
-followed by a `ProcessRunner::post` barrier.
+`check-source.py` checks portable syntax, privacy and release identities.
+UI JSON and filesystem work belongs in bounded background Rust operations;
+no new per-session UI worker/cache or blocking UI-thread parsing is allowed.
 
 A change to tmux or `ps` call sites must keep Unix behaviour unchanged: compare a
 [tmux census](docs/ci-and-aur.md#unix-tmux-census) of the branch with one of main.
@@ -167,10 +169,10 @@ backend classes when a behaviour must hold for both.
 On Arch, `bash scripts/ci/arch.sh` also builds and validates the pacman package
 as an unprivileged user. It substitutes a local Git source only in its disposable
 build directory; it never installs the package or enables services.
-Hosted Dev CI runs shared Rust/protocol checks, Linux CLI, Arch desktop/package,
+Hosted Dev CI runs shared Rust/protocol checks, Linux CLI, Arch package,
 macOS and Android on main. PRs retain Windows/iOS for affected or unknown paths;
 Nightly and Stable require the full matrix. Manual runs default to all platforms,
-with independent macOS-desktop and iOS flags. Validate workflow
+with independent macOS and iOS flags. Validate workflow
 edits locally before pushing. Daily nightlies publish a verified binary to GitHub and
 AUR, and the Windows portable zip to GitHub, only after every check passes; stable
 releases, which carry the zip their own candidate run tested, remain manually published.
@@ -181,6 +183,16 @@ Native integration tests may need separately installed agent CLIs or a real desk
 read each suite's setup before running it. Do not run tests against live agent state.
 Some platform tests only exist on macOS, Linux or Windows. Record any unavailable
 checks.
+
+The default Unix Claude/Codex native suites also require a private Rust test
+image for their ID-layout Effort fixture. From the exact clean, committed source,
+build the CLI and image together with `scripts/ci/native-effort-seed.py`; see the
+[native qualification commands](docs/ci-and-aur.md#native-agent-compatibility-and-upstream-review).
+The runner verifies the receipt's source tree and both executable hashes before
+and after execution. The fixture alone uses the ignored seed method to transfer
+its own saved record through the real owner-transfer code; Effort requests run
+the production CLI. The private test image is never included in product
+installers or release assets.
 
 The OpenCode 2 native suite needs an installed OpenCode 2.0.32 or newer 2.x. Run it
 locally on request; full Linux and macOS CI run it with the latest release. See
@@ -194,7 +206,7 @@ The dismissing click must cancel without activating the control behind the popup
 ```sh
 QT_QPA_PLATFORM=cocoa .ci-build/gui/tests/test_machinespage colorPickerDismissalKeepsTheSavedColor
 QT_QPA_PLATFORM=cocoa .ci-build/gui/tests/test_projectsdialog projectColorChangesRequireApply customProjectColorRemainsStaged
-QT_QPA_PLATFORM=cocoa .ci-build/gui/tests/test_sessionswindow colorPickerUsesWorkspaceThemeAndCancelsOutside
+QT_QPA_PLATFORM=cocoa .ci-build/gui/tests/test_sessionswindow_settings1 colorPickerUsesWorkspaceThemeAndCancelsOutside
 ```
 
 On a KDE Plasma 6 Wayland desktop, the optional native window-layer check uses
@@ -205,7 +217,7 @@ and leaves unrelated windows and desktop rules alone:
 QT_QPA_PLATFORM=wayland ZERUS_TEST_KWIN=1 \
   tray/build/tests/test_kwinwindowlayer nativeKWinChangesOnlyOurWindowAndRestores
 QT_QPA_PLATFORM=wayland \
-  tray/build/tests/test_sessionswindow windowLayerControlsKeepFocusAndLayout
+  tray/build/tests/test_sessionswindow_settings2 windowLayerControlsKeepFocusAndLayout
 ```
 
 The ordinary `kwinwindowlayer` test runs on a private D-Bus session with a fake
@@ -253,6 +265,36 @@ Gitleaks on the candidate source archive and Beads data, and review binary asset
 and dependency notices. The local privacy script catches common accidental machine
 paths and keys; it is not a complete secret scanner.
 
+## Russian catalogs
+
+`client/src/i18n.next-ru.json` is the reviewed Next-only supplement (source
+key -> text; a plural is a list of three forms) and `client/src/i18n.ru.json` is
+generated from it and the shared Qt catalog by
+`client/scripts/generate-i18n-catalog.py`. `.gitattributes` names the merge
+driver `i18n` for both files, so two branches that add different keys merge
+without a conflict. A key both sides changed differently stays a conflict with
+both values in the file; the generated catalog is then rebuilt from the merged
+supplement instead of being merged.
+
+Enable the driver once per clone before merging by hand:
+
+```sh
+git config merge.i18n.driver "python3 scripts/i18n-merge.py %O %A %B %L %P"
+```
+
+Use `python` instead of `python3` in Git Bash on Windows. Zerus's own merge
+paths (the merge queue, `git-merge-lead` and the accepted-work merge) pass the
+same driver with `-c` at merge time; the repository's config stays free of
+merge drivers, which Zerus refuses on purpose. Configure the driver only in a
+checkout you merge by hand: a repository that has it configured is refused by
+Zerus's merge paths. After resolving a supplement conflict, regenerate and
+check the catalog:
+
+```sh
+python3 client/scripts/generate-i18n-catalog.py
+python3 client/scripts/generate-i18n-catalog.py --check
+```
+
 <a id="windows"></a>
 
 ## Windows
@@ -261,22 +303,10 @@ Windows builds the [portable zip](docs/installation.md#windows): `hgs.exe`, whos
 session host runs local sessions once they are enabled, and `hgs-tray.exe`.
 You need:
 
-- Visual Studio 2022 with the x64 C++ tools and a Windows SDK; its own CMake
-  (3.22 or later is needed for the Windows tests) and Ninja are used;
-- Rust for MSVC: stable, and 1.99.1 with clippy;
-- Python 3.9 or later for the Qt test fixtures and 3.11 or later for the
-  packaging scripts;
-- Git for Windows with Git Bash, and 7-Zip;
-- Qt 6.10.3 `msvc2022_64` with Qt Multimedia (no Qt WebEngine: the embedded
-  DeepSeek Native UI is an optional Linux plugin).
-  CI installs the official archives pinned in `packaging/windows/qt.json`, each
-  verified before 7-Zip extracts it. The same works locally and makes
-  `~/Qt/6.10.3/msvc2022_64` (`--seven-zip` names 7-Zip when `7z` is not on
-  `PATH`):
-
-```sh
-python scripts/install-qt-windows.py --output ~/Qt
-```
+- Visual Studio 2022 with the x64 C++ tools and Windows SDK;
+- Rust for MSVC: stable, and the pinned 1.99.1 with clippy;
+- Python 3.11 or later, Node.js 24/npm, Git for Windows with Git Bash, and 7-Zip;
+- Evergreen WebView2 for interactive Zerus Next checks (no Qt SDK/runtime).
 
 Clone with `git clone -c core.autocrlf=false`, as CI does: test fixtures and
 scripts must keep LF line endings. Then, from Git Bash in the checkout:
@@ -299,8 +329,6 @@ HGS_TEST_CONPTY_DIR="$(cygpath -w "$PWD/target/conpty")" \
 HGS_TEST_BIN="$(cygpath -w "$PWD/target/release/hgs.exe")" \
 HGS_TEST_CONPTY_DIR="$(cygpath -w "$PWD/target/conpty")" \
   python -X utf8 scripts/ci/agent-compatibility.py </dev/null
-export QT_ROOT_DIR="$(cygpath -w ~/Qt/6.10.3/msvc2022_64)"
-bash scripts/ci/gui.sh </dev/null
 cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --lib windows_management::tests
 cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --test windows_gateway
 cargo +1.99.1 build --release --locked --manifest-path services/mobile/connector/Cargo.toml
@@ -310,9 +338,15 @@ HGS_TEST_FAKE_AGENT="$(cygpath -w "$PWD/target/debug/examples/fake_agent.exe")" 
   python scripts/ci/outside-job.py --custody-only --timeout 900 \
     --log artifacts/test-results/windows-mobile-gateway.log -- \
     python -m unittest discover -s tests -p test_windows_mobile_gateway.py -v </dev/null
+export CARGO_TARGET_DIR="$PWD/target/windows-next"
+(cd client && npm ci --no-audit --no-fund && \
+    npm run tauri -- build --ci --no-bundle --config src-tauri/tauri.windows.switch.conf.json --features video)
+python client/scripts/collect-notices.py artifacts/windows-frontend-licenses
+unset CARGO_TARGET_DIR
 python scripts/package-windows.py --cli target/release/hgs.exe \
     --connector services/mobile/connector/target/release/zerus-mobile-connector.exe \
-    --gui .ci-build/gui/hgs-tray.exe --conpty target/conpty \
+    --gui target/windows-next/release/hgs-tray.exe --conpty target/conpty \
+    --frontend-licenses artifacts/windows-frontend-licenses \
     --output artifacts/zerus-windows-x86_64.zip
 python scripts/check-windows-portable.py artifacts/zerus-windows-x86_64.zip --run --selftest
 ```
@@ -329,18 +363,18 @@ runs with one latest Claude Code and Codex package per agent, each against a loc
 API: [testing the Windows session host](docs/windows-host-testing.md).
 
 Kimi's optional native input, recovery, question and startup-trust fixtures are
-`test_kimi_native.NativeKimi` (three cases),
-`test_kimi_questions_native.NativeKimiQuestions` (three) and
-`test_kimi_questions_native.NativeKimiTrust` (three). Run them only with an
+`test_kimi_native.NativeKimi`,
+`test_kimi_questions_native.NativeKimiQuestions` and
+`test_kimi_questions_native.NativeKimiTrust`. Run them only with a
 privately selected `HGS_KIMI_TEST_BIN`, exact `HGS_KIMI_TEST_SHA256` and the runner's
 sealed `HGS_KIMI_TEST_RECORD` plus official manifest, a sealed
-`HGS_TEST_BIN`, private helper PATH and evidence directory; never point them at
+`HGS_TEST_BIN`, the exact-source Effort seed receipt, private helper PATH and evidence directory; never point them at
 the installed Kimi. Each case runs a private copy, disables automatic updates,
 uses its loopback model and platform fixture, proves the child image and private
 environment, and retains uncertain cleanup. The macOS cases compile one exec
-shim per case, so they require both native and compiler resources. A current
-latest-release campaign runs twelve native cases, including long Other answers,
-explicit recovery of a retained editor, and preservation of a mismatching draft. Historical two-version receipts
+shim per case, so they require both native and compiler resources. The maintained
+inventory includes long Other answers, explicit recovery of a retained editor,
+preservation of a mismatching draft and ID-layout Effort changes. Historical two-version receipts
 do not define current selection. The seventeen R2 and seven question-fixture
 controls use stand-ins and loopback
 servers and establish fixture behavior only. `test_kimi_trust` and
@@ -349,9 +383,10 @@ are synthetic integration tests, not pure controls. Historical native results
 do not qualify a newly composed candidate.
 
 The separate [latest Kimi native workflow](.github/workflows/kimi-native.yml)
-runs these eight cases on disposable standard Linux and macOS runners for
+runs these cases on disposable standard Linux and macOS runners for
 relevant PR changes or a manual run. It builds hgs once with Rust 1.99.1 and
-two jobs, runs the existing pinned tmux in a private prefix, resolves the official
+two jobs, seals the private Effort test image from the same source, runs the
+existing pinned tmux in a private prefix, resolves the official
 latest release once and verifies its versioned manifest, exact target, bounded
 size and SHA-256 before native
 execution. It receives no provider or publication credentials, uses no cache,
@@ -377,21 +412,11 @@ qualifications; they do not add Kimi to every main run.
 `scripts/fetch-conpty.py` downloads the ConPTY package pinned in
 `packaging/windows/conpty.json` from nuget.org and writes only its checked
 `conpty.dll` and `OpenConsole.exe`; `package-windows.py` puts them next to
-`hgs.exe` and fetches them itself without `--conpty`. On Windows,
-`scripts/ci/gui.sh` re-enters itself in the Visual Studio x64 environment
-(`scripts/ci/msvc-env.py`), builds with Ninja and `cl` against `QT_ROOT_DIR` and runs
-every Qt suite offscreen. The Qt fixtures are Python scripts that a small native
-shim (`zerus-test-helper`) starts, because Windows cannot run scripts directly.
-Outside a console, the shim hands each call to a worker of the test program's pool
-(`tray/tests/support/fixture-worker.py`), which keeps one warm interpreter and ends
-a fixture whose shim is killed; `ZERUS_FIXTURE_POOL=0` starts a Python process per
-call instead.
-`package-windows.py` finds the app-local Visual C++ runtime with `vswhere`, and
+`hgs.exe` and fetches them itself without `--conpty`. `package-windows.py` finds the app-local Visual C++ runtime with `vswhere`, and
 `check-windows-portable.py --run --selftest` starts both executables from an
 extracted copy with a minimal environment and enables local sessions in its
-disposable profile, which must stage the pinned ConPTY pair. Never start the packaged app with
-`QT_QPA_PLATFORM=offscreen`: the zip has no offscreen plugin, and Qt's error box
-then hangs the process out of sight.
+disposable profile, which must stage the pinned ConPTY pair. Interactive checks need a real desktop session and WebView2; private CLI/pipe
+fixtures do not establish GUI/tray/notification acceptance.
 
 Windows OpenSSH (`ssh.exe`) never exits after it has used a synchronous pipe for
 one of its standard streams, the kind Rust's standard library, Python, PowerShell
@@ -406,7 +431,7 @@ rewrites arguments that look like POSIX paths when it starts a Windows program: 
 `MSYS_NO_PATHCONV=1` before passing remote paths such as `/workspace/orbit` to
 `hgs.exe`. A check against a real peer is described in
 [the real-peer smoke](docs/ci-and-aur.md#real-peer-smoke-on-a-windows-pc).
-`tray/tools/export-windows-icon.py` (Pillow) regenerates the checked-in Windows icon
+`packaging/desktop/export-windows-icon.py` (Pillow) regenerates the checked-in Windows icon
 after artwork changes.
 
 `test_windows_mobile_gateway.py` needs Git for Windows' `openssl` on PATH and

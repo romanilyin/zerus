@@ -8,6 +8,74 @@ use sha2::{Digest, Sha256};
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+// Kimi 2.4.1 fires TurnStarted without awaiting it, but awaits the Stop hook
+// before ending its step or starting another turn. Stop omits turn_id. At that
+// blocking boundary the latest main turn.prompt identifies this same turn.
+// Never infer it from hook arrival time, text, or the previous HGS start.
+pub(super) fn bind_stop_turn(record: &Value, event: &mut Value) {
+    if string(record, "agent") != "kimi"
+        || string(event, "hook_event_name") != "Stop"
+        || !["", "main"].contains(&string(event, "agent_id"))
+    {
+        return;
+    }
+    if event.get("turn_id").is_some() {
+        event["turn_identity_source"] = json!("kimi_hook");
+        return;
+    }
+    let Ok(paths) = questions::wire_paths(record) else { return };
+    let [path] = paths.as_slice() else { return };
+    if let Some(id) = stop_turn_file(path) {
+        event["turn_id"] = json!(id);
+        event["turn_identity_source"] = json!("kimi_wire");
+    }
+}
+
+fn stop_turn_file(path: &Path) -> Option<u64> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO swapped in after discovery must not park the Stop hook while
+        // it holds the global state lock, before we can check the file type.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    let (before, metadata) = crate::platform::FileIdentity::with_metadata(&file).ok()?;
+    if !metadata.is_file() { return None; }
+    let length = metadata.len();
+    let offset = length.saturating_sub(MAX_BYTES);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    (&mut file).take(MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    let (after, final_metadata) = crate::platform::FileIdentity::with_metadata(&file).ok()?;
+    if bytes.len() as u64 != length - offset || before != after || final_metadata.len() != length
+        || crate::platform::FileIdentity::at(path).ok()?.0 != before
+    { return None; }
+    stop_turn_tail(&bytes, offset > 0)
+}
+
+fn stop_turn_tail(bytes: &[u8], clipped_start: bool) -> Option<u64> {
+    let mut latest = None;
+    for (index, line) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+        if clipped_start && index == 0 { continue; }
+        if line.len() > 1024 * 1024 || !line.ends_with(b"\n") { return None; }
+        let event: Value = serde_json::from_slice(line).ok()?;
+        if !event.is_object() || !event["type"].is_string() { return None; }
+        if string(&event, "type") != "turn.prompt" { continue; }
+        match event["agentId"].as_str()? {
+            "main" => {},
+            "" => return None,
+            _ => continue,
+        }
+        let id = event["turnId"].as_u64().filter(|id| *id <= i64::MAX as u64)?;
+        if latest.is_some_and(|previous| id <= previous) { return None; }
+        latest = Some(id);
+    }
+    latest
+}
+
 fn assistant_message(event: &Value) -> Option<Value> {
     if string(event, "type") != "agent.message.appended"
         || !["", "main"].contains(&string(event, "agentId"))
@@ -39,6 +107,57 @@ fn assistant_message(event: &Value) -> Option<Value> {
         "detail":journal::clipped(&json!(text), 32000)}))
 }
 
+/// Main user parts are display candidates only. Preserve all parts (including
+/// startup-hook context) rather than trusting hook-looking tags as provenance.
+fn user_message(event: &Value) -> Option<Value> {
+    if event["type"] != "turn.prompt"
+        || !["", "main"].contains(&string(event, "agentId"))
+        || event["origin"]["kind"] != "user"
+        || event["turnId"]
+            .as_u64()
+            .is_none_or(|id| id > i64::MAX as u64)
+    {
+        return None;
+    }
+    let id = string(event, "promptId");
+    let at = event["time"].as_f64()? / 1000.0;
+    let parts = event["input"].as_array()?;
+    if id.is_empty()
+        || id.len() > 160
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        || !at.is_finite()
+        || at <= 0.0
+        || parts.is_empty()
+        || parts.len() > 64
+        || !parts
+            .iter()
+            .all(|part| part["type"] == "text" && part["text"].is_string())
+    {
+        return None;
+    }
+    let text = parts
+        .iter()
+        .map(|part| string(part, "text"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut body = journal::activity_message_body("kimi_wire", &text, at, id);
+    body["kimi_turn_id"] = event["turnId"].clone();
+    let mut remaining = journal::MESSAGE_TEXT_LIMIT;
+    let retained: Vec<_> = parts
+        .iter()
+        .map(|part| {
+            let text = string(part, "text");
+            let shown = journal::clipped(&json!(text), remaining);
+            remaining = remaining.saturating_sub(text.chars().count());
+            shown
+        })
+        .collect();
+    body["message_parts"] = json!(retained);
+    Some(body)
+}
+
 // Kimi's live loop records text as it becomes visible in the TUI. The older
 // agent.message.appended envelopes can arrive together only at the end of the
 // turn. step.end links those copies by messageId, without guessing from text or
@@ -56,6 +175,7 @@ fn wire_messages(bytes: &[u8], clipped_start: bool) -> Vec<Value> {
         if ![
             b"agent.message.appended".as_slice(),
             b"context.append_loop_event".as_slice(),
+            b"turn.prompt".as_slice(),
         ]
         .iter()
         .any(|kind| line.windows(kind.len()).any(|part| part == *kind))
@@ -66,6 +186,10 @@ fn wire_messages(bytes: &[u8], clipped_start: bool) -> Vec<Value> {
             continue;
         };
         if !["", "main"].contains(&string(&event, "agentId")) {
+            continue;
+        }
+        if let Some(message) = user_message(&event) {
+            messages.push(message);
             continue;
         }
         if let Some(message) = assistant_message(&event) {
@@ -135,9 +259,18 @@ fn wire_messages(bytes: &[u8], clipped_start: bool) -> Vec<Value> {
             .unwrap_or(0.0)
             .total_cmp(&b["at"].as_f64().unwrap_or(0.0))
     });
-    if messages.len() > 50 {
-        messages.drain(..messages.len() - 50);
-    }
+    let (mut bodies, mut replies) = (0, 0);
+    messages.reverse();
+    messages.retain(|message| {
+        let count = if message["type"] == "UserMessageBody" {
+            &mut bodies
+        } else {
+            &mut replies
+        };
+        *count += 1;
+        *count <= 50
+    });
+    messages.reverse();
     messages
 }
 
@@ -202,7 +335,13 @@ fn read_details(record: &Value, include_turns: bool) -> Result<(Vec<Value>, Vec<
         (&mut file).take(MAX_BYTES)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
-        messages.extend(wire_messages(&bytes, offset > 0));
+        let mut found = wire_messages(&bytes, offset > 0);
+        for message in &mut found {
+            if message["type"] == "UserMessageBody" {
+                message["kimi_conversation_id"] = record["conversation_id"].clone();
+            }
+        }
+        messages.extend(found);
         if include_turns {
             (turns, complete) = wire_turns(&bytes, offset > 0);
             complete &= file.metadata().map_err(|e| e.to_string())?.len() == length;
@@ -219,6 +358,68 @@ mod tests {
         json!({"type":"turn.prompt", "agentId":"main", "turnId":id,
             "promptId":format!("prompt-{id}"), "origin":{"kind":"user"}, "time":100000,
             "input":[{"type":"text", "text":prompt}]})
+    }
+
+    #[test]
+    fn blocking_stop_binds_the_latest_main_turn_from_a_complete_stable_tail() {
+        let child = json!({"type":"turn.prompt","agentId":"child","turnId":99});
+        let bytes = lines(&[user_turn(0,"first"), user_turn(1,"follow-up"), child]);
+        assert_eq!(stop_turn_tail(&bytes, false), Some(1));
+        assert_eq!(stop_turn_tail(&lines(&[user_turn(0,"first")]), false), Some(0));
+        assert_eq!(stop_turn_tail(&[b"partial older row\n".to_vec(),bytes.clone()].concat(), true), Some(1));
+        // No lifetime turn-count cap: only this bounded tail's latest identity
+        // is needed, not a claim that the complete conversation was loaded.
+        let turns=(0..80).map(|id| user_turn(id,"fixture")).collect::<Vec<_>>();
+        assert_eq!(stop_turn_tail(&lines(&turns),false),Some(79));
+        let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("wire.jsonl");
+        std::fs::write(&path,&bytes).unwrap();
+        assert_eq!(stop_turn_file(&path),Some(1));
+        assert_eq!(stop_turn_file(dir.path()),None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replaced_fifo_does_not_park_the_blocking_stop_reader() {
+        use std::os::unix::{ffi::OsStrExt,fs::OpenOptionsExt};
+        use std::{sync::mpsc,thread,time::Duration};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("wire.jsonl");
+        std::fs::write(&path,lines(&[user_turn(1,"fixture")])).unwrap();
+        assert_eq!(stop_turn_file(&path),Some(1));
+        std::fs::remove_file(&path).unwrap();
+        let name=std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this NUL-terminated path remains live for the syscall and
+        // names only this test's private temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(),0o600) },0);
+        let fifo=path.clone();let (send,receive)=mpsc::channel();
+        let reader=thread::spawn(move || send.send(stop_turn_file(&fifo)).unwrap());
+        let result=receive.recv_timeout(Duration::from_secs(5));
+        // A broken blocking implementation must still leave no worker behind.
+        // Linux permits O_RDWR on a FIFO without a peer; keep its writer alive
+        // until the original reader has joined, even if that thread was late.
+        let rescue=result.is_err().then(|| std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(libc::O_NONBLOCK).open(&path).unwrap());
+        reader.join().unwrap();drop(rescue);
+        assert_eq!(result,Ok(None),"a nonregular replacement must be refused without waiting for a writer");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path,lines(&[user_turn(2,"fixture")])).unwrap();
+        assert_eq!(stop_turn_file(&path),Some(2));
+    }
+
+    #[test]
+    fn unknown_or_nonmonotonic_stop_identity_never_falls_back_to_a_previous_turn() {
+        let valid=lines(&[user_turn(1,"fixture")]);
+        for bytes in [valid[..valid.len()-1].to_vec(),[valid.clone(),b"invalid\n".to_vec()].concat(),
+            lines(&[user_turn(1,"a"),user_turn(1,"b")]),
+            lines(&[user_turn(1,"a"),user_turn(0,"b")]),
+            [valid.clone(),vec![b'x';1024*1024+1],b"\n".to_vec()].concat()] {
+            assert_eq!(stop_turn_tail(&bytes,false),None);
+        }
+        for id in [Value::Null,json!(-1),json!("1"),json!(1.5),json!(true),json!(u64::MAX)] {
+            let mut unknown=user_turn(2,"unknown"); unknown["turnId"]=id;
+            assert_eq!(stop_turn_tail(&[valid.clone(),lines(&[unknown])].concat(),false),None);
+        }
+        let mut missing=user_turn(2,"unknown");missing.as_object_mut().unwrap().remove("agentId");
+        assert_eq!(stop_turn_tail(&[valid,lines(&[missing])].concat(),false),None);
     }
 
     #[test]
@@ -386,5 +587,67 @@ mod tests {
         event["agentId"] = json!("main");
         event["message"]["meta"]["finish"]["finishReason"] = json!("length");
         assert!(assistant_message(&event).is_none());
+    }
+}
+
+#[cfg(test)]
+mod full_own_message {
+    use super::*;
+    #[test]
+    fn native_main_user_text_is_available_without_admitting_peer_or_system_input() {
+        let text = "before ".repeat(170) + "[Image #1] AFTER IMAGE";
+        let row = json!({"type":"turn.prompt","agentId":"main","turnId":3,"promptId":"msg_3","origin":{"kind":"user"},"time":100000,
+            "input":[{"type":"text","text":text}]});
+        let messages = wire_messages((row.to_string() + "\n").as_bytes(), false);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["detail"], text);
+        assert_eq!(messages[0]["kimi_turn_id"], 3);
+        let temp = tempfile::tempdir().unwrap();
+        let cid = uuid::Uuid::new_v4().to_string();
+        let path = temp
+            .path()
+            .join("sessions/workspace")
+            .join(&cid)
+            .join("agents/main/wire.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, row.to_string() + "\n").unwrap();
+        let found =
+            read(&json!({"agent":"kimi","agent_home":temp.path(),"conversation_id":cid})).unwrap();
+        assert_eq!(found[0]["kimi_turn_id"], 3);
+        assert_eq!(found[0]["kimi_conversation_id"], cid);
+        for changed in [
+            json!({"agentId":"peer"}),
+            json!({"origin":{"kind":"system"}}),
+        ] {
+            let mut other = row.clone();
+            other
+                .as_object_mut()
+                .unwrap()
+                .extend(changed.as_object().unwrap().clone());
+            assert!(wire_messages((other.to_string() + "\n").as_bytes(), false).is_empty());
+        }
+    }
+
+    #[test]
+    fn handwritten_native_parts_stay_bounded_and_malformed_turns_stay_hidden() {
+        let row = json!({"type":"turn.prompt","agentId":"main","turnId":3,"promptId":"msg_3","origin":{"kind":"user"},"time":100000,
+            "input":[{"type":"text","text":"Startup context"},{"type":"text","text":"x".repeat(40000)}]});
+        let shown = user_message(&row).unwrap();
+        assert_eq!(shown["message_text_truncated"], true);
+        assert_eq!(shown["message_parts"][0], "Startup context");
+        assert!(
+            shown["message_parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part.as_str().unwrap().chars().count())
+                .sum::<usize>()
+                <= 32002
+        );
+        for invalid in [json!(false), json!({}), json!("3"), json!(-1)] {
+            let mut other = row.clone();
+            other["turnId"] = invalid;
+            assert!(user_message(&other).is_none());
+        }
     }
 }

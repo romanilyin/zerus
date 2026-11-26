@@ -66,11 +66,12 @@ class LatestFixture(unittest.TestCase):
             with self.subTest(spec=spec), self.assertRaisesRegex(ValueError, 'registry version'):
                 F.selection(json.dumps({**self.metadata, 'dependencies': {'example': spec}}).encode())
 
-    def test_official_metadata_fetch_is_single_bounded_and_redirects_refuse(self):
+    def test_official_metadata_fetch_is_bounded_and_redirects_refuse(self):
         response = io.BytesIO(self.raw)
+        response.url = F.LATEST
         with patch.object(F.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value = response
-            self.assertEqual(F.discover(time.monotonic() + 30), self.raw)
+            self.assertEqual(F.discovery.read_metadata(F.LATEST, F.MAX_METADATA, policy='no-redirect')[0], self.raw)
             request = opener.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, F.LATEST)
             self.assertGreater(opener.return_value.open.call_args.kwargs['timeout'], 29)
@@ -79,7 +80,7 @@ class LatestFixture(unittest.TestCase):
         with patch.object(F.urllib.request, 'build_opener') as opener:
             opener.return_value.open.return_value = io.BytesIO(b'x' * (F.MAX_METADATA + 1))
             with self.assertRaisesRegex(ValueError, 'metadata exceeds'):
-                F.discover(time.monotonic() + 30)
+                F.discovery.read_metadata(F.LATEST, F.MAX_METADATA, policy='no-redirect')[0]
         with self.assertRaisesRegex(ValueError, 'must not redirect'):
             F.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://example.invalid/x')
 
@@ -98,6 +99,17 @@ class LatestFixture(unittest.TestCase):
                 F.validate_lock(json.dumps(lock).encode(), self.chosen)
         with self.assertRaises(ValueError):
             F.validate_lock(b' ' * (F.MAX_LOCK + 1), self.chosen)
+
+    def test_security_overrides_are_required_and_vulnerable_pins_are_rejected(self):
+        for package, fixed in F.SECURITY_OVERRIDES.items():
+            path = 'node_modules/' + package
+            self.lock['packages'][path] = dict(version=fixed, resolved='https://example.invalid/x.tgz', integrity=self.seal)
+        F.validate_security_pins(json.dumps(self.lock).encode())
+        for package, vulnerable in [('@modelcontextprotocol/client', '2.2.0'), ('fflate', '0.8.2')]:
+            lock = copy.deepcopy(self.lock)
+            lock['packages']['node_modules/' + package]['version'] = vulnerable
+            with self.subTest(package=package), self.assertRaisesRegex(ValueError, 'security'):
+                F.validate_security_pins(json.dumps(lock).encode())
 
     def fake_npm(self, command, **kwargs):
         prefix = Path(command[command.index('--prefix') + 1])
@@ -155,6 +167,8 @@ class LatestFixture(unittest.TestCase):
         with private_root() as root:
             receipt = self.fixture(root)
             self.assertEqual([c[1] for c in self.commands], ['--version', 'config', 'config', 'install', 'ci'])
+            manifest = json.loads((self.prefix / 'package.json').read_text())
+            self.assertEqual(manifest['overrides'], F.SECURITY_OVERRIDES)
             executable = self.prefix / 'node_modules/.bin/dsh'
             self.assertEqual(F.verify_install(receipt, executable), self.version)
             self.assertEqual(F.package_root(executable, {F.RECEIPT_ENV: str(receipt)}), self.prefix / 'node_modules' / F.PACKAGE)
@@ -289,14 +303,14 @@ class LatestFixture(unittest.TestCase):
                 value = super().read(size)
                 clock[0] = 6.0
                 return value
-        response = Late(self.raw)
+        def late_discovery(*args, **kwargs):
+            self.assertEqual(kwargs['deadline'], 5.0)
+            clock[0] = 6.0
+            return self.raw, {}
         with patch.object(F.time, 'monotonic', side_effect=lambda: clock[0]), \
-                patch.object(F.urllib.request, 'build_opener') as opener:
-            opener.return_value.open.return_value = response
+                patch.object(F.discovery, 'fetch_metadata', side_effect=late_discovery):
             with self.assertRaisesRegex(ValueError, 'deadline expired'):
                 F.discover(5.0)
-            self.assertEqual(opener.return_value.open.call_args.kwargs['timeout'], 5.0)
-        self.assertTrue(response.closed)
         clock[0] = 0.0
         source = Late(b'fixture')
         with patch.object(F.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(Path, 'open', return_value=source):

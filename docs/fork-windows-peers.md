@@ -29,6 +29,14 @@ the phone reaches every PC through the relay.
   **Settings -> Sessions -> Keep the session host running for other computers**:
   its Zerus then runs `hgs session-host start`, a host that stays without
   sessions until `hgs session-host stop`, and checks it every minute.
+- An administrator's commands over SSH run elevated, and an elevated token
+  makes BUILTIN\Administrators the owner of every file it creates. The peer's
+  `hgs` therefore sets its own user as the default owner at start
+  (`platform::own_new_files`), so the state folders stay the user's: the private
+  stores (input receipts and the rest) refuse a folder another owner holds, and
+  every send to that peer stalled ("could not retain the pre-input refusal").
+  Folders an older peer `hgs` created that way need their owner back once,
+  for example `icacls PATH /setowner *USER-SID` for each entry Administrators own.
 
 ## A lasting connection
 
@@ -43,13 +51,57 @@ one connection per Windows peer instead:
   pipe that only this user can open; the peer runs each as its own `hgs.exe`
   with the request's arguments, several at once, so no argument passes through
   `cmd.exe`;
-- the broker leaves after ten idle minutes or when its connection ends.
+- the broker leaves after ten idle minutes without requests or streams, or when
+  its connection ends.
 
 Polling and JSON commands use it (`ls`, `inspect`, `archives`, `worktrees`,
-`git-status`, `dirs`, `project`, `analytics`, `account ls|inspect`, and
-`terminal`, `send`, `settings`, `effort`, `history` with `--json`). Interactive
-commands, launches and everything else keep their own ssh. A request that no
-broker took uses its own ssh as before. When a broker cannot connect, for example
+`git-status`, `git-diff`, `dirs`, `project`, `analytics`, `account ls|inspect`,
+`recovery get`, swarm exchanges, and listed JSON team reads). JSON `terminal`,
+`send`, `settings`, `effort`, `history` and `rules` commands also use it.
+Interactive commands and other unlisted commands keep their own ssh. A request
+that no broker took uses its own ssh as before; an uncertain submission is never
+replayed.
+
+With protocol 2 at both ends, `hgs @peer watch --json` uses the same connection.
+The watch-v1 NDJSON bytes, input operations and desktop helper stay unchanged.
+The peer advertises `protocol: 2` and `streams: true` alongside `hello: 1`.
+The broker also answers a local capability probe, so a running protocol 1 broker
+or a protocol 1 peer keeps today's `--ssh-bytes-client` watch path without
+consuming stdin or submitting a watch as a probe. No running broker is stopped
+or replaced to negotiate a newer protocol.
+
+Stream requests carry `stream: true`; output frames carry an ID, a base64
+`chunk` and its `stdout` or `stderr` channel. Input frames carry the same ID and
+base64 `input`; null input closes that watch's stdin. A `code` or `error` frame
+ends the stream. Ordinary protocol 2 answers also use chunks, which the broker
+reassembles for existing local request clients. Each chunk contains at most
+64 KiB of raw bytes (about 86 KiB after base64); the existing 96 MiB frame cap
+and watch-v1's own 1 MiB limit remain. Protocol 1 requests retain their original
+single answer.
+
+A bounded round-robin output queue interleaves IDs so a large answer cannot
+monopolize the writer. A slow local consumer loses only its own pipe; it never
+blocks the shared peer reader. Closing a watch closes its remote stdin. Closing
+an ordinary request discards its eventual answer without cancelling the remote
+operation. A lost connection ends watch and lets the desktop reconnect as
+before. The peer serve process also checks for a settled executable replacement,
+closes watch inputs and drains already accepted commands before leaving.
+Linux and macOS peers keep their existing OpenSSH ControlMaster path.
+
+A command's preparation asks the broker too. Before a command runs, `hgs` finds
+the peer's login shell and, when the command needs a capability (a session
+selected by `--session-id`, as every Send from the desktop is), reads the peer's
+`hgs --help`: two more ssh connections, which together get six seconds. To a
+busy Windows computer each takes seconds, and on 2026-11-17 a Send from
+Activity ended there before anything was sent, yet showed as "may have been
+delivered". A listed command now asks the running broker for the help and goes
+through it without any ssh connection of its own (a send that took 5 to 6 s in
+preparation takes under half a second); a command that keeps its own ssh asks a
+broker that already runs for the help and still finds the shell itself. When
+preparation fails all the same, the message ends with `no remote operation was
+sent`, and the desktop shows that Send or answer as not sent, with its draft
+kept and no Allow retry (`NOT_FORWARDED` in `src/cli.rs` and
+`client/core/src/actions.rs`). When a broker cannot connect, for example
 to a peer whose hgs predates the channel, it records that in
 `~/.config/hgs/peer-channel/<alias>.failed` and requests use their own ssh for
 ten minutes. `HGS_PEER_CHANNEL=0` turns the channel off.
@@ -60,7 +112,7 @@ On the **peer** (the PC to be managed):
 
 1. Install the fork's Zerus, start it, and enable local sessions (Machines).
 2. Turn on **Settings -> Sessions -> Keep the session host running for other
-   computers**.
+   computers**, or run the peer without the desktop app (below).
 3. Make sure both PCs can reach each other, for example in one Tailscale tailnet.
 4. Enable OpenSSH Server for key logins from the managing PC. In PowerShell as
    Administrator (the account must be an administrator):
@@ -116,6 +168,69 @@ removing a folder on one computer removes it everywhere.
 
 A computer whose hgs predates this (upstream, or an older fork build) refuses a
 drive folder in the catalog, and project sync with it fails until it is updated.
+
+## A peer without the desktop app
+
+A PC that only runs agents for another computer does not need Zerus's window,
+tray or webview. After local sessions are enabled once (step 1, or
+`hgs session-host install` from the unpacked zip), on the peer:
+
+```powershell
+hgs session-host autostart on      # start the keeper at every sign-in, and now
+hgs session-host autostart status  # sign-in entry, keeper and session host
+hgs session-host autostart off     # remove the entry and stop the keeper
+```
+
+`autostart on` writes `"%USERPROFILE%\.local\bin\hgs.exe" session-host keep`
+into this user's `HKCU\...\Run` key. `hgs session-host keep` starts the keeper
+once, windowless and detached (`src/host/keeper.rs`). It holds one lock (a
+second keeper leaves), and once a minute it starts the session host unless it
+runs and the team worker while a team is active and no worker runs; the
+session host restarts the recovery worker itself. It has no window, webview or
+GPU context and sleeps between checks. When an update replaces the stable CLI,
+the keeper hands over to the new one.
+
+The keeper must start in the user's own sign-in, never in an SSH session, for
+the same reason as the host: over SSH, `autostart on` only registers it, and it
+starts at the next sign-in. A PC without anyone signed in runs nothing; use
+Windows automatic sign-in for a PC that boots unattended (a locked screen is
+fine). `hgs session-host stop` stops an idle host, but a running keeper starts
+it again within a minute; `autostart off` first.
+
+The desktop app on the managing PC still does all the work: sessions, teams,
+Activity and Terminal go through the peer's `hgs` over SSH as before.
+
+### Light mode
+
+`hgs-tray.exe --light` runs the same keeper behind a notification-area icon
+and nothing else (no window, webview or desktop engine). Its tooltip says
+whether the session host runs; Open Zerus starts the full desktop and closes
+the icon, Quit closes only the icon. Settings > Startup > **Start in light
+mode at login** replaces Start Zerus at login with it, and **Switch to light
+mode now** starts it and quits the desktop.
+
+## Teams across computers
+
+A team's lead and worker run on one computer; a member may run on another
+(the member row's Computer). The lead's computer starts the member there and
+hands out its tasks over SSH, so it needs SSH to the member's computer. The
+member reports, asks and reads its attempt with `hgs @LEAD team report|ask|current
+--json`, which the lead's computer authorizes by the attempt id; an agent's
+other `team` operations on another computer stay refused.
+
+When the member's computer cannot reach the lead's (a Windows PC without an
+SSH server, as is common), its `report` and `ask` are kept on the member's
+computer (`teams/member-outbox`) and the call answers `"queued": true`. The
+lead's team worker collects them every 15 seconds over its own connection
+(`hgs @MEMBER team outbox take --json`, through the lasting channel to a
+Windows peer), applies each on its computer and then removes it there
+(`ack`). A taken item that was never applied is offered again after ten
+minutes and dropped after a day. `current` has no such fallback: the task and
+attempt are in the hand-out message. Both computers need this build.
+
+A member's startup text spans lines once iron rules apply. `cmd.exe` cannot
+carry a line break, `%` or `"` to a Windows peer, so such a detached launch
+goes through the lasting channel, which passes the arguments unchanged.
 
 ## Limits
 

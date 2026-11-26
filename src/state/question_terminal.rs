@@ -841,7 +841,7 @@ impl Native<'_> {
         if ["pane", "pid", "process_start", "conversation_id"]
             .iter()
             .any(|key| current[*key] != self.original[*key])
-            || !matches(&current, live()?.get(string(&current, "name")))
+            || !matches(&current, panes_of(&live()?, &current))
             || !process_alive(&current)
             || pause_active(&current)
             || !string(&current, "error").is_empty()
@@ -854,6 +854,10 @@ impl Native<'_> {
     fn pending(&self) -> Result<Value> {
         let current = self.identity()?;
         let pending = super::questions::current(&current)?;
+        self.check_pending(&pending)?;
+        Ok(current)
+    }
+    fn check_pending(&self, pending: &[Value]) -> Result<()> {
         if !pending.iter().any(|card| {
             string(card, "question_id") == string(self.card, "question_id")
                 && string(card, "tool_call_id") == string(self.card, "tool_call_id")
@@ -861,7 +865,15 @@ impl Native<'_> {
         }) {
             return Err("the pending question changed or was already answered".into());
         }
-        Ok(current)
+        Ok(())
+    }
+    /// Advisory inspection already has a complete pending snapshot. Recheck
+    /// the live terminal identity without turning its screen read into another
+    /// receipt migration. Actual input still goes through `pending` afresh.
+    pub(super) fn screen_among(&self, pending: &[Value]) -> Result<String> {
+        let current = self.identity()?;
+        self.check_pending(pending)?;
+        Self::capture(&current)
     }
     pub(super) fn capture(current: &Value) -> Result<String> {
         let result =
@@ -882,6 +894,10 @@ impl Native<'_> {
                 super::claude_question::same_panel(previous, &actual, self.card)
             } else if string(self.card, "source") == "codex_async" {
                 super::codex_questions::same_panel(previous, &actual, self.card)
+            } else if string(&current, "agent") == "kimi" && super::kimi_goal::is(self.card) {
+                super::kimi_approval::bound_goal(&current, self.card).is_ok_and(|event| {
+                    super::kimi_goal::same_panel(previous, &actual, &event["request"])
+                })
             } else {
                 previous == &actual
             }

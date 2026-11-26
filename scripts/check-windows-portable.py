@@ -5,8 +5,8 @@ Every platform reads only the zip directory, build-info.json and the ConPTY
 pair, whose SHA-256 must be the pinned one, as the release publishers do. On
 Windows, --run also extracts the bundle into a disposable folder and starts its
 executables with a minimal environment: no Qt, build, user or HGS_* paths, and
-PATH without the bundle, so they must load the Qt and MSVC runtime from their
-own folder. --selftest then also enables local sessions in that folder's
+PATH without the bundle. New packages use Tauri plus the separately installed
+WebView2 Evergreen runtime; legacy archives keep their old Qt checks. --selftest then also enables local sessions in that folder's
 temporary profile with `hgs.exe session-host install`, which must stage the
 pinned pair into the host image; no session host starts.
 """
@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -27,6 +28,46 @@ ROOT = Path(__file__).resolve().parents[1]
 # Variables Windows programs need to start; everything else is dropped.
 SYSTEM_VARIABLES = {"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "COMPUTERNAME", "OS",
                     "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "USERNAME", "USERDOMAIN"}
+
+
+# Debug-only hosted-fixture seams (zerus-yfbd.1) compile only under
+# cfg(debug_assertions). A published image must not carry their markers.
+DEBUG_SEAM = ROOT / "src" / "desktop" / "windows_registration" / "native" / "mode" / "held_pause.rs"
+# The swarm adoption fault fixtures' hold (zerus-fiyaa), also debug-only.
+ADOPTION_SEAM = ROOT / "src" / "swarm" / "adoption.rs"
+
+
+def debug_seam_markers():
+    """The seams' exact environment names and handshake prefixes, read from
+    their source so that a rename cannot leave this check vacuous."""
+    text = DEBUG_SEAM.read_text(encoding="utf-8")
+    name = re.search(r'pub\(super\) const ENV: &str = "([A-Z_]+)";', text)
+    require(name is not None, "The debug-only held pause seam no longer names its environment marker.")
+    prefixes = [prefix for prefix in ("held-pause-", "held-release-") if f'format!("{prefix}{{request}}' in text]
+    require(len(prefixes) == 2, "The debug-only held pause seam no longer names its handshake files.")
+    adoption = ADOPTION_SEAM.read_text(encoding="utf-8")
+    start = adoption.find("#[cfg(debug_assertions)]\nmod test_hold {")
+    require(start >= 0, "The debug-only adoption hold is no longer a cfg(debug_assertions) module.")
+    hold = adoption[start:]
+    hold_name = re.search(r'    const ENV: &str = "([A-Z_]+)";', hold)
+    require(hold_name is not None, "The debug-only adoption hold no longer names its environment marker.")
+    hold_prefixes = [prefix for prefix in ("adoption-test-hold-", "adoption-test-release-")
+                     if f'format!("{prefix}{{request}}' in hold]
+    require(len(hold_prefixes) == 2, "The debug-only adoption hold no longer names its handshake files.")
+    return [name[1].encode(), *(prefix.encode() for prefix in prefixes),
+            hold_name[1].encode(), *(prefix.encode() for prefix in hold_prefixes)]
+
+
+def require_no_debug_seams(path):
+    markers = debug_seam_markers()
+    with zipfile.ZipFile(path) as archive:
+        images = [entry for entry in archive.infolist() if entry.filename.lower().endswith((".exe", ".dll"))]
+        require(any(entry.filename.endswith("/hgs.exe") for entry in images), "Bundle has no hgs.exe to check.")
+        for entry in images:
+            data = archive.read(entry)
+            for marker in markers:
+                require(marker not in data, f"{entry.filename} carries the debug-only seam marker {marker.decode()}.")
+    print(f"No debug-only seam markers in {len(images)} executables and libraries.")
 
 
 def isolated_environment(base):
@@ -74,6 +115,10 @@ def main():
     require(manifest["source_commit"] == commit, f"Bundle commit {manifest['source_commit']} is not {commit}.")
     require(manifest["version"] == version and manifest["cli_version"] == cli_version,
             "Bundle versions differ from VERSION/Cargo.toml.")
+    # WhiteWh fork, task #388: a fork zip is the Tauri desktop and hgs, no Qt.
+    require(manifest.get("fork") is None or manifest.get("desktop") == "tauri",
+            "A fork zip ships only the Tauri desktop.")
+    require_no_debug_seams(args.zip)
     with zipfile.ZipFile(args.zip) as archive:
         entries = archive.infolist()
     unpacked = sum(entry.file_size for entry in entries)
@@ -100,6 +145,10 @@ def main():
                 gui_build = json.loads(run(tray, ["--build-info"], environment, base))
                 require(cli_build == manifest["cli_build"] and gui_build == manifest["gui_build"],
                         "Executed portable binaries do not match their fork provenance")
+            lore_report = run(bundle / "lore.exe", ["--version"], environment, base)
+            require(lore_report == f"lore {manifest.get('lore_version')}",
+                    f"lore.exe --version: {lore_report!r}, expected 'lore {manifest.get('lore_version')}'.")
+            print(f"lore.exe {manifest.get('lore_version')} starts from the extracted bundle.")
             if manifest.get("mobile_connector_bundled"):
                 connector_version = run(bundle / "zerus-mobile-connector.exe", ["--version"], environment, base)
                 require(connector_version.startswith("zerus-mobile-connector "), "Bundled connector does not start.")
@@ -107,15 +156,39 @@ def main():
                                        str(base / "config/mobile/connector.json")], environment, base))
                 require(status.get("configured") is False and status.get("running") is False,
                         "Fresh portable connector status is not isolated/unconfigured.")
+                workspace = json.loads(run(bundle / "zerus-mobile-connector.exe", ["--workspace", "status", "--config",
+                                          str(base / "config/mobile/connector.json")], environment, base))
+                require(workspace.get("state") == "unconfigured" and workspace.get("encrypted") is False
+                        and workspace.get("config_revision") == "",
+                        "Bundled connector does not support the desktop workspace status protocol.")
+                phones = json.loads(run(hgs, ["mobile", "phones", "--json"], environment, base))
+                require(phones.get("configured") is False,
+                        "Fresh portable phone discovery is not isolated/unconfigured.")
             print(f"hgs.exe {cli_version} and hgs-tray.exe {version} start from the extracted bundle.")
             if args.selftest:
                 box = json.loads(run(hgs, ["ls", "--json", "--local"], environment, base))
                 require(isinstance(box, dict) and box.get("ok") is True and box.get("local_sessions") is False and
                         box.get("sessions") == [], "hgs.exe does not report a control-only local computer.")
                 # hgs-tray must find the hgs.exe next to it, not one from PATH.
-                report = run(tray, ["--selftest"], environment, base)
-                require(report.startswith("hgs ok: "), f"Unexpected hgs-tray --selftest output: {report}")
-                print(f"Control-only local computer {box.get('host')!r}; hgs-tray --selftest: {report}")
+                if manifest.get("desktop") == "tauri":
+                    report = json.loads(run(tray, ["--build-info"], environment, base))
+                    require(report.get("version") == version and report.get("sourceCommit") == commit
+                            and report.get("sourceDirty") is False and report.get("ZerusGUI") == "tauri"
+                            and report.get("CFBundleIdentifier") == "com.hgdev.hgs-tray",
+                            "Portable desktop is not the exact clean Tauri switch build.")
+                    print("Tauri desktop build/source/switch identity matches the portable package.")
+                    # WhiteWh fork, task #65: hgs-tray.exe embeds the fork build
+                    # and feed build-info.json names.
+                    fork = manifest.get("fork")
+                    if fork is not None:
+                        require(not report.get("distribution") and report.get("forkBuild") == fork.get("build") and
+                                report.get("forkFeed", "") == fork.get("feed"),
+                                "Portable desktop does not embed the fork build and feed of build-info.json.")
+                        print(f"Fork build {fork.get('build')} and feed {fork.get('feed') or 'none'} are embedded.")
+                else:
+                    report = run(tray, ["--selftest"], environment, base)
+                    require(report.startswith("hgs ok: "), f"Unexpected hgs-tray --selftest output: {report}")
+                    print(f"Control-only local computer {box.get('host')!r}; hgs-tray --selftest: {report}")
                 # Enabling local sessions from the extracted folder stages the
                 # ConPTY pair next to hgs.exe into the host image (spec D2, D6).
                 # Only the temporary profile changes, and nothing starts a host.

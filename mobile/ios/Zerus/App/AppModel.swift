@@ -14,6 +14,7 @@ final class AppModel {
 
     // MARK: Private state
 
+    @ObservationIgnored private let outboxPins = OutboxPins()
     @ObservationIgnored private(set) var messages: OrderedStatePersistence<MessageState>?
     private(set) var messageState = MessageState()
     @ObservationIgnored private var accountsStore: OrderedStatePersistence<[AccountCatalog]>?
@@ -64,7 +65,11 @@ final class AppModel {
     var sessionQuery = "" { didSet { if oldValue != sessionQuery { sessionScopeChanged() } } }
     private(set) var selectedMachines: Set<MachineKey> = []
     private(set) var collapsedProjects: Set<String> = []
-    private(set) var expandedSubagents: Set<String> = []
+    /// Parents whose subagents and child sessions are hidden: one toggle, kept across relaunches
+    /// by machine UUID and session ID (TeamCollapse, zerus-sa9qn.5).
+    private(set) var teamCollapse = TeamCollapse()
+    @ObservationIgnored private var teamsStore: OrderedStatePersistence<[String]>?
+    @ObservationIgnored private var groupedCache: (source: [AccountCatalog], groups: [GroupedAccount])?
     private(set) var sessionProjectScope: ProjectSummary?
     @ObservationIgnored private var unscoped: (filter: SessionFilter, query: String)?
     private(set) var listPresentation = SessionListPresentation()
@@ -168,12 +173,15 @@ final class AppModel {
 
     private func openPrivateState() async throws {
         guard let sealed = sealedStore else { throw ZerusError.invalid("Private storage is unavailable.") }
+        let writerRetention = OutboxRetention.Normalizer(), publishedRetention = OutboxRetention.Normalizer(), pins = outboxPins
         let loaded = try await Task.detached { () -> (MessageState, [AccountCatalog]) in
             let state = try sealed.read("message_state", as: MessageState.self) ?? MessageState()
             let accounts = (try? sealed.read("account_catalog", as: [AccountCatalog].self)) ?? []
-            return (state.recovered(), AccountSnapshots.restored(accounts))
+            let retained = writerRetention.normalize(state.recovered(), pinned: pins.snapshot())
+            return (publishedRetention.normalize(retained, pinned: pins.snapshot()), AccountSnapshots.restored(accounts))
         }.value
-        let messageStore = OrderedStatePersistence(initial: loaded.0) { try sealed.write("message_state", $0) }
+        let messageStore = OrderedStatePersistence(initial: loaded.0, normalize: { writerRetention.normalize($0, pinned: pins.snapshot()) },
+            normalizePublished: { publishedRetention.normalize($0, pinned: pins.snapshot()) }) { try sealed.write("message_state", $0) }
         messageStore.onChange = { [weak self] in self?.messageStateChanged($0) }
         messageStore.onResult = { [weak self] failure in
             if failure != nil {
@@ -194,6 +202,9 @@ final class AppModel {
         }
         accountsStore = accounts
         accountCatalogs = accounts.state
+        let teams = await Task.detached { ChildSessions.parseTeams((try? sealed.read("collapsed_teams", as: [String].self)) ?? []) }.value
+        teamsStore = OrderedStatePersistence(initial: teams) { try sealed.write("collapsed_teams", $0) }
+        teamCollapse = teamCollapse.loaded(teams)
         // Offline navigation index: last known sessions and computers until the catalog refreshes.
         // A preview opened while storage loads keeps its own catalog.
         guard !demo else { return }
@@ -210,8 +221,10 @@ final class AppModel {
 
     /// Saves pending debounced edits, as Android does when the app stops.
     func flushPrivateState() {
+        retainOutbox()
         messages?.flushAsync()
         accountsStore?.flushAsync()
+        teamsStore?.flushAsync()
         conversation.flushRead()
     }
 
@@ -225,12 +238,19 @@ final class AppModel {
         conversation.messageStateChanged(old: old, new: value)
     }
 
+    /// Retain identities still referenced by live delivery or the current presentation.
+    func retainOutbox() {
+        guard let conversation else { return }
+        outboxPins.retain(delivery: conversation.deliveryFlights, receipts: conversation.receiptFlights, events: conversation.events)
+    }
+
     /// Applies a private-state reducer now and schedules its debounced write.
     func editMessages(_ reduce: @escaping @Sendable (MessageState) -> MessageState) {
         guard let messages else {
             error = "Private storage is not ready."
             return
         }
+        retainOutbox()
         messages.edit(reduce)
     }
 
@@ -239,12 +259,14 @@ final class AppModel {
     func durableMessages(_ reduce: @escaping @Sendable (MessageState) throws -> MessageState,
                          acknowledge: (@Sendable (MessageState, MessageState) -> MessageState)? = nil) async throws -> MessageState {
         guard let messages else { throw ZerusError.invalid("Private storage is not ready.") }
+        retainOutbox()
         return try await messages.durable(reduce, acknowledge: acknowledge)
     }
 
     @discardableResult
     func flushMessages() async throws -> MessageState {
         guard let messages else { throw ZerusError.invalid("Private storage is not ready.") }
+        retainOutbox()
         return try await messages.flush()
     }
 
@@ -372,7 +394,7 @@ final class AppModel {
             connections = next
             pendingEncryptedPairings.remove(connection.id)
             accountsStore?.edit { rows in rows.filter { $0.key.connectionId != connection.id } }
-            messages?.edit { state in
+            editMessages { state in
                 var copy = state
                 copy.conversationIndex = state.conversationIndex.filter { $0.target.connectionId != connection.id }
                 return copy
@@ -541,7 +563,7 @@ final class AppModel {
         let rows = nextSessions, hosts = nextMachines
         let index = await Task.detached { ConversationIndex.capture(rows, hosts) }.value
         if connections == original {
-            messages?.edit { state in
+            editMessages { state in
                 var copy = state
                 copy.conversationIndex = index
                 return copy
@@ -625,8 +647,28 @@ final class AppModel {
         if collapsedProjects.contains(key.key) { collapsedProjects.remove(key.key) } else { collapsedProjects.insert(key.key) }
     }
 
-    func toggleSubagents(_ target: Target) {
-        if expandedSubagents.contains(target.key) { expandedSubagents.remove(target.key) } else { expandedSubagents.insert(target.key) }
+    /// The machine UUID of a target's computer, which parent links and collapsed parents name.
+    func machineUuid(_ target: Target) -> String? { machine(target.machineKey)?.machineId }
+
+    func teamCollapsed(_ session: Session) -> Bool { teamCollapse.collapsed(session, machine: machineUuid(session.target)) }
+
+    /// Shows or hides a parent's subagents and child sessions, and remembers it across relaunches.
+    func toggleTeam(_ session: Session) {
+        let collapsed = !teamCollapsed(session)
+        let saved = ChildSessions.teamId(machineUuid(session.target), session).flatMap { id in
+            teamsStore?.edit { ChildSessions.withTeam($0, id, collapsed: collapsed) }
+        }
+        teamCollapse = teamCollapse.choose(session.target.key, collapsed: collapsed, saved: saved)
+        scheduleList()
+    }
+
+    /// Grouped accounts, which label the cards' account marks; regrouped only when the catalogs change.
+    var groupedAccounts: [GroupedAccount] {
+        let source = displayedAccounts
+        if let cached = groupedCache, cached.source == source { return cached.groups }
+        let groups = AccountGrouping.group(source)
+        groupedCache = (source, groups)
+        return groups
     }
 
     func viewProjectSessions(_ project: ProjectSummary) {
@@ -654,7 +696,7 @@ final class AppModel {
         let generation = listGeneration
         let sessions = self.sessions, machines = self.machines, projects = self.projects
         let selected = selectedMachines, query = sessionQuery, project = sessionProjectScope?.key, filter = sessionFilter
-        let drafts = messageState.drafts, range = archive?.range ?? ArchiveRange()
+        let drafts = messageState.drafts, range = archive?.range ?? ArchiveRange(), teams = teamCollapse
         let later = Set((conversation?.readState.records ?? []).filter(\.reviewLater).map { ConversationReadPolicies.key($0.target) })
         Task { [weak self] in
             let prepared = await Task.detached(priority: .userInitiated) {
@@ -662,7 +704,7 @@ final class AppModel {
                                                 query: query, project: project, filter: filter, drafts: drafts, archiveRange: range,
                                                 readAllCandidate: { row, online in
                                                     ReadAllPolicies.listCandidate(row, online: online, reviewLater: later.contains(ConversationReadPolicies.key(row.target)))
-                                                })
+                                                }, teams: teams)
             }.value
             guard let self, self.listGeneration == generation else { return }
             self.listPresentation = prepared
@@ -684,7 +726,7 @@ final class AppModel {
     func machineColorOverride(_ key: MachineKey) -> String? { messageState.machineColors.first { $0.key == key }?.hex }
 
     func renameMachine(_ key: MachineKey, _ name: String?) async -> Bool {
-        guard storageReady, !demo, !machineNameSaving.contains(key), let messages else { return false }
+        guard storageReady, !demo, !machineNameSaving.contains(key), messages != nil else { return false }
         guard machines.contains(where: { $0.key == key }), connections.contains(where: { $0.id == key.connectionId }) else {
             error = "This machine is no longer connected to this workspace."
             return false
@@ -702,7 +744,7 @@ final class AppModel {
             return copy
         }
         do {
-            _ = try await messages.durable(reduce, acknowledge: { current, _ in reduce(current) })
+            _ = try await durableMessages(reduce, acknowledge: { current, _ in reduce(current) })
             return true
         } catch {
             self.error = "Could not save the machine name. \(Self.message(error, fallback: ""))"
@@ -711,7 +753,7 @@ final class AppModel {
     }
 
     func setMachineColor(_ key: MachineKey, _ hex: String?) async -> Bool {
-        guard storageReady, !demo, !machineColorSaving.contains(key), let messages else { return false }
+        guard storageReady, !demo, !machineColorSaving.contains(key), messages != nil else { return false }
         let checked: String?
         do { checked = try hex.map(MachineColors.checked) } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? ""
@@ -725,7 +767,7 @@ final class AppModel {
             return copy
         }
         do {
-            _ = try await messages.durable(reduce, acknowledge: { current, _ in reduce(current) })
+            _ = try await durableMessages(reduce, acknowledge: { current, _ in reduce(current) })
             return true
         } catch {
             self.error = "Could not save the machine color. \(Self.message(error, fallback: ""))"

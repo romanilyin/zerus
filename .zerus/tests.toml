@@ -1,0 +1,333 @@
+# U62: this repository's test configuration (hgs guide tests). The mechanism
+# is Zerus's; these suites, commands and limits are this project's own. The
+# owner may override any of it in the team settings.
+version = 1
+
+# Task 377: files this project generates (its Russian catalog derives from the
+# Qt .ts and the Next supplement); every queue merge and git-merge-lead run
+# them again and fold their output into the merge commit.
+generate = ["python client/scripts/generate-i18n-catalog.py"]
+
+[map]
+file = ".zerus/test-map.json"
+durations = ".zerus/test-durations.json"
+unmapped = "report"
+# Files no test answers for: documentation, artwork, notes and tool settings.
+ignore = [
+    "docs/**", "design/**", "examples/**", "*.md", "LICENSE", ".beads/**",
+    ".agents/**", ".codex/**", ".cursor/**", ".gitignore", ".gitattributes",
+    ".gitleaksignore", "packaging/rust-licenses/**", "**/licenses/**",
+    # The configuration and its map: `hgs test map --check` answers for them.
+    ".zerus/**",
+]
+
+# The release full run is the fork CI's run of the candidate, on the owner's word.
+[full]
+where = "ci"
+policy = "owner"
+target = "fork-windows.yml"
+
+# One automatic retry of a plain failure (never of a crash): a pass on it is
+# flaky, quarantined for two weeks; three episodes become a lead item (#718).
+[retries]
+flaky = 1
+quarantine_days = 14
+episodes = 3
+
+# A suite growing more than half over its recorded time is flagged; every
+# suite has a time budget (minutes) and a size budget (test lines, about a
+# fifth over today's; the larger providers set their own below).
+[budgets]
+grow_percent = 50
+suite_minutes = 30
+suite_lines = 30000
+
+# Unchanged inputs reuse the last green result (Rust never); 30 reused results,
+# or one reused measurement older than a week, propose a full run (#718).
+[reuse]
+full_after = 30
+max_age_days = 7
+
+# Test isolation (#720): each test run in its own folders; read by
+# state::teams::isolation, which checks these keys.
+[isolation]
+enabled = true
+# The templates that are tests: each runs in .zerus-team/runs/<run> with its
+# own home, data, temporary and XDG folders (the defaults per platform).
+templates = ["cargo-test", "android-test"]
+# The test programs' and their temporary files' name prefixes: a new entry
+# with one in a watched folder fails the run. In the person's %TEMP%, which
+# other agent sessions share (their hgs-*.json inputs), a new directory with
+# one fails, and a new file only when it names the run folder.
+prefixes = ["test_", "hgs-", ".hgs-", "zerus-test"]
+# Zerus's own log: a line naming the run folder fails the run.
+logs = ["~/.local/state/hgs/zerus.log"]
+# Files whose any change fails the run would go in files = [...]; the tray's
+# settings are watched as a log instead, since the owner's own tray writes them.
+
+[isolation.env]
+# On Windows USERPROFILE selects home; without it a test can reach the person's real profile.
+USERPROFILE = "home"
+HGS_STATE_DIR = "state"
+# The tray's home (its log, settings and single-instance socket) is the
+# run's home.
+HGS_TRAY_HOME = "home"
+
+[isolation.windows]
+# The tray's settings: the run folder named in them fails the run.
+logs = ["~/AppData/Roaming/hgdev/hgs-tray.ini"]
+
+[isolation.unix]
+logs = ["~/.config/hgdev/hgs-tray.conf"]
+
+# Task 174 (owner, 2026-11-07): the build cache serves every member's cargo
+# and CMake templates and the merge queue's cargo runs (sccache for Rust,
+# ccache for C++), in one shared folder under Zerus's state.
+[build_cache]
+enabled = true
+tool = "sccache"
+compilers = ["rust", "cxx"]
+
+# Task 174: an accept merges the reported commit into the lead branch (the
+# owner's integration folder, else the team's folder), tests it there and keeps
+# it or returns the task; the merger reviews and resolves, never builds by hand.
+[merge_queue]
+enabled = true
+
+# #742: tools beyond the providers' runners. Zerus offers a missing one to the
+# owner once per computer (Waiting for you); nobody else installs it.
+[[tool]]
+name = "cargo-llvm-cov"
+why = "measuring Rust modules against the test map (hgs test coverage)"
+
+[[tool]]
+name = "OpenCppCoverage"
+why = "measuring Qt test binaries against the test map on Windows"
+platforms = ["windows"]
+
+[[tool]]
+name = "gcovr"
+why = "measuring Qt test binaries against the test map (gcov)"
+platforms = ["linux", "macos"]
+
+[resources.gui]
+cpu = 2
+ram_mb = 2048
+exclusive = false
+
+[resources.device]
+cpu = 4
+ram_mb = 4096
+exclusive = true
+
+# The hgs CLI: its module graph names each module's tests; a change in a
+# module also runs the tests of the modules that use it.
+[[provider]]
+name = "rust"
+kind = "cargo"
+sources = ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", ".cargo/**"]
+widen = "dependants"
+command = "cargo test --locked {targets}"
+budget_lines = 210000
+
+[[provider.paths]]
+files = ["crates/replica/**"]
+mentions = "zerus_replica"
+
+[[provider.paths]]
+files = ["crates/watch-protocol/**"]
+mentions = "zerus_watch_protocol"
+
+[[provider]]
+name = "replica"
+kind = "cargo"
+root = "crates/replica"
+sources = ["crates/replica/**"]
+command = "cargo test --locked --target-dir ../../target/replica {targets}"
+
+[[provider]]
+name = "replica-ffi"
+kind = "cargo"
+root = "crates/replica-ffi"
+sources = ["crates/replica-ffi/**"]
+command = "cargo test --locked --target-dir ../../target/replica-ffi {targets}"
+
+# The desktop's storage crates.
+[[provider]]
+name = "content-search"
+kind = "cargo"
+root = "crates/content-search"
+sources = ["crates/content-search/**"]
+
+[[provider]]
+name = "desktop-catalog"
+kind = "cargo"
+root = "crates/desktop-catalog"
+sources = ["crates/desktop-catalog/**"]
+
+[[provider]]
+name = "desktop-ledger"
+kind = "cargo"
+root = "crates/desktop-ledger"
+sources = ["crates/desktop-ledger/**"]
+
+[[provider]]
+name = "desktop-migration"
+kind = "cargo"
+root = "crates/desktop-migration"
+sources = ["crates/desktop-migration/**"]
+
+[[provider]]
+name = "desktop-read-policy"
+kind = "cargo"
+root = "crates/desktop-read-policy"
+sources = ["crates/desktop-read-policy/**"]
+
+[[provider]]
+name = "watch-protocol"
+kind = "cargo"
+root = "crates/watch-protocol"
+sources = ["crates/watch-protocol/**"]
+
+# The lore binary Zerus ships: the pinned CodeLore dependency's wrapper (task 256), with
+# its own lock and target folder. The lore suite itself runs in the CodeLore repository.
+[[provider]]
+name = "lore"
+kind = "cargo"
+root = "crates/lore-bin"
+sources = ["crates/lore-bin/**", "tests/fixtures/secret-scan-vectors.json"]
+command = "cargo test --locked --target-dir ../../target/lore {targets}"
+
+# The Python suites: a test runs when a file it names or imports changes; the
+# integration tests that start target/debug/hgs run for every CLI change.
+[[provider]]
+name = "python"
+budget_lines = 75000
+kind = "unittest"
+root = "tests"
+sources = [
+    "tests/**", "scripts/**", "packaging/**", ".github/**", "hgs", "hgs_state.py",
+    "install.sh", "mac-install.sh", "tmux.conf", "VERSION", "DEV_VERSION",
+    "packaging/desktop/update-installed.py", "packaging/desktop/sign-local-macos.py",
+]
+tests = ["tests/test_*.py"]
+# Real agents and hosts on this computer: never chosen automatically.
+manual = ["tests/test_dsh_native.py"]
+# The suite is POSIX-only (os.uname() and friends); the fork's Windows CI runs only cargo tests.
+platforms = ["linux", "macos"]
+
+[[provider.paths]]
+files = ["src/**", "Cargo.toml", "Cargo.lock", "build.rs"]
+mentions = "target/debug/hgs"
+
+# Every workflow is read by the CI policy tests, which find them by folder.
+[[provider.paths]]
+files = [".github/workflows/**"]
+targets = ["tests/test_ci_security.py", "tests/test_ci_profiles.py", "tests/test_ci_phase_queues.py"]
+
+[[provider]]
+name = "client-core"
+budget_lines = 80000
+kind = "cargo"
+root = "client/core"
+sources = ["client/core/**", "client/fixtures/**"]
+command = "cargo test --locked --target-dir ../../target/client-core {targets}"
+
+[[provider]]
+name = "client-tauri"
+budget_lines = 63000
+kind = "cargo"
+root = "client/src-tauri"
+sources = ["client/src-tauri/**"]
+
+[[provider]]
+name = "client-media"
+kind = "cargo"
+root = "client/media"
+sources = ["client/media/**"]
+
+[[provider]]
+name = "client-web"
+kind = "npm"
+root = "client"
+sources = ["client/src/**", "client/public/**", "client/bench/**", "client/perf-probe-mac/**", "client/*"]
+tests = ["client/src/**/*.test.ts", "client/src/**/*.test.tsx"]
+command = "npx vitest run {targets}"
+
+[[provider]]
+name = "client-scripts"
+kind = "unittest"
+root = "client/scripts"
+sources = ["client/scripts/**"]
+tests = ["client/scripts/test_*.py"]
+
+[[provider]]
+name = "android"
+kind = "gradle"
+root = "mobile/android"
+sources = ["mobile/android/**"]
+tests = ["mobile/android/app/src/test/**/*.kt", "mobile/android/app/src/test/**/*.java"]
+elsewhere = ["mobile/android/app/src/androidTest/**"]
+command = "./gradlew --no-daemon testDebugUnitTest -PzerusFirebase=true {targets}"
+resources = "device"
+
+[[provider]]
+name = "ios"
+kind = "command"
+root = "mobile/ios/ZerusKit"
+sources = ["mobile/ios/**"]
+affected = "all"
+command = "swift test"
+platforms = ["macos"]
+
+[[provider]]
+name = "relay"
+kind = "cargo"
+root = "services/mobile/relay"
+sources = ["services/mobile/relay/**", "services/mobile/vectors/**"]
+# Its test code uses Unix file modes without a platform guard, so the tests
+# do not build on Windows; the fork's Windows CI does not run them either.
+platforms = ["linux", "macos"]
+
+[[provider]]
+name = "connector"
+kind = "cargo"
+root = "services/mobile/connector"
+sources = ["services/mobile/connector/**"]
+command = "cargo test --locked --lib {targets}"
+
+[[provider]]
+name = "mobile-crypto"
+kind = "cargo"
+root = "services/mobile/crypto"
+sources = ["services/mobile/crypto/**"]
+
+[[provider]]
+name = "mobile-workspace"
+kind = "cargo"
+root = "services/mobile/workspace-tests"
+sources = ["services/mobile/workspace-tests/**"]
+
+[[provider]]
+name = "windows-private"
+kind = "cargo"
+root = "services/mobile/windows-private"
+sources = ["services/mobile/windows-private/**"]
+platforms = ["windows"]
+
+[[provider]]
+name = "mobile-python"
+kind = "unittest"
+root = "services/mobile/tests"
+sources = ["services/mobile/**"]
+tests = ["services/mobile/tests/test_*.py"]
+# The suite needs fcntl and an installed zerus_mobile package (CI installs it
+# on Ubuntu); it does not run on Windows.
+platforms = ["linux", "macos"]
+
+[[provider]]
+name = "speech"
+kind = "unittest"
+root = "services/speech/tests"
+sources = ["services/speech/**"]
+tests = ["services/speech/tests/test_*.py"]

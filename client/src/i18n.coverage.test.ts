@@ -1,0 +1,160 @@
+import { describe, expect, it } from "vitest";
+import catalog from "./i18n.ru.json";
+import english from "./i18n.english.json";
+import supplement from "./i18n.next-ru.json";
+
+// Every static tr()/trNoop() source is a reviewed Qt catalog entry, a reviewed
+// Next-only entry (i18n.next-ru.json, merged by the generator) or an explicit
+// English-only string (i18n.english.json, read by this test only).
+// tr() of a value stays in the files below: their values come from their own
+// trNoop() tables or from literal component props, never from session text,
+// agent output, identities or file names.
+const DYNAMIC_FILES: Record<string, string> = {
+  "./store/phase-controls.ts": "the closed product/Core phase-control reasons registered in its trNoop table; unknown prose stays verbatim",
+  "./ui/components/Rail.tsx": "its own screen table",
+  "./ui/components/TitleBar.tsx": "the rail's screen table (Rail.tsx ITEMS)",
+  "./ui/teams/decisions.ts": "the lead-changes digest's group names (trNoop GROUP_LABELS)",
+  "./ui/screens/Machines.tsx": "field labels passed as literal props",
+  "./ui/screens/MachineConnectionDialog.tsx": "its own option tables",
+  "./ui/screens/Settings.tsx": "the section table",
+  "./ui/screens/settings/ui.tsx": "titles, labels and hints passed as literal props",
+  "./ui/sessions/SessionList.tsx": "its filter and scope tables",
+  "./ui/sessions/SessionCard.tsx": "the core's closed caption vocabulary and child states",
+  "./ui/sessions/keep-warm.ts": "the host's keep-warm reasons, registered with trNoop",
+  "./ui/sessions/organization-ui.ts": "its selection-move counts and notice, registered with trNoop",
+  "./ui/sessions/KeepWarmRow.tsx": "the core's keep-warm refusals, registered in keep-warm.ts",
+  "./store/questionRouting.ts": "the core's question routing refusals, registered with trNoop",
+  "./ui/sessions/Inspector.tsx": "its own tab table and actions-ui identity titles",
+  "./ui/sessions/ActionDialogs.tsx": "actions-ui menu labels, reasons and notices; detail reasons from the core",
+  "./store/sessionTerminal.ts": "actions-ui change reasons and its own marked Resume and open terminal notices",
+  "./ui/sessions/mark-entries.ts": "the actions store notice constants",
+  "./store/actions.ts": "its own notice constants",
+  "./store/processes.ts": "the hub's fixed summaries in its own FIXED_SUMMARIES table",
+  "./store/content-search-model.ts": "its own identity label table, registered with trNoop",
+  "./store/restores.ts": "the actions notice constants",
+  "./store/taskBoard.ts": "its own task action table",
+  "./ui/screens/tasks-ui.ts": "its own task stage table",
+  "./ui/screens/Tasks.tsx": "the stage tile table and the task pause reason",
+  "./ui/screens/TaskInspector.tsx": "the task pause reason",
+  "./ui/screens/TaskStartReview.tsx": "the native TaskStart present() closed stale-check and unreadable-receipt reasons",
+  "./ui/screens/TaskWorkflow.tsx": "the task pause reason",
+  "./ui/sessions/SavedDrafts.tsx": "the Saved drafts store's TEXTS, REASONS and SECTIONS tables and its own Show more table",
+  "./ui/sessions/ArchiveBar.tsx": "the archive period table",
+  "./ui/sessions/archive-dates.ts": "the archive period table",
+  "./ui/sessions/opencode-models.ts": "its credential kind table",
+  "./ui/sessions/session-usage-ui.ts": "its own token and time field tables",
+  "./ui/sessions/transcript.ts": "its own event title, voice state and local stamp tables",
+  "./ui/teams/MemberCard.tsx": "the core's member states and roles",
+  "./ui/teams/actions.ts": "the core's action vocabulary and stage kinds",
+  "./ui/teams/task-line.ts": "the core's stage states and roles",
+  "./ui/teams/team-model.ts": "the core's team and member states",
+  "./ui/teams/TeamTab.tsx": "the core's node states, roles and deciders, and its own label table",
+  "./ui/sessions/Activity.tsx": "the transcript voice state table, inbox-actions Remove texts and send-error native refusal",
+  "./ui/sessions/shortcutHelp.ts": "the shortcut registry's command titles and its own group table",
+  "./ui/screens/settings/Keyboard.tsx": "the shortcut registry's command titles and groups",
+  "./store/goTo.ts": "its own section table and the shortcut registry's command titles and groups",
+  "./store/archive.ts": "its own notice constant",
+  "./store/backgroundTasks.ts": "its own activity table",
+  "./store/composer.ts": "its own error constants, the draft store refused-save constant and send-error native refusal",
+  "./ui/sessions/send-error.ts": "its own NO_COLOR_SEND refusal constant",
+  "./store/contentSearch.ts": "its own notice constant",
+  "./store/creations.ts": "the creations-ui notice constant",
+  "./store/drops.ts": "its own drop hint constants",
+  "./store/endActions.ts": "its own notice constant and its title and cancel tables",
+  "./store/forks.ts": "the fork-ui notice constant",
+  "./store/native-ui-model.ts": "its own status constants",
+  "./store/organization.ts": "its own notice and reason constants",
+  "./store/taskCancel.ts": "its own notice constant",
+  "./ui/components/folder-browser.ts": "its own status and button constants",
+  "./ui/components/MachineTile.tsx": "its own state table",
+  "./ui/screens/project-folders.ts": "its own notice constant",
+  "./ui/screens/settings/analytics-text.ts": "its own computer name constant",
+  "./ui/screens/settings/Appearance.tsx": "its own variant table",
+  "./ui/screens/settings/ApprovalsConfirm.tsx": "the approval opt-in constants",
+  "./ui/screens/settings/approvals-journal.ts": "its own placeholder constant",
+  "./ui/screens/settings/Approvals.tsx": "the approval opt-in and journal constants",
+  "./ui/screens/settings/Sessions.tsx": "the native notification controller's closed unavailable, unconfirmed and not-applied messages",
+  "./ui/screens/settings/computer-invitations.ts": "its own notice constant",
+  "./ui/screens/settings/connector-actions.ts": "the workspace enrollment notice constants",
+  "./ui/screens/settings/legacy-relay.ts": "its own notice constant",
+  "./ui/screens/settings/Recovery.tsx": "its own help constant and recovery settings status/error prose",
+  "./ui/screens/settings/Voice.tsx": "its own provider help table",
+  "./ui/screens/settings/workspace-enrollment.ts": "its own notice constants",
+  "./ui/screens/settings/WorkspacePanel.tsx": "the workspace enrollment notice constant",
+  "./ui/screens/WorktreeOverviewDialog.tsx": "the overview state's category table",
+  "./ui/sessions/CreationCard.tsx": "the creations-ui menu constant",
+  "./ui/sessions/CreationPanel.tsx": "the creations-ui button table",
+  "./ui/sessions/creations-ui.ts": "its own status and menu constants",
+  "./ui/sessions/LaunchWarning.tsx": "the launch warning title and button table",
+  "./ui/sessions/local-actions.ts": "its own reason constants",
+  "./ui/sessions/inbox-actions.ts": "its own Remove and notice constants",
+  "./ui/sessions/InboxRemove.tsx": "inbox-actions' Remove texts",
+  "./ui/sessions/machine-batch.ts": "its own menu constant",
+  "./ui/sessions/newsession-ui.ts": "its own New project row constant",
+  "./ui/sessions/selection-live.ts": "the machine-batch menu constant",
+  "./ui/sessions/selection.ts": "its own action text table",
+  "./ui/sessions/selection-ui.ts": "the selection hint constant",
+  "./ui/teams/TeamCatalogEditor.tsx": "its own tab and add tables and the core catalog schema's closed field labels, hints and choices",
+  "./ui/teams/NewTeam.tsx": "the memory mode table's labels and hints (MEMORY_LABELS, trNoop in store/newTeamForm.ts)",
+};
+
+const SOURCES = import.meta.glob(["./**/*.ts", "./**/*.tsx", "!./**/*.test.ts", "!./i18n.ts"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+const STATIC = /\btr(?:Noop)?\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`[^`$]*`)/g;
+const DYNAMIC = /\btr\(\s*(?!["'])(?!`[^`$]*`)/;
+// Qt's tr(source, disambiguation): both literal, keyed "disambiguation\u0004source".
+const DISAMBIGUATED = /\btrc\(\s*("(?:[^"\\\n]|\\.)*")\s*,\s*("(?:[^"\\\n]|\\.)*")/g;
+
+function literal(token: string): string {
+  if (token.startsWith("`")) return token.slice(1, -1);
+  if (token.startsWith("'")) return JSON.parse(`"${token.slice(1, -1).replace(/\\'/g, "'").replace(/"/g, '\\"')}"`);
+  return JSON.parse(token);
+}
+
+const sources = new Map<string, string[]>();
+for (const [file, text] of Object.entries(SOURCES)) {
+  for (const match of text.matchAll(STATIC)) {
+    const source = literal(match[1]);
+    sources.set(source, [...(sources.get(source) ?? []), file]);
+  }
+}
+const disambiguated = new Map<string, string>();
+for (const [file, text] of Object.entries(SOURCES)) {
+  for (const match of text.matchAll(DISAMBIGUATED)) disambiguated.set(`${literal(match[1])}\u0004${literal(match[2])}`, file);
+}
+// Include the ordinary CLI listing's marked diagnostics alongside the Rust desktop sources.
+const RUST = import.meta.glob([
+  "../core/src/**/*.rs",
+  "../src-tauri/src/**/*.rs",
+  "../../src/state/listing_metadata/{listing,pages}.rs",
+], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+const MARKED = /\b(?:text|source)!\(\s*("(?:[^"\\\n]|\\.)*")/g;
+const marked = new Set(Object.values(RUST).flatMap((text) => [...text.matchAll(MARKED)].map((match) => JSON.parse(match[1]) as string)));
+const translated = catalog as Record<string, unknown>;
+const englishOnly = new Set(english as string[]);
+
+describe("interface string coverage", () => {
+  it("translates every wrapped literal or lists it as English-only", () => {
+    const missing = [...sources].filter(([source]) => !(source in translated) && !englishOnly.has(source)).map(([source, files]) => `${JSON.stringify(source)} in ${files[0]}`);
+    expect(missing).toEqual([]);
+  });
+
+  it("translates every disambiguated literal", () => {
+    expect([...disambiguated].filter(([key]) => !(key in translated)).map(([key, file]) => `${JSON.stringify(key)} in ${file}`)).toEqual([]);
+  });
+
+  it("keeps the English-only list current", () => {
+    expect([...englishOnly].filter((source) => source in translated)).toEqual([]);
+    expect([...englishOnly].filter((source) => !sources.has(source))).toEqual([]);
+    expect(english as string[]).toEqual([...english as string[]].sort());
+  });
+
+  it("keeps only used sources in the Next-only supplement", () => {
+    // A disambiguated entry ("disambiguation\u0004source") is used by its trc() literal.
+    expect(Object.keys(supplement).filter((source) => !sources.has(source) && !marked.has(source) && !disambiguated.has(source))).toEqual([]);
+  });
+
+  it("translates computed values only in reviewed files", () => {
+    const unreviewed = Object.entries(SOURCES).filter(([file, text]) => DYNAMIC.test(text) && !(file in DYNAMIC_FILES)).map(([file]) => file);
+    expect(unreviewed).toEqual([]);
+  });
+});

@@ -15,6 +15,13 @@ use std::{
 };
 
 mod shim;
+// Read-only Windows inspection primitives. The guarded cleanup sampler is
+// still closed until its object matching and owned-worker integration land.
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
+mod windows_membership;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod worktree_membership;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -24,13 +31,140 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-/// A completed process roster may still contain protected Linux processes whose
+/// Task #28: whether this process runs in a sandbox below Medium integrity
+/// (a DeepSeek member's confined shell on Windows). It reads Zerus state, but
+/// writes and the session host stay closed to it, so its `hgs run` and its
+/// host reads go through the member's folder to the team worker instead.
+/// Never on Unix, where agent sandboxes have no integrity levels.
+pub fn sandboxed() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = SANDBOXED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    #[cfg(windows)]
+    {
+        crate::host::token::below_medium() || foreign_sandbox()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Task #48: whether this process runs as another user than the owner of the
+/// hgs state, and may not read the owner's hgs configuration: Codex's Windows
+/// sandbox (`CodexSandboxOffline`, at Medium integrity). Such a process reads
+/// the state but writes none of it, so its member calls go through its folder
+/// to the team worker, as a DeepSeek sandbox's do. Both signs are needed: the
+/// owner always reads its own configuration. Never on Unix.
+pub fn foreign_sandbox() -> bool {
+    #[cfg(windows)]
+    {
+        static FOREIGN_SANDBOX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FOREIGN_SANDBOX.get_or_init(|| {
+            let Some(home) = home() else { return false };
+            let state = env::var_os("HGS_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(below(&home, ".local/state/hgs/sessions")));
+            let config = env::var_os("HGS_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(below(&home, ".config/hgs")));
+            owned_by_another_user(&state)
+                && std::fs::read_dir(&config).is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+
+
+#[cfg(test)]
+thread_local! {
+    static SANDBOXED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test's stand-in for this process's sandbox, on this thread.
+#[cfg(test)]
+pub(crate) fn set_test_sandboxed(sandboxed: Option<bool>) {
+    SANDBOXED.with(|value| value.set(sandboxed));
+}
+
+/// Task #28: lowers this process to Low integrity before it starts a
+/// sandboxed member's run, so the run keeps the member's sandbox level.
+pub fn lower_to_low_integrity() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::host::token::lower_current_to_low()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(io::Error::other("integrity levels exist only on Windows"))
+    }
+}
+
+/// Start a child of the desktop service (a remote watch, a probe, maintenance).
+/// The service has no console on Windows, so its children start without a
+/// console window there; on Unix they take their turn as other children do.
+pub fn spawn_service_child(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        spawn_in_turn(command)
+    }
+    #[cfg(windows)]
+    {
+        spawn_windowless(command)
+    }
+}
+
+/// Whether a console belongs to this process alone: it has a window and no other
+/// process, such as the user's shell, is attached. Windows creates one for a
+/// console program whose starter gave it none (a logon task, COM activation).
+#[cfg(any(windows, test))]
+pub fn private_console(window: bool, attached: u32) -> bool {
+    window && attached == 1
+}
+
+/// A completed process roster may still contain protected processes whose
 /// paths the OS refuses to disclose. Keep these separate from readable paths:
-/// they require personal confirmation, never automatic cleanup authority.
+/// background cleanup keeps them; only the confirmed Terminate/Remove policy
+/// may ignore actual permission denials. This data is never signal authority.
+/// Whether a process has a file open, as the host can report it: `Unknown` when
+/// the host's holder lookup does not work (on Windows, the Restart Manager did
+/// not start), so a caller can take the conservative path instead of a wrong
+/// "not held".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenFiles {
+    Held,
+    NotHeld,
+    /// The host cannot read the file's holders; `reason` says why.
+    Unknown(String),
+}
+
+#[cfg(test)]
+pub(crate) mod open_files_test {
+    use std::sync::Mutex;
+    /// A forced "unknown" reason for tests that exercise the conservative path.
+    pub(crate) static FORCED: Mutex<Option<String>> = Mutex::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn forced_open_files_unknown() -> Option<String> {
+    open_files_test::FORCED.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_forced_open_files_unknown(reason: Option<&str>) {
+    *open_files_test::FORCED.lock().unwrap() = reason.map(str::to_owned);
+}
+
 #[derive(Default)]
 pub struct WorktreeProcesses {
     pub paths: Vec<(u32, PathBuf, String)>,
     pub unreadable: Vec<UnreadableWorktreeProcess>,
+    /// Complete bounded native cwd/image/FD inspection, with only actual
+    /// permission denials represented in `unreadable`. Never inferred from Err.
+    pub membership_complete: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -40,6 +174,7 @@ pub struct UnreadableWorktreeProcess {
     pub command: String,
     pub cwd: bool,
     pub executable: bool,
+    pub files: bool,
     /// Kernel-verified invocation ancestor, retained as diagnostic metadata.
     pub invocation_ancestor: bool,
 }
@@ -50,6 +185,7 @@ impl From<Vec<(u32, PathBuf, String)>> for WorktreeProcesses {
         Self {
             paths,
             unreadable: Vec::new(),
+            membership_complete: false,
         }
     }
 }
@@ -121,7 +257,8 @@ pub struct SshChild {
 }
 /// The output of a successful ssh command, without its error text.
 pub fn ssh_capture(args: &[String]) -> Option<String> {
-    let out = ssh_output(ssh().args(args).stderr(Stdio::null())).ok()?;
+    let remote = args.last()?;
+    let out = ssh_output(crate::ssh_bytes::command(remote).ok()?.args(args).stderr(Stdio::null())).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -131,21 +268,31 @@ pub fn ssh_capture(args: &[String]) -> Option<String> {
 /// while a scanner or reader briefly holds the destination; retry that for a
 /// bounded time. Unix renames at once.
 pub fn persist(
+    temporary: tempfile::NamedTempFile,
+    path: impl AsRef<Path>,
+) -> Result<File, tempfile::PersistError> {
+    persist_with_wait(temporary, path, std::time::Instant::now, std::thread::sleep)
+}
+
+// Keep the real file operations in retry tests; only scheduling is controlled.
+fn persist_with_wait(
     mut temporary: tempfile::NamedTempFile,
     path: impl AsRef<Path>,
+    now: impl Fn() -> std::time::Instant,
+    mut wait: impl FnMut(std::time::Duration),
 ) -> Result<File, tempfile::PersistError> {
     let path = path.as_ref();
     let mut delay = std::time::Duration::from_millis(10);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = now() + std::time::Duration::from_secs(1);
     loop {
         match temporary.persist(path) {
             Ok(file) => return Ok(file),
             Err(error)
                 if transient_replace_error(&error.error)
-                    && std::time::Instant::now() < deadline =>
+                    && now() < deadline =>
             {
                 temporary = error.file;
-                std::thread::sleep(delay);
+                wait(delay);
                 delay = (delay * 2).min(std::time::Duration::from_millis(200));
             }
             Err(error) => return Err(error),
@@ -164,24 +311,36 @@ pub fn lock_contended(error: &io::Error) -> bool {
 /// Windows frees a closed handle's lock only when system resources allow, and a
 /// forked child can keep a Unix descriptor open until exec, so closing the file
 /// alone can leave the next process waiting.
-pub struct FileLock(File);
+pub struct FileLock {
+    inner: zerus_file_lock::OwnedLock,
+}
+
+#[cfg(all(test, unix))]
+use zerus_file_lock::testing::{FAIL_UNLOCK, UNLOCK_ATTEMPTS};
 
 impl FileLock {
     pub fn exclusive(file: File) -> io::Result<Self> {
         fs2::FileExt::lock_exclusive(&file)?;
-        Ok(Self(file))
+        Ok(Self::held(file))
     }
 
     /// Takes ownership of a file whose lock this process has just acquired.
     pub fn held(file: File) -> Self {
-        Self(file)
+        Self {
+            inner: zerus_file_lock::OwnedLock::acquired(file),
+        }
     }
-}
 
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Rust 1.89+ File::unlock would shadow the trait method; name fs2 explicitly.
-        let _ = fs2::FileExt::unlock(&self.0);
+    /// Preserve a caller's fallible normal release without retrying it in Drop.
+    /// Error exits still use the acquisition-owner guard's ordinary Drop.
+    pub(crate) fn release(self) -> io::Result<()> {
+        self.inner.release()
+    }
+
+    /// The identity of the exact file object this lock is held on.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub fn identity(&self) -> io::Result<FileIdentity> {
+        FileIdentity::of(self.inner.file())
     }
 }
 
@@ -359,29 +518,18 @@ pub enum RunError {
     Unsupported,
 }
 
+/// One POSIX shell word, bare when nothing in it needs quoting. Quoted words
+/// also read the same in fish, a person's or SSH peer's shell: fish reads
+/// `\\` and `\'` even inside single quotes, so every backslash and quote
+/// stays outside them (`'a'\\'b'`), which POSIX shells read identically
+/// (zerus-sa9qn.43).
 pub fn quote(word: &str) -> String {
     if !word.is_empty()
         && word
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"_./:=@%+,~-".contains(&c))
     {
-        word.into()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-pub fn join<S: AsRef<str>>(args: &[S]) -> String {
-    args.iter()
-        .map(|s| quote(s.as_ref()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-/// Quotes a word for an SSH peer's login shell, which may be fish. fish also
-/// reads `\\` and `\'` inside single quotes, so every backslash stays outside
-/// them; a word without one keeps the `quote` form.
-pub fn remote_quote(word: &str) -> String {
-    if !word.contains('\\') {
-        return quote(word);
+        return word.into();
     }
     let mut quoted = String::from("'");
     for c in word.chars() {
@@ -393,6 +541,17 @@ pub fn remote_quote(word: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+pub fn join<S: AsRef<str>>(args: &[S]) -> String {
+    args.iter()
+        .map(|s| quote(s.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+/// Quotes a word for an SSH peer's login shell, which may be fish: `quote`,
+/// which is fish-safe for every word now.
+pub fn remote_quote(word: &str) -> String {
+    quote(word)
 }
 pub fn remote_join<S: AsRef<str>>(args: &[S]) -> String {
     args.iter()
@@ -544,6 +703,90 @@ pub fn restore_terminal() {
     }
 }
 
+/// How fish reads one command line, modelled on fish's documented quoting
+/// (fish is not installed on the build machines; zerus-sa9qn.43): inside
+/// single quotes only `\'` and `\\` are escapes and every other character is
+/// literal; outside quotes a backslash escapes the next character, whitespace
+/// separates words, and anything fish would act on (`;`, `&`, `|`, `<`, `>`,
+/// `(`, `)`, `$`, `*`, `?`, `{`, `}`, a double quote, a newline, or `~` and
+/// `#` at the start of a word) is reported instead of read. A newline
+/// outside quotes ends a command.
+#[cfg(test)]
+pub(crate) fn fish_commands(line: &str) -> std::result::Result<Vec<Vec<String>>, String> {
+    let (mut commands, mut words, mut word, mut started) =
+        (Vec::new(), Vec::new(), String::new(), false);
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+                commands.push(std::mem::take(&mut words));
+                continue;
+            }
+            ' ' | '\t' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+                continue;
+            }
+            '\'' => loop {
+                match chars.next() {
+                    None => return Err(format!("an unterminated quote in {line:?}")),
+                    Some('\'') => break,
+                    Some('\\') if matches!(chars.peek(), Some('\'' | '\\')) => {
+                        word.push(chars.next().expect("peeked"));
+                    }
+                    Some(c) => word.push(c),
+                }
+            },
+            '\\' => match chars.next() {
+                Some(
+                    c @ ('a'
+                    | 'b'
+                    | 'e'
+                    | 'f'
+                    | 'n'
+                    | 'r'
+                    | 't'
+                    | 'v'
+                    | 'x'
+                    | 'X'
+                    | 'u'
+                    | 'U'
+                    | 'c'
+                    | '0'..='7'),
+                ) => return Err(format!("the escape \\{c} in {line:?}")),
+                Some(c) => word.push(c),
+                None => return Err(format!("a trailing backslash in {line:?}")),
+            },
+            '~' | '#' if !started => return Err(format!("{c:?} starts a word in {line:?}")),
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' | '$' | '*' | '?' | '{' | '}' | '"' => {
+                return Err(format!("fish acts on {c:?} in {line:?}"))
+            }
+            c => word.push(c),
+        }
+        started = true;
+    }
+    if started {
+        words.push(word);
+    }
+    commands.push(words);
+    Ok(commands)
+}
+
+/// The words of one fish command line (`fish_commands`), refusing a second.
+#[cfg(test)]
+pub(crate) fn fish_words(line: &str) -> std::result::Result<Vec<String>, String> {
+    match fish_commands(line)?.as_slice() {
+        [words] => Ok(words.clone()),
+        _ => Err(format!("more than one command in {line:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,13 +802,89 @@ mod tests {
     #[test]
     fn remote_commands_keep_posix_quoting_for_windows_paths() {
         assert_eq!(quote("~/.local/bin/hgs"), "~/.local/bin/hgs");
-        assert_eq!(quote(r"C:\Users\a b"), r"'C:\Users\a b'");
+        // The peer's sh reads `C:\Users\a b`; the backslashes stay outside the
+        // quotes for fish (zerus-sa9qn.43).
+        assert_eq!(quote(r"C:\Users\a b"), r"'C:'\\'Users'\\'a b'");
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(quote(""), "''");
         assert_eq!(
             join(&["inspect", "zerus://session?a=1&b=2", "--local"]),
             "inspect 'zerus://session?a=1&b=2' --local"
         );
+    }
+
+    /// Words a person pastes (dry-run lines, `machine ssh` prints) or a fish
+    /// login shell reads; `x\'; touch pwned; #` is the #2127 review's folder.
+    const HOSTILE: &[&str] = &[
+        "x\\'; touch pwned; #",
+        "claude/p/x\\'; touch pwned; #",
+        "a\\b",
+        "x\\",
+        "\\'",
+        "\\\\'",
+        "a\\\\'b; touch pwned",
+        "it's",
+        "'\\''",
+        "$(touch pwned)",
+        "`touch pwned`",
+        "a\"b; touch pwned",
+        "x;touch pwned",
+        "x/~root",
+        "#x",
+        "x\u{2019}; touch pwned",
+        "x\ntouch pwned",
+        "",
+    ];
+
+    /// zerus-sa9qn.43: every word `quote` writes reads back exactly in fish
+    /// (modelled, `fish_words`) and in sh (run), alone and joined.
+    #[test]
+    fn quoted_words_read_back_exactly_in_fish_and_sh() {
+        for word in HOSTILE.iter().copied() {
+            assert_eq!(
+                fish_words(&quote(word)),
+                Ok(vec![word.to_owned()]),
+                "{word:?} -> {}",
+                quote(word)
+            );
+            assert_eq!(remote_quote(word), quote(word));
+        }
+        let all: Vec<String> = HOSTILE.iter().map(|word| word.to_string()).collect();
+        assert_eq!(fish_words(&join(&all)), Ok(all.clone()));
+        #[cfg(unix)]
+        {
+            let folder = tempfile::tempdir().unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\0' {}", join(&all)))
+                .current_dir(folder.path())
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(!folder.path().join("pwned").exists());
+            let read: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(read, all);
+        }
+    }
+
+    /// The model itself: what fish documents for single quotes.
+    #[test]
+    fn the_fish_model_reads_quotes_as_fish_documents() {
+        assert_eq!(fish_words(r"'a\'b'"), Ok(vec!["a'b".to_owned()]));
+        assert_eq!(fish_words(r"'a\\b'"), Ok(vec![r"a\b".to_owned()]));
+        assert_eq!(fish_words(r"'a\b'"), Ok(vec![r"a\b".to_owned()]));
+        assert_eq!(
+            fish_words(r"'a'\''b' c"),
+            Ok(vec!["a'b".to_owned(), "c".to_owned()])
+        );
+        // The old form of `x\'; touch pwned; #`: fish ends the quote late.
+        assert!(fish_words(r"'x\'\''; touch pwned; #'")
+            .unwrap_err()
+            .contains("';'"));
     }
 
     #[test]
@@ -669,3 +988,70 @@ mod tests {
         drop(still_open);
     }
 }
+
+#[cfg(test)]
+mod console_allocation_tests {
+    #[test]
+    fn only_a_console_no_other_process_uses_is_released() {
+        // A logon task or COM start: Windows made a console for this process alone.
+        assert!(super::private_console(true, 1));
+        // Started from a terminal: the user's shell shares it, so it stays.
+        assert!(!super::private_console(true, 2));
+        // No console window, or no attached process count: nothing to release.
+        assert!(!super::private_console(false, 1));
+        assert!(!super::private_console(true, 0));
+    }
+
+    #[test]
+    fn desktop_service_children_start_without_console_windows() {
+        // A plain spawn from the console-less service would give every remote
+        // watch, probe or maintenance child (and its ssh.exe) a window.
+        for (name, source) in [
+            ("fleet", include_str!("../desktop/fleet.rs")),
+            ("maintenance", include_str!("../desktop/maintenance.rs")),
+        ] {
+            let body = source
+                .split("\nfn spawn(command: &mut ")
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .expect(name);
+            assert!(
+                body.contains("platform::spawn_service_child(command)"),
+                "{name}"
+            );
+            assert!(!body.contains(".spawn()"), "{name} spawns directly");
+        }
+        let shared = include_str!("mod.rs")
+            .split("pub fn spawn_service_child(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("spawn_service_child");
+        assert!(shared.contains("#[cfg(windows)]") && shared.contains("spawn_windowless(command)"));
+        assert!(
+            include_str!("windows.rs").contains("command.creation_flags(CREATE_NO_WINDOW).spawn()")
+        );
+    }
+
+    #[test]
+    fn the_manifest_gives_hgs_no_console_when_its_starter_has_none() {
+        let manifest = include_str!("../hgs.manifest");
+        let settings = manifest
+            .split("<windowsSettings>")
+            .nth(1)
+            .and_then(|rest| rest.split("</windowsSettings>").next())
+            .expect("windowsSettings");
+        assert!(settings.contains(
+            r#"<consoleAllocationPolicy xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">detached</consoleAllocationPolicy>"#
+        ));
+        // The settings it already had stay.
+        assert!(
+            settings.contains(">UTF-8</activeCodePage>")
+                && settings.contains(">true</longPathAware>")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod lock_tests;
+#[cfg(all(test, unix))]
+pub(crate) mod residual_lock_tests;

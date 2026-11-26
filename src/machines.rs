@@ -16,6 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod retry_delays;
+mod source;
+
 fn yes() -> bool {
     true
 }
@@ -32,7 +35,13 @@ pub struct Connection {
     pub identity_file: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// U62 (#732): the owner made this Machine a test runner of this platform
+    /// class (windows, linux, macos or android); empty is none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub test_runner: String,
 }
+/// The platform classes a test runner may serve.
+pub const TEST_RUNNER_CLASSES: [&str; 4] = ["windows", "linux", "macos", "android"];
 impl Default for Connection {
     fn default() -> Self {
         Self {
@@ -43,6 +52,7 @@ impl Default for Connection {
             port: None,
             identity_file: String::new(),
             enabled: true,
+            test_runner: String::new(),
         }
     }
 }
@@ -77,6 +87,10 @@ pub fn load(dir: &Path) -> Result<BTreeMap<String, Connection>> {
 fn revision(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+pub(crate) fn adoption_configuration_revision(config: &Config) -> Result<String> {
+    Ok(revision(&read(&config.dir)?))
+}
 fn validate_alias(alias: &str) -> Result<()> {
     if alias.is_empty()
         || alias.len() > 80
@@ -94,6 +108,9 @@ fn validate_alias(alias: &str) -> Result<()> {
 }
 fn validate(alias: &str, c: &Connection) -> Result<()> {
     validate_alias(alias)?;
+    if !c.test_runner.is_empty() && !TEST_RUNNER_CLASSES.contains(&c.test_runner.as_str()) {
+        return Err(Error::new(1, "A test runner serves windows, linux, macos or android."));
+    }
     if c.transport == crate::wsl::Transport::WslLocal {
         if !c.hostname.is_empty() || !c.user.is_empty() || c.port.is_some() || !c.identity_file.is_empty() {
             return Err(Error::new(2, "wsl-local profiles cannot contain SSH overrides"));
@@ -188,14 +205,7 @@ fn write_profile(
     expected: Option<&str>,
     create_only: bool,
 ) -> Result<()> {
-    fs::create_dir_all(&config.dir)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(config.dir.join("machines.lock"))?;
-    let _lock = platform::FileLock::exclusive(lock)?;
+    let _lock = lock(config)?;
     let bytes = read(&config.dir)?;
     if expected.is_some_and(|value| value != revision(&bytes)) {
         return Err(Error::new(
@@ -228,6 +238,17 @@ fn write_profile(
     platform::sync_dir(&config.dir)?;
     Ok(())
 }
+/// The one lock every local machine settings writer holds.
+fn lock(config: &Config) -> Result<platform::FileLock> {
+    fs::create_dir_all(&config.dir)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(config.dir.join("machines.lock"))?;
+    Ok(platform::FileLock::exclusive(lock)?)
+}
 fn list(config: &Config) -> Result<Value> {
     // Profile values and the optimistic-lock revision must describe one snapshot.
     let bytes = read(&config.dir)?;
@@ -245,7 +266,8 @@ fn list(config: &Config) -> Result<Value> {
         })
         .collect();
     Ok(
-        json!({"local":config.host(),"machines":rows,"revision":revision(&bytes),"environment_override":config.peers_from_environment}),
+        json!({"local":config.host(),"machines":rows,"revision":revision(&bytes),"environment_override":config.peers_from_environment,
+            "retry_delays":retry_delays::view(&config.dir)}),
     )
 }
 // `ssh -G` never opens a network connection, but a user's Match exec directive
@@ -357,6 +379,26 @@ fn resolve(config: &Config, alias: &str) -> Result<Value> {
 const PROBE: &str = r#"export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; printf '\n__HGS_MACHINE__\n'; printf 'os='; uname -s; printf 'arch='; uname -m; printf 'hgs='; if test -x "$HOME/.local/bin/hgs"; then "$HOME/.local/bin/hgs" --version 2>/dev/null; else printf '\n'; fi; printf 'tmux='; tmux -V 2>/dev/null || printf '\n'; printf 'cargo='; command -v cargo || true"#;
 fn check(config: &Config, alias: &str) -> Result<Value> {
     if let Some(profile) = crate::wsl::profile(config, alias) { return crate::wsl::check(profile, alias); }
+    if crate::remote_shell::windows(config, alias)? {
+        // WhiteWh fork: later commands (connect timeout, peer channel) read this.
+        let _ = crate::windows_peer::record(config, alias, true);
+        let version = crate::remote_shell::output(config, alias, &["--version"])?;
+        let listing = crate::remote_shell::output(config, alias, &["ls", "--local", "--json"])?;
+        let value: Value = serde_json::from_slice(&listing.stdout).unwrap_or(Value::Null);
+        let enabled = value["ok"] == true
+            && value["sessions"].is_array()
+            && value.get("local_sessions").is_none_or(|v| v == true);
+        let hgs = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+        let ready = version.status.success()
+            && listing.status.success()
+            && hgs.starts_with("hgs ")
+            && enabled;
+        return Ok(
+            json!({"alias":alias,"ok":ready,"ssh_ok":true,"platform":"windows","os":"Windows","arch":"unknown","hgs":hgs,
+            "local_sessions":enabled,"tmux":null,"cargo":null,
+            "error":if ready { "" } else { "Install Zerus and enable local sessions with hgs session-host install on that Windows account" }}),
+        );
+    }
     let out = platform::ssh_output(
         platform::ssh()
             .args(ssh_options(config, alias))
@@ -454,12 +496,39 @@ fn check_windows(config: &Config, alias: &str) -> Result<Option<Value>> {
     Ok(Some(result))
 }
 
-fn setup(config: &Config, alias: &str, source: Option<&str>, dry: bool) -> Result<i32> {
+fn setup_revision(config: &Config, alias: &str, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let bytes = read(&config.dir)?;
+    let current = decode(&bytes)?.machines;
+    if expected != revision(&bytes)
+        || current != config.machines
+        || (!config.base_peers.iter().any(|peer| peer == alias) && !current.contains_key(alias))
+    {
+        return Err(Error::new(
+            1,
+            "Machine settings changed elsewhere. Reload the page before setup.",
+        ));
+    }
+    Ok(())
+}
+fn setup(
+    config: &Config,
+    alias: &str,
+    source: Option<&str>,
+    expected: Option<&str>,
+    dry: bool,
+) -> Result<i32> {
     if crate::wsl::profile(config, alias).is_some() {
         return Err(Error::new(2,"Install the fork's Linux hgs in the selected WSL environment explicitly; WSL setup never replaces an installed agent or starts OpenCode"));
     }
     if crate::windows_peer::is_windows(config, alias) {
         return Err(Error::new(1, "This is a Windows computer: install Zerus there and enable local sessions in Machines, then choose Check."));
+    }
+    setup_revision(config, alias, expected)?;
+    if !dry && crate::remote_shell::windows(config, alias)? {
+        return Err(Error::new(2, "Install the Windows Zerus package and run hgs session-host install on that account; source bootstrap is for POSIX computers"));
     }
     let root = source
         .map(std::path::PathBuf::from)
@@ -491,7 +560,7 @@ hgs_stage=$(mktemp -d "$HOME/.local/share/hgs/setup.XXXXXXXX")
 trap 'rm -rf "$hgs_stage"' EXIT HUP INT TERM
 tar xzf - -C "$hgs_stage"
 printf 'Building HGS for this machine…\n'
-HGS_INSTALL_PREFIX="$HOME/.local" bash "$hgs_stage/install.sh"
+HGS_MOBILE_CONNECTOR=0 HGS_INSTALL_PREFIX="$HOME/.local" bash "$hgs_stage/install.sh"
 if test ! -e "$HOME/.config/hgs/config"; then
   (set -C; printf 'HGS_SELF="%s"\n' "$1" > "$HOME/.config/hgs/config") || true
 fi
@@ -518,26 +587,22 @@ printf 'Setup complete: '
         println!("Bundle CLI sources from {} and run a native build/install on {alias} (no session restart).", root.display());
         return Ok(0);
     }
+    let sources = source::Snapshot::new(&root)?;
     let bundle = tempfile::NamedTempFile::new()?;
     let result = platform::status(
         Command::new("tar")
             .args(["czf", "-"])
             .arg("-C")
-            .arg(&root)
-            .args([
-                "Cargo.toml",
-                "Cargo.lock",
-                "build.rs",
-                "src",
-                "scripts",
-                "install.sh",
-                "hgs_state.py",
-            ])
+            .arg(sources.path())
+            .arg(".")
             .stdout(bundle.reopen()?),
     )?;
     if !result.success() {
         return Err(Error::new(1, "Could not package the HGS CLI sources."));
     }
+    // The SSH options above are frozen from this exact config snapshot. A
+    // changed profile during source preparation refuses before contacting it.
+    setup_revision(config, alias, expected)?;
     let code = platform::ssh_status(
         platform::ssh().args(arguments),
         fs::File::open(bundle.path())?,
@@ -554,10 +619,13 @@ pub fn dispatch(config: &Config, args: &[String], dry: bool) -> Result<i32> {
         println!("{}", list(config)?);
         return Ok(0);
     }
+    if command == "retry-delays" {
+        return retry_delays::dispatch(config, &args[1..], dry);
+    }
     let alias = args.get(1).ok_or_else(|| {
         Error::new(
             1,
-            "usage: hgs machine <set|remove|reset|resolve|check|ssh|setup> <alias>",
+            "usage: hgs machine <set|remove|reset|resolve|check|ssh|setup> <alias>, or hgs machine retry-delays [--set FIRST SECOND THIRD LATER | --reset]",
         )
     })?;
     validate_alias(alias)?;
@@ -628,17 +696,15 @@ pub fn dispatch(config: &Config, args: &[String], dry: bool) -> Result<i32> {
             Ok(0)
         }
         "setup" => {
-            let source = match &args[2..] {
-                [] => None,
-                [flag, path] if flag == "--source" => Some(path.as_str()),
-                _ => {
-                    return Err(Error::new(
-                        1,
-                        "usage: hgs machine setup <alias> [--source <checkout>]",
-                    ))
+            let (mut source, mut expected) = (None, None);
+            for pair in args[2..].chunks(2) {
+                match pair {
+                    [flag, value] if flag == "--source" && source.is_none() => source = Some(value.as_str()),
+                    [flag, value] if flag == "--revision" && expected.is_none() => expected = Some(value.as_str()),
+                    _ => return Err(Error::new(1, "usage: hgs machine setup <alias> [--source <checkout>] [--revision <revision>]")),
                 }
-            };
-            setup(config, alias, source, dry)
+            }
+            setup(config, alias, source, expected, dry)
         }
         "check" => {
             if args.len() != 2 {

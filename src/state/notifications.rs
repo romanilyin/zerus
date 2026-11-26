@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 const MAX_REVISION: u64 = i64::MAX as u64;
 const MAX_CONVERSATIONS: usize = 8;
@@ -225,9 +227,46 @@ pub(super) fn enrich(session: &mut Value, store: Option<&Store>, owner: &str) {
     let conversation = string(session, "conversation_id");
     let value = store
         .filter(|_| owner_identity(owner) && identity(conversation))
-        .map(|store| json!(preference(store, owner, conversation)))
+        .map(|store| {
+            let mut preference = preference(store, owner, conversation);
+            // U43: a member of an active team without a recorded choice is muted
+            // by default on every device here (N3: only a session on this
+            // computer; a member on another computer keeps its notifications
+            // there, as docs/reference.md states). A stored choice (revision >
+            // 0) wins; the lead of every active team is never muted by this
+            // default.
+            if preference.revision == 0 && !preference.muted && team_muted(string(session, "host"), string(session, "name")) {
+                preference.muted = true;
+            }
+            json!(preference)
+        })
         .unwrap_or(Value::Null);
     session["notification_preferences"] = value;
+}
+
+/// U43: the team store identity, its active revision, and the non-lead member
+/// sessions read from it.
+type TeamMutedCache = Option<((PathBuf, u64, Option<SystemTime>, i64), BTreeSet<(String, String)>)>;
+
+/// U43/N3/L2: whether this (host, name) is a non-lead member of an active team
+/// on this computer. The cache key is the team store file and the active
+/// teams' revision, so a member added and one removed between two equal-length
+/// writes still refreshes the set, and a listing that asks per session reads
+/// the teams once per change.
+fn team_muted(host: &str, name: &str) -> bool {
+    if name.is_empty() || !host.is_empty() {
+        // A session on another computer is never muted by this hgs's default.
+        return false;
+    }
+    let Ok(metadata) = fs::metadata(super::teams::store::path()) else { return false };
+    let revision = super::teams::store::Store::open(false).and_then(|store| store.active_revision()).unwrap_or(-1);
+    let key = (root(), metadata.len(), metadata.modified().ok(), revision);
+    static TEAM_MUTED: Mutex<TeamMutedCache> = Mutex::new(None);
+    let mut cache = TEAM_MUTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.as_ref().map(|(cached, _)| cached) != Some(&key) {
+        *cache = Some((key, super::teams::muted_member_sessions()));
+    }
+    cache.as_ref().is_some_and(|(_, names)| names.contains(&(host.to_owned(), name.to_owned())))
 }
 
 /// Preserve the preference owner when a native provider renames its binding.
@@ -393,8 +432,9 @@ fn update(
 }
 
 /// The raw binding only: never read_marks::current, archive reconciliation,
-/// native adoption, approval fitting, input, acknowledgement or lifecycle.
-fn current(name: &str) -> Result<Option<Value>> {
+/// native adoption, approval fitting, input, acknowledgement or lifecycle. A
+/// `--session-id` selection must still be the record's (#1355 review).
+pub(super) fn current(name: &str) -> Result<Option<Value>> {
     if opencode::exists(name) {
         return opencode::binding(name).map(Some);
     }
@@ -416,6 +456,7 @@ fn current(name: &str) -> Result<Option<Value>> {
     {
         return Err("invalid notification session binding".into());
     }
+    session_id::verify(&record)?;
     if !identity(string(&record, "run_id"))
         || string(&record, "run_id").len() > 128
         || !identity(string(&record, "conversation_id"))
@@ -428,7 +469,7 @@ fn current(name: &str) -> Result<Option<Value>> {
         return Ok(None);
     }
     let panes = live()?;
-    if panes.contains_key(name) && !matches(&record, panes.get(name)) {
+    if terminal_live(&panes, &record)? && !matches(&record, panes_of(&panes, &record)) {
         return Ok(None);
     }
     Ok(Some(record))
@@ -487,6 +528,9 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         return Err("notification request exceeds limits".into());
     }
     let request = parse(crate::state::without_bom(&bytes))?;
+    // zerus-ucck P3c: the request's run and conversation select among
+    // sessions that share the label.
+    expect(name, &request.run_id, &request.conversation_id)?;
     let _preference_guard = lock(Some(&root().join("notifications.lock")))?;
     // Same lock files as their writers, without the default lock's rename
     // recovery. An interrupted rename is refused, never completed here.
@@ -994,5 +1038,130 @@ mod tests {
         fs::write(&path, "{broken").unwrap();
         assert!(read_store(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"{broken");
+    }
+
+    /// U43: an active team's member with no recorded choice reads muted in
+    /// every listing; its lead, a session outside any team, a recorded choice
+    /// and a finished team's member do not.
+    #[test]
+    fn an_active_teams_member_reads_muted_without_a_recorded_choice() {
+        use crate::state::teams::model::{Member, SessionRef, Team, TeamStatus};
+        use crate::state::teams::store::Store as TeamStore;
+        let dir = tempfile::tempdir().unwrap();
+        crate::state::with_test_state_root(dir.path(), || {
+            let mut teams = TeamStore::open(true).unwrap();
+            let team = |id: &str, status: TeamStatus, lead: &str, member: &str| Team {
+                id: id.into(),
+                name: "T".into(),
+                lead: lead.into(),
+                status,
+                members: vec![
+                    Member {
+                        id: lead.into(),
+                        role: "Lead".into(),
+                        agent: "claude".into(),
+                        session: Some(SessionRef { name: format!("claude/x/{lead}"), run_id: "r0".into(), ..Default::default() }),
+                        ..Default::default()
+                    },
+                    Member {
+                        id: "dev".into(),
+                        role: "Backend".into(),
+                        agent: "dsh".into(),
+                        session: Some(SessionRef { name: member.into(), run_id: "r1".into(), ..Default::default() }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            teams.create("11111111-1111-4111-8111-111111111111", &json!({}), team("running", TeamStatus::Running, "lead", "dsh/x/dev"), vec![]).unwrap();
+            teams.create("22222222-2222-4222-8222-222222222222", &json!({}), team("done", TeamStatus::Done, "oldlead", "dsh/x/old"), vec![]).unwrap();
+            let store = Store::default();
+            // The member's default row: revision 0 and muted, with no write.
+            let mut member = session();
+            member["name"] = json!("dsh/x/dev");
+            enrich(&mut member, Some(&store), "dsh/x/dev");
+            assert_eq!(member["notification_preferences"]["muted"], true, "{member}");
+            assert_eq!(member["notification_preferences"]["revision"], 0);
+            // A recorded choice wins, even when it is an unmute at revision 3.
+            let mut chosen = Store::default();
+            chosen.sessions.entry("dsh/x/dev".into()).or_default().insert(
+                "conversation-1".into(),
+                Preference { conversation_id: "conversation-1".into(), muted: false, revision: 3, suppressed: Suppressed::default() },
+            );
+            let mut chosen_row = session();
+            chosen_row["name"] = json!("dsh/x/dev");
+            enrich(&mut chosen_row, Some(&chosen), "dsh/x/dev");
+            assert_eq!(chosen_row["notification_preferences"]["muted"], false);
+            // The lead is never muted by the default; nor is a non-member or a
+            // member of a finished team.
+            for (owner, name) in [("claude/x/lead", "claude/x/lead"), ("dsh/x/other", "dsh/x/other"), ("dsh/x/old", "dsh/x/old")] {
+                let mut row = session();
+                row["name"] = json!(name);
+                enrich(&mut row, Some(&store), owner);
+                assert_eq!(row["notification_preferences"]["muted"], false, "{name}: {row}");
+            }
+            // #595 N3: only a session on this computer is muted by the default;
+            // a row carrying another host keeps its notifications there.
+            let mut remote_row = session();
+            remote_row["name"] = json!("dsh/x/dev");
+            remote_row["host"] = json!("mac");
+            enrich(&mut remote_row, Some(&store), "dsh/x/dev");
+            assert_eq!(remote_row["notification_preferences"]["muted"], false, "{remote_row}");
+            // A member on another computer is not in this host's set, so a local
+            // session with the same name does not read muted from it.
+            teams
+                .create(
+                    "33333333-3333-4333-8333-333333333333",
+                    &json!({}),
+                    Team {
+                        id: "33333333-3333-4333-8333-333333333333".into(),
+                        name: "Remote".into(),
+                        lead: "rlead".into(),
+                        status: TeamStatus::Running,
+                        members: vec![
+                            Member {
+                                id: "rlead".into(),
+                                role: "Lead".into(),
+                                agent: "claude".into(),
+                                session: Some(SessionRef { name: "claude/x/rlead".into(), run_id: "r0".into(), ..Default::default() }),
+                                ..Default::default()
+                            },
+                            Member {
+                                id: "rem".into(),
+                                role: "Backend".into(),
+                                agent: "dsh".into(),
+                                computer: "mac".into(),
+                                session: Some(SessionRef { host: "mac".into(), name: "dsh/x/remote".into(), run_id: "r1".into(), ..Default::default() }),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .unwrap();
+            let mut stranger = session();
+            stranger["name"] = json!("dsh/x/remote");
+            enrich(&mut stranger, Some(&store), "dsh/x/remote");
+            assert_eq!(stranger["notification_preferences"]["muted"], false, "{stranger}");
+            // #595 L2: a member added after the set was read is muted on the next
+            // read; the active revision is part of the cache key.
+            teams
+                .mutate(None, "running", None, |team, _| {
+                    team.members.push(Member {
+                        id: "newdev".into(),
+                        role: "Backend".into(),
+                        agent: "dsh".into(),
+                        session: Some(SessionRef { name: "dsh/x/new".into(), run_id: "r1".into(), ..Default::default() }),
+                        ..Default::default()
+                    });
+                    Ok(json!({}))
+                })
+                .unwrap();
+            let mut added = session();
+            added["name"] = json!("dsh/x/new");
+            enrich(&mut added, Some(&store), "dsh/x/new");
+            assert_eq!(added["notification_preferences"]["muted"], true, "{added}");
+        });
     }
 }

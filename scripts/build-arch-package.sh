@@ -2,13 +2,14 @@
 # Build and validate this exact checkout; full recipe tests run by default.
 set -euo pipefail
 build_only=false
-if [ "$#" -gt 1 ]; then echo 'Usage: build-arch-package.sh [--build-only]' >&2; exit 2; fi
+if [ "$#" -gt 2 ]; then echo 'Usage: build-arch-package.sh [--build-only | --checked-source SHA]' >&2; exit 2; fi
 case "${1:-}" in
     '') ;;
     --build-only) build_only=true ;;
-    *) echo 'Usage: build-arch-package.sh [--build-only]' >&2; exit 2 ;;
+    --checked-source) build_only=true ;;
+    *) echo 'Usage: build-arch-package.sh [--build-only | --checked-source SHA]' >&2; exit 2 ;;
 esac
-if [ "$build_only" = true ]; then
+if [ "${1:-}" = --build-only ]; then
     if [[ "${ZERUS_RELEASE_CHANNEL:-}" != dev || ! "${ZERUS_DEV_BUILD_NUMBER:-}" =~ ^[1-9][0-9]*$ ]]; then
         echo '--build-only requires the Dev channel and a positive Dev build number.' >&2
         exit 2
@@ -17,6 +18,15 @@ fi
 cd "$(dirname "$0")/.."
 if [ "$(id -u)" = 0 ]; then echo 'makepkg must run as an unprivileged user.' >&2; exit 1; fi
 repo_root="$PWD"
+if [ "${1:-}" = --checked-source ]; then
+    # This is scheduling, not a qualification receipt: the release seal still
+    # consumes the successful source job's exact archive/recipe/package hashes.
+    if [[ ! "${2:-}" =~ ^[0-9a-f]{40}$ ]] || [ "$2" != "$(git rev-parse HEAD)" ]; then
+        echo 'Parallel source checks must name this exact checkout commit.' >&2; exit 2
+    fi
+elif [ "$#" -gt 1 ]; then
+    echo 'Unexpected package build arguments.' >&2; exit 2
+fi
 git rev-parse --verify HEAD > /dev/null
 package_build="$repo_root/.ci-build/arch-package"
 mkdir -p "$package_build" artifacts/test-results
@@ -28,9 +38,8 @@ cp packaging/aur/zerus-git/PKGBUILD "$package_build/PKGBUILD"
 rm -f "$package_build"/*.pkg.tar.zst artifacts/zerus-git-*.pkg.tar.zst
 # Only this disposable copy uses a local source; the distributable recipe keeps
 # its anonymous upstream URL. No token or personal checkout path enters AUR.
-python3 - "$package_build/PKGBUILD" "$repo_root" "$build_only" <<'PY'
+python3 - "$package_build/PKGBUILD" "$repo_root" <<'PY'
 from pathlib import Path
-import re
 import sys
 path=Path(sys.argv[1])
 upstream="source=('zerus::git+https://github.com/ufna/zerus.git#branch=main')"
@@ -39,11 +48,6 @@ assert text.count(upstream)==1
 uri=Path(sys.argv[2]).as_uri()
 assert "'" not in uri
 text=text.replace(upstream,"source=('zerus::git+"+uri+"')")
-assert sys.argv[3] in ('true', 'false')
-if sys.argv[3]=='true':
-    # The public recipe is untouched; only this disposable build disables Qt tests.
-    text,count=re.subn(r'(?<![\w-])-DBUILD_TESTING=(?:ON|OFF)(?!\w)', '-DBUILD_TESTING=OFF', text)
-    assert count==1, 'Expected one explicit package CMake testing setting'
 path.write_text(text)
 PY
 makepkg_args=(--cleanbuild --force --noconfirm)

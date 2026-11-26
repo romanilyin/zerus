@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Request { request_id: String, expected_run_id: String, expected_conversation_id: String }
+pub(super) struct Request { pub request_id: String, pub expected_run_id: String, pub expected_conversation_id: String }
 
 pub(super) fn pending(record: &Value) -> bool {
     ["submitted", "compacting", "uncertain"].contains(&string(&record["compact_context_request"], "status"))
@@ -55,28 +55,53 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
     let mut bytes = Vec::new(); io::stdin().take(8193).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
     if bytes.len() > 8192 { return Err("Compact request is too large".into()); }
     let request: Request = serde_json::from_slice(crate::state::without_bom(&bytes)).map_err(|e|e.to_string())?;
+    let receipt = submit(&args[0], request, None)?;
+    println!("{receipt}"); Ok(0)
+}
+
+/// Shared native command path, including every manual compact guard.
+pub(super) fn submit(name: &str, request: Request, prepared: Option<&Value>) -> Result<Value> {
     let uuid = uuid::Uuid::parse_str(&request.request_id).map_err(|_|"Invalid request identity")?;
-    let name = &args[0];
     let guard = lock(None)?;
     let mut record = input::checked_ready(name, &request.expected_run_id, &request.expected_conversation_id)?;
+    if prepared.is_some_and(|original| !kimi_expiry::same_identity(original,&record)
+        || !kimi_expiry::owned(&record) || record["kimi_pre_send"] != original["kimi_pre_send"]) {
+        return Err("Session process or pre-send custodian changed before compaction; no keys were typed".into());
+    }
+    if let Some(original) = prepared {
+        let current = kimi_expiry::decision(&record);
+        if current.as_ref().is_none_or(|current| ["model","cache_duration","min_tokens_to_hint","last_active_at","tokens"]
+            .iter().any(|key| current[*key] != original["last_send_compaction"][*key])) {
+            return Err("Cache-expiry inputs changed before compaction; no compact keys were typed".into());
+        }
+    }
     if !clear_context::available(&record, true) || record["pending_settings"].is_object() {
         return Err("Wait for the agent to become idle before compacting context".into());
     }
     input::checked_terminal(&record, true)?;
     let path = absolute_root()?.join("compact_receipts").join(format!("{uuid}.json"));
     if path.exists() { return Err("This compact was already attempted. Check Terminal before trying again".into()); }
-    recovery::cancel_for_input(name)?;
+    recovery::cancel_for_input(&record)?;
     let mut receipt = json!({"request_id":request.request_id,"name":name,"run_id":request.expected_run_id,
         "conversation_id":request.expected_conversation_id,"status":"submitted","at":now()});
     record["compact_context_request"] = receipt.clone();
     write(&mut record)?;
     atomic(&path, &json!({"status":"in_progress"}).to_string())?;
     let result: Result<()> = (|| {
-        backend::current().send(string(&record,"pane"), &[backend::Key::Literal("/compact")])?;
+        // Kimi 2.5.3 computeArgumentHint matches /^\/(\S+)( ?)$/.
+        // Its hint rendering loses the composer border and hardware cursor.
+        // Two trailing spaces hide that hint; Kimi trims the empty instruction.
+        // Keep the exact command verifier below unchanged.
+        // Evidence: artifacts/test-results/kimi-compact/diagnosis/RAW-SHA256SUMS
+        // SHA-256: ddf8b09fc81ebfec93fdcae7a175a52e33920d6c0154ebf98e4b2ba2763ef383
+        // Qwen Code names it /compress (0.27.4).
+        let command = match string(&record, "agent") { "kimi" => "/compact  ", "qwen" => "/compress", _ => "/compact" };
+        let typed = command.trim_end();
+        backend::current().send(string(&record,"pane"), &[backend::Key::Literal(command)])?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let current = kimi_tui_choice::identity(&record)?;
-            if clear_context::ready(&current, "/compact")? { break; }
+            if clear_context::ready(&current, typed)? { break; }
             if Instant::now() >= deadline { return Err("Native /compact input could not be verified".into()); }
             std::thread::sleep(Duration::from_millis(40));
         }
@@ -84,19 +109,26 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         let current = input::checked_ready(name, &request.expected_run_id, &request.expected_conversation_id)?;
         kimi_tui_choice::identity(&record)?;
         input::checked_terminal(&current, false)?;
-        if !clear_context::ready(&current, "/compact")? { return Err("The native input changed before /compact".into()); }
+        if !clear_context::ready(&current, typed)? { return Err(format!("The native input changed before {typed}")); }
         backend::current().send(string(&current,"pane"), &[backend::Key::Named("Enter")])?;
         Ok(())
     })();
+    // From the typed command on, every error may follow input (zerus-1wchz).
+    let uncertain = |error: String| {
+        format!("Compact delivery uncertain: {error}. Check Terminal before retrying")
+    };
     if let Err(error) = result {
         receipt["status"] = json!("uncertain");
-        record["compact_context_request"] = receipt.clone(); write(&mut record)?;
-        atomic(&path, &receipt.to_string())?;
-        return Err(format!("Compact delivery uncertain: {error}. Check Terminal before retrying"));
+        record["compact_context_request"] = receipt.clone();
+        let recorded = write(&mut record).and_then(|()| atomic(&path, &receipt.to_string()));
+        return Err(uncertain(match recorded {
+            Ok(()) => error,
+            Err(failed) => format!("{error}; {failed}"),
+        }));
     }
     drop(guard); // Native hooks must be free to report start/completion.
-    atomic(&path, &receipt.to_string())?;
-    println!("{receipt}"); Ok(0)
+    atomic(&path, &receipt.to_string()).map_err(uncertain)?;
+    Ok(receipt)
 }
 
 #[cfg(test)] mod tests {

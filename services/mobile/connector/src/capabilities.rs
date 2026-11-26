@@ -16,6 +16,12 @@ use zerus_relay::protocol::OPERATIONS;
 pub const REPROBE_SECONDS: f64 = 300.0;
 /// `hgs --help` budget (seconds).
 pub const PROBE_TIMEOUT: f64 = 3.0;
+pub const TASK_IDENTITY_HELP_MARKER: &str = "Mobile task identity ABI: task-session-identity-v2";
+pub const TASK_IDENTITY_FEATURE: &str = "task_session_identity_v2";
+pub const TASK_UPLOAD_HELP_MARKER: &str = "Mobile task media ABI: task-media-upload-v1";
+pub const TASK_UPLOAD_FEATURE: &str = "task_media_upload_v1";
+pub const TASK_EDIT_HELP_MARKER: &str = "Mobile task edit ABI: task-admitted-edit-v1";
+pub const TASK_EDIT_FEATURE: &str = "task_admitted_edit_v1";
 /// Windows v1 deliberately excludes POSIX paths, one-hop routing, native
 /// providers absent from the host, speech and voice. Same table drives
 /// advertisement and dispatch refusal, after durable duplicate handling.
@@ -53,6 +59,9 @@ pub fn external_operation_allowed(operation: &str) -> bool {
 }
 
 pub const WINDOWS_OPERATIONS: &[&str] = &[
+    "send_outcome",
+    "send_outcome_receipt",
+    "send_receipt",
     "inspect",
     "history",
     "archive_list",
@@ -65,6 +74,7 @@ pub const WINDOWS_OPERATIONS: &[&str] = &[
     "compact_context",
     "mark_read",
     "session_notifications",
+    "session_question_routing",
     "terminal_snapshot",
     "terminal_input",
     "hooks_status",
@@ -93,6 +103,9 @@ pub const CLEAR_CONTEXT_DISMISS_HELP_MARKER: &str = "Mobile clear-context ABI: d
 /// [`crate::launch::OPERATIONS`]. Every other known operation is refused
 /// as unsupported and never advertised.
 pub const IMPLEMENTED: &[&str] = &[
+    "send_outcome",
+    "send_outcome_receipt",
+    "send_receipt",
     "analytics_read",
     "archive_list",
     "attachment_read",
@@ -109,6 +122,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "inspect",
     "mark_read",
     "session_notifications",
+    "session_question_routing",
+    "session_question_route_person",
+    "session_question_route_person_status",
     "process_output",
     "project_assignment",
     "project_assign",
@@ -177,6 +193,12 @@ pub enum Gate {
     /// The phone's Send now, Cancel and Done list.
     TaskActions,
     Repository,
+    SendReceipt,
+    /// The person's per-child question route switch (zerus-sa9qn.33).
+    QuestionRouting,
+    /// A phone's signed latch statement (zerus-sa9qn.50).
+    QuestionRoutePerson,
+    QuestionRoutePersonRevision,
 }
 
 impl Gate {
@@ -188,6 +210,10 @@ impl Gate {
             Gate::TaskExchange => flags.task_exchange,
             Gate::TaskActions => flags.task_actions,
             Gate::Repository => flags.repository,
+            Gate::SendReceipt => flags.send_receipt,
+            Gate::QuestionRouting => flags.question_routing,
+            Gate::QuestionRoutePerson => flags.question_route_person,
+            Gate::QuestionRoutePersonRevision => flags.question_route_person_revision,
         }
     }
 
@@ -200,6 +226,10 @@ impl Gate {
             Gate::TaskExchange => "task_exchange",
             Gate::TaskActions => "task_actions",
             Gate::Repository => "repository",
+            Gate::SendReceipt => "send_receipt",
+            Gate::QuestionRouting => "question_routing",
+            Gate::QuestionRoutePerson => "question_route_person",
+            Gate::QuestionRoutePersonRevision => "question_route_person_revision",
         }
     }
 
@@ -211,6 +241,12 @@ impl Gate {
             Gate::TaskExchange => "hgs task exchange|digests --json",
             Gate::TaskActions => "hgs task mobile-send|mobile-cancel|mobile-done --json",
             Gate::Repository => crate::repositories::HELP_MARKER,
+            Gate::SendReceipt => crate::send_receipt::HELP_MARKER,
+            Gate::QuestionRouting => crate::session_question_routing::HELP_MARKER,
+            Gate::QuestionRoutePerson => crate::session_question_route_person::HELP_MARKER,
+            Gate::QuestionRoutePersonRevision => {
+                crate::session_question_route_person::REVISION_HELP_MARKER
+            }
         }
     }
 }
@@ -230,6 +266,11 @@ pub struct ConnectorOnly {
 /// of the black-box suites read the same table from
 /// `services/mobile/tests/rust-only-operations.json`.
 pub const CONNECTOR_ONLY: &[ConnectorOnly] = &[
+    ConnectorOnly {
+        operation: "send_receipt",
+        gate: Gate::SendReceipt,
+        class: Class::Read,
+    },
     ConnectorOnly {
         // The session-action marker predates queue removal: an older hgs prints it
         // and refuses the request. Only `remove_queued` in the session's
@@ -277,6 +318,23 @@ pub const CONNECTOR_ONLY: &[ConnectorOnly] = &[
     ConnectorOnly {
         operation: "task_done",
         gate: Gate::TaskActions,
+        class: Class::Read,
+    },
+    // The person's per-child question route switch (zerus-sa9qn.33).
+    ConnectorOnly {
+        operation: "session_question_routing",
+        gate: Gate::QuestionRouting,
+        class: Class::Mutation,
+    },
+    // A phone's signed latch statement (zerus-sa9qn.50).
+    ConnectorOnly {
+        operation: "session_question_route_person",
+        gate: Gate::QuestionRoutePerson,
+        class: Class::Mutation,
+    },
+    ConnectorOnly {
+        operation: "session_question_route_person_status",
+        gate: Gate::QuestionRoutePersonRevision,
         class: Class::Read,
     },
 ];
@@ -331,6 +389,8 @@ pub const SPEECH_CONFIG: &[&str] = &[
 /// What the native CLI offers, from its help text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
+    pub send_outcome: bool,
+    pub send_receipt: bool,
     pub windows_gateway: bool,
     pub analytics: bool,
     pub archive: bool,
@@ -347,6 +407,11 @@ pub struct Flags {
     pub directory_create: bool,
     pub read: bool,
     pub session_notifications: bool,
+    /// The exact `session-question-routing-v1` line (zerus-sa9qn.33).
+    pub question_routing: bool,
+    /// The exact `question-route-person-v1` line (zerus-sa9qn.50).
+    pub question_route_person: bool,
+    pub question_route_person_revision: bool,
     pub preference: bool,
     pub attachment_read: bool,
     pub file_read: bool,
@@ -363,9 +428,26 @@ pub struct Flags {
     pub task_exchange: bool,
     /// The phone's Send now, Cancel and Done list, which it never offers either.
     pub task_actions: bool,
+    /// Exact native marker for identity-bound task Send and Done requests.
+    pub task_session_identity: bool,
+    /// Bounded upload frames inside task exchange, independently negotiated.
+    pub task_media_upload: bool,
+    /// Native admitted edits; advertised only on the qualified encrypted route.
+    pub task_admitted_edit: bool,
     /// `hgs watch --json` (watch-v1): the heartbeat follows the local listing
     /// as a stream instead of running `ls` (`watch_listing`). Not an operation.
     pub watch: bool,
+    /// `session-id-selector-v1`: the CLI selects a session by `--session-id`.
+    /// Not an operation (`session_selector`).
+    pub session_selector: bool,
+    /// `mobile-peer-session-id-v1`: its mobile peer entry points accept that
+    /// flag after the session. Not an operation.
+    pub peer_session_id: bool,
+    /// Complete current-session reads and ID project membership, not just mutation selection.
+    pub session_labels: bool,
+    /// `inspect <session> --current-read`: a main inspection names the reply
+    /// and attention a read mark may acknowledge now. Not an operation.
+    pub current_read: bool,
 }
 
 impl Flags {
@@ -373,6 +455,18 @@ impl Flags {
     pub fn from_help(help: &str) -> Flags {
         let has = |marker: &str| help.contains(marker);
         let flags = Flags {
+            send_outcome: [
+                zerus_relay::send_outcome::HELP_MARKER,
+                "mobile-peer-send-outcome-v2",
+                crate::send_receipt::HELP_MARKER,
+                crate::session_selector::SELECTOR_MARKER,
+                crate::session_selector::PEER_MARKER,
+            ]
+            .iter()
+            .all(|marker| help.lines().any(|line| line.trim() == *marker)),
+            send_receipt: help
+                .lines()
+                .any(|line| line.trim() == crate::send_receipt::HELP_MARKER),
             windows_gateway: help.lines().any(|line| line.trim() == WINDOWS_HELP_MARKER),
             analytics: has("hgs [@host] analytics --json"),
             archive: has("archives --json"),
@@ -390,9 +484,19 @@ impl Flags {
             worktree: has("Mobile worktree ABI: worktrees-v1"),
             directory_create: has("dirs --create <path>"),
             read: has("read <session> --json"),
+            current_read: has("inspect <session> --current-read"),
             session_notifications: help
                 .lines()
                 .any(|line| line.trim() == crate::session_notifications::HELP_MARKER),
+            question_routing: help
+                .lines()
+                .any(|line| line.trim() == crate::session_question_routing::HELP_MARKER),
+            question_route_person: help
+                .lines()
+                .any(|line| line.trim() == crate::session_question_route_person::HELP_MARKER),
+            question_route_person_revision: help.lines().any(|line| {
+                line.trim() == crate::session_question_route_person::REVISION_HELP_MARKER
+            }),
             preference: has("swarm preference set mobile_delivery"),
             attachment_read: has("attachment <session> --request ID --index N"),
             file_read: has("file-read <session> --json"),
@@ -412,9 +516,28 @@ impl Flags {
             peers: has("mobile-peers --json") && has("mobile-peer --json"),
             task_exchange: has("hgs task exchange|digests --json"),
             task_actions: has("hgs task mobile-send|mobile-cancel|mobile-done --json"),
+            task_media_upload: help
+                .lines()
+                .any(|line| line.trim() == TASK_UPLOAD_HELP_MARKER),
+            task_admitted_edit: has("hgs task exchange|digests --json")
+                && help
+                    .lines()
+                    .any(|line| line.trim() == TASK_EDIT_HELP_MARKER),
+            task_session_identity: help
+                .lines()
+                .any(|line| line.trim() == TASK_IDENTITY_HELP_MARKER),
             watch: help
                 .lines()
                 .any(|line| line.trim() == zerus_watch_protocol::HELP_MARKER),
+            session_selector: help
+                .lines()
+                .any(|line| line.trim() == crate::session_selector::SELECTOR_MARKER),
+            peer_session_id: help
+                .lines()
+                .any(|line| line.trim() == crate::session_selector::PEER_MARKER),
+            session_labels: help
+                .lines()
+                .any(|line| line.trim() == crate::session_selector::LABELS_MARKER),
         };
         if flags.windows_gateway {
             return flags.windows_local();
@@ -431,6 +554,7 @@ impl Flags {
     }
     pub fn windows_local(mut self) -> Self {
         self.windows_gateway = true;
+        self.task_admitted_edit = false;
         self.peers = false;
         self.voice = false;
         self.voice_video = false;
@@ -467,6 +591,7 @@ impl Flags {
                 removed.extend(operations.iter().copied());
             }
         };
+        remove(self.send_outcome, zerus_relay::send_outcome::OPERATIONS);
         remove(self.worktree, WORKTREES);
         remove(self.analytics, &["analytics_read"]);
         remove(self.archive, &["archive_list"]);
@@ -571,12 +696,21 @@ impl Flags {
             );
         }
         let mut features = features;
+        if self.task_session_identity
+            && operations.contains(&"task_send")
+            && operations.contains(&"task_done")
+        {
+            features.push(TASK_IDENTITY_FEATURE);
+        }
+        if self.task_media_upload && operations.contains(&"task_exchange") {
+            features.push(TASK_UPLOAD_FEATURE);
+        }
         // Connector-only: the Python connector never advertises it, so apps
         // do not send an OpenCode effort to it.
         if operations.contains(&"launch") && !self.windows_gateway {
             features.push("opencode_launch_effort");
-            features.sort_unstable();
         }
+        features.sort_unstable();
         if self.windows_gateway {
             features.retain(|feature| {
                 !["send_agent", "gateway_one_hop", "inspect_agent"].contains(feature)

@@ -1,14 +1,21 @@
 // Account limit windows and their pace, ported from tray/src/AccountUsage.h.
 // Pace compares used quota with the share of the window that has passed:
 // spending faster than that share exhausts the limit before it resets.
+// The core projects resets as Unix seconds; `fromProjected` turns them into
+// minutes from `now` on each 15 s render, so nothing else runs on a timer.
+import type { ProjectedWindow, Usage } from "../../types";
+import { tr } from "../../i18n";
+import { clockOf, dayTimeOf } from "./dates";
 
 export interface UsageWindow {
-  /** Window length in minutes (300 = 5 h, 10080 = 7 d). */
-  minutes: number;
+  /** Window length in minutes (300 = 5 h, 10080 = 7 d); null when the provider reports none. */
+  minutes: number | null;
   /** Used share, 0..100. */
   used: number;
-  /** Minutes until reset; not positive when the window already ended. */
-  resetsIn: number;
+  /** Minutes until reset; null when unknown (it counts as current, as in Qt); not positive once ended. */
+  resetsIn: number | null;
+  /** The provider's name for the window ("Sonnet", "Monthly"). */
+  label?: string;
 }
 
 export type Tone = "normal" | "warning" | "critical";
@@ -29,14 +36,22 @@ export interface Pace {
   tone: Tone;
 }
 
-const thresholdTone = (used: number): Tone => (used >= 90 ? "critical" : used >= 70 ? "warning" : "normal");
+/** A projected window at `now` (Unix seconds). */
+export const fromProjected = (w: ProjectedWindow, now: number): UsageWindow => ({
+  minutes: w.minutes, used: w.used, label: w.label, resetsIn: w.resets_at === null ? null : (w.resets_at - now) / 60,
+});
 
-export const current = (w: UsageWindow) => w.resetsIn > 0;
+export const windowsAt = (windows: readonly ProjectedWindow[], now: number) => windows.map((w) => fromProjected(w, now));
+
+export const thresholdTone = (used: number): Tone => (used >= 90 ? "critical" : used >= 70 ? "warning" : "normal");
+
+/** AccountUsage::current: a reset that is unknown or still ahead. */
+export const current = (w: UsageWindow) => w.resetsIn === null || w.resetsIn > 0;
 
 export function pace(w: UsageWindow): Pace {
   const used = Math.max(0, Math.min(100, w.used));
   const result: Pace = { known: false, early: false, used, elapsed: 0, minutesLeft: -1, runsOutIn: -1, projected: -1, tone: thresholdTone(used) };
-  if (w.minutes <= 0 || w.resetsIn <= 0) return result;
+  if (!w.minutes || w.minutes <= 0 || w.resetsIn === null || w.resetsIn <= 0) return result;
   result.known = true;
   result.minutesLeft = w.resetsIn;
   const passed = Math.max(0, w.minutes - w.resetsIn);
@@ -51,52 +66,309 @@ export function pace(w: UsageWindow): Pace {
   return result;
 }
 
-export const period = (w: UsageWindow) =>
-  w.minutes === 10080 ? "7d" : w.minutes % 1440 === 0 ? `${w.minutes / 1440}d` : w.minutes % 60 === 0 ? `${w.minutes / 60}h` : `${w.minutes}m`;
+/** AccountUsage::period: the duration after the provider's name; "Usage" when neither is known. */
+export function period(w: UsageWindow) {
+  const m = w.minutes ?? 0;
+  const duration = m === 10080 ? "7d" : m && m % 1440 === 0 ? `${m / 1440}d` : m && m % 60 === 0 ? `${m / 60}h` : m ? `${m}m` : "";
+  const name = w.label ?? "";
+  return name ? (duration ? `${name} ${duration}` : name) : duration || tr("Usage");
+}
 
-export function remaining(minutes: number) {
+export function remaining(minutes: number | null) {
+  if (minutes === null) return tr("reset unknown");
   const m = Math.max(0, Math.ceil(minutes));
-  if (!m) return "refresh needed";
-  if (m >= 1440) return `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`;
-  if (m >= 60) return `${Math.floor(m / 60)}h ${m % 60}m`;
-  return `${m}m`;
+  if (!m) return tr("refresh needed");
+  if (m >= 1440) return tr("%1d %2h", Math.floor(m / 1440), Math.floor((m % 1440) / 60));
+  if (m >= 60) return tr("%1h %2m", Math.floor(m / 60), m % 60);
+  return tr("%1m", m);
 }
 
 /** Footer countdown: only the largest whole unit fits next to the percentage. */
 export function countdown(minutes: number) {
   const m = Math.max(1, Math.ceil(minutes));
-  return m < 60 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d`;
+  return m < 60 ? tr("%1m", m) : m < 2880 ? tr("%1h", Math.floor(m / 60)) : tr("%1d", Math.floor(m / 1440));
 }
 
-export function windowText(w: UsageWindow, withReset = true) {
-  if (!current(w)) return `${period(w)} refresh`;
-  return `${period(w)} ${Math.round(w.used)}%${withReset && w.used >= 100 ? ` (${remaining(w.resetsIn)})` : ""}`;
+/** "5h 34%", with the time to reset once usage reaches `resetFrom` percent. */
+export function windowText(w: UsageWindow, withReset = true, resetFrom = 100) {
+  if (!current(w)) return period(w) + tr(" refresh");
+  return `${period(w)} ${Math.round(w.used)}%${withReset && w.used >= resetFrom ? ` (${remaining(w.resetsIn)})` : ""}`;
 }
 
 export function approximately(minutes: number) {
   const m = Math.max(1, Math.floor(minutes)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), r = m % 60;
-  if (d) return h ? `${d}d ${h}h` : `${d}d`;
-  if (h) return r ? `${h}h ${r}m` : `${h}h`;
-  return `${m}m`;
+  if (d) return h ? tr("%1d %2h", d, h) : tr("%1d", d);
+  if (h) return r ? tr("%1h %2m", h, r) : tr("%1h", h);
+  return tr("%1m", m);
 }
 
 export function forecast(w: UsageWindow) {
   if (!current(w)) return "";
   const p = pace(w);
   if (!p.known || p.early || p.used >= 100) return "";
-  return p.runsOutIn >= 0 ? `At the current pace, the limit runs out in about ${approximately(p.runsOutIn)}`
-    : `At the current pace, about ${Math.round(p.projected)}% by reset`;
+  return p.runsOutIn >= 0 ? tr("At the current pace, the limit runs out in about %1", approximately(p.runsOutIn))
+    : tr("At the current pace, about %1% by reset", Math.round(p.projected));
 }
 
-/** AccountUsage::tooltip: provider, account, each window with its reset and forecast. */
-export function usageTooltip(provider: string, label: string, windows: UsageWindow[], updated?: string) {
-  const lines = [provider, label];
+const TONES: Tone[] = ["normal", "warning", "critical"];
+
+/** AccountUsage::severest: the most urgent pace tone of the current windows; undefined when none reports usage. */
+export function severest(windows: readonly UsageWindow[]): Tone | undefined {
+  let tone: Tone | undefined;
   for (const w of windows) {
-    lines.push(`${period(w)}: ${Math.round(w.used)}% used`);
-    if (current(w)) lines.push(`Resets in ${remaining(w.resetsIn)}`);
+    if (!current(w)) continue;
+    const next = pace(w).tone;
+    if (!tone || TONES.indexOf(next) > TONES.indexOf(tone)) tone = next;
+  }
+  return tone;
+}
+
+const PROVIDERS: Record<string, string> = { claude: "Claude", codex: "Codex", kimi: "Kimi", qwen: "Qwen Code", opencode: "OpenCode", ollama: "Ollama", dsh: "DeepSeek", deepseek: "DeepSeek", sh: "Shell" };
+/** IdentityBadges::providerName. */
+export const providerName = (provider: string) => PROVIDERS[provider] ?? provider;
+
+/** No window to draw yet: the meters show their placeholders. */
+export const usageLoading = (u: Usage) => u.status === "loading" && !u.windows.length;
+
+const BALANCE_KINDS: Record<string, () => string> = {
+  Total: () => tr("Total"), "Topped up": () => tr("Topped up"), Granted: () => tr("Granted"), Wallet: () => tr("Wallet"), Bonus: () => tr("Bonus"),
+};
+/** A reported balance kind in the interface language; an unknown kind stays as the provider names it. */
+export const balanceKind = (kind: string) => BALANCE_KINDS[kind]?.() ?? kind;
+
+/**
+ * The balances a compact place shows. A DeepSeek API key reports a Total per
+ * currency with its Topped up and Granted parts, so only the Totals stand for
+ * it; other sources keep every balance.
+ */
+export function headlineBalances(u: Usage) {
+  const totals = u.balances.filter((b) => b.kind === "Total");
+  return totals.length ? totals : u.balances;
+}
+
+const AMOUNT = /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/;
+const SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥" };
+/** "$6.20", "¥110.00" or "-$0.03"; another currency keeps its code ("6.20 EUR"). */
+export function balanceAmount(b: Usage["balances"][number]) {
+  const amount = b.balance.trim();
+  const symbol = SYMBOLS[b.currency];
+  if (!symbol) return `${amount} ${b.currency}`.trim();
+  const negative = amount.startsWith("-");
+  return `${negative ? "-" : ""}${symbol}${amount.replace(/^[-+]/, "")}`;
+}
+
+const numeric = (b: Usage["balances"][number]) => AMOUNT.test(b.balance) && Number.isFinite(Number(b.balance));
+/** The compact balance in place of limit meters: each numeric headline amount ("$6.20"), joined by two spaces; empty without one. */
+export function balanceCompact(u: Usage) {
+  return headlineBalances(u).filter(numeric).map(balanceAmount).join("  ");
+}
+
+/**
+ * What the compact balance means, for its tooltip and accessible label:
+ * "Balance: 6.20 USD", then a Total's Topped up and Granted parts; other
+ * kinds keep their own names. Empty without a numeric headline balance.
+ */
+export function balanceTitle(u: Usage) {
+  const lines: string[] = [];
+  for (const b of headlineBalances(u).filter(numeric)) {
+    if (b.kind && b.kind !== "Total") { lines.push(`${balanceKind(b.kind)}: ${b.balance} ${b.currency}`.trim()); continue; }
+    lines.push(tr("Balance: %1 %2", b.balance, b.currency).trim());
+    if (b.kind === "Total") {
+      for (const part of u.balances) if (part.currency === b.currency && part.kind !== "Total") lines.push(`${balanceKind(part.kind)}: ${part.balance} ${part.currency}`.trim());
+    }
+  }
+  return lines.join("\n");
+}
+
+/** DeepSeek says the API-key balance no longer covers API calls. */
+export const balanceLow = (u: Usage) => u.balance_available === false;
+
+/** What replaces the meters without windows (AccountUsage::Button::summaryText). */
+export function summaryText(u: Usage) {
+  const compact = balanceCompact(u);
+  if (compact) return compact;
+  const b = headlineBalances(u)[0];
+  if (b) return `${b.balance} ${b.currency}`;
+  if (u.status === "configured") return u.provider === "opencode" ? tr("Configured") : tr("API key");
+  if (u.status === "signed_out") return tr("Sign in required");
+  if (u.status === "expired") return tr("Sign-in expired");
+  if (u.status === "rate_limited") return tr("Rate limited");
+  if (u.status === "unavailable" || u.refresh_error || u.offline) return tr("limits n/a");
+  return tr("Unavailable");
+}
+
+/** AccountUsage::state: what the usage panel says without windows or balances. */
+export function stateText(u: Usage) {
+  const s = u.status;
+  if (!s || s === "loading") return tr("Loading account details…");
+  if (s === "rate_limited") return tr("Usage refresh is rate limited. Previous limits remain visible; sign-in is unchanged.");
+  if (s === "configured" && u.provider === "opencode") return tr("OpenCode uses its native provider configuration. Usage is not available here.");
+  if (s === "configured" && u.provider === "qwen") return tr("Qwen Code reports no usage limits here. A Qwen subscription shows its plan; an account on a model server shows its speed.");
+  if (s === "configured") return tr("API key configured. Zerus could not read its DeepSeek balance; refresh to retry.");
+  if (u.offline || s === "offline") return tr("Machine is offline. Showing the last available account data.");
+  if (s === "expired") return tr("Native sign-in has expired. Open the agent or sign in again, then refresh usage.");
+  if (s === "signed_out" && u.provider === "dsh") return tr("DeepSeek account is signed out. API-key connections are configured separately in the native settings.");
+  if (s === "signed_out") return tr("No native subscription sign-in found. API-key sessions may still work.");
+  if (s === "credentials_locked") return tr("Saved sign-in is in the locked macOS Keychain. Unlock it in Keychain Access, then refresh.");
+  if (s === "desktop_session_unavailable") return tr("Saved sign-in requires the Mac desktop session. Log in to macOS and check the HGS installation, then refresh.");
+  if (s === "credentials_unavailable") return tr("The saved Keychain sign-in could not be used. Check account access or sign in again.");
+  return tr("Usage is unavailable from this provider. Open its native account page or refresh after signing in.");
+}
+
+/** Qt's "d MMM HH:mm" in local time ("3 ноября 02:27" in Russian); optionally include seconds. */
+export const dayTime = (seconds: number, withSeconds = false) => dayTimeOf(new Date(seconds * 1000), withSeconds);
+
+/** Qt's "HH:mm" in local time. */
+export const clock = (seconds: number) => clockOf(new Date(seconds * 1000));
+
+export const usageRetryWaiting = (u: Usage, now: number) => u.status === "rate_limited" && (u.retry_at ?? 0) > now;
+
+/**
+ * Shown beside retained meters in both the footer and account views. A
+ * tooltip names clock times instead of ages and countdowns, so it never
+ * changes while it shows (zerus-5ryrx, zerus-f5gta).
+ */
+export function rateLimitNotice(u: Usage, now: number, tooltip = false) {
+  if (u.status !== "rate_limited") return "";
+  const age = u.checked_at === null ? tr("No saved limits, rate limited")
+    : tooltip ? tr("Limits from %1, rate limited", clock(u.checked_at))
+    : tr("Limits %1 min ago, rate limited", Math.max(0, Math.floor((now - u.checked_at) / 60)));
+  const retry = !usageRetryWaiting(u, now) ? tr("Refresh to check limits.")
+    : tooltip ? tr("Retry at %1", clock(u.retry_at!)) : tr("Retry in %1 s", Math.ceil(u.retry_at! - now));
+  return `${age}. ${retry}`;
+}
+
+/** AccountUsage::tooltip (AccountUsage.h:197-219). */
+export function accountTooltip(u: Usage, now: number) {
+  const lines: string[] = [];
+  const provider = providerName(u.provider);
+  if (provider) lines.push(provider);
+  if (u.label && u.label !== provider) lines.push(u.label);
+  for (const value of [u.identity.name, u.identity.email, u.identity.plan, u.identity.organization]) if (value) lines.push(value);
+  for (const p of u.windows) {
+    const w = fromProjected(p, now);
+    lines.push(tr("%1: %2% used", period(w), Math.round(w.used)));
+    if (p.resets_at !== null) lines.push(tr("Resets %1", dayTime(p.resets_at)) + (current(w) ? tr(" (in %1)", remaining(w.resetsIn)) : ""));
     const f = forecast(w);
     if (f) lines.push(f);
   }
-  if (updated) lines.push(`Updated ${updated}`);
+  for (const b of u.balances) lines.push(b.kind === "Total" ? tr("Balance: %1 %2", b.balance, b.currency).trim() : `${balanceKind(b.kind)}: ${b.balance} ${b.currency}`);
+  if (balanceLow(u)) lines.push(tr("DeepSeek reports the balance is too low for API calls."));
+  if (u.checked_at !== null) {
+    if (u.seeded) lines.unshift(tr("Checked %1", clock(u.checked_at)));
+    else lines.push(tr("Updated %1", clock(u.checked_at)));
+  }
+  if (u.refreshing) lines.push(tr("Updating… Previous values remain visible."));
+  else if (u.refresh_error) lines.push(tr("Update failed. Showing the last available values."));
+  if (u.offline) lines.push(tr("Machine is offline."));
+  if (u.status === "rate_limited") lines.push(rateLimitNotice(u, now, true));
+  if (!u.windows.length && !u.balances.length) lines.push(stateText(u));
+  lines.push(tr("Updates every 5 minutes. Open account details."));
   return lines.join("\n");
+}
+
+/** AccountUsage::limitRecoveryNotice: a fresh below-limit snapshot may explain
+ * an early reset, but never acknowledges the failed native turn. */
+export function limitRecoveryNotice(u: Usage, failureAt: number, now: number) {
+  const checked = u.checked_at ?? 0;
+  if (failureAt <= 0 || u.status !== "ok" || u.offline || u.refresh_error || checked <= failureAt || checked > now + 5 || now - checked > 300) return "";
+  let session = false, week = false;
+  for (const p of u.windows) {
+    const w = fromProjected(p, now);
+    if (!Number.isFinite(w.used) || w.used < 0 || w.used >= 100 || p.resets_at === null || p.resets_at <= now) return "";
+    session ||= p.minutes === 300;
+    week ||= p.minutes === 10080;
+  }
+  return session && week
+    ? tr("Latest account usage is below the limit. Answer any open usage-limit choice in Activity or Terminal, then send a message to continue.")
+    : "";
+}
+
+/** AccountUsage::exhausted, including the cached/offline explanation. */
+export function exhausted(u: Usage, now: number) {
+  const lines: string[] = [];
+  for (const p of u.windows) {
+    if (p.used < 100) continue;
+    const w = fromProjected(p, now);
+    lines.push(!current(w) ? tr("%1 limit window ended; refresh usage", period(w))
+      : p.resets_at !== null ? tr("%1 limit reached. Resets in %2", period(w), remaining(w.resetsIn))
+      : tr("%1 limit reached. Reset time is unavailable", period(w)));
+  }
+  const text = lines.join("\n");
+  return text && (u.offline || u.refresh_error || u.status === "rate_limited") ? tr("Last reported usage: %1. Refresh to check current limits.", text) : text;
+}
+
+export interface ExhaustedSummary { label: string; shortLabel: string; remaining: string }
+
+/** The Usage limit chip. Its reset is a separate value, never a dot-separated suffix. */
+export function exhaustedSummary(u: Usage, now: number): ExhaustedSummary | undefined {
+  let nearest: number | undefined, reached = false, ended = false;
+  for (const p of u.windows) {
+    if (p.used < 100) continue;
+    const w = fromProjected(p, now);
+    if (!current(w)) { ended = true; continue; }
+    reached = true;
+    if (p.resets_at !== null && (nearest === undefined || p.resets_at < nearest)) nearest = p.resets_at;
+  }
+  if (reached) return { label: tr("Limit reached"), shortLabel: tr("Limit"), remaining: nearest === undefined ? "" : remaining((nearest - now) / 60) };
+  return ended ? { label: tr("Refresh usage"), shortLabel: tr("Limit"), remaining: "" } : undefined;
+}
+
+/** The mockup's usage chip shows the highest current percentage from 50%. */
+export function usageChipPercent(u: Usage, now: number): number | undefined {
+  let highest: number | undefined;
+  for (const p of u.windows) {
+    const w = fromProjected(p, now);
+    if (!current(w) || !Number.isFinite(w.used) || w.used < 50) continue;
+    highest = Math.max(highest ?? 0, w.used);
+  }
+  return highest === undefined ? undefined : Math.round(highest);
+}
+
+/**
+ * Task #351: what the composer's usage chip draws. Claude and Codex get the
+ * account's windows (the two bars, the weekly percent and the days to its
+ * reset); a DeepSeek (dsh) session gets its balance, or says why it is unknown.
+ */
+export interface UsageChipView {
+  kind: "windows" | "balance";
+  /** The current windows, in the provider's order; the meters draw two. */
+  windows: UsageWindow[];
+  /** The weekly window (10080 minutes), else the longest one reported. */
+  weekly?: UsageWindow;
+  /** The weekly used share, rounded. */
+  percent?: number;
+  /** The days and hours until the weekly reset ("3d 4h"). */
+  reset?: string;
+  /** The DeepSeek balance, as the provider words it. */
+  balance?: string;
+  /** Why there is no balance. */
+  reason?: string;
+  /** The chip's one line. */
+  label: string;
+}
+
+export function usageChipView(u: Usage, now: number, agent = ""): UsageChipView {
+  const provider = (u.provider || agent).toLowerCase();
+  if (provider === "dsh" || provider === "deepseek") {
+    const b = u.balances[0];
+    if (b) return { kind: "balance", windows: [], balance: `${b.balance} ${b.currency}`, label: tr("Balance %1", `${b.balance} ${b.currency}`) };
+    return { kind: "balance", windows: [], reason: stateText(u), label: tr("Balance unknown") };
+  }
+  // A Qwen subscription reports its plan, never a remaining share: Qwen tells
+  // the credits only once they run out (owner, 2026-11-17).
+  if (provider === "qwen" && u.identity?.plan && !u.windows.length && u.status !== "signed_out" && u.auth_status !== "signed_out") {
+    const plan = u.identity.plan;
+    return { kind: "balance", windows: [], balance: `Qwen ${plan}`, reason: tr("Qwen reports the subscription's credits only once they run out."),
+      label: tr("Qwen subscription %1", plan) };
+  }
+  const windows = windowsAt(u.windows, now).filter(current);
+  // The weekly window is the 7-day one; failing that, the longest reported.
+  const weekly = windows.find((w) => w.minutes === 10080)
+    ?? windows.reduce<UsageWindow | undefined>((longest, w) => (!longest || (w.minutes ?? 0) > (longest.minutes ?? 0) ? w : longest), undefined);
+  const percent = weekly ? Math.round(weekly.used) : undefined;
+  const reset = weekly && weekly.resetsIn !== null ? remaining(weekly.resetsIn) : undefined;
+  const label = percent === undefined ? tr("Usage available")
+    : reset ? tr("Usage %1%, resets in %2", percent, reset) : tr("Usage %1%", percent);
+  return { kind: "windows", windows, weekly, percent, reset, label };
 }

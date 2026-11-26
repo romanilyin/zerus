@@ -50,7 +50,69 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        hgs path-ref describe|validate|map   explicit lexical identity (JSON stdin)
        hgs mobile-peers --json        guarded direct-peer discovery (mobile-peer ABI 1)
        hgs approval-log begin|finish|list|detail  local automatic-approval journal (JSON stdin)
+       hgs desktop serve|status [--json]   per-user background desktop service
+       hgs desktop revoke --json          revoke desktop writers before Qt rollback
+       hgs desktop watch|request --json    private local desktop-v1 IPC
+       hgs desktop feed --json             passive owner source data, no reader launch
+       hgs desktop registration --json    preview this user's passive service definition
+       hgs desktop store-check --json     read-only: whether a start gets past the desktop store and its rollback backup
+       hgs desktop registration --json --background    preview Unix background definition
+       hgs desktop registration mode-check --json   verify an interactive mode-switch caller
+       hgs desktop revoke-hold --json --request-id UUID   retain original rollback exclusion until stdin EOF
+       hgs desktop registration install|remove|status --json   Windows interactive-user logon task
+       hgs desktop notification-registration install|status --json   Windows Toast registration
+       hgs desktop notification-registration remove --json --request-id UUID   after exact settled revoke
+       hgs desktop import-evidence --json private staged migration input on stdin
+       hgs desktop import-status --json --import-id UUID  read one import manifest
+       Desktop service ABI: desktop-v1
+       Desktop approval audit ABI: desktop-approval-audit-v1
+       Desktop frontend request ABI: desktop-ui-request-v1
+       Desktop ownership ABI: desktop-ownership-v1
+       Desktop state preparation: desktop-state-prepare-v1
+       Desktop ownership observation ABI: desktop-ownership-observation-v1
+       Notification controls ABI: desktop-notification-controls-v1
+       Desktop creation clone ABI: desktop-creation-clone-v1
+       Desktop creation worktree ABI: desktop-creation-worktree-v1
+       Desktop creation worktree receipt control: future-fence-v1
+       Desktop creation launch ABI: desktop-creation-launch-v1
+       Desktop task message ABI: desktop-task-message-v1
+       Desktop task message references: desktop-task-message-reference-v1
+       Desktop task message input review: desktop-task-message-input-review-v1
+       Desktop deferred send ABI: desktop-deferred-send-v1
+       Desktop question route: route-questions-v1
+       Desktop deferred answer ABI: desktop-deferred-answer-v1
+       Desktop Teams Person ABI: desktop-team-person-v1
+       Desktop Teams Person actions ABI: desktop-team-person-actions-v2
+       Desktop Teams Person placement fields: desktop-team-person-placement-v1
+       Desktop deferred answer update phase: desktop-deferred-answer-update-phase-v1
+       Desktop deferred compact to send ABI: desktop-deferred-compact-to-send-v1
+       Desktop deferred session resume ABI: desktop-deferred-session-resume-v1
+       Desktop deferred session resume Codex readiness: desktop-deferred-session-resume-codex-v1
+       Desktop task start reconcile ABI: desktop-task-start-reconcile-v1
+       Desktop pending read import ABI: desktop-pending-reads-v1
+       Desktop activation ABI: desktop-activation-v1
+       Desktop maintenance ABI: desktop-maintenance-v1
+       Desktop cache maintenance ABI: desktop-cache-maintenance-v1
+       Desktop termination outcome ABI: desktop-termination-outcome-v1
+       Desktop startup ABI: desktop-startup-v1
+       Desktop logon registration ABI: desktop-logon-task-v1
+       Desktop registration refresh ABI: desktop-registration-refresh-v1
+       Desktop registration mode ABI: desktop-registration-mode-v1
+       Desktop registration mode review ABI: desktop-registration-mode-review-v1
+       Desktop registration first mode choice ABI: desktop-registration-mode-first-choice-v1
+       Desktop service mode choice scope ABI: desktop-service-mode-choice-scope-v1
+       Desktop Toast registration ABI: desktop-notification-registration-v1
+        Desktop revoke ABI: desktop-revoke-v1
+        Desktop revoke hold ABI: desktop-revoke-hold-v1
+        Desktop import ABI: desktop-import-v1
+        Desktop source feed ABI: desktop-source-feed-v1
+        Desktop owner ABI: desktop-delegation-v1
+        Desktop catalog ABI: desktop-catalog-v1
+        Desktop catalog changes ABI: desktop-catalog-changes-v1
+        Desktop catalog relay ABI: desktop-catalog-relay-v1
        hgs mobile-peer --json         guarded direct-peer native request from JSON stdin
+       mobile-peer-send-outcome-v2
+       mobile-peer-session-id-v1
        hgs [@host] voice <session> --json  send and inspect persistent voice messages (JSON stdin; voice-video-v1)
        hgs [@host] speech --json      host speech providers and durable jobs (JSON stdin)
        hgs [@host] analytics --json   private bounded computer analytics (JSON stdin)
@@ -65,6 +127,8 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        hgs [@host] hooks <session> --json   read scoped hook health (hooks-health-v1)
        hgs [@host] hooks --account ID [--repair] --json   inspect or explicitly repair handlers
        hgs [@host] inspect <session> [--archive <id>] [--after <cursor>]   activity as JSON
+       hgs [@host] inspect <session> --read-observation   raw shared reads for a current journal-backed main session
+       hgs [@host] inspect <session> --current-read   with the reply and attention a read mark may acknowledge now
        hgs [@host] reference <session> --json [--archive ID] [--agent ID]   copy a session reference
        hgs self [--json]              the calling agent's own session reference
        hgs [@host] guide [topic]      how agents message, wait for, launch and stop sessions and use tasks
@@ -75,31 +139,63 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        hgs [@host] processes <session> --output ID | --stop ID --run RUN --conversation ID [--generation ID]
        hgs [@host] send <session> --json   submit message/attachments from JSON stdin
        hgs [@host] send-cancel <session> --json   cancel a message hgs still holds ({"request_id"})
+       hgs [@host] send <session> --delivery-outcome-v2 --json   opt in to an exact terminal not-offered outcome
+       hgs send <codex session> --observe --json   read whether a send to this computer's Codex session would be taken now, changing nothing
        hgs [@host] recovery action --scoped-json exact waiting-job control
        hgs [@host] recovery team-override   a team's reset wait for one session (JSON stdin)
        hgs [@host] history <session> --json bounded exact public history
        hgs [@host] history-projection <session> --json retired and refreshed history rows
        hgs [@host] graph snapshot --json   bounded saved relationship metadata (partial coverage)
+       hgs [@host] host-access status|support|bind --json   multi-person host access: caller, provider support, binding
+       hgs [@host] host-access share publish|memory|list|read|continue --json   shared project history and memory (JSON stdin)
+       hgs [@host] host-access compute --json   one mediated remote file or command call (JSON stdin)
+       hgs host-access remote-compute claude-args --host H --root R --json   local agent with remote tools only
        hgs [@host] wait begin|ack|finish|cancel|list --json   explicit independent-agent waits (JSON stdin)
-       hgs [@host] team OPERATION --json   agent teams: plan, run, report and decide tasks (JSON stdin)
+       hgs [@host] team OPERATION --json   agent teams: plan, run, report and decide tasks (JSON stdin or --json-file PATH)
+       hgs team outbox take|ack --json   a lead computer's worker collects its remote members' kept reports
+       hgs [@host] rules get|set|migrate --json   owner-managed iron rules, iron-rules-v1 (JSON stdin)
        hgs run --json [--wait] | --list --json   a build Zerus tracks as this session's work (JSON stdin)
+       hgs test config|map|affected|durations|coverage|tools …   the project's tests (.zerus/tests.toml; hgs guide tests)
+       hgs test runner --json   a test runner's side (test-runner-v1): the queue's suite of an exact commit, isolated
        hgs [@host] terminal <session> --json scoped terminal screen/input; draft/submit_draft for the composer draft
        hgs [@host] AGENT DIRECTORY --new -n TAG -d --launch-id UUID
        hgs [@host] session-action <session> --json scoped native lifecycle action
+       hgs session-action-status <session> --json read an original exact lifecycle receipt
+       hgs @host --expect-machine ID session-action-status <session> --json
+       lifecycle-receipt-status-v1
+       hgs [@host] <command> --session-id ID ...   select a live or saved session by its durable ID instead of its name
+       session-id-selector-v1
+       session-launch-identity-v1
+       session-labels-v1
+       hgs [@host] <command> 'zerus://session?...' ...   select the session a reference names, on every session command
+       session-reference-selector-v1
        hgs [@host] compact-context <session> --json compact the idle agent context using its native command
        hgs [@host] clear-context <session> --json   clear the idle agent context using its native command
        hgs [@host] interrupt <session> --json   interrupt the current turn, keep the session
        hgs [@host] attachment <session> --request ID --index N --conversation ID   read a sent attachment
        hgs [@host] file-read <session> --json   read a document on the conversation computer
        hgs @host download --path REMOTE_PATH --output LOCAL_FILE   download a copy through configured SSH or explicit WSL
+       hgs @host tunnel --port PORT   forward a free local port to the peer's 127.0.0.1:PORT while stdin stays open (JSON)
        hgs [@host] answer <session> --json   answer an exact pending question from JSON stdin
+       hgs [@host] answer <session> --observe --json   read a pending question's consent identity, changing nothing
+       hgs [@host] delivery receipt <original-session-name> --json   read exact original send evidence from JSON stdin
+       hgs [@host] parent <session> --json   read, adopt (as the calling agent), set or clear its parent session from JSON stdin
        hgs [@host] read <session> --json   mark the current reply/attention read (JSON stdin)
+       hgs [@host] subagent retire <session> --json   retire an exact stale child record (JSON stdin)
+       Subagent retirement ABI: subagent-retire-v1
        hgs [@host] notifications <session> --json   shared mute preference (session-notifications-v1)
+       hgs [@host] keep-warm <session> --json   keep the prompt cache warm for 1-7 hours or always (session-keep-warm-v1)
+       hgs [@host] question-routing <session> --json   send this child's questions to its parent, the person's switch (session-question-routing-v1)
        hgs [@host] fork <session> [-n name] [-d] [--archive ID]  branch into a new conversation
        hgs [@host] effort <session> --json   change this agent's effort from JSON stdin
        hgs [@host] settings <session> --json model and effort for this session (JSON stdin)
+       hgs [@host] switch-account <session> --account ID --request-id UUID   move a running session to another account of its agent
+       hgs [@host] switch-account <session> --to ID --request-id UUID   an account of another agent moves the session there with a handoff (also: session switch-account)
+       hgs [@host] switch-account <session> --account ID --preview   what that choice would do and why it is refused; changes nothing
        hgs [@host] recovery get | set | action   automatic recovery policy (JSON stdin for writes)
        hgs [@host] search --query <text> [--limit N]   search saved session contents
+       hgs [@host] search --indexed --query <text> [--limit 1..100] [--cursor C]   content-search-query-v1
+       hgs [@host] search --index-status | --index-step | --index-discover | --index-catchup   bounded index diagnostics (JSON stdin for step)
        hgs [@host] schedules <session> [--json]   native DeepSeek Schedule tasks (JSON stdin changes)
        hgs machine ls | set <alias> --json <profile> | remove <alias> | reset <alias>
        hgs machine resolve <alias>          effective SSH settings (no connection)
@@ -110,14 +206,20 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        hgs presence set --json        desktop idle/lock time from JSON stdin (written by the tray)
        hgs subagents-confirm get|set --json   ask before an agent starts subagents on this computer (JSON stdin for set)
        hgs session-upload-block get|set --json   block DeepSeek's session-log upload on this computer (JSON stdin for set)
+       hgs sandbox-folder grant DIRECTORY --json   give this user the folder rights the DeepSeek sandbox needs
        hgs swarm preference get --json   shared phone notification timing
        hgs swarm preference set mobile_delivery VALUE --json   immediate|away|away_5|away_10|away_15|away_30
        hgs machine check <alias> | ssh <alias> [--directory PATH] | setup <alias> [--source <checkout>]
+       hgs model-server list [--json] | status SERVER [--json] | up SERVER MODEL [--detach] | down SERVER MODEL [--yes] | logs SERVER [MODEL] [--lines N] | save --json | test --json   model servers on this computer (local private configuration)
        hgs [@host] account ls | add ID --provider AGENT --label NAME | rm ID | restore ID | login ID
        hgs [@host] account rename ID --label NAME | inspect ID [--refresh]
        hgs [@host] account default [ID]   show or select the default account for new sessions
        hgs [@host] account model-settings ID   inspect this account's native model catalog and launch defaults
        hgs [@host] account model-defaults ID --model MODEL [--effort LEVEL] [--revision REV]   defaults for new sessions
+       hgs [@host] account permissions ID --mode bypass|provider|default [--revision REV]   default: bypass for Claude, Codex and Kimi
+       hgs [@host] account compact-on-expiry ID --enabled true|false [--revision REV]   compact Kimi before an expired-cache send (default on)
+       hgs [@host] account permission-scope ID --scope account|computer [--revision REV]   share the permission mode across the account's computers, or keep it per computer
+       hgs [@host] account mark ID [--color #RRGGBB|none] [--emoji EMOJI|none] [--if-unset] [--revision REV]   the account's color and emoji on session cards everywhere
        hgs [@host] account set-key native-dsh --json   save API key from private JSON stdin
        hgs machine file-proof <alias> --json   verify a scoped WSL file before explicit local mapping (wsl-file-proof-v1)
        hgs [@host] account bind-existing native-opencode --json   preview and bind one native conversation (opencode-bind-existing-v1)
@@ -137,10 +239,27 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        hgs [@host] worktrees status|cancel --request-id UUID --json   original creation receipt
        Worktree creation ABI: worktree-requests-v1
        hgs [@host] worktrees review --path PATH [--worktree WORKTREE] [--json]   cleanup verdicts and fingerprints
+       hgs [@host] worktrees programs --json   bounded read-only native program manifest (stdin)
+       Worktree programs ABI: worktree-programs-v1
+       hgs [@host] worktrees program-holder --json   bounded read-only native checkout custody (stdin)
+       Worktree program custody ABI: worktree-program-custody-v1
+       Worktree program presentation ABI: worktree-program-presentation-v1
+       hgs worktrees program-stop --json   original native-confirmed program stop (private stdin)
+       hgs worktrees program-stop-status --json   original result only, never replay (stdin)
+       Worktree program stop ABI: worktree-program-stop-v1
+       hgs worktrees program-cleanup --json   original live Remove continuation (private stdin)
+       hgs worktrees program-cleanup-status --json   original removal result only (stdin)
+       Worktree program cleanup ABI: worktree-program-cleanup-v1
        hgs [@host] worktrees policy get|set --json   worktree-maintenance-v1 (host-local cleanup rules)
        hgs [@host] worktrees sweep --json   one bounded automatic cleanup step
        hgs [@host] worktrees inspect --path WORKTREE --common-dir DIR [--file RELATIVE_PATH] [--json]   bounded read-only changes
        hgs [@host] worktrees remove --path WORKTREE --common-dir DIR --fingerprint HASH [--ignored-fingerprint HASH] [--discard-fingerprint HASH] [--preserve-archive-restore] [--delete-branch] [--json]
+       hgs [@host] worktrees keep-folder --path FOLDER --common-dir DIR --fingerprint HASH [--request-id ID] [--json]   forget a partial-removal record; the folder stays
+       hgs [@host] worktrees delete-leftover --path FOLDER --common-dir DIR --fingerprint HASH --confirm-delete [--process-fingerprint HASH] [--request-id ID] [--json]   delete a reviewed leftover's files; the branch stays
+       hgs [@host] worktrees leftovers [--json]   partial-removal leftovers whose repository is gone
+       Worktree leftover ABI: worktree-leftovers-v1 (review "leftovers" after a partial removal, catalog "leftovers" count)
+       Worktree leftover deletion ABI: worktree-leftover-delete-v1
+       Worktree leftover keep ABI: worktree-leftover-keep-v1 (request-bound keep-folder outcome)
        Mobile worktree ABI: worktrees-v1 (catalog/create/verified project placement)
        hgs [@host] repository check|clone --url URL --parent PATH --name NAME --json
        hgs [@host] repository status --request-id UUID --json
@@ -150,35 +269,61 @@ pub(crate) const USAGE: &str = r#"usage: hgs [@host] <cmd> [project] [-c [ID]] [
        Mobile project assignment ABI: session-project-v1
        Mobile clear-context ABI: dismiss-prompt-v1
        session-notifications-v1
+       session-keep-warm-v1
+       delivery-receipt-v1
+       native-send-outcome-v2
+       session-question-routing-v1
+       session-question-routing-v2
+       question-route-person-v1
+       question-route-person-v2
+       session-parent-v1
+       launch-parent-v1
+       claimed-parent-v1
        hgs [@host] dirs [--hidden] [path]   directories as JSON (default: home)
        hgs [@host] dirs --create <path> [--request-id UUID]   create one folder (existing parent)
+       hgs [@host] path-info --path <path>   whether a path exists, its kind and size (JSON schema 1); reads no content
        hgs [@host] kill <session> [--archive <id>]
        hgs [@host] rename <session> <new-full-name> [--archive <id>]
-       hgs [@host] archives --json           date-filtered archive pages (JSON stdin)
-       hgs [@host] archive <session>          move a stopped conversation to Archive
+       hgs [@host] archives --json [--bounded]   date-filtered archive pages (JSON stdin); --bounded caps counts at 10,000 and each scan at 25,000 rows
+       archive-bounded-pages-v1
+       hgs acknowledge-input <session> --json   person-only keyless release (exact review on stdin)
+       input-acknowledgment-v1
+       hgs [@host] archive <session> [--with-children]   move a stopped conversation to Archive
+       hgs [@host] terminate <session> [--expected-run-id ID] [--with-children]   stop and keep the conversation in Archive
        hgs [@host] pause <session>|--all       save and gracefully close idle agents
        hgs [@host] resume <session>|--all [-d] [--archive <id>]   restore exact conversations
        hgs [@host] resume <session> --fresh [-d] [--expected-run-id ID]   same settings, new conversation
        hgs notify [--bell] <session> [text]   event for the tray (no tray = no-op)
        hgs project ls [--json] | add <name> <dir> | set <name> <dir> | rm <name>
+       hgs project config get|set|move|find --json   project memory (RustCodeLore), project-memory-v1 (JSON stdin)
        hgs task list|get|add|edit|move|stage|target|start|send|handoff|cancel|report|comment|settings …   project tasks (JSON; agents read one line)
+       hgs task list --project P --stage S --limit N [--after|--before CURSOR] [--if-revision R]   one indexed page
+       hgs task attachment REF --file N [--entry ID]   one task file's bytes, for metadata-only history pages
        hgs task exchange|digests --json                 the phone's task exchange (mobile)
+       hgs task report-attempt REF --attempt UUID [--progress|--ready] [--considered REV]   pinned execution report (report-attempt-v1)
+       hgs task begin-attempt REF --attempt UUID [--json]   inactive task-scoped acknowledgement
+       hgs task control plan|execute|status --json   inactive task controls (JSON stdin)
        hgs task mobile-send|mobile-cancel|mobile-done --json   the phone's task actions (mobile)
+       Mobile task identity ABI: task-session-identity-v2
+       Mobile task media ABI: task-media-upload-v1
+       Mobile task edit ABI: task-admitted-edit-v1
+       hgs [@host] team preview on|off|status | catalog | template | create | list | waiting | status | inbox | queue | cards | journal | current | admit | route | accept | return | reassign | hold | release | cancel | reply | ask | pause-member | resume-member | stop-member | archive-member   Agent Teams (preview; JSON on stdin)
        hgs clip                       PNG from this box's clipboard to stdout (rc 1: no image)
        hgs paste <session> <pane> [client]   the tmux C-v binding; not for hand use
-  cmd      claude | codex | kimi (know --resume) | opencode (native API) | sh (login shell) | any command
+  cmd      claude | codex | kimi | qwen (know --resume) | opencode (native API) | sh (login shell) | any command
   project  name from ~/.config/hgs/projects, a path, or omitted = current dir
-  -c       resume the dir's last conversation (claude/kimi -c, codex resume --last)
+  -c       resume the dir's last conversation (claude/kimi/qwen -c, codex resume --last)
   -c ID    resume this exact conversation UUID; --resume=ID is also accepted
   -n tag   separate session <cmd>/<project>/<tag>
   --account ID   use a named native agent profile for this session
-  --permissions auto|bypass   this session's native permission mode instead of the account's (auto: claude only)
+  --permissions provider|bypass|native:<json>   this session's discovered native permission selection instead of the account's
   --local-model NAME   this session's model of a local Ollama account (claude)
-  --model PROVIDER/MODEL   OpenCode native model for a new session
-  --effort VARIANT   OpenCode effort; needs --model, one of that model's effort_options (omit for the model's default)
+  --model-server NAME   this session runs on a model server's API (needs --model MODEL; a new session)
+  --model PROVIDER/MODEL   OpenCode or DeepSeek native model for a new session
+  --effort VARIANT   OpenCode or DeepSeek effort; needs --model, one of that model's effort_options (omit for the model's default)
   --new    always create a separate session; generate a name unless -n is given
   -d       start detached (do not attach)      --fresh  explicitly replace a saved conversation
-  --rc     claude --remote-control (phone)     --bare   ignore a project run_<cmd>.sh launcher
+  --rc     claude --remote-control (phone)     --bare   ignore a project run_<cmd>.sh/.ps1 launcher
   --dry-run  print the tmux/ssh command
 ~/.config/hgs/config sets HGS_SELF (names that mean "this box") and HGS_PEERS
 (the ssh aliases that hgs ls polls and @host hops to); environment variables win.
@@ -192,6 +337,7 @@ Claude/Codex/Kimi install tracking hooks; Codex hooks need trust in /hooks.
 pause refuses untracked/busy sessions. Saved sessions survive reboot; a opens them again.
 Archive holds completed conversations; only explicit resume --archive restores them.
 terminate stops a tracked session and preserves it in Archive; kill explicitly forgets it.
+terminate/archive --with-children then end the session's live child sessions, each by its own rules.
 pause/resume --all covers tracked terminal agents; OpenCode uses exact per-session controls.
 resume --all excludes Archive. kill --archive forgets only that archived entry.
 rename changes the session label while preserving its agent/project, process and conversation.
@@ -210,7 +356,7 @@ fn local_sessions() -> Result<()> {
 // Repository preparation owns only its checkout and receipt. Like the existing
 // configuration/control commands, it does not require or enable a session host.
 fn needs_local_sessions(command: &str) -> bool {
-    !matches!(command, "ls" | "watch" | "machine" | "presence" | "swarm" | "project" | "account" | "speech" | "analytics" | "graph" | "wait" | "team" | "mobile" | "hooks" | "repository")
+    !matches!(command, "ls" | "watch" | "machine" | "presence" | "swarm" | "project" | "account" | "speech" | "analytics" | "graph" | "wait" | "team" | "rules" | "mobile" | "hooks" | "repository" | "session-action-status" | "delivery" | "subagent" | "path-info")
 }
 
 /// Fails unless this process may run what the processes of a session run:
@@ -226,11 +372,48 @@ fn mobile_peers(config: &Config, args: &[String]) -> Result<i32> {
     crate::mobile_peers::dispatch(config, args)
 }
 #[cfg(not(unix))]
-fn mobile_peers(_: &Config, _: &[String]) -> Result<i32> {
+fn mobile_peers(config: &Config, args: &[String]) -> Result<i32> {
+    #[cfg(windows)]
+    if args.first().is_some_and(|op| matches!(op.as_str(), "__mobile-peer-identity" | "__mobile-peer-local")) {
+        return crate::mobile_peers::dispatch(config, args);
+    }
+    let _ = (config, args);
     Err(Error::new(
         2,
         "One-hop mobile peer routing is unavailable on a Windows gateway; local Windows sessions are supported.",
     ))
+}
+/// The refusal of every `send ... --observe` but the supported one.
+const OBSERVE_ONLY: &str =
+    "hgs send --observe takes exactly `hgs send <codex session> --observe --json` on this computer";
+
+/// The one disposition of the send's effect-free observation
+/// (zerus-5wmh.66.4.10, .10.1). It runs first, before the helper
+/// rendezvous, any machine guard, `@host` or `--client` forwarding, a dry
+/// run, a session reference or `--session-id` selection, label repair,
+/// provider routing and stdin. Only the desktop service's own call goes on,
+/// straight to the observation: exactly `hgs send <session> --observe
+/// --json`, naming a local Codex session by its plain name. Any other argv
+/// with `send` and `--observe` before a `--` separator refuses with no
+/// effect. `None`: not an observation.
+fn observe_gate(args: &[String]) -> Option<Result<i32>> {
+    let head = args.split(|arg| arg == "--").next().unwrap_or_default();
+    if !(head.iter().any(|arg| arg == "--observe") && head.iter().any(|arg| arg == "send")) {
+        return None;
+    }
+    Some(match args {
+        [send, name, observe, json]
+            if send == "send"
+                && observe == "--observe"
+                && json == "--json"
+                && zerus_client_core::desktop::session_resume::observed(name)
+                && !name.contains('@') =>
+        {
+            platform::prepare_environment();
+            local_sessions().and_then(|()| state::observe_send(name).map_err(|e| Error::new(1, e)))
+        }
+        _ => Err(Error::new(2, OBSERVE_ONLY)),
+    })
 }
 fn state_command(verb: &str, args: &[String]) -> Result<i32> {
     let mut command = vec![verb.to_owned()];
@@ -262,6 +445,9 @@ fn wsl_forward(config: &Config, target: &str, command: &str, args: &[String], dr
     if command == "download" {
         return Some(crate::download::dispatch(config, target, args, dry));
     }
+    if command == "tunnel" {
+        return Some(crate::tunnel::dispatch(config, target, args, dry));
+    }
     Some(crate::wsl::run(profile, command, args, dry))
 }
 
@@ -276,6 +462,45 @@ fn setting_command(local: bool, command: &str, args: &[String], dry: bool) -> Re
         return Err(Error::new(1, format!("hgs {command} does not support --dry-run")));
     }
     state_command(command, args)
+}
+/// The owner's one-click fix for a DeepSeek session that cannot start: give
+/// this user inheritable full control of one folder, the grant the sandbox
+/// needs (U34). Only this user's own rights change, and only when the check
+/// says the sandbox lacks them; the result is checked again before it is told.
+fn sandbox_folder(args: &[String]) -> Result<i32> {
+    if args.first().map(String::as_str) != Some("grant") {
+        return Err(Error::new(1, "usage: hgs sandbox-folder grant DIRECTORY [--elevated] --json"));
+    }
+    let path = require(args, 1, "Missing folder")?;
+    let folder = Path::new(path);
+    if !folder.is_absolute() || !folder.is_dir() {
+        return Err(Error::new(1, format!("{path} is not an existing absolute folder")));
+    }
+    #[cfg(windows)]
+    {
+        let fail = |error: std::io::Error| Error::new(1, format!("Could not change the rights of {path}: {error}"));
+        if crate::platform::sandbox_folder_problem(folder).map_err(fail)?.is_none() {
+            println!("{}", serde_json::json!({"status":"ok","path":path}));
+            return Ok(0);
+        }
+        // T-o8dps1: --elevated asks Windows for an administrator's approval
+        // first; the rights are checked again as this user either way.
+        if has(args, "--elevated") {
+            crate::platform::grant_full_control_elevated(folder).map_err(fail)?;
+        } else {
+            crate::platform::grant_full_control(folder).map_err(fail)?;
+        }
+        if let Some(problem) = crate::platform::sandbox_folder_problem(folder).map_err(fail)? {
+            return Err(Error::new(1, format!("The grant did not take: {problem}")));
+        }
+        println!("{}", serde_json::json!({"status":"granted","path":path}));
+        Ok(0)
+    }
+    #[cfg(not(windows))]
+    {
+        println!("{}", serde_json::json!({"status":"ok","path":path}));
+        Ok(0)
+    }
 }
 fn has(args: &[String], arg: &str) -> bool {
     args.iter().any(|a| a == arg)
@@ -353,11 +578,11 @@ fn binding_exists(config: &Config, name: &str) -> Result<bool> {
 /// On Windows only the stable CLI, whichever hgs.exe runs now: records, hooks
 /// and recipes never name a portable folder that an update replaces (spec D8).
 #[cfg(windows)]
-fn executable_path() -> Result<PathBuf> {
+pub(crate) fn executable_path() -> Result<PathBuf> {
     platform::stable_executable().map_err(|error| Error::new(1, error))
 }
 #[cfg(unix)]
-fn executable_path() -> Result<PathBuf> {
+pub(crate) fn executable_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("HGS_EXECUTABLE").filter(|s| !s.is_empty()) {
         let path = PathBuf::from(path);
         if path.is_absolute() && platform::executable(&path) {
@@ -385,12 +610,19 @@ fn executable_path() -> Result<PathBuf> {
     }
     Ok(env::current_exe()?)
 }
-/// Refuse a launch or attach inside a session pane, `-d` or not; only `fork -d`
-/// and `resume -d` start a session from inside one.
-fn nested_guard(dry: bool) -> Result<()> {
+/// The detached form that a launch refused inside a session pane names: a new
+/// session started beside that one, as `fork -d` and `resume -d` start theirs.
+const DETACHED_LAUNCH: &str = "--new -d";
+/// Refuse to attach this terminal inside a session pane: `hgs a`, and a launch
+/// without `-d`. A detached launch, `fork -d` and `resume -d` start their
+/// sessions from inside one; `retry` names that detached form, if any.
+fn nested_guard(dry: bool, retry: Option<&str>) -> Result<()> {
     if !dry && terminal().inside() {
         let name = terminal().enclosing_session();
-        return Err(Error::new(2, nested_refusal(cfg!(unix), Some(&name), None)));
+        return Err(Error::new(
+            2,
+            nested_refusal(cfg!(unix), Some(&name), retry),
+        ));
     }
     Ok(())
 }
@@ -418,9 +650,39 @@ pub(crate) fn usage() -> &'static str {
 /// Commands that only Unix dispatches: `notify` for the tray, and `clip` and
 /// `paste`, which tmux's C-v binding runs.
 const UNIX_ONLY_COMMANDS: [&str; 3] = ["notify", "clip", "paste"];
-/// Whether a usage line tells of what only Unix has: a command of
-/// `UNIX_ONLY_COMMANDS` or the Ctrl+V that runs `hgs paste`.
+/// Lines for Unix commands/input bindings or the POSIX creation ABIs.
 fn unix_only_usage(line: &str) -> bool {
+    if line.contains("worktrees program-holder ") || line.contains("worktrees program-stop") || line.contains("worktrees program-cleanup") {
+        return true;
+    }
+    if [
+        zerus_client_core::desktop::creation_clone::HELP_MARKER,
+        zerus_client_core::desktop::creation_worktree::HELP_MARKER,
+        zerus_client_core::desktop::creation_worktree::CONTROL_HELP_MARKER,
+        zerus_client_core::desktop::creation_launch::HELP_MARKER,
+        zerus_client_core::desktop::task_message::HELP_MARKER,
+        zerus_client_core::desktop::task_message::REFERENCE_HELP_MARKER,
+        zerus_client_core::desktop::task_message::review::HELP_MARKER,
+        zerus_client_core::desktop::deferred_send::HELP_MARKER,
+        zerus_client_core::desktop::question_route::HELP_MARKER,
+        zerus_client_core::desktop::deferred_answer::HELP_MARKER,
+        zerus_client_core::desktop::team_person::HELP_MARKER,
+        zerus_client_core::desktop::team_person_actions::HELP_MARKER,
+        zerus_client_core::desktop::team_person_actions::PLACEMENT_MARKER,
+        zerus_client_core::desktop::deferred_answer::UPDATE_PHASE_MARKER,
+        zerus_client_core::desktop::compact_to_send::HELP_MARKER,
+        zerus_client_core::desktop::session_resume::HELP_MARKER,
+        zerus_client_core::desktop::session_resume::OBSERVE_MARKER,
+        zerus_client_core::desktop::task_start_reconcile::HELP_MARKER,
+        zerus_client_core::worktree_programs::custody::HELP_MARKER,
+        zerus_client_core::worktree_programs::presentation::HELP_MARKER,
+        zerus_client_core::worktree_programs::stop::HELP_MARKER,
+        zerus_client_core::worktree_programs::cleanup::HELP_MARKER,
+    ]
+    .contains(&line.trim())
+    {
+        return true;
+    }
     let mut words = line.split_whitespace();
     match words.next() {
         Some("hgs") => words
@@ -443,6 +705,48 @@ fn unix_only(command: &str, unix: bool) -> Result<()> {
 /// has no tmux C-v binding, which pulls a peer's image through `hgs paste` and
 /// `hgs clip`, no `hgs notify`, and its dry runs print the session host's
 /// requests, so its text tells of none of them and does not name tmux.
+/// What this computer's `hgs --help` prints. The creation worktree executor
+/// binds Git to a `/proc/self/fd` link, and no qualified seam yet attests the
+/// code a macOS task message, deferred send or deferred answer child runs, so
+/// only Linux advertises those ABIs.
+fn help_text() -> Cow<'static, str> {
+    let usage = advertised(usage_text(cfg!(unix)), cfg!(target_os = "linux"));
+    let usage = if cfg!(target_os = "linux") {
+        Cow::Owned(format!("{usage}\n{}\n", state::LISTING_METADATA_MARKER))
+    } else {
+        usage
+    };
+    match crate::tasks::controls::help_marker() {
+        Some(marker) => format!("{usage}\n{marker}\n").into(),
+        None => usage,
+    }
+}
+fn advertised(usage: Cow<'static, str>, linux: bool) -> Cow<'static, str> {
+    if linux {
+        return usage;
+    }
+    let markers = [
+        zerus_client_core::desktop::creation_worktree::HELP_MARKER,
+        zerus_client_core::desktop::creation_worktree::CONTROL_HELP_MARKER,
+        zerus_client_core::desktop::task_message::HELP_MARKER,
+        zerus_client_core::desktop::task_message::REFERENCE_HELP_MARKER,
+        zerus_client_core::desktop::task_message::review::HELP_MARKER,
+        zerus_client_core::desktop::deferred_send::HELP_MARKER,
+        zerus_client_core::desktop::question_route::HELP_MARKER,
+        zerus_client_core::desktop::deferred_answer::HELP_MARKER,
+        zerus_client_core::desktop::deferred_answer::UPDATE_PHASE_MARKER,
+        zerus_client_core::desktop::compact_to_send::HELP_MARKER,
+        zerus_client_core::desktop::session_resume::HELP_MARKER,
+        zerus_client_core::desktop::session_resume::OBSERVE_MARKER,
+    ];
+    usage
+        .lines()
+        .filter(|line| !markers.contains(&line.trim()))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+        .into()
+}
+
 fn usage_text(tmux: bool) -> Cow<'static, str> {
     if tmux {
         return USAGE.into();
@@ -455,12 +759,92 @@ fn usage_text(tmux: bool) -> Cow<'static, str> {
         .into()
 }
 
-pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
+#[cfg(any(windows, test))]
+mod swarm_restart;
+
+pub fn dispatch(args: Vec<String>) -> Result<i32> {
+    dispatch_at(args, Instant::now())
+}
+
+/// The start of the one stderr line `hgs` writes for a refused command.
+pub(crate) const ERROR_PREFIX: &str = "hgs: ";
+/// The line `hgs` writes on stderr, in one piece and last, when a command is
+/// refused (main.rs); nothing about the refusal goes to stdout. A reader of a
+/// child's refusal parses this line (zerus-63rru.57).
+pub(crate) fn error_line(message: &str) -> String {
+    format!("{ERROR_PREFIX}{message}\n")
+}
+
+pub(crate) fn dispatch_at(args: Vec<String>, entered: Instant) -> Result<i32> {
+    if let Some(result) = observe_gate(&args) {
+        return result;
+    }
+    // Keep an original helper alive until its parent has observed live code.
+    // Only a bounded pipe prefix is consumed; ordinary dispatch/auth is intact.
+    #[cfg(unix)]
+    let args = zerus_client_core::run::rendezvous::dispatch_args(args)
+        .map_err(|_| Error::new(2, "original helper rendezvous refused"))?;
+    #[cfg(any(windows, test))]
+    if let Some(request) = swarm_restart::select(&args) {
+        return swarm_restart::dispatch(request, entered);
+    }
+    #[cfg(not(any(windows, test)))]
+    let _ = entered;
+    let json = args.iter().any(|arg| arg == "--json");
+    let result = dispatch_normal(args);
+    // A read that refused because several sessions share the label it named,
+    // with nothing in the request selecting one (zerus-ucck P3c), exits 5 with
+    // the ambiguity report, as resolution does.
+    match (result, state::session_id::refused()) {
+        (Err(_), Some((text, value))) => {
+            if json {
+                println!("{value}");
+            }
+            Err(Error::new(state::session_id::AMBIGUOUS, text))
+        }
+        (result, _) => result,
+    }
+}
+
+fn dispatch_normal(mut args: Vec<String>) -> Result<i32> {
+    // This self-image owner inherits the original caller's already-selected
+    // executable search/locale context. Repeating prepare_environment would
+    // prepend PATH again before its exact context check. The shared state
+    // entry still rejects extra argv and validates inherited objects/frame
+    // before Root; no ordinary command or Windows control lane changes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if args.first().map(String::as_str)==Some("__state")
+        && args.get(1).map(String::as_str)==Some("native-picker-custodian-v1") {
+        return state::dispatch(&args[1..]).map_err(|e| Error::new(1, e));
+    }
+    // Task 352: `hgs [@host] session switch-account` is `hgs switch-account`.
+    let at = usize::from(args.first().is_some_and(|arg| arg.starts_with('@')));
+    if args.get(at).is_some_and(|arg| arg == "session") && args.get(at + 1).is_some_and(|arg| arg == "switch-account") {
+        args.remove(at);
+    }
     if args.first().is_some_and(|s| s == "swarm") && args.get(1).is_some_and(|s| s == crate::wsl::RECEIVER) {
         crate::wsl::validate_request(&args[2..])?;
         if !cfg!(target_os = "linux") { return Err(Error::new(2,"The wsl-local receiver requires a Linux hgs build")); }
         env::set_var(crate::wsl::POLICY, "existing-only");
         args.drain(..2);
+    }
+    // A connector read uses the long-lived closed namespace so a downgraded
+    // executable refuses it instead of falling through to a session launch.
+    // This one read needs neither a native session host nor a writer.
+    if args.first().map(String::as_str) == Some("__state")
+        && args.get(1).map(String::as_str) == Some("delivery")
+    {
+        return state::dispatch(&args[1..]).map_err(|e| Error::new(1, e));
+    }
+    if crate::desktop::launchd_command(&args) {
+        args.pop();
+        return dispatch(args).map_err(|mut error| {
+            if error.code == crate::desktop::STARTUP_REFUSED {
+                error.code = 0;
+                error.message = format!("{}; automatic restart paused", error.message);
+            }
+            error
+        });
     }
     // Private: the screen model behind the differential tmux capture test.
     if args.first().is_some_and(|a| a == "__screen-capture") {
@@ -478,22 +862,61 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
     // Existing hooks call this private stable ABI, including hooks installed before migration.
     if args.first().is_some_and(|a| a == "__state") {
         session_process()?;
+        if args
+            .get(1)
+            .is_some_and(|verb| matches!(verb.as_str(), "send" | "send-now"))
+        {
+            check_send_caller()?;
+        }
         return state::dispatch(&args[1..]).map_err(|e| Error::new(1, e));
     }
-    let config = Config::load()?;
+    crate::desktop::launch_configuration(&args)?;
+    let config = Config::load().map_err(|mut error| {
+        if crate::desktop::registered_command(&args) {
+            error.code = crate::desktop::STARTUP_REFUSED;
+        }
+        error
+    })?;
     // WhiteWh fork: both ends of the lasting channel to a Windows peer.
     if args.first().is_some_and(|a| a == "__peer") {
         return crate::peer_channel::command(&config, &args[1..]);
     }
+    // Task #28 (2): a sandboxed member's host reads go to its team worker.
+    if let Some(answer) = state::sandbox_read(&args) {
+        return answer.map_err(|error| Error::new(1, error));
+    }
     // An encrypted gateway binds every local native call to the physical
     // machine it advertised. This check also works on Windows, without a
     // shell, stdin rewriting or a second native process.
+    let mut guarded = false;
     if args.first().is_some_and(|a| a == "--expect-machine") {
+        guarded = true;
         let expected = args.get(1).ok_or_else(|| Error::new(2, "Missing expected machine identity"))?;
-        if uuid::Uuid::parse_str(expected).ok().is_none_or(|id| id.to_string() != *expected)
-            || crate::swarm::local_node_id(&config).map_err(|_| Error::new(1,"Native machine identity is unavailable"))? != *expected
-        {
+        if uuid::Uuid::parse_str(expected).ok().is_none_or(|id| id.to_string() != *expected) {
             return Err(Error::new(1,"Mobile target identity changed; refresh computers"));
+        }
+        let guarded_at = if args.get(2).is_some_and(|a| a=="--client") {4} else {2};
+        let actual = if args.get(guarded_at).is_some_and(|a| a=="session-action-status"||a=="delivery") {
+            state::lifecycle_receipt_machine(&config).map_err(|_| Error::new(1,"Native machine identity is unavailable"))?
+        } else {
+            crate::swarm::local_node_id(&config).map_err(|_| Error::new(1,"Native machine identity is unavailable"))?
+        };
+        if actual != *expected {
+            // A forwarded session reference names the machine it expects; the
+            // SSH alias that carried it reached another one (zerus-ucck P1c).
+            let hop = args.get(guarded_at).is_some_and(|command| {
+                is_reference_call(command, args.get(guarded_at + 1..).unwrap_or_default())
+            });
+            return Err(Error::new(1, if hop {
+                "Session reference belongs to another computer; the selected SSH alias does not match"
+            } else {
+                "Mobile target identity changed; refresh computers"
+            }));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if args.get(guarded_at).is_some_and(|a|a=="effort"||a=="settings")
+            || (args.get(guarded_at).is_some_and(|a|a=="__state")&&args.get(guarded_at+1).is_some_and(|a|a=="effort"||a=="settings")) {
+            state::remember_picker_caller_machine(&config,expected);
         }
         args.drain(..2);
         let command_at=if args.first().is_some_and(|a|a=="--client") {
@@ -559,12 +982,155 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         }
     }
     let Some(command) = args.get(index) else {
-        eprint!("{}", usage_text(cfg!(unix)));
+        eprint!("{}", help_text());
         return Ok(1);
     };
     let args = &args[index + 1..];
+    // The per-child question route switch (zerus-sa9qn.32): refuse a change
+    // from an agent's own process tree here, before any `@host` forwarding,
+    // because the peer's hgs cannot see this caller (zerus-sa9qn.47). This is
+    // a guard against accidental agent use, not a security boundary: the
+    // person-only control is the global switch (zerus-sa9qn.49). The routed
+    // command is found in every form a peer runs it: `--expect-machine ID
+    // [--client C] [__state] COMMAND` and `[__state] COMMAND`
+    // (zerus-sa9qn.51).
+    let (first, then) = if command == "--expect-machine" {
+        let at = if args.get(1).is_some_and(|a| a == "--client") {
+            3
+        } else {
+            1
+        };
+        (args.get(at), args.get(at + 1))
+    } else {
+        (Some(command), args.first())
+    };
+    let routed = if first.is_some_and(|a| a == "__state") {
+        then
+    } else {
+        first
+    }
+    .map(String::as_str);
+    // The same agent refusal as a local change, before forwarding
+    // (zerus-ppd26.1, zerus-ppd26.15).
+    if routed == Some("question-routing") {
+        if let Some(refused) = crate::state::question_routing::agent_refusal() {
+            println!("{refused}");
+            return Ok(1);
+        }
+    }
+    // A send under a recorded DeepSeek host that is actually found is the
+    // host's own hosted call only when the host bridge's call marker and its
+    // own complete session token pair are there. A marked call without that
+    // proof (for example an older host's inherited markers), partial markers,
+    // or no markers would reach a live target without a sender. Refuse it
+    // here, before any reference hop or `@host` forwarding (zerus-ppd26.22).
+    // Only a host actually found refuses: an unverifiable check, such as a
+    // sandboxed agent's sender-less send, keeps working as before.
+    if matches!(routed, Some("send" | "send-now")) {
+        check_send_caller()?;
+    }
     if let Some(result) = wsl_forward(&config, &target, command, args, dry) {
         return result;
+    }
+    // zerus-un7n phase 5: on a multi-person host every route that acts on this
+    // computer proves its caller and state owner before it reads or changes
+    // sessions, accounts, logs or usage; a legacy host admits everything.
+    if target.is_empty() || config.is_self(&target) {
+        crate::host_access::gate::admit(&crate::host_access::runtime::current(), command, args, &state::state_root())?;
+    }
+    // zerus-ucck P1c: a session reference selects the session it names on every
+    // session command, through the same checks as `--session-id`. `inspect`
+    // keeps its own read-only reference path below.
+    let referenced;
+    let args = if is_reference_call(command, args) {
+        if session_id_flag(command, args)?.is_some() {
+            return Err(Error::new(2, "Select a session by its reference or by --session-id, not both"));
+        }
+        let reference = crate::session_reference::Reference::parse(&args[0])?;
+        if !reference.agent.is_empty() {
+            return Err(Error::new(1, "A child agent's reference is read-only; use hgs inspect"));
+        }
+        let local_id = crate::swarm::local_node_id(&config).map_err(|e| Error::new(1, e.to_string()))?;
+        if reference.machine != local_id {
+            // A guarded call, including the one hop below, acts only on the
+            // machine it verified; it never forwards a reference again.
+            if guarded {
+                return Err(Error::new(1, "Session reference belongs to another computer; a guarded call acts only on this computer"));
+            }
+            if matches!(command.as_str(), "native-ui" | "__dsh-ui-url") {
+                return Err(Error::new(1, "Open another computer's native UI by name or --session-id"));
+            }
+            // Exactly one verified hop: the peer runs the command as a call
+            // guarded by the reference's machine, so a peer that is not that
+            // machine refuses, and the machine that is never forwards it.
+            let host = if !target.is_empty() && !config.is_self(&target) {
+                &target
+            } else if config.peers.contains(&reference.host) && !config.is_self(&reference.host) {
+                &reference.host
+            } else {
+                return Err(Error::new(1, "The referenced computer is not configured here; choose its configured @host"));
+            };
+            return remote_via(&config, host, command, args, dry, Some(&reference.machine));
+        }
+        if !target.is_empty() && !config.is_self(&target) {
+            return Err(Error::new(1, "A local session reference cannot route to another computer"));
+        }
+        local_sessions()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if command=="effort"||command=="settings" {state::remember_picker_caller_machine(&config,&reference.machine);}
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let effort_name=if command=="effort"||command=="settings" {
+            Some(state::resolve_effort_reference(&reference).map_err(|e|Error::new(1,e))?)
+        } else {None};
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let effort_name:Option<String>=None;
+        let name=if let Some(name)=effort_name {name} else {
+            let name = state::resolve_reference(&reference).map_err(|e| Error::new(1, e))?;
+            state::session_id::select_reference(&name, &reference.session, &reference.conversation, &reference.run);
+            name
+        };
+        let mut rest = vec![name];
+        rest.extend_from_slice(&args[1..]);
+        if !reference.archive.is_empty() {
+            if !ARCHIVE_COMMANDS.contains(&command.as_str()) {
+                return Err(Error::new(1, format!("The reference names an archived conversation; hgs {command} needs a saved session")));
+            }
+            if has(&rest, "--archive") {
+                return Err(Error::new(2, "The reference already names its archive"));
+            }
+            rest.extend(["--archive".to_owned(), reference.archive.clone()]);
+        }
+        referenced = rest;
+        &referenced[..]
+    } else {
+        args
+    };
+    // zerus-ucck P1: `--session-id ID` selects the session the command names
+    // first. A peer receives it unchanged, only after advertising it.
+    let selected;
+    let args = if session_id_flag(command, args)?.is_some()
+        && (target.is_empty() || config.is_self(&target))
+    {
+        local_sessions()?;
+        selected = select_session(command, args)?;
+        &selected[..]
+    } else {
+        args
+    };
+    // zerus-ucck P3a: a label named without a selection is resolved among
+    // its candidates here, on the computer that holds the sessions.
+    // Commands exempt from local sessions (hooks, session-action-status)
+    // find their own session through `ids/`, and an archive ID already
+    // selects exactly (#1437 review).
+    if state::session_id::selected().is_none()
+        && resolves_label_first(
+            command,
+            args,
+            target.is_empty() || config.is_self(&target),
+            platform::local_sessions(),
+        )
+    {
+        resolve_label(command, args)?;
     }
     match command.as_str() {
         "--expect-machine" => {
@@ -581,12 +1147,14 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
             if !target.is_empty() && !config.is_self(&target) {
                 return remote(&config, &target, "--help", args, dry);
             }
-            print!("{}", usage_text(cfg!(unix)));
+            print!("{}", help_text());
             println!("Encrypted workspace ABI: guarded-local-v1");
             println!("WSL local receiver ABI: wsl-local-v1 (OpenCode existing-only)");
             #[cfg(target_os = "linux")]
             println!("WSL file snapshot ABI: wsl-file-snapshot-v1");
             println!("Desktop creation ABI: guarded-create-v1");
+            println!("Account transfer ABI: revision-copy-v1");
+            println!("{}", crate::host_access::gate::MARKER);
             #[cfg(windows)]
             print!("{}\nMobile gateway ABI: windows-local-v1\n", crate::host::admin::HELP);
             return Ok(0);
@@ -601,6 +1169,16 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         "--version" | "version" => return crate::status::version(&config, &target, args),
         // Read-only on every machine; never routed as an agent launch.
         "status" => return crate::status::run(&config, &target, args, dry),
+        // U60: model servers are configured on this computer, privately.
+        "model-server" => {
+            if !target.is_empty() && !config.is_self(&target) {
+                return Err(Error::new(2, "model-server is configured on this computer; omit @host"));
+            }
+            if dry {
+                return Err(Error::new(2, "model-server does not support --dry-run"));
+            }
+            return state::model_servers::dispatch(&config, args);
+        }
         // Text compiled into this hgs; a peer answers with its own.
         // WhiteWh fork: a build or long test Zerus tracks as this session's work.
         "run" => {
@@ -611,6 +1189,21 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
                 return Err(Error::new(1, "hgs run does not support --dry-run"));
             }
             return state_command("build", args);
+        }
+        // U62: the project's tests, from .zerus/tests.toml and its map.
+        "test" => {
+            if !target.is_empty() && !config.is_self(&target) {
+                // #732: a test runner is reached through hgs's own SSH; every
+                // other test command reads the project in this folder.
+                if args.first().is_some_and(|action| action == "runner") && !dry {
+                    return remote(&config, &target, command, args, dry);
+                }
+                return Err(Error::new(2, "hgs test reads the project in this folder; omit @host"));
+            }
+            if dry {
+                return Err(Error::new(2, "hgs test does not support --dry-run"));
+            }
+            return crate::test_discipline::dispatch(args);
         }
         "guide" => {
             if !target.is_empty() && !config.is_self(&target) {
@@ -631,6 +1224,15 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         setting if kept_setting(setting) => {
             return setting_command(target.is_empty() || config.is_self(&target), setting, args, dry);
         }
+        "sandbox-folder" => {
+            if !(target.is_empty() || config.is_self(&target)) {
+                return Err(Error::new(1, "hgs sandbox-folder changes a folder's rights on the computer it runs on; run it there"));
+            }
+            if dry {
+                return Err(Error::new(1, "hgs sandbox-folder does not support --dry-run"));
+            }
+            return sandbox_folder(args);
+        }
         _ => {}
     }
     if args.first().is_some_and(|value| value.starts_with("zerus://")) {
@@ -640,6 +1242,11 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         }
         let reference = crate::session_reference::Reference::parse(&args[0])?;
         let local_id = crate::swarm::local_node_id(&config).map_err(|e| Error::new(1,e.to_string()))?;
+        // Like every other session command, a guarded inspect reads only the
+        // computer it verified (#1376 review).
+        if guarded && local_id != reference.machine {
+            return Err(Error::new(1, "Session reference belongs to another computer; a guarded call acts only on this computer"));
+        }
         if local_only && local_id != reference.machine {
             return Err(Error::new(1,"Session reference belongs to another computer; the selected SSH alias does not match"));
         }
@@ -658,30 +1265,58 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         return Ok(0);
     }
     if command == "native-ui" {
-        let name = require(args, 0, "usage: hgs native-ui <session> [--json]")?;
-        if args.get(1).is_some_and(|v| v == "--json") && !dry {
+        // A local selector was resolved above. A peer resolves its own through
+        // a gated `__dsh-ui-url`; a name alone never stands in for the ID.
+        let mut rest = args.to_vec();
+        let selector = match session_id_flag(command, args)? {
+            Some((at, id)) => {
+                rest.drain(at..at + 2);
+                if !args[..at].iter().any(|arg| !arg.starts_with('-')) {
+                    rest.insert(0, String::new());
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        let name = match selector {
+            Some(_) => rest[0].as_str(),
+            None => require(&rest, 0, "usage: hgs native-ui <session> [--json]")?,
+        };
+        if rest.get(1).is_some_and(|v| v == "--json") && !dry {
             println!(
                 "{}",
-                serde_json::json!({"url":crate::native_ui::address(&config,&target,name)?})
+                serde_json::json!({"url":crate::native_ui::address(&config,&target,name,selector.as_deref())?})
             );
             return Ok(0);
         }
-        return crate::native_ui::open(&config, &target, name, dry);
+        return crate::native_ui::open(&config, &target, name, selector.as_deref(), dry);
     }
     if command == "account"
         && args.first().is_some_and(|v| v == "login")
         && args.get(1).is_some_and(|v| v == "native-dsh")
     {
-        return crate::native_ui::open(&config, &target, "@account", dry);
+        return crate::native_ui::open(&config, &target, "@account", None, dry);
     }
     if command == "a" && args.first().is_some_and(|v| v.starts_with("dsh/")) {
-        return crate::native_ui::open(&config, &target, &args[0], dry);
+        // A DeepSeek attach is its native UI: a remote selector takes the same
+        // gated `__dsh-ui-url` as native-ui (a local one was resolved above).
+        let selector = session_id_flag(command, args)?.map(|(_, id)| id);
+        return crate::native_ui::open(&config, &target, &args[0], selector.as_deref(), dry);
     }
     if command == "download" {
         return crate::download::dispatch(&config, &target, args, dry);
     }
+    if command == "tunnel" {
+        return crate::tunnel::dispatch(&config, &target, args, dry);
+    }
     if command == "approval-log" {
         return crate::approval_log::dispatch(&config, &target, args, dry);
+    }
+    if command == "desktop" {
+        return crate::desktop::dispatch(&config, &target, args, dry);
+    }
+    if command == "acknowledge-input" {
+        return crate::desktop::input_acknowledgment::dispatch(&config, &target, args, dry);
     }
     // Windows only, before local sessions are enabled, and never forwarded: it
     // enables them on this computer (spec D2). On Unix the word stays a program.
@@ -703,6 +1338,9 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
     if !target.is_empty() && !config.is_self(&target) {
         return remote(&config, &target, command, args, dry);
     }
+    if command == "host-access" {
+        return crate::host_access::command::dispatch(args, dry);
+    }
     if command == "external" { return crate::external_workstreams::dispatch(&config,args,dry); }
     if args.first().is_some_and(|name| crate::external_workstreams::reserved(name))
         && matches!(command.as_str(), "inspect" | "send" | "history" | "a" | "kill" | "rename" | "archive" | "terminate" | "pause" | "resume" | "fork" | "processes" | "send-now" | "session-action" | "terminal" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "read" | "notifications" | "attachment" | "file-read") {
@@ -718,6 +1356,7 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
     match command.as_str() {
         "hooks" => state::hook_health::dispatch(&config, args, dry),
         "analytics" => crate::analytics::dispatch(&config, args, dry),
+        "path-info" => crate::path_info::command(args, dry),
         "speech" => crate::speech::dispatch(&config, args, dry),
         "mobile" => crate::phones::dispatch(&config, args, dry),
         "__dsh-ui-url" => {
@@ -726,17 +1365,37 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
             println!("{}", json!({"url":url}));
             Ok(0)
         }
+        "subagent" => {
+            if args.len() != 3 || !["retire", "settle"].contains(&args[0].as_str()) || args[2] != "--json" || dry {
+                return Err(Error::new(1,"usage: hgs subagent retire|settle NAME --json (JSON stdin)"));
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin().lock().take(8193).read_to_end(&mut bytes)?;
+            let result = if args[0] == "settle" { state::subagent_lifecycle::settle(&args[1],&bytes) } else { state::subagent_lifecycle::retire(&args[1],&bytes) }.map_err(|e|Error::new(1,e))?;
+            println!("{result}"); Ok(0)
+        }
         "ls" => list(&config, args, dry),
+        "listing-index" => {
+            if dry {
+                println!("hgs listing-index (display metadata only)");
+                return Ok(0);
+            }
+            let value = state::listing_index(args).map_err(|e| Error::new(1, e))?;
+            println!("{value}");
+            Ok(0)
+        }
         "watch" => crate::watch::run(&config, args, dry),
         "archives" => {
             let mobile = cfg!(windows) && args.last().map(String::as_str)==Some("--windows-mobile");
             let args = if mobile { &args[..args.len()-1] } else { args };
-            if (args != ["--json"] && args != ["lookup","--json"]) || dry { return Err(Error::new(1,"usage: hgs archives [lookup] --json (JSON query on stdin)")); }
+            let bounded = !mobile && args == ["--json","--bounded"];
+            if (args != ["--json"] && args != ["lookup","--json"] && !bounded) || dry { return Err(Error::new(1,"usage: hgs archives [lookup] --json [--bounded] (JSON query on stdin)")); }
             let query = state::archive_catalog::read_query().map_err(|e| Error::new(1,e))?;
             let result = if args.first().map(String::as_str) == Some("lookup") {
                 if mobile { state::archive_catalog::lookup_scoped(&query,true) } else { state::archive_catalog::lookup(&query) }
             } else if mobile { state::archive_catalog::page_scoped(&query,true) }
-            else { state::archive_catalog::page(&query) }.map_err(|e| Error::new(1,e))?;
+            else { state::archive_catalog::page_with(&query,bounded) }.map_err(|e| Error::new(1,e))?;
             println!("{result}"); Ok(0)
         },
         "reference" => {
@@ -753,11 +1412,15 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
             }
             state_command(command, &args)
         }
-        "inspect" | "processes" | "worktrees" | "git-status" | "git-diff" | "repository" | "dirs" | "send" | "send-now" | "send-cancel" | "session-action" | "terminal" | "history" | "history-projection" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "search" | "read" | "notifications"
-        | "attachment" | "file-read" | "recovery" | "voice" | "schedules" | "graph" | "wait" | "team" => {
+        "inspect" | "processes" | "worktrees" | "git-status" | "git-diff" | "repository" | "dirs" | "send" | "send-now" | "send-cancel" | "session-action" | "session-action-status" | "terminal" | "history" | "history-projection" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "search" | "read" | "notifications" | "keep-warm" | "question-routing"
+        | "attachment" | "file-read" | "recovery" | "voice" | "schedules" | "graph" | "wait" | "team" | "rules" | "switch-account" | "parent" | "delivery" => {
+            if command == "rules" && dry { return Err(Error::new(1,"Rules operations do not support --dry-run")); }
+            if command == "delivery" && dry { return Err(Error::new(1,"Delivery receipt reads do not support --dry-run")); }
+            if command == "session-action-status" && dry { return Err(Error::new(1,"Lifecycle receipt reads do not support --dry-run")); }
             if command == "repository" && dry { return Err(Error::new(1,"Repository operations do not support --dry-run")); }
             if command == "wait" && dry { return Err(Error::new(1,"Wait operations do not support --dry-run")); }
             if command == "team" && dry { return Err(Error::new(1,"Team operations do not support --dry-run")); }
+            if command == "switch-account" && dry { return Err(Error::new(1,"Changing a session's account does not support --dry-run")); }
             if command == "graph" && dry { return Err(Error::new(1,"Graph reads do not support --dry-run")); }
             if command == "dirs" && has(args, "--create") && dry {
                 return Err(Error::new(1, "folder creation does not support --dry-run"));
@@ -765,7 +1428,7 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
             if command == "worktrees" && args.first().is_some_and(|s| s == "create" || s == "cancel" || s == "remove" || s == "sweep" || s == "policy" && args.get(1).is_some_and(|s|s=="set")) && dry {
                 return Err(Error::new(1, "worktree creation, removal and policy changes do not support --dry-run"));
             }
-            if (matches!(command.as_str(), "processes" | "send" | "send-now" | "send-cancel" | "session-action" | "terminal" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "recovery" | "read" | "notifications" | "voice" | "schedules") || (command=="attachment" && has(args,"--stage"))) && dry {
+            if (matches!(command.as_str(), "processes" | "send" | "send-now" | "send-cancel" | "session-action" | "terminal" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "recovery" | "read" | "notifications" | "keep-warm" | "question-routing" | "voice" | "schedules" | "parent") || (command=="attachment" && has(args,"--stage"))) && dry {
                 return Err(Error::new(1, "message input does not support --dry-run"));
             }
             state_command(command, args)
@@ -804,6 +1467,8 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
         },
         "project" => project(&config, args, dry),
         "task" => crate::tasks::dispatch(&config, args, dry),
+        // WhiteWh fork: `hgs team` is the fork's own teams (state::teams, the
+        // arm above); upstream's Agent Teams CLI (crate::teams) is not wired.
         _ => launch(&config, command, args, &client, dry),
     }
 }
@@ -813,9 +1478,10 @@ pub fn dispatch(mut args: Vec<String>) -> Result<i32> {
 /// then runs the base command in place of this process on Unix and as its
 /// child on Windows, which has no exec (spec D8).
 fn run(args: &[String]) -> Result<i32> {
-    let n: usize = require(args, 0, "--run needs a resume-argument count")?
-        .parse()
-        .map_err(|_| Error::new(1, "invalid --run resume-argument count"))?;
+    let count = state::launch_identity::resume_count(
+        require(args, 0, "--run needs a resume-argument count")?
+    ).map_err(|error| Error::new(1,error))?;
+    let n = count.value;
     if n >= args.len() - 1 {
         return Err(Error::new(
             1,
@@ -825,6 +1491,13 @@ fn run(args: &[String]) -> Result<i32> {
     if env::var("HGS_SESSION").is_ok_and(|s| !s.is_empty())
         && env::var("HGS_TRACKING").as_deref() != Ok("0")
     {
+        // The existing lifecycle receives its unchanged numeric grammar.
+        // Required identities were verified before any bootstrap/native work.
+        if count.required {
+            let mut plain = args.to_vec();
+            plain[0] = n.to_string();
+            return state_command("run", &plain);
+        }
         return state_command("run", args);
     }
     let resume = &args[1..n + 1];
@@ -836,6 +1509,9 @@ fn run(args: &[String]) -> Result<i32> {
     let _stops = platform::ShutdownGuard::install()?;
     #[cfg(windows)]
     crate::host::supervisor::open();
+    // U60 (#658 N3): an untracked launch takes the model server's secret
+    // environment from the private file the launch left and removes it.
+    crate::state::model_servers::apply_session_secrets()?;
     if n != 0 {
         let start = Instant::now();
         let rc = run_resume(resume)?;
@@ -952,7 +1628,7 @@ fn peer_session(command: &str, args: &[String]) -> String {
                 tag = args.get(i + 1).cloned().unwrap_or_default();
                 i += 1;
             }
-            "--launch-id" | "--permissions" | "--local-model" => i += 1,
+            "--launch-id" | "--permissions" | "--local-model" | "--parent-link" | "--parent" => i += 1,
             option if option.starts_with('-') => {}
             name if project.is_empty() => project = name.into(),
             _ => {}
@@ -979,14 +1655,6 @@ fn peer_session(command: &str, args: &[String]) -> String {
         }
     )
 }
-/// `hgs ls --local --json` on `peer`, in that computer's shell.
-fn peer_ls(config: &Config, peer: &str, archives: bool) -> String {
-    let mut args: Vec<String> = ["ls", "--local", "--json"].map(String::from).into();
-    if !archives {
-        args.push("--no-archives".into());
-    }
-    crate::windows_peer::hgs(config, peer, &args).unwrap_or_default()
-}
 fn peer_json_archives(config: &Config, peer: &str, archives: bool) -> Value {
     if let Some(profile) = crate::wsl::profile(config, peer) { return crate::wsl::listing(profile, peer, archives); }
     // WhiteWh fork: a Windows peer answers through its lasting channel.
@@ -1003,8 +1671,9 @@ fn peer_json_archives(config: &Config, peer: &str, archives: bool) -> Value {
             }
         }
     }
-    let output = platform::ssh_output(
-        platform::ssh()
+    let words = if archives { vec!["ls", "--local", "--json"] } else { vec!["ls", "--local", "--json", "--no-archives"] };
+    let output = crate::remote_shell::hgs(config, peer, &words).map_err(|e| std::io::Error::other(e.message)).and_then(|remote| platform::ssh_output(
+        crate::ssh_bytes::command(&remote)?
             .args(crate::machines::ssh_options(config, peer))
             .args([
                 "-o",
@@ -1012,10 +1681,10 @@ fn peer_json_archives(config: &Config, peer: &str, archives: bool) -> Value {
                 "-o",
                 &crate::windows_peer::connect_timeout(config, peer, 3),
                 peer,
-                peer_ls(config, peer, archives).as_str(),
+                &remote,
             ])
             .stderr(Stdio::piped()),
-    );
+    ));
     let (error, detail) = match output {
         Ok(out) if out.status.success() && !out.stdout.is_empty() => {
             match serde_json::from_slice::<Value>(&out.stdout) {
@@ -1053,6 +1722,445 @@ fn peer_json_archives(config: &Config, peer: &str, archives: bool) -> Value {
     value.insert("sessions".into(), json!([]));
     Value::Object(value)
 }
+#[cfg(test)]
+thread_local! {
+    static REMOTE_DRY_PLAN: std::cell::RefCell<Option<(Vec<String>, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The help line a peer lists once it resolves `--session-id` (zerus-ucck P1).
+pub(crate) const SELECTOR: &str = "session-id-selector-v1";
+
+/// A help marker a peer lists: a whole line, or text within a line.
+#[derive(Debug)]
+pub(crate) enum Marker {
+    Line(&'static str),
+    Text(&'static str),
+}
+
+/// Every marker a peer must list before it receives `--session-id`, for the
+/// command or for the one a guarded `--expect-machine` call wraps: what that
+/// call needs already, then the selector. None without a selector.
+fn selector_markers(command: &str, args: &[String]) -> Result<Option<Vec<Marker>>> {
+    let (inner, rest, mut markers) = if command == "--expect-machine" {
+        let inner = args.get(1).map(String::as_str).unwrap_or_default();
+        let mut markers = vec![Marker::Text("guarded-create-v1")];
+        if inner == "session-action-status" {
+            markers.push(Marker::Line("lifecycle-receipt-status-v1"));
+        }
+        (inner, args.get(2..).unwrap_or_default(), markers)
+    } else {
+        (command, args, Vec::new())
+    };
+    let selector = session_id_flag(inner, rest)?.is_some();
+    let reference = is_reference_call(inner, rest);
+    if !selector && !reference {
+        return Ok(None);
+    }
+    match inner {
+        "notifications" => markers.push(Marker::Line("session-notifications-v1")),
+        "keep-warm" => markers.push(Marker::Line("session-keep-warm-v1")),
+        "question-routing" => markers.push(Marker::Line("session-question-routing-v1")),
+        "hooks" => markers.push(Marker::Text("hooks-health-v1")),
+        _ => {}
+    }
+    if selector {
+        markers.push(Marker::Line(SELECTOR));
+    }
+    if reference {
+        markers.push(Marker::Line(REFERENCE_SELECTOR));
+    }
+    Ok(Some(markers))
+}
+
+/// The POSIX script for a bounded archive page on a peer (zerus-080n8): an
+/// older CLI rejects `--bounded`, so one that does not list the marker gets
+/// the exact call, which it always served. `guarded` (an `--expect-machine`
+/// call) first needs `guarded-create-v1`, as every guarded call does.
+pub(crate) fn bounded_archive_script(args: &[String], guarded: bool) -> String {
+    let exact: Vec<String> = args.iter().filter(|arg| *arg != "--bounded").cloned().collect();
+    let page = format!(
+        "if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*{}[[:space:]]*'; then exec ~/.local/bin/hgs {}; else exec ~/.local/bin/hgs {}; fi",
+        state::archive_catalog::BOUNDED_MARKER, platform::join(args), platform::join(&exact)
+    );
+    platform::remote_sh(&if guarded {
+        format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'guarded-create-v1'; then {page}; else echo 'hgs: update the selected computer to continue verified creation' >&2; exit 1; fi")
+    } else {
+        page
+    })
+}
+
+/// A POSIX script that runs `hgs ARGS` on the peer only when the installed
+/// CLI's help lists every marker; otherwise it asks for an update.
+pub(crate) fn gated(markers: &[Marker], args: &[String]) -> String {
+    let probes: Vec<String> = markers
+        .iter()
+        .map(|marker| match marker {
+            Marker::Line(line) => format!(
+                "~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*{line}[[:space:]]*'"
+            ),
+            Marker::Text(text) => format!("~/.local/bin/hgs --help 2>/dev/null | grep -qF '{text}'"),
+        })
+        .collect();
+    platform::remote_sh(&format!(
+        "if {}; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to select sessions by ID' >&2; exit 1; fi",
+        probes.join(" && "),
+        platform::join(args)
+    ))
+}
+
+/// Commands whose first argument is a session, which `--session-id` may
+/// select instead (zerus-ucck P1).
+/// Session commands that also take an archived conversation (`--archive ID`),
+/// which an archived session reference selects (zerus-ucck P1c).
+const ARCHIVE_COMMANDS: &[&str] = &["processes", "reference", "fork", "kill", "rename", "resume"];
+
+/// The help line a peer lists once it resolves session references on every
+/// session command (zerus-ucck P1c).
+pub(crate) const REFERENCE_SELECTOR: &str = "session-reference-selector-v1";
+
+/// A session command, other than `inspect`, whose session is a reference.
+fn is_reference_call(command: &str, args: &[String]) -> bool {
+    command != "inspect"
+        && SESSION_COMMANDS.contains(&command)
+        && args.first().is_some_and(|value| value.starts_with("zerus://"))
+}
+
+/// `notify` and `paste` are the tray's and tmux's own entry points, and
+/// `subagent retire` names its session second; they keep names only.
+const SESSION_COMMANDS: &[&str] = &[
+    "inspect", "reference", "processes", "send", "send-now", "send-cancel", "switch-account", "history", "history-projection",
+    "terminal", "session-action", "session-action-status", "compact-context", "clear-context",
+    "interrupt", "attachment", "file-read", "answer", "read", "notifications", "keep-warm", "question-routing", "fork", "effort",
+    "settings", "schedules", "voice", "hooks", "a", "kill", "rename", "archive", "terminate",
+    "pause", "resume", "native-ui", "__dsh-ui-url", "parent",
+];
+
+/// The position and value of `--session-id` for a session command, refused
+/// when repeated, empty or not a session ID. Other commands keep their own
+/// meaning (`hgs task --session-id`, an agent's own flag after `--`).
+fn session_id_flag(command: &str, args: &[String]) -> Result<Option<(usize, String)>> {
+    if !SESSION_COMMANDS.contains(&command) {
+        return Ok(None);
+    }
+    let options = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    let mut flags = args[..options].iter().enumerate().filter(|(_, arg)| *arg == "--session-id");
+    let Some((at, _)) = flags.next() else {
+        return Ok(None);
+    };
+    if flags.next().is_some() {
+        return Err(Error::new(2, "--session-id may be given once"));
+    }
+    let id = args.get(at + 1).map(String::as_str).unwrap_or("");
+    if !state::session_id::canonical(id) {
+        return Err(Error::new(2, "--session-id needs a session ID (a lowercase UUID from hgs ls --json)"));
+    }
+    Ok(Some((at, id.to_owned())))
+}
+
+/// Whether dispatch resolves the label a session command names before the
+/// command runs (zerus-ucck P3a). Only on the computer that holds the
+/// sessions, with its local sessions enabled, and only for a plain label:
+/// never a reference (`zerus://`), which routes or resolves itself, nor a
+/// command that finds its own session or names an archive. Otherwise the
+/// command's own refusal or routing answers first, as before label
+/// resolution existed: a Windows computer without local sessions still
+/// refuses the native DeepSeek UI and routes a peer's reference
+/// (zerus-t2hd0).
+fn resolves_label_first(command: &str, args: &[String], here: bool, local: bool) -> bool {
+    SESSION_COMMANDS.contains(&command)
+        && needs_local_sessions(command)
+        && here
+        && local
+        && !has(args, "--archive")
+        && args
+            .first()
+            .is_some_and(|first| !first.starts_with('-') && !first.starts_with("zerus://"))
+}
+
+/// zerus-ucck P3c: how each session command carries the identities it
+/// expects, which select among the sessions that share the label it names.
+/// Its guard arrives with its request on standard input, and its own check
+/// selects (`state::expect`); until then every read of the label refuses.
+const REQUEST_GUARDED: &[&str] = &[
+    "send", "send-now", "history", "history-projection", "terminal", "session-action",
+    "compact-context", "clear-context", "interrupt", "attachment", "file-read", "answer", "read",
+    "notifications", "keep-warm", "question-routing", "effort", "settings", "schedules", "voice", "parent",
+];
+/// Its guard is on its command line (`--expected-run-id`, `--run`, `--run-id`,
+/// `--expected-conversation-id`, `--conversation`).
+#[cfg_attr(not(test), allow(dead_code))]
+const FLAG_GUARDED: &[&str] = &["fork", "terminate", "resume", "processes", "reference", "a"];
+/// It carries none: a label several sessions share is refused (exit 5).
+#[cfg_attr(not(test), allow(dead_code))]
+const UNGUARDED: &[&str] = &["inspect", "kill", "rename", "archive", "pause", "native-ui", "__dsh-ui-url", "send-cancel", "switch-account"];
+/// It finds its own session and is not resolved here: `hooks` through `ids/`
+/// and its request's identities, `session-action-status` through its receipts.
+#[cfg_attr(not(test), allow(dead_code))]
+const SELF_RESOLVED: &[&str] = &["hooks", "session-action-status"];
+
+/// The guard of `command` invoked with `args`: identities on its command line
+/// select now; a command whose request carries them waits for it.
+fn label_guard(command: &str, args: &[String]) -> state::LabelGuard {
+    let value = |flags: &[&str]| {
+        args.windows(2)
+            .find(|pair| flags.contains(&pair[0].as_str()))
+            .map(|pair| pair[1].clone())
+            .unwrap_or_default()
+    };
+    let run = value(&["--expected-run-id", "--run", "--run-id"]);
+    let conversation = value(&["--expected-conversation-id", "--conversation"]);
+    if !run.is_empty() || !conversation.is_empty() {
+        state::LabelGuard::Given { run, conversation }
+    } else if REQUEST_GUARDED.contains(&command) {
+        state::LabelGuard::Request
+    } else {
+        state::LabelGuard::None
+    }
+}
+
+/// The label a session command names first, resolved (`state::resolve_label`):
+/// the ambiguity report goes to standard output under `--json`, and its text is
+/// the error, with exit status 5.
+fn resolve_label(command: &str, args: &[String]) -> Result<()> {
+    // Only the first argument names the session: a later word may be an
+    // option's value, never a label.
+    let Some(name) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        return Ok(());
+    };
+    local_sessions()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if command=="effort"||command=="settings" {
+        return state::resolve_effort_label(name,label_guard(command,args)).map_err(|refusal| {
+            if let Some(value)=refusal.value.filter(|_|args.iter().any(|arg|arg=="--json")) {println!("{value}");}
+            Error::new(refusal.code,refusal.text)
+        });
+    }
+    state::resolve_label(name, label_guard(command, args)).map_err(|refusal| {
+        if let Some(value) = refusal.value.filter(|_| args.iter().any(|arg| arg == "--json")) {
+            println!("{value}");
+        }
+        Error::new(refusal.code, refusal.text)
+    })
+}
+
+/// The arguments with `--session-id ID` replaced by the selected session's
+/// current name. A name given before the flag must be that name; arguments
+/// after it are the command's own (a message, a new name, a path).
+fn select_session(command: &str, args: &[String]) -> Result<Vec<String>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if command=="effort"||command=="settings" {return select_picker_session(command,args);}
+    let Some((at, id)) = session_id_flag(command, args)? else {
+        return Ok(args.to_vec());
+    };
+    let names = state::session_id::names_of(&id).map_err(|e| Error::new(1, e))?;
+    let name = match names.as_slice() {
+        [] => return Err(Error::new(1, format!("No live or saved session has ID {id}"))),
+        [name] => name.clone(),
+        _ => {
+            return Err(Error::new(
+                state::session_id::AMBIGUOUS,
+                format!("Several sessions carry ID {id}: {}", names.join(", ")),
+            ))
+        }
+    };
+    // Resolution names the session; the command's own reads under its lock
+    // must still find this ID on the record they act on.
+    state::session_id::select(&name, &id);
+    let mut rest = args.to_vec();
+    rest.drain(at..at + 2);
+    match args[..at].iter().find(|arg| !arg.starts_with('-')) {
+        Some(given) if *given != name => Err(Error::new(
+            1,
+            format!("Session ID {id} is {name}, not {given}"),
+        )),
+        Some(_) => Ok(rest),
+        None => {
+            rest.insert(0, name);
+            Ok(rest)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn select_picker_session(command: &str, args: &[String]) -> Result<Vec<String>> {
+    let Some((at, id)) = session_id_flag(command, args)? else {
+        return Ok(args.to_vec());
+    };
+    let name =
+        state::resolve_effort_id(&id).map_err(|refusal| Error::new(refusal.code, refusal.text))?;
+    let mut rest = args.to_vec();
+    rest.drain(at..at + 2);
+    match args[..at].iter().find(|arg| !arg.starts_with('-')) {
+        Some(given) if *given != name => Err(Error::new(
+            1,
+            format!("Session ID {id} is {name}, not {given}"),
+        )),
+        Some(_) => Ok(rest),
+        None => {
+            rest.insert(0, name);
+            Ok(rest)
+        }
+    }
+}
+
+/// The terminal of the session `--session-id` selected under `session`, bound
+/// before the first effect: its record, read under the state lock, still
+/// carries the ID, and the name's immutable session ID runs that record's run.
+/// None without a selection; an error when the name now runs anything else
+/// (#1355 review). The caller acts on the immutable ID, never the name.
+fn bound_terminal(session: &str) -> Result<Option<(String, String)>> {
+    let Some(run) = state::session_id::selected_run(session).map_err(|e| Error::new(1, e))? else {
+        return Ok(None);
+    };
+    let changed = || {
+        let message = state::session_id::selected().map(|selection| selection.changed());
+        Error::new(1, message.unwrap_or_else(|| format!("{session} changed; refresh and retry")))
+    };
+    let own = state::terminal_of(session).map_err(|e| Error::new(1, e))?;
+    let info = terminal()
+        .probe(Target::Name(&own), &[PaneField::SessionId, PaneField::RunMarker])
+        .ok_or_else(changed)?;
+    let fields = info.fields();
+    if fields.len() != 2
+        || !fields[0]
+            .strip_prefix('$')
+            .is_some_and(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err(changed());
+    }
+    if run.is_empty() || fields[1] != run {
+        return Err(changed());
+    }
+    Ok(Some((fields[0].to_owned(), run)))
+}
+
+/// Commands that start a session, one list for the hosted forwarding refusal,
+/// the claimed-parent gate (`fork` takes no `--parent`) and the forwarded
+/// parent link; with `--parent` a launch names its parent.
+const LAUNCH_COMMANDS: &[&str] = &["claude", "codex", "kimi", "qwen", "hermes", "dsh", "opencode", "fork"];
+
+/// Why forwarding `command` to another computer is refused for a resident
+/// DeepSeek host's tool call (`HGS_AGENT=dsh`) without its hosted proof, or
+/// `None` (zerus-ppd26 Part B). Such a call is never the person, and the peer
+/// cannot see who calls: on every route it sends nothing and launches nothing
+/// without an explicit `--parent`, and on a route that names a machine (a
+/// session reference, forwarded as its verified hop or as `inspect`'s
+/// argument, or `--expect-machine`) it runs no command at all. A launch with
+/// `--parent` names its parent and goes on.
+fn hosted_forwarding_refusal(
+    command: &str,
+    args: &[String],
+    machine: Option<&str>,
+) -> Option<String> {
+    let (verb, rest, named) = if command == "--expect-machine" {
+        (
+            args.get(1).map(String::as_str).unwrap_or_default(),
+            args.get(2..).unwrap_or_default(),
+            true,
+        )
+    } else {
+        let referenced = args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg.starts_with("zerus://"));
+        (command, args, machine.is_some() || referenced)
+    };
+    let launch = LAUNCH_COMMANDS.contains(&verb);
+    let parent = launch && names_parent(rest);
+    let send = matches!(verb, "send" | "send-now");
+    if !(send || launch && !parent || named && !parent) {
+        return None;
+    }
+    let reason = state::session_graph::hosted_proof_refusal()?;
+    Some(if send {
+        hosted_send_refusal(&reason)
+    } else if launch {
+        state::parent_link::hosted_launch_refusal(&reason)
+    } else {
+        format!("This DeepSeek tool call (HGS_AGENT=dsh) cannot prove its session, so it does not act on another computer: {reason}")
+    })
+}
+
+/// The launch and fork options that take a value, which the parent scan
+/// skips. A behavioural test runs the launch and fork parsers for every
+/// option literal, so value consumption is independent of source-arm shape
+/// (zerus-ppd26.13, .14, .20).
+const LAUNCH_VALUE_OPTIONS: &[&str] = &[
+    "-n",
+    "--model",
+    "--effort",
+    "--account",
+    "--parent-link",
+    "--launch-id",
+    "--archive",
+    "--expected-run-id",
+    "--expected-conversation-id",
+    "--session-id",
+];
+
+/// Whether a launch's own options name its parent: `--parent` followed by a
+/// claim with its session, run and conversation IDs (zerus-ppd26.10). The
+/// scan follows the launch and fork option grammars, so the value of another
+/// option (`-n --parent`), a conversation ID after `-c`, or an agent flag
+/// after `--` never counts as a parent.
+fn names_parent(args: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--" => return false,
+            "--parent" => {
+                return args.get(i + 1).is_some_and(|claim| {
+                    serde_json::from_str::<serde_json::Value>(claim).is_ok_and(|claim| {
+                        ["session_id", "run_id", "conversation_id"]
+                            .iter()
+                            .all(|key| claim[key].as_str().is_some_and(|id| !id.is_empty()))
+                    })
+                })
+            }
+            option if LAUNCH_VALUE_OPTIONS.contains(&option) => i += 1,
+            "-c" | "--resume" | "--continue"
+                if args
+                    .get(i + 1)
+                    .is_some_and(|value| conversation_id(value).is_some()) =>
+            {
+                i += 1
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Public and private native send entries use the same caller admission.
+/// A proven hosted source may retain its call context in an already-attributed
+/// child; the private state entry skips attribution, never this proof.
+fn check_send_caller() -> Result<()> {
+    let proven_hosted = crate::state::session_graph::hosted_agent_call()
+        && ["HGS_SESSION", "HGS_RUN_ID"]
+            .iter()
+            .all(|name| env::var(name).is_ok_and(|value| !value.is_empty()));
+    let check = crate::state::dsh::host_check();
+    if check == crate::state::dsh::HostCheck::Unregistered {
+        return Err(Error::new(1, crate::state::dsh::UNREGISTERED_HOST));
+    }
+    if check == crate::state::dsh::HostCheck::Under
+        && state::session_graph::send_origin().is_none()
+        && !proven_hosted
+    {
+        return Err(Error::new(1, check.sentence().unwrap_or_default()));
+    }
+    if let Some(reason) = state::session_graph::hosted_proof_refusal() {
+        return Err(Error::new(1, hosted_send_refusal(&reason)));
+    }
+    Ok(())
+}
+
+/// The refusal of a send by a DeepSeek tool call without its hosted proof.
+fn hosted_send_refusal(reason: &str) -> String {
+    format!("This DeepSeek tool call (HGS_AGENT=dsh) cannot prove its session, so its message is not sent: {reason}")
+}
+
 fn remote(
     config: &Config,
     target: &str,
@@ -1061,8 +2169,256 @@ fn remote(
     global_dry: bool,
 ) -> Result<i32> {
     if let Some(profile) = crate::wsl::profile(config, target) { return crate::wsl::run(profile, command, args, global_dry); }
+    let result = remote_via(config, target, command, args, global_dry, None);
+    // WhiteWh fork: a member's report or question that could not reach the
+    // lead's computer waits here; the lead's worker collects it (outbox.rs).
+    let input = MEMBER_INPUT.with(|kept| kept.borrow_mut().take());
+    match (&result, input) {
+        (Err(error), Some(input)) if error.code == 3 && matches!(args[0].as_str(), "report" | "ask") => {
+            let value: Value = serde_json::from_slice(&input).map_err(|e| Error::new(1, e.to_string()))?;
+            let receipt = crate::state::teams::member_outbox::queue(target, &args[0], &value).map_err(|e| Error::new(1, format!("{}; {e:#}", error.message)))?;
+            println!("{receipt}");
+            Ok(0)
+        }
+        (Err(error), _) if error.code == 3 && member_team_call(command, args) && args[0] == "current" => Err(Error::new(
+            3,
+            format!("{}; your task and attempt are in your hand-out message", error.message),
+        )),
+        _ => result,
+    }
+}
+
+thread_local! {
+    /// WhiteWh fork: an agent's member call input, kept for its outbox.
+    static MEMBER_INPUT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Commands whose handler takes a caller without session markers for the
+/// person (zerus-ppd26.9): `task` (the actor of every task change), `team`
+/// (its person-only operations) and `question-routing` (the person's switch,
+/// zerus-sa9qn.47). Another computer's hgs, reached over SSH, sees no marker
+/// of the agent that calls it, so an agent's call stops on this computer. A
+/// newer peer may run a command this hgs lacks, so its name is listed too.
+/// Commands that act the same for an agent and the person (answer,
+/// interrupt, terminal input, `wait` with its ticket), or that refuse an
+/// unknown caller there (`parent`, `wait begin`), still forward.
+pub(crate) const PERSON_ONLY_FORWARDED: &[&str] = &["task", "team", "question-routing"];
+
+/// The command a forwarded call runs: past `--expect-machine ID [--client
+/// C]` and the private `__state` entry.
+fn routed_command<'a>(command: &'a str, args: &'a [String]) -> Option<&'a str> {
+    let (first, then) = if command == "--expect-machine" {
+        let at = if args.get(1).is_some_and(|arg| arg == "--client") {
+            3
+        } else {
+            1
+        };
+        (
+            args.get(at).map(String::as_str),
+            args.get(at + 1).map(String::as_str),
+        )
+    } else {
+        (Some(command), args.first().map(String::as_str))
+    };
+    if first == Some("__state") {
+        then
+    } else {
+        first
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A unit test's caller, so a route check is tested without changing this
+    /// process's environment, which other tests share (zerus-ppd26.12).
+    static TEST_AGENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether an agent runs this hgs (zerus-ppd26.9): it claims a session's
+/// markers, proven or not (`hgs task` refuses an unproven claim here too), it
+/// is a resident DeepSeek host's tool call (`HGS_AGENT=dsh`), or a live
+/// session proves it as its caller, a Claude background job included. Like
+/// every marker this guards against accidental agent use, not against an
+/// agent that clears its own environment.
+pub(crate) fn agent_caller() -> bool {
+    #[cfg(test)]
+    if let Some(agent) = TEST_AGENT.with(std::cell::Cell::get) {
+        return agent;
+    }
+    let set = |name: &str| env::var_os(name).is_some_and(|value| !value.is_empty());
+    (set("HGS_SESSION") && set("HGS_RUN_ID"))
+        || env::var_os("HGS_AGENT").is_some_and(|agent| agent == "dsh")
+        || state::session_graph::caller_record().is_some()
+}
+
+/// The refusal of a person-only command an agent would run on another
+/// computer, before anything is forwarded (zerus-ppd26.9).
+fn person_only_forwarding(command: &str, args: &[String]) -> Result<()> {
+    let Some(verb) =
+        routed_command(command, args).filter(|verb| PERSON_ONLY_FORWARDED.contains(verb))
+    else {
+        return Ok(());
+    };
+    if state::dsh::host_check() == state::dsh::HostCheck::Unregistered {
+        return Err(Error::new(1, state::dsh::UNREGISTERED_HOST));
+    }
+    // WhiteWh fork: a team member on another computer reports, asks and reads
+    // its attempt on the lead's computer, which authorizes these by the
+    // attempt id alone (never as the person); its input is checked below.
+    if member_team_call(command, args) {
+        return Ok(());
+    }
+    if !agent_caller() {
+        // A peer loses readable local ancestry as well as session markers.
+        // Apply the same refusal as a local person action before any SSH,
+        // including when a marked ancestor's child clears its own markers.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::tasks::person::check()?;
+        return Ok(());
+    }
+    Err(Error::new(
+        1,
+        format!(
+            "hgs {verb} on another computer would act as the person there, which cannot see which agent calls it. \
+             An agent runs hgs {verb} on its own computer; a person's shell outside the agent's process tree \
+             can unset inherited HGS_SESSION and HGS_RUN_ID"
+        ),
+    ))
+}
+
+/// Inspect only an agent's forwarded answer, before any SSH or capability
+/// probe. Other answer bytes pass on unchanged; people keep their original
+/// stdin. A private file retains bounded JSON for Windows' SSH relay too.
+/// WhiteWh fork: `hgs @LEAD team report|ask|current --json`, the three calls
+/// a member's hand-out names for a team whose lead runs on another computer.
+fn member_team_call(command: &str, args: &[String]) -> bool {
+    command == "team"
+        && matches!(args, [op, json] if json == "--json" && matches!(op.as_str(), "report" | "ask" | "current"))
+}
+
+/// WhiteWh fork: an agent's member call carries its attempt id and never
+/// speaks for the person (`"by"`), so the lead's computer authorizes it by
+/// that attempt only.
+fn member_team_input(bytes: &[u8]) -> std::result::Result<(), &'static str> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| "a team member's call reads one JSON object on stdin")?;
+    let object = value.as_object().ok_or("a team member's call reads one JSON object on stdin")?;
+    if object.contains_key("by") {
+        return Err("a team member's call on another computer never speaks for the person (\"by\")");
+    }
+    if !object.get("attempt").and_then(Value::as_str).is_some_and(|attempt| !attempt.trim().is_empty()) {
+        return Err("a team member's call on another computer names its attempt (\"attempt\" from the hand-out)");
+    }
+    Ok(())
+}
+
+fn forwarded_answer_input(command: &str, args: &[String]) -> Result<Option<fs::File>> {
+    use std::io::{Read, Seek, Write};
+    if member_team_call(command, args) && agent_caller() {
+        let mut bytes = Vec::new();
+        std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 256 * 1024 {
+            return Err(Error::new(1, "a team member's call exceeds 256 KiB"));
+        }
+        member_team_input(&bytes).map_err(|reason| Error::new(1, reason))?;
+        MEMBER_INPUT.with(|kept| *kept.borrow_mut() = Some(bytes.clone()));
+        let mut input = tempfile::tempfile()?;
+        input.write_all(&bytes)?;
+        input.rewind()?;
+        return Ok(Some(input));
+    }
+    if routed_command(command, args) != Some("answer") || !agent_caller() {
+        return Ok(None);
+    }
+    // Match the native answer contract's 128 KiB bound.
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 {
+        return Err(Error::new(1, "answer payload exceeds128 KiB"));
+    }
+    if let Some(reason) = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|answer| {
+            let id = answer["question_id"].as_str()?;
+            if id.starts_with("codex-sandbox:") {
+                Some("Codex's sandbox setup needs the person's answer in Zerus or Terminal; an agent cannot forward this answer")
+            } else if id.starts_with("kimi-cache:") {
+                // Launch-parent proof is local to the exact child; it cannot
+                // authorize even Compact and continue through a remote hop.
+                Some("Kimi's context choice cannot be forwarded by an agent. A verified launch parent may choose Compact and continue only for that exact child locally; ask the person in Zerus or Terminal for a remote answer.")
+            } else {
+                None
+            }
+        })
+    {
+        return Err(Error::new(1, reason));
+    }
+    let mut input = tempfile::tempfile()?;
+    input.write_all(&bytes)?;
+    input.rewind()?;
+    Ok(Some(input))
+}
+
+/// The port Codex's browser sign-in waits on, on the signing computer.
+const CALLBACK_PORT: u16 = 1455;
+/// SSH options for a remote sign-in: this computer's loopback port 1455
+/// forwarded to the peer's, on a connection of its own (never a shared
+/// master, which would keep the port after sign-in), continuing when the
+/// local port is busy.
+const CALLBACK_FORWARD: [&str; 6] = ["-o", "ExitOnForwardFailure=no", "-o", "ControlPath=none", "-L", "1455:localhost:1455"];
+
+/// Whether a peer call signs an account in (`account login`, guarded or not).
+fn account_sign_in(command: &str, args: &[String]) -> bool {
+    let rest = if command == "--expect-machine" {
+        if args.get(1).map(String::as_str) != Some("account") {
+            return false;
+        }
+        args.get(2..).unwrap_or_default()
+    } else if command == "account" {
+        args
+    } else {
+        return false;
+    };
+    rest.first().is_some_and(|operation| operation == "login")
+}
+
+/// The SSH line a peer command's dry run prints, for a person to read or
+/// paste: the alias is one word that reads back exactly (zerus-sa9qn.39). An
+/// alias may hold `;`, `$(…)`, backticks and quotes, and `platform::quote`
+/// leaves a leading `~` or `=` bare, which shells expand (tilde, zsh equals),
+/// so such an alias is quoted too. The remote command is already quoted.
+fn dry_run_line(flags: &[String], alias: &str, remote: &str) -> String {
+    let mut word = platform::quote(alias);
+    if word == alias && alias.starts_with(['~', '=']) {
+        word = format!("'{alias}'");
+    }
+    format!("ssh {} {word} {remote}", platform::join(flags))
+}
+
+/// `remote`, optionally as the one verified hop of a session reference: the
+/// peer runs the command guarded by `--expect-machine MACHINE`, with the same
+/// SSH options the command has without it (zerus-ucck P1c).
+fn remote_via(
+    config: &Config,
+    target: &str,
+    command: &str,
+    args: &[String],
+    global_dry: bool,
+    machine: Option<&str>,
+) -> Result<i32> {
+    // Every route to another computer passes here, before any ssh is built.
+    person_only_forwarding(command, args)?;
+    let answer_input = forwarded_answer_input(command, args)?;
     if target.starts_with('-') || target.chars().any(char::is_whitespace) {
         return Err(Error::new(1, "invalid SSH host alias"));
+    }
+    // Every route to another computer passes here, by @host or by a session
+    // reference's verified hop: the one place a DeepSeek tool call without its
+    // hosted proof is refused before anything is forwarded (zerus-ppd26).
+    if let Some(refusal) = hosted_forwarding_refusal(command, args, machine) {
+        return Err(Error::new(1, refusal));
     }
     let mut args = args.to_vec();
     if command == "inspect" && args.first().is_some_and(|arg| arg.starts_with("zerus://session?")) && args.len()==1 {
@@ -1130,14 +2486,16 @@ fn remote(
         "--expect-machine" => {
             let expected=require(&args,0,"Missing expected machine identity")?;
             let actual=require(&args,1,"Missing guarded command")?;
-            let terminal=!has(&args,"-d")&&!matches!(actual,"dirs"|"worktrees"|"repository"|"--help"|"dsh"|"opencode");
+            let terminal=!has(&args,"-d")&&!matches!(actual,"dirs"|"path-info"|"worktrees"|"repository"|"session-action-status"|"delivery"|"--help"|"dsh"|"opencode"|"listing-index")
+                && !(actual == "ls" && has(&args, "--paged"));
             flags=vec!["-o".into(),"BatchMode=yes".into(),"-o".into(),crate::windows_peer::connect_timeout(config, target, 3)];
             if terminal { flags.insert(0,"-t".into()); }
             let mut all=vec!["--expect-machine".into(),expected.into(),"--client".into(),config.host().into()];
             all.extend_from_slice(&args[1..]);all
         }
-        "archives" | "kill" | "terminate" | "pause" | "inspect" | "reference" | "processes" | "worktrees" | "git-status" | "git-diff" | "repository" | "dirs" | "project" | "archive" | "rename"
-        | "send" | "send-now" | "send-cancel" | "session-action" | "terminal" | "history" | "history-projection" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "search" | "schedules" | "graph" | "wait" | "team" | "guide" | "dsh" | "opencode" | "attachment" | "file-read" | "recovery" | "swarm" | "read" | "notifications" | "speech" | "analytics" | "voice" | "hooks" | "--help" => {
+        "session-action-status" if machine.is_none() => return Err(Error::new(2,"A remote lifecycle receipt read requires --expect-machine ID before session-action-status")),
+        "archives" | "session-action-status" | "kill" | "terminate" | "pause" | "inspect" | "reference" | "processes" | "worktrees" | "git-status" | "git-diff" | "repository" | "dirs" | "listing-index" | "project" | "archive" | "rename"
+        | "send" | "send-now" | "send-cancel" | "session-action" | "terminal" | "history" | "history-projection" | "interrupt" | "clear-context" | "compact-context" | "answer" | "effort" | "settings" | "search" | "schedules" | "graph" | "wait" | "team" | "rules" | "guide" | "dsh" | "opencode" | "attachment" | "file-read" | "recovery" | "swarm" | "read" | "notifications" | "keep-warm" | "question-routing" | "speech" | "analytics" | "voice" | "hooks" | "parent" | "delivery" | "path-info" | "test" | "--help" => {
             flags = vec![
                 "-o".into(),
                 "BatchMode=yes".into(),
@@ -1172,59 +2530,111 @@ fn remote(
             all
         }
     };
+    if account_sign_in(command, &args) {
+        // Codex finishes a browser sign-in on the signing computer's
+        // localhost:1455, which a browser on this computer cannot reach.
+        // Forward this computer's port there, as OpenAI documents for
+        // headless sign-in (T-tknwyr). A busy local port only warns, and
+        // a connection of its own releases the forward when sign-in ends.
+        flags.extend(CALLBACK_FORWARD.map(String::from));
+        if !global_dry && !has(&args, "--dry-run") {
+            eprintln!("hgs: Signing in on {target}. Open the sign-in link in a browser on this computer; this computer's localhost:{CALLBACK_PORT} is forwarded to {target} so the browser can finish.");
+        }
+    }
     flags.extend(crate::machines::ssh_options(config, target));
-    let remote = if crate::windows_peer::is_windows(config, target) {
-        // WhiteWh fork: a Windows computer runs the same build's commands; its
-        // cmd.exe has no POSIX capability probes.
-        let mut windows_args = remote_args.clone();
-        if command == "analytics" {
-            windows_args.push("--read-only".into());
-        }
-        // Listed commands use the lasting channel (src/peer_channel.rs); `ls --json`
-        // does so in peer_json_archives below.
-        let json_listing = command == "ls" && has(&args, "--json");
-        if let Some(reads_stdin) = crate::peer_channel::routed(command, &args).filter(|_| !json_listing && !global_dry && !has(&args, "--dry-run")) {
-            let input = if reads_stdin {
-                let mut bytes = Vec::new();
-                io::stdin().read_to_end(&mut bytes)?;
-                Some(bytes)
-            } else {
-                None
-            };
-            match crate::peer_channel::request(config, target, &windows_args, input.clone()) {
-                Some(Ok(answer)) => {
-                    if command == "ls" {
-                        println!("{target}:");
-                    }
-                    io::stdout().write_all(&answer.stdout)?;
-                    io::stdout().flush()?;
-                    io::stderr().write_all(&answer.stderr)?;
-                    return Ok(answer.code);
+    let mut remote_args: Vec<String> = match machine {
+        Some(machine) => ["--expect-machine".to_owned(), machine.to_owned()].into_iter().chain(remote_args).collect(),
+        None => remote_args,
+    };
+    let wrapped_path_info = command == "--expect-machine" && args.get(1).is_some_and(|actual| actual == "path-info");
+    let remote = if let Some(markers) = selector_markers(command, &args)? {
+        // An older peer would read the flag as a session name; it must
+        // advertise the selector, and what the command needs already, first.
+        gated(&markers, &remote_args)
+    } else if command == "path-info" || wrapped_path_info {
+        // An older peer would read an unknown command as an agent launch, so
+        // the actual command's marker gates it, wrapped by --expect-machine
+        // too (zerus-3skhm). A path's ~ reaches the peer's hgs as written:
+        // hgs expands ~/ itself and refuses ~user, which the peer's shell
+        // would expand (zerus-ie12o).
+        let words = remote_args
+            .iter()
+            .map(|word| {
+                if word.starts_with('~') {
+                    format!("'{}'", word.replace('\'', "'\\''"))
+                } else {
+                    platform::join(&[word])
                 }
-                Some(Err(error)) => return Err(Error::new(3, error)),
-                // No broker took it: the command's own ssh, with the stdin already read.
-                None => {
-                    if let Some(input) = input {
-                        return run_with_input(&mut ssh, flags, target, crate::windows_peer::command(&windows_args)?, input);
-                    }
-                }
-            }
-        }
-        crate::windows_peer::command(&windows_args)?
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let guarded = if wrapped_path_info || machine.is_some() {
+            "~/.local/bin/hgs --help 2>/dev/null | grep -qF 'guarded-create-v1' && "
+        } else {
+            ""
+        };
+        platform::remote_sh(&format!(
+            "if {guarded}~/.local/bin/hgs --help 2>/dev/null | grep -qF 'hgs [@host] path-info --path'; then exec ~/.local/bin/hgs {words}; else echo 'hgs: update the selected computer to check file paths' >&2; exit 1; fi"
+        ))
+    } else if command == "--expect-machine"
+        && args
+            .get(1)
+            .is_some_and(|verb| verb == "listing-index" || verb == "ls" && has(&args, "--paged"))
+    {
+        platform::remote_sh(&format!(
+            "if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'guarded-create-v1' && ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*{}[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer for indexed session listing' >&2; exit 1; fi",
+            state::LISTING_METADATA_MARKER,
+            platform::join(&remote_args)
+        ))
+    } else if command == "--expect-machine"
+        && args
+            .get(1)
+            .is_some_and(|actual| actual == "session-action-status")
+    {
+        // Probe the same executable, without reading the JSON stream. An old
+        // peer must never interpret this reader's name as a program to launch.
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'guarded-create-v1' && ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*lifecycle-receipt-status-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to read lifecycle receipts' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "--expect-machine" && args.get(1).is_some_and(|inner| inner == "archives") && has(&args, "--bounded") {
+        // zerus-wzzr9: a machine-guarded archive page falls back the same way.
+        bounded_archive_script(&remote_args, true)
     } else if command == "--expect-machine" {
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'guarded-create-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to continue verified creation' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "subagent" {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'Subagent retirement ABI: subagent-retire-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to retire stale subagent records' >&2; exit 1; fi",platform::join(&remote_args)))
     } else if command == "repository" {
-        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'repository-clone-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to clone repositories' >&2; exit 1; fi",platform::join(&remote_args)))
+        platform::remote_sh(&format!(
+            "if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'repository-clone-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to clone repositories' >&2; exit 1; fi",
+            platform::join(&remote_args)
+        ))
+    } else if command == "listing-index" || command == "ls" && has(&args, "--paged") {
+        platform::remote_sh(&format!(
+            "if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*{}[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer for indexed session listing' >&2; exit 1; fi",
+            state::LISTING_METADATA_MARKER,
+            platform::join(&remote_args)
+        ))
     } else if command == "wait" {
         // Old peers otherwise interpret an unknown command as an agent launch.
         // Probe the same installed executable without consuming JSON stdin.
         // These probes are POSIX scripts; a fish login shell runs them under sh.
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'hgs [@host] wait'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to track waits' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "rules" {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'iron-rules-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to use iron rules' >&2; exit 1; fi", platform::join(&remote_args)))
     } else if command == "team" {
         // WhiteWh fork: the same probe as wait, for peers without agent teams.
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'hgs [@host] team OPERATION'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to use agent teams' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "delivery" {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*delivery-receipt-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to read original send receipts' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "parent" {
+        // An older peer would read an unknown command as an agent launch.
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*session-parent-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to change parent sessions' >&2; exit 1; fi",platform::join(&remote_args)))
     } else if command == "notifications" {
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*session-notifications-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to change notification preferences' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "archives" && has(&args, "--bounded") {
+        bounded_archive_script(&remote_args, false)
+    } else if command == "question-routing" {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*session-question-routing-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to change where child questions go' >&2; exit 1; fi",platform::join(&remote_args)))
+    } else if command == "keep-warm" {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*session-keep-warm-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to keep the prompt cache warm' >&2; exit 1; fi",platform::join(&remote_args)))
     } else if command == "hooks" {
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'hooks-health-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to inspect hook health' >&2; exit 1; fi",platform::join(&remote_args)))
     } else if command == "analytics" {
@@ -1232,31 +2642,235 @@ fn remote(
     } else if command == "watch" {
         // An older peer would read an unknown command as an agent launch.
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF '{}'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to stream events (watch-v1)' >&2; exit 1; fi",zerus_watch_protocol::HELP_MARKER,platform::join(&remote_args)))
+    } else if command == "test" {
+        // #732: a test runner without this hgs would read it as an agent launch.
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'test-runner-v1'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to run tests (test-runner-v1)' >&2; exit 1; fi",platform::join(&remote_args)))
     } else if command == "guide" {
         platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qF 'hgs [@host] guide'; then exec ~/.local/bin/hgs {}; else echo 'hgs: the selected computer has no agent guide; check hgs @host -h' >&2; exit 1; fi",platform::join(&remote_args)))
-    } else { format!("~/.local/bin/hgs {}", platform::remote_join(&remote_args)) };
+    } else if LAUNCH_COMMANDS.contains(&command)
+        && command != "fork"
+        && args
+            .iter()
+            .take_while(|s| s.as_str() != "--")
+            .any(|s| s == "--parent")
+    {
+        platform::remote_sh(&format!("if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*claimed-parent-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else echo 'hgs: update the selected computer to claim a launch parent' >&2; exit 1; fi", platform::join(&remote_args)))
+    } else if let Some(link) = (LAUNCH_COMMANDS.contains(&command) && machine.is_none())
+        .then(state::parent_link::forwarded_argument)
+        .flatten()
+    {
+        // The peer records this agent as the new session's parent only if it
+        // advertises launch-parent-v1; an older peer launches without it.
+        let mut with = remote_args.clone();
+        let at = with.iter().position(|arg| arg == "--").unwrap_or(with.len());
+        with.splice(at..at, ["--parent-link".to_owned(), link]);
+        platform::remote_sh(&format!(
+            "if ~/.local/bin/hgs --help 2>/dev/null | grep -qEx '[[:space:]]*launch-parent-v1[[:space:]]*'; then exec ~/.local/bin/hgs {}; else exec ~/.local/bin/hgs {}; fi",
+            platform::join(&with),
+            platform::join(&remote_args)
+        ))
+    } else {
+        format!("~/.local/bin/hgs {}", platform::remote_join(&remote_args))
+    };
+    if !global_dry
+        && !has(&args, "--dry-run")
+        && command == "ls"
+        && has(&args, "--json")
+        && !has(&args, "--paged")
+    {
+        println!(
+            "{}",
+            peer_json_archives(config, target, !has(&args, "--no-archives"))
+        );
+        return Ok(0);
+    }
+    // WhiteWh fork: the stdin a Windows peer's channel was offered and did not take.
+    let mut channel_input: Option<Option<Vec<u8>>> = None;
+    let remote = if global_dry || has(&args, "--dry-run") { remote } else {
+        let mut markers: Vec<(&str, bool)> = match command {
+            "--expect-machine" if args.get(1).is_some_and(|v| v == "session-action-status") => vec![("guarded-create-v1", false), ("lifecycle-receipt-status-v1", true)],
+            "--expect-machine" if args.get(1).is_some_and(|v| v == "delivery") => vec![("guarded-create-v1", false), ("delivery-receipt-v1", true)],
+            "--expect-machine" if wrapped_path_info => vec![("guarded-create-v1", false), ("hgs [@host] path-info --path", false)],
+            "--expect-machine" => vec![("guarded-create-v1", false)],
+            "subagent" => vec![("Subagent retirement ABI: subagent-retire-v1", false)],
+            "repository" => vec![("repository-clone-v1", false)],
+            "delivery" => vec![("delivery-receipt-v1", true)],
+            "wait" => vec![("hgs [@host] wait", false)],
+            "rules" => vec![("iron-rules-v1", false)],
+            "team" => vec![("hgs [@host] team OPERATION", false)],
+            "notifications" => vec![("session-notifications-v1", true)],
+            "keep-warm" => vec![("session-keep-warm-v1", true)],
+            "question-routing" => vec![("session-question-routing-v1", true)],
+            "hooks" => vec![("hooks-health-v1", false)],
+            "analytics" => vec![("hgs [@host] analytics --json", false)],
+            "path-info" => vec![("hgs [@host] path-info --path", false)],
+            "watch" => vec![(zerus_watch_protocol::HELP_MARKER, false)],
+            "guide" => vec![("hgs [@host] guide", false)],
+            "claude" | "codex" | "kimi" | "qwen" | "dsh" | "opencode" if args.iter().take_while(|s| s.as_str() != "--").any(|s| s == "--parent") => vec![("claimed-parent-v1", true)],
+            _ => vec![],
+        };
+        if let Some(selected) = selector_markers(command, &args)? {
+            markers = selected.iter().map(|marker| match marker {
+                Marker::Line(value) => (*value, true), Marker::Text(value) => (*value, false),
+            }).collect();
+        }
+        if command == "listing-index"
+            || command == "ls" && has(&args, "--paged")
+            || command == "--expect-machine"
+                && args.get(1).is_some_and(|verb| {
+                    verb == "listing-index" || verb == "ls" && has(&args, "--paged")
+                })
+        {
+            markers.push((state::LISTING_METADATA_MARKER, true));
+        }
+        if machine.is_some() { markers.push(("guarded-create-v1", false)); }
+        let mut words = remote_args.clone();
+        // Ask a known Windows peer through its broker before a shell probe.
+        // Only a verified missing marker removes --bounded; lost answers
+        // fail preparation rather than silently changing the requested read.
+        let archives = command == "archives" || (command == "--expect-machine" && args.get(1).is_some_and(|inner| inner == "archives"));
+        if archives && has(&args, "--bounded") {
+            let markers = [(state::archive_catalog::BOUNDED_MARKER, true)];
+            let channel = if crate::windows_peer::is_windows(config, target) {
+                crate::peer_channel::supports(config, target, &markers, true)
+            } else { None };
+            let supported = match channel {
+                Some(Ok(supported)) => Some(supported),
+                Some(Err(error)) => return Err(Error::new(3, not_forwarded(target, &error))),
+                None if crate::remote_shell::windows(config, target).unwrap_or(false) => {
+                    Some(crate::remote_shell::supports(config, target, &markers)
+                        .map_err(|error| Error::new(3, not_forwarded(target, &error.message)))?)
+                }
+                None => None,
+            };
+            if supported == Some(false) {
+                words.retain(|arg| arg != "--bounded");
+                remote_args.retain(|arg| arg != "--bounded");
+            }
+        }
+        if command == "analytics" { words.push("--read-only".into()); }
+        const MISSING: &str = "Update the selected computer before using this command; the required capability is missing";
+        // WhiteWh fork: a Windows peer's lasting channel answers what the
+        // command needs of the peer, and takes a listed command itself, before
+        // any ssh connection of this command's own. Shell discovery and the
+        // help probe each cost one such connection, seconds to a busy Windows
+        // computer, and share six seconds: together they ended a Send to a busy
+        // peer before anything was sent.
+        let mut verified = false;
+        if crate::windows_peer::is_windows(config, target) {
+            let listed = crate::peer_channel::routed(command, &args);
+            let watch_stream = command == "watch" && has(&args, "--json");
+            match crate::peer_channel::supports(config, target, &markers, listed.is_some() || watch_stream) {
+                Some(Ok(true)) => verified = true,
+                Some(Ok(false)) => return Err(Error::new(1, MISSING)),
+                // No broker, or its answer was lost: this command's own ssh asks.
+                Some(Err(_)) | None => {}
+            }
+            if verified && watch_stream {
+                match crate::peer_channel::watch(config, target, &remote_args) {
+                    Some(Ok(code)) => return Ok(code),
+                    Some(Err(error)) => return Err(Error::new(3, error)),
+                    // Neither endpoint took the stream. Keep the byte-client
+                    // SSH path for an existing protocol 1 broker or peer.
+                    None => {}
+                }
+            }
+            if let (true, Some(reads_stdin)) = (verified, listed) {
+                let input = channel_stdin(reads_stdin)?;
+                match crate::peer_channel::request(config, target, &channel_args(command, &remote_args), input.clone()) {
+                    Some(Ok(answer)) => return channel_answer(answer),
+                    Some(Err(error)) => return Err(Error::new(3, error)),
+                    // No broker took it: its own ssh below, with the stdin already read.
+                    None => channel_input = Some(input),
+                }
+            }
+        }
+        // WhiteWh fork: a detached agent launch whose words cmd.exe cannot
+        // carry (a team member's multi-line startup text) goes through the
+        // lasting channel, which hands the peer's hgs its argv unchanged.
+        if crate::windows_peer::is_windows(config, target)
+            && channel_launch(command, &args)
+            && remote_args.iter().any(|word| crate::windows_peer::quote(word).is_err())
+        {
+            return match crate::peer_channel::request(config, target, &channel_args(command, &remote_args), None) {
+                Some(Ok(answer)) => channel_answer(answer),
+                Some(Err(error)) => Err(Error::new(3, error)),
+                None => Err(Error::new(3, not_forwarded(
+                    target,
+                    "this launch's text holds a line break, % or \" that only the lasting channel carries, and the channel did not start",
+                ))),
+            };
+        }
+        // Planning only asks; a failure here ends the command before its
+        // operation reaches the peer, and says so for a caller that must
+        // tell "not sent" from "maybe sent" (the desktop's Send and answers).
+        crate::remote_shell::adapt(config, target, &words, &remote, if verified { &[] } else { &markers }, MISSING)
+            .map_err(|e| if e.code == 3 { Error::new(3, not_forwarded(target, &e.message)) } else { e })?
+    };
     if global_dry || has(&args, "--dry-run") {
         if let Some(title) = tab {
             if config.tab {
                 println!("tab {title} color={}", platform::tab_color(config, target));
             }
         }
-        println!("ssh {} {target} {remote}", platform::join(&flags));
+        #[cfg(test)]
+        REMOTE_DRY_PLAN.with(|plan| *plan.borrow_mut() = Some((flags.clone(), remote.clone())));
+        println!("{}", dry_run_line(&flags, target, &remote));
         return Ok(0);
     }
-    if command == "ls" && has(&args, "--json") {
-        println!("{}", peer_json_archives(config, target, !has(&args,"--no-archives")));
+    if command == "ls" && has(&args, "--json") && !has(&args, "--paged") {
+        println!(
+            "{}",
+            peer_json_archives(config, target, !has(&args, "--no-archives"))
+        );
         return Ok(0);
     }
-    if command == "ls" {
+    if command == "ls" && !has(&args, "--json") {
         println!("{target}:");
     }
     let _tab = tab
         .as_ref()
         .map(|title| TabGuard::begin(config, title, &platform::tab_color(config, target)));
+    if remote.starts_with(crate::ssh_bytes::PREFIX) {
+        let mut framed = crate::ssh_bytes::command(&remote)?;
+        for (key, value) in ssh.get_envs() {
+            match value { Some(value) => { framed.env(key, value); }, None => { framed.env_remove(key); } }
+        }
+        ssh = framed;
+    }
+    // WhiteWh fork: a Windows peer answers listed commands through its lasting
+    // channel (src/peer_channel.rs); `ls --json` does so in peer_json_archives.
+    if crate::windows_peer::is_windows(config, target) {
+        if let Some(reads_stdin) = crate::peer_channel::routed(command, &args) {
+            // The channel was asked above when it answered the capability
+            // question; otherwise it is asked now, after this command's own probes.
+            let (input, answered) = match channel_input.take() {
+                Some(input) => (input, None),
+                None => {
+                    let input = channel_stdin(reads_stdin)?;
+                    let answered = crate::peer_channel::request(config, target, &channel_args(command, &remote_args), input.clone());
+                    (input, answered)
+                }
+            };
+            match answered {
+                Some(Ok(answer)) => return channel_answer(answer),
+                Some(Err(error)) => return Err(Error::new(3, error)),
+                // No broker took it: the command's own ssh, with the stdin already read.
+                None => {
+                    if let Some(input) = input {
+                        return run_with_input(&mut ssh, flags, target, remote, input);
+                    }
+                }
+            }
+        }
+    }
     flags.push(target.into());
     flags.push(remote);
-    let rc = platform::wait_interactive(ssh.args(flags))?;
+    ssh.args(flags);
+    let rc = match answer_input {
+        Some(input) => platform::wait_interactive_with_input(&mut ssh, input)?,
+        None => platform::wait_interactive(&mut ssh)?,
+    };
     if rc == 255 {
         if link
             .as_ref()
@@ -1271,6 +2885,61 @@ fn remote(
         return Err(Error::new(3, format!("{target} unreachable")));
     }
     Ok(rc)
+}
+
+/// The end of the message of a peer command that failed while it was
+/// prepared: nothing of its operation reached the peer. The desktop reads it
+/// (`client/core/src/actions.rs`, `NOT_FORWARDED`) to tell a Send or an answer
+/// that was not sent from one that may have been, so the text is a contract.
+pub(crate) const NOT_FORWARDED: &str = "no remote operation was sent";
+
+/// `message` of a failed preparation for `target`, ending in [`NOT_FORWARDED`].
+fn not_forwarded(target: &str, message: &str) -> String {
+    let message = message.trim_end().trim_end_matches('.');
+    if message.ends_with(NOT_FORWARDED) {
+        format!("{target} unreachable: {message}")
+    } else {
+        format!("{target} unreachable: {message}; {NOT_FORWARDED}")
+    }
+}
+
+/// WhiteWh fork: an agent launch that never attaches a terminal here: a
+/// terminal agent's with `-d`, DeepSeek's and OpenCode's always.
+fn channel_launch(command: &str, args: &[String]) -> bool {
+    let own: Vec<&String> = args.iter().take_while(|arg| arg.as_str() != "--").collect();
+    match command {
+        "dsh" | "opencode" => true,
+        "claude" | "codex" | "kimi" | "qwen" | "hermes" => own.iter().any(|arg| arg.as_str() == "-d"),
+        _ => false,
+    }
+}
+
+/// WhiteWh fork: the argv a Windows peer's channel runs for `command`.
+fn channel_args(command: &str, remote_args: &[String]) -> Vec<String> {
+    let mut args = remote_args.to_vec();
+    if command == "analytics" {
+        args.push("--read-only".into());
+    }
+    args
+}
+
+/// WhiteWh fork: this command's stdin, read whole for the channel when the
+/// command reads it there.
+fn channel_stdin(reads_stdin: bool) -> Result<Option<Vec<u8>>> {
+    if !reads_stdin {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    io::stdin().read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// WhiteWh fork: the peer's answer as this command's own output and exit code.
+fn channel_answer(answer: crate::peer_channel::Answer) -> Result<i32> {
+    io::stdout().write_all(&answer.stdout)?;
+    io::stdout().flush()?;
+    io::stderr().write_all(&answer.stderr)?;
+    Ok(answer.code)
 }
 
 /// WhiteWh fork: a Windows peer's command whose stdin was read for the channel,
@@ -1320,7 +2989,38 @@ fn private_stores(raw: &mut Value) {
 }
 /// `ls --json --local --no-archives`, which `hgs watch` streams.
 pub(crate) fn local_listing(config: &Config) -> Result<Value> { local_json_archives(config, false) }
+/// Task #18 of team c536f0e5 (P2.6b): one peer's object of `ls --json
+/// --no-archives`, listed as `ls` lists it; the team worker's fallback for a
+/// peer whose catalog stream does not follow it.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn worker_peer_listing(config: &Config, peer: &str) -> Value {
+    peer_json_archives(config, peer, false)
+}
+/// Task #7 of team c536f0e5 (P1.6): what `ls --json --no-archives` prints,
+/// read without a process: this computer first, then each peer when `peers`
+/// (without them, `--local`'s object in the same list). The team worker
+/// reads it every tick.
+pub(crate) fn worker_listing(config: &Config, peers: bool) -> Result<Value> {
+    let local = if cfg!(target_os = "linux") {
+        let query = state::ListingQuery { paged: false, cursor: None, page_size: 64 };
+        local_json_archives_with(config, false, Some(&query))?
+    } else {
+        local_json_archives(config, false)?
+    };
+    let mut fleet = vec![local];
+    if peers {
+        fleet.extend(config.peers.iter().map(|peer| peer_json_archives(config, peer, false)));
+    }
+    Ok(json!(fleet))
+}
 fn local_json_archives(config: &Config, archives: bool) -> Result<Value> {
+    local_json_archives_with(config, archives, None)
+}
+fn local_json_archives_with(
+    config: &Config,
+    archives: bool,
+    ordinary: Option<&state::ListingQuery>,
+) -> Result<Value> {
     if !platform::local_sessions() {
         // A control console: no tmux, session state or local projects. Absent
         // `local_sessions` means true, so Unix listings stay as they were.
@@ -1337,44 +3037,90 @@ fn local_json_archives(config: &Config, archives: bool) -> Result<Value> {
         crate::external_workstreams::append_listing(config,&mut raw)?;
         return Ok(raw);
     }
+    // Task 193: where a listing's time goes; over SLOW_MS it is one slow-calls
+    // line (`hgs inspect` already has the same phases).
+    let mut phases = crate::state::slow_calls::Phases::start();
     let mut projects = serde_json::Map::new();
     for project in config.projects()? {
         projects.insert(project.name, json!(project.dir));
     }
+    phases.mark("projects");
     // Before the terminal lists: a launch's session that this listing does not
     // show existed before it began and has ended.
     let launches = state::launches::Evidence::read();
+    phases.mark("launches");
     // A listing that fails is an error: no sessions would show live ones as stopped.
     let listing = terminal().listing().map_err(|e| Error::new(1, e))?;
+    phases.mark("terminal");
     let sessions = state::listed_rows(&listing);
     let mut raw = json!({"host":config.host(),"ok":true,"hgs_version":env!("CARGO_PKG_VERSION"),"projects":projects,"sessions":sessions,"peers":config.peers,"metrics":crate::metrics::snapshot(&config.state)});
+    phases.mark("raw");
     // Phone alerts wait while the owner is active here; see src/presence.rs.
     if let Some(presence) = crate::presence::listing(&config.state, crate::presence::now()) {
         raw["desktop_presence"] = presence;
     }
+    phases.mark("presence");
     raw["preferences"] = crate::swarm::preferences(config);
     private_stores(&mut raw);
+    phases.mark("preferences");
     // Windows: the session host as found, never started (spec D2). Unix
     // listings stay as they were.
     #[cfg(windows)]
     {
         raw["local_host"] = crate::host::admin::local_host(&config.state);
     }
+    phases.mark("local_host");
     // A session renamed before merge_listing reads the panes keeps its ID.
     let ids = state::listed_ids(&listing);
-    let mut merged = state::merge_listing_archives(raw, &ids, archives).map_err(|e| Error::new(1, e))?;
+    let mut merged = match ordinary {
+        Some(query) => state::merge_ordinary_listing(raw, &ids, archives, query),
+        None => state::merge_listing_archives(raw, &ids, archives),
+    }
+    .map_err(|e| Error::new(1, e))?;
+    phases.mark("merge");
     merged["archive_paging"] = json!(true);
     merged["archive_revision"] = json!(state::archive_catalog::revision().map_err(|e|Error::new(1,e))?);
     let ended = launches.ended(merged["sessions"].as_array().map_or(&[], Vec::as_slice));
     if !ended.is_empty() {
         merged["ended_launches"] = json!(ended);
     }
+    phases.mark("ended");
     crate::external_workstreams::append_listing(config,&mut merged)?;
+    phases.mark("external");
+    phases.finish("ls", config.host());
     Ok(merged)
 }
 fn local_list(config: &Config) -> Result<()> {
     if !platform::local_sessions() {
         println!("  (control console: sessions run on remote machines)");
+        return Ok(());
+    }
+    if cfg!(target_os = "linux") {
+        let value = local_json_archives_with(config, false, Some(&state::ListingQuery::default()))?;
+        let native = terminal()
+            .attached_counts()
+            .map_err(|error| Error::new(1, error))?;
+        let mut live = std::collections::BTreeSet::new();
+        if let Some(native) = native {
+            for (name, count) in native {
+                println!("  {name:<40} {count} client(s)");
+                live.insert(name);
+            }
+        } else {
+            println!("  (no sessions)");
+        }
+        for row in value["sessions"]
+            .as_array()
+            .ok_or_else(|| Error::new(1, "Invalid session listing"))?
+        {
+            if !live.contains(state::display_name(row)) && row["state"] != "archived" {
+                println!(
+                    "  {:40} {} (hgs resume)",
+                    state::display_name(row),
+                    row["state"].as_str().unwrap_or("stopped")
+                );
+            }
+        }
         return Ok(());
     }
     match terminal().attached_counts().map_err(|e| Error::new(1, e))? {
@@ -1400,8 +3146,50 @@ fn list(config: &Config, args: &[String], global_dry: bool) -> Result<i32> {
             println!("{}", terminal().describe(&DryRun::ListJson));
             return Ok(0);
         }
-        let archives = !has(args,"--no-archives");
-        let local = local_json_archives(config, archives)?;
+        let archives = !has(args, "--no-archives");
+        let paged = has(args, "--paged");
+        let cursor = args
+            .iter()
+            .position(|arg| arg == "--cursor")
+            .map(|n| require(args, n + 1, "--cursor needs a token").map(str::to_owned))
+            .transpose()?;
+        let page_size = args
+            .iter()
+            .position(|arg| arg == "--page-size")
+            .map(|n| {
+                require(args, n + 1, "--page-size needs 1..128").and_then(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| Error::new(1, "Invalid --page-size"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(64);
+        if !(1..=128).contains(&page_size)
+            || (cursor.is_some() && !paged)
+            || (paged && !has(args, "--local"))
+        {
+            return Err(Error::new(
+                1,
+                "Paged ls requires --json --local, --page-size 1..128 and an optional --cursor",
+            ));
+        }
+        let query = state::ListingQuery {
+            paged,
+            cursor,
+            page_size,
+        };
+        let local = if cfg!(target_os = "linux") {
+            local_json_archives_with(config, archives, Some(&query))?
+        } else {
+            if paged {
+                return Err(Error::new(
+                    1,
+                    "Indexed session listing is not qualified on this platform",
+                ));
+            }
+            local_json_archives(config, archives)?
+        };
         if has(args, "--local") {
             println!("{local}");
         } else {
@@ -1430,6 +3218,10 @@ fn list(config: &Config, args: &[String], global_dry: bool) -> Result<i32> {
             }
             continue;
         }
+        let Ok(remote) = crate::remote_shell::hgs(config, peer, &["ls", "--local"]) else {
+            println!("  offline");
+            continue;
+        };
         let mut flags = crate::machines::ssh_options(config, peer);
         flags.extend(
             [
@@ -1438,11 +3230,11 @@ fn list(config: &Config, args: &[String], global_dry: bool) -> Result<i32> {
                 "-o",
                 &crate::windows_peer::connect_timeout(config, peer, 3),
                 peer,
+                &remote,
             ]
             .into_iter()
             .map(str::to_owned),
         );
-        flags.push(crate::windows_peer::hgs(config, peer, &["ls".into(), "--local".into()])?);
         match platform::ssh_capture(&flags) {
             Some(out) => println!("{}", out.trim_end_matches('\n')),
             None => println!("  offline"),
@@ -1455,7 +3247,7 @@ fn attach_command(config: &Config, args: &[String], client: &str, mut dry: bool)
     const HELP: &str = "usage: hgs a <session> [--existing [--run-id ID]]";
     let session = require(args, 0, HELP)?;
     if state::dsh::exists(session) {
-        return crate::native_ui::open(config, "", session, dry || has(args, "--dry-run"));
+        return crate::native_ui::open(config, "", session, None, dry || has(args, "--dry-run"));
     }
     let mut existing = false;
     let mut run_id = None;
@@ -1475,6 +3267,8 @@ fn attach_command(config: &Config, args: &[String], client: &str, mut dry: bool)
     if run_id.is_some() && !existing {
         return Err(Error::new(1, "--run-id requires --existing"));
     }
+    // OpenCode has no terminal record: its adapter checks its own binding,
+    // which carries the selected ID, and any supplied run.
     if state::opencode::exists(session) {
         return state::opencode::attach(session, run_id, dry).map_err(|error| Error::new(1, error));
     }
@@ -1484,17 +3278,30 @@ fn attach_command(config: &Config, args: &[String], client: &str, mut dry: bool)
     if dry {
         println!(
             "{}",
-            terminal().describe(&DryRun::AttachExisting { session, run_id })
+            terminal().describe(&DryRun::AttachExisting {
+                session: &state::terminal_of(session).map_err(|e| Error::new(1, e))?,
+                run_id,
+            })
         );
         return Ok(0);
     }
-    nested_guard(false)?;
+    nested_guard(false, None)?;
+    // A selected session binds to its verified run before any client or attach
+    // effect, and a supplied --run-id must be that same run (#1355 review).
+    if let Some((id, run)) = bound_terminal(session)? {
+        if run_id.is_some_and(|expected| expected != run) {
+            return Err(Error::new(1, crate::state::backend::RUN_CHANGED));
+        }
+        return attach_target(config, session, client, Target::Session(&id), Some(&run));
+    }
     // Resolve exact name to an immutable tmux session ID before checking the run.
     // If it disappears later, attach fails instead of creating or selecting a new one.
     const ENDED: &str = "session is no longer running; resume it explicitly";
+    // The session's own terminal (P3b), never another under its label.
+    let own = state::terminal_of(session).map_err(|e| Error::new(1, e))?;
     let target = terminal()
         .probe(
-            Target::Name(session),
+            Target::Name(&own),
             &[PaneField::SessionId, PaneField::RunMarker],
         )
         .ok_or_else(|| Error::new(1, ENDED))?;
@@ -1520,20 +3327,29 @@ fn attach(config: &Config, session: &str, client: &str, dry: bool) -> Result<i32
     if dry {
         println!(
             "{}",
-            terminal().describe(&DryRun::Attach { session, client })
+            terminal().describe(&DryRun::Attach {
+                session: &state::terminal_of(session).map_err(|e| Error::new(1, e))?,
+                client,
+            })
         );
         return Ok(0);
     }
-    nested_guard(false)?;
+    nested_guard(false, None)?;
     terminal().attachable()?;
-    if !session_exists(session) && config.state.is_dir() {
+    // The session's own terminal (P3b); a resume may name a new one, so it
+    // is read again after it.
+    let own = |session: &str| state::terminal_of(session).map_err(|e| Error::new(1, e));
+    if !session_exists(&own(session)?) && config.state.is_dir() {
         env::set_var("HGS_CLIENT", client);
         let rc = state_command("resume", &[session.into()])?;
         if rc != 0 {
             return Ok(rc);
         }
     }
-    attach_target(config, session, client, Target::Name(session), None)
+    match bound_terminal(session)? {
+        Some((id, run)) => attach_target(config, session, client, Target::Session(&id), Some(&run)),
+        None => attach_target(config, session, client, Target::Name(&own(session)?), None),
+    }
 }
 
 fn attach_target(
@@ -1568,8 +3384,9 @@ fn attach_requested(
 ) -> Result<i32> {
     // Capture the tmux identity before rechecking the conversation. If the name
     // is reused afterwards, attach must fail instead of selecting its new owner.
+    let own = state::terminal_of(session).map_err(|e| Error::new(1, e))?;
     let target = terminal()
-        .probe(Target::Name(session), &[PaneField::SessionId])
+        .probe(Target::Name(&own), &[PaneField::SessionId])
         .filter(|info| {
             info.value().strip_prefix('$').is_some_and(|value| {
                 !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
@@ -1615,11 +3432,22 @@ fn kill(config: &Config, args: &[String], mut dry: bool) -> Result<i32> {
         return state_command("forget", &args);
     }
     if dry {
-        println!("{}", terminal().describe(&DryRun::Kill { session }));
+        let own = state::terminal_of(session).map_err(|e| Error::new(1, e))?;
+        println!("{}", terminal().describe(&DryRun::Kill { session: &own }));
         return Ok(0);
     }
-    if session_exists(session) {
-        let rc = terminal().kill(session)?;
+    // The session's own terminal (P3b), never another under its label.
+    let own = state::terminal_of(session).map_err(|e| Error::new(1, e))?;
+    if session_exists(&own) {
+        let rc = match bound_terminal(session)? {
+            Some((id, _)) => {
+                terminal()
+                    .kill_session(Target::Session(&id))
+                    .map_err(|error| Error::new(1, error))?;
+                0
+            }
+            None => terminal().kill(&own)?,
+        };
         if rc != 0 {
             return Ok(rc);
         }
@@ -1665,38 +3493,60 @@ fn rename(config: &Config, args: &[String], mut dry: bool) -> Result<i32> {
     }
     Ok(result)
 }
-fn fork_session(config: &Config, args: &[String], client: &str, mut dry: bool) -> Result<i32> {
-    let name = require(
-        args,
-        0,
-        "usage: hgs fork <session> [-n name] [-d] [--archive ID]",
-    )?;
-    let (mut tag, mut archive, mut expected_run, mut expected_conversation) =
-        (None, None, None, None);
-    let mut detached = false;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--dry-run" => dry = true,
-            "-d" => detached = true,
-            "-n" | "--archive" | "--expected-run-id" | "--expected-conversation-id" => {
-                let value = require(args, index + 1, "missing fork option value")?;
-                let slot = match args[index].as_str() {
-                    "-n" => &mut tag,
-                    "--archive" => &mut archive,
-                    "--expected-run-id" => &mut expected_run,
-                    _ => &mut expected_conversation,
-                };
-                if slot.is_some() {
-                    return Err(Error::new(1, "duplicate fork option"));
+struct ForkOptions<'a> {
+    name: &'a str,
+    tag: Option<&'a str>,
+    archive: Option<&'a str>,
+    expected_run: Option<&'a str>,
+    expected_conversation: Option<&'a str>,
+    dry: bool,
+    detached: bool,
+}
+impl<'a> ForkOptions<'a> {
+    fn parse(args: &'a [String], mut dry: bool) -> Result<Self> {
+        let name = require(
+            args,
+            0,
+            "usage: hgs fork <session> [-n name] [-d] [--archive ID]",
+        )?;
+        let (mut tag, mut archive, mut expected_run, mut expected_conversation) =
+            (None, None, None, None);
+        let mut detached = false;
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--dry-run" => dry = true,
+                "-d" => detached = true,
+                "--parent-link" => {
+                    let link = require(args, index + 1, "--parent-link needs a link")?;
+                    state::parent_link::accept_forwarded(link).map_err(|e| Error::new(1, e))?;
+                    index += 1;
                 }
-                *slot = Some(value);
-                index += 1;
+                "-n" | "--archive" | "--expected-run-id" | "--expected-conversation-id" => {
+                    let value = require(args, index + 1, "missing fork option value")?;
+                    let slot = match args[index].as_str() {
+                        "-n" => &mut tag,
+                        "--archive" => &mut archive,
+                        "--expected-run-id" => &mut expected_run,
+                        _ => &mut expected_conversation,
+                    };
+                    if slot.is_some() {
+                        return Err(Error::new(1, "duplicate fork option"));
+                    }
+                    *slot = Some(value);
+                    index += 1;
+                }
+                option => return Err(Error::new(1, format!("unknown fork option: {option}"))),
             }
-            option => return Err(Error::new(1, format!("unknown fork option: {option}"))),
+            index += 1;
         }
-        index += 1;
+        Ok(Self { name, tag, archive, expected_run, expected_conversation, dry, detached })
     }
+}
+
+fn fork_session(config: &Config, args: &[String], client: &str, dry: bool) -> Result<i32> {
+    let ForkOptions { name, tag, archive, expected_run, expected_conversation, dry, detached } =
+        ForkOptions::parse(args, dry)?;
     if !detached && !dry && terminal().inside() {
         return Err(Error::new(
             2,
@@ -1709,7 +3559,7 @@ fn fork_session(config: &Config, args: &[String], client: &str, mut dry: bool) -
     if detached || dry {
         Ok(0)
     } else if state::dsh::exists(&target) {
-        crate::native_ui::open(config, "", &target, false)
+        crate::native_ui::open(config, "", &target, None, false)
     } else {
         attach(config, &target, client, false)
     }
@@ -1847,6 +3697,8 @@ fn project(config: &Config, args: &[String], dry: bool) -> Result<i32> {
     let subcommand = args.first().map(String::as_str).unwrap_or("ls");
     let args = if args.is_empty() { args } else { &args[1..] };
     match subcommand {
+        // Task 126: project memory, by the project's stable identity.
+        "config" => return crate::state::project_memory::dispatch(args).map_err(|e| Error::new(1, e)),
         "ls" => {
             let projects = config.projects()?;
             if has(args, "--json") {
@@ -1912,7 +3764,7 @@ fn project(config: &Config, args: &[String], dry: bool) -> Result<i32> {
         _ => {
             return Err(Error::new(
                 1,
-                "usage: hgs project ls [--json] | add <name> <dir> | set <name> <dir> | rm <name>",
+                "usage: hgs project ls [--json] | add <name> <dir> | set <name> <dir> | rm <name> | config get|set|move --json",
             ))
         }
     }
@@ -1961,6 +3813,7 @@ struct LaunchOptions {
     account: Option<String>,
     permissions: Option<String>,
     local_model: Option<String>,
+    model_server: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     launch_id: Option<String>,
@@ -1999,6 +3852,7 @@ impl LaunchOptions {
                     i += 1;
                 }
                 "--model" => { options.model=Some(require(args,i+1,"--model needs provider/model")?.into()); i+=1; }
+                "--model-server" => { options.model_server=Some(require(args,i+1,"--model-server needs a server name")?.into()); i+=1; }
                 "--effort" => { options.effort=Some(require(args,i+1,"--effort needs a model variant")?.into()); i+=1; }
                 "--account" => {
                     options.account =
@@ -2007,12 +3861,21 @@ impl LaunchOptions {
                 }
                 "--permissions" => {
                     options.permissions =
-                        Some(require(args, i + 1, "--permissions needs auto or bypass")?.into());
+                        Some(require(args, i + 1, "--permissions needs provider, bypass or native:<json>")?.into());
                     i += 1;
                 }
                 "--local-model" => {
                     options.local_model =
                         Some(require(args, i + 1, "--local-model needs a model name")?.into());
+                    i += 1;
+                }
+                "--parent-link" => {
+                    let link = require(args, i + 1, "--parent-link needs a link")?;
+                    state::parent_link::accept_forwarded(link).map_err(|e| Error::new(1, e))?;
+                    i += 1;
+                }
+                "--parent" => {
+                    state::parent_link::accept_claimed(require(args, i + 1, "--parent needs a JSON identity")?).map_err(|e| Error::new(1, e))?;
                     i += 1;
                 }
                 "--launch-id" => {
@@ -2068,7 +3931,12 @@ impl LaunchOptions {
             }
             i += 1;
         }
-        nested_guard(options.dry)?;
+        // Inside a session pane only a detached launch runs: it starts its
+        // session beside that one, as `fork -d` and `resume -d` do, and never
+        // attaches or switches this terminal.
+        if !options.detached {
+            nested_guard(options.dry, Some(DETACHED_LAUNCH))?;
+        }
         if options.launch_id.is_some() && !options.new_only {
             return Err(Error::new(1, "--launch-id requires --new"));
         }
@@ -2099,10 +3967,64 @@ impl LaunchOptions {
                     "new session name cannot contain '/', ':', '.', control characters or surrounding whitespace",
                 ));
             }
+            if let Some(problem) = zerus_client_core::actions::tag_problem(&options.tag) {
+                return Err(Error::new(1, problem));
+            }
         }
         Ok(options)
     }
 }
+/// Whether Claude has saved a conversation for `directory`. Claude names its
+/// history folder after its own working directory as the system reports it
+/// (process.cwd(): symlinks resolved, so /var/... is /private/var/... on
+/// macOS), not after the configured path, so a project configured through a
+/// symlink is looked up under its physical path as well (zerus-ngeih).
+fn claude_history_exists(history_root: &Path, directory: &str) -> bool {
+    let has = |directory: &str| {
+        fs::read_dir(history_root.join(claude_history_folder(directory)))
+            .ok()
+            .is_some_and(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            })
+    };
+    has(directory)
+        || fs::canonicalize(directory)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .is_some_and(|physical| physical != directory && has(&physical))
+}
+
+/// Claude Code 2.1.322's VL/Pe/sre rule: escape UTF-16 units, and above 200
+/// units append the base-36 absolute signed wrapping hash of the original path.
+fn claude_history_folder(directory: &str) -> String {
+    let mut escaped = String::with_capacity(208);
+    let mut length = 0;
+    let mut hash = 0_i32;
+    for unit in directory.encode_utf16() {
+        if length < 200 {
+            escaped.push(char::from_u32(u32::from(unit)).filter(char::is_ascii_alphanumeric).unwrap_or('-'));
+        }
+        length += 1;
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    if length > 200 {
+        let mut value = hash.unsigned_abs();
+        let mut digits = [b'0'; 7];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(value % 36) as usize];
+            value /= 36;
+            if value == 0 { break; }
+        }
+        escaped.push('-');
+        escaped.extend(digits[at..].iter().copied().map(char::from));
+    }
+    escaped
+}
+
 fn resolve_project(
     config: &Config,
     command: &str,
@@ -2164,6 +4086,13 @@ fn resolve_project(
         ),
     ))
 }
+fn record_native_launch(launch: Option<&str>, name: &str) {
+    let Some(id) = launch else { return };
+    let _ = match state::session_id_of(name) {
+        Some(session) => state::launches::started_with_session(id, name, &session),
+        None => state::launches::started(id, name),
+    };
+}
 fn launch(
     config: &Config,
     command: &str,
@@ -2177,23 +4106,39 @@ fn launch(
     // This launch's own mode becomes the agent's native flag, which the
     // account default then leaves alone.
     if let Some(mode) = options.permissions.as_deref() {
-        if crate::accounts::permission_args(&command_name, mode).is_empty() {
-            return Err(Error::new(1, format!("--permissions {mode} is not available for {command_name}")));
-        }
+        // Syntax and static shortcuts only. Fresh native options are checked
+        // once when the launch actually builds its flags.
+        crate::accounts::validate_permission_mode(&command_name, mode)?;
         if crate::accounts::explicit_permissions(&command_name, &options.extra) {
             return Err(Error::new(1, "choose --permissions or the agent's own permission flags, not both"));
         }
+    }
+    if state::parent_link::claimed_launch() && !matches!(command_name.as_str(), "claude" | "codex" | "kimi" | "qwen" | "dsh" | "opencode") {
+        return Err(Error::new(1, "--parent is available for Claude, Codex, Kimi, Qwen Code, DeepSeek and OpenCode launches"));
     }
     if command_name=="opencode" {
         if options.account.as_deref().is_some_and(|id|id!="native-opencode") {return Err(Error::new(1,"Choose native-opencode; separate OpenCode profiles are not supported"));}
         if options.resume || !options.extra.is_empty() || options.fresh || options.remote_control {return Err(Error::new(1,"Use saved HGS session names to resume OpenCode; select a model with --model provider/model"));}
         if options.effort.is_some() && options.model.is_none() {return Err(Error::new(1,"--effort needs --model"));}
+        // U60 (#658 N1): OpenCode has no per-session provider contract; a model
+        // server session on it would need a global provider entry, so it is not
+        // offered. Codex and Claude Code get session-scoped settings instead.
+        if options.model_server.is_some() {
+            return Err(Error::new(1, "OpenCode is not offered for a model server; start Codex or Claude Code"));
+        }
         let project=if project=="/" {"root".into()}else{sanitize(&project)};
         let tag=if options.tag.is_empty(){"main"}else{&options.tag};let name=format!("opencode/{project}/{tag}");
         state::opencode::launch(&name,&directory,options.launch_id.as_deref(),options.model.as_deref(),options.effort.as_deref(),options.dry,options.new_only).map_err(|e|Error::new(1,e))?;
+        if !options.dry { record_native_launch(options.launch_id.as_deref(), &name); }
         if !options.dry {println!("OpenCode session ready: {name}\nOpen this session in Zerus.");}return Ok(0);
     }
-    if options.model.is_some() || options.effort.is_some() {return Err(Error::new(1,"--model and --effort are OpenCode launch options; other agent flags go after --"));}
+    if options.model_server.is_some() {
+        if options.model.is_none() { return Err(Error::new(1, "--model-server needs --model MODEL")); }
+        if options.local_model.is_some() { return Err(Error::new(1, "Choose --model-server or --local-model, not both")); }
+        if options.resume || options.resume_id.is_some() || options.fresh {
+            return Err(Error::new(1, "--model-server starts a new session; resume keeps the conversation's original provider"));
+        }
+    } else if command_name != "dsh" && (options.model.is_some() || options.effort.is_some()) {return Err(Error::new(1,"--model and --effort are OpenCode launch options; other agent flags go after --"));}
     if command_name == "dsh" {
         if options
             .account
@@ -2216,6 +4161,9 @@ fn launch(
         } else {
             sanitize(&project)
         };
+        if options.effort.is_some() && options.model.is_none() {
+            return Err(Error::new(1, "--effort needs --model"));
+        }
         let name = format!(
             "dsh/{project}{}",
             if options.tag.is_empty() {
@@ -2224,18 +4172,30 @@ fn launch(
                 format!("/{}", options.tag)
             }
         );
-        state::dsh::launch(
+        state::dsh::launch_with_model(
             &name,
             &directory,
             options.launch_id.as_deref(),
+            options.model.as_deref().unwrap_or(""),
+            options.effort.as_deref().unwrap_or(""),
+            options.permissions.as_deref(),
             options.dry,
             options.new_only,
         )
         .map_err(|e| Error::new(1, e))?;
+        if !options.dry { record_native_launch(options.launch_id.as_deref(), &name); }
         if !options.dry {
             println!("DeepSeek session ready: {name}\nOpen this session in Zerus.");
         }
         return Ok(0);
+    }
+    // From inside a session only a detached launch or a dry run gets here
+    // (`nested_guard`). The new session takes an identity of its own: tmux
+    // starts its pane from the server's environment and the Windows host drops
+    // the caller's session variables (`host::SESSION_CONTEXT`), and its account
+    // comes from this launch, never from the caller's profile.
+    if terminal().inside() {
+        crate::accounts::forget_session_profile(config);
     }
     let explicit_account = options.account.is_some();
     // Exact conversation lookup is scoped to the chosen account's native home.
@@ -2248,10 +4208,10 @@ fn launch(
         Vec::new()
     };
     let requested_session = if let Some(id) = &options.resume_id {
-        if !matches!(command_name.as_str(), "claude" | "codex" | "kimi") {
+        if !matches!(command_name.as_str(), "claude" | "codex" | "kimi" | "qwen" | "hermes") {
             return Err(Error::new(
                 1,
-                "resuming a conversation ID requires claude, codex or kimi",
+                "resuming a conversation ID requires claude, codex, kimi, qwen or hermes",
             ));
         }
         if options.tag.is_empty() {
@@ -2281,6 +4241,14 @@ fn launch(
         )
     });
     let existing = session_exists(&session);
+    if !options.tag.is_empty() && !existing && !binding_exists(config, &session)? {
+        if let Some(problem) = zerus_client_core::actions::tag_problem(&options.tag) {
+            return Err(Error::new(1, problem));
+        }
+    }
+    if state::parent_link::claimed_launch() && (existing || binding_exists(config, &session)?) {
+        return Err(Error::new(1, "--parent applies only to new sessions; use hgs parent adopt for an existing session"));
+    }
     if explicit_account
         && (existing || (!options.fresh && binding_exists(config, &session)?))
     {
@@ -2321,6 +4289,40 @@ fn launch(
         let id = options.account.as_deref().ok_or_else(|| Error::new(1, "--local-model needs --account"))?;
         account_environment.extend(crate::accounts::local_model_session(config, id, &command_name, model)?);
     }
+    // Owner spec 2026-11-14: Claude's Auto mode asks its safety classifier the
+    // same local model, which times out ("auto mode cannot determine the safety
+    // of Bash"). A local-model session (a model server, or an account whose own
+    // settings point at a gateway) whose default would be Auto starts in
+    // acceptEdits instead; an explicit choice is left alone.
+    if command_name == "claude" && options.permissions.is_none() && !crate::accounts::explicit_permissions(&command_name, &options.extra) {
+        let home = account_environment
+            .iter()
+            .find_map(|line| line.strip_prefix("CLAUDE_CONFIG_DIR="))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&config.home).join(".claude"));
+        let local = options.model_server.is_some() || crate::state::model_servers::account_gateway(&home).is_some();
+        let account = options.account.as_deref().unwrap_or("");
+        if local && crate::accounts::permission_mode(config, account, "claude").ok().as_deref() == Some("auto") {
+            eprintln!("hgs: this local-model session starts in acceptEdits, not Auto: Auto's safety classifier asks the same model and times out. Choose --permissions bypass to skip approvals.");
+            options.permissions = Some(r#"native:{"permission_mode":"acceptEdits"}"#.to_owned());
+        }
+    }
+    // U60: this session runs on a model server's API; the settings are this
+    // launch's environment only, so the global agent configuration is untouched.
+    // The key is not part of that environment: it goes to a private file that
+    // `hgs --run` reads and removes, so no command line, tmux start command or
+    // dry-run carries it (#658 N3).
+    let mut model_server_args: Vec<String> = Vec::new();
+    let mut model_server_secrets: Vec<String> = Vec::new();
+    let mut model_server_name = String::new();
+    if let Some(server) = options.model_server.as_deref() {
+        let model = options.model.as_deref().ok_or_else(|| Error::new(1, "--model-server needs --model MODEL"))?;
+        let settings = crate::state::model_servers::session_settings(config, server, &command_name, model)?;
+        account_environment.extend(settings.env);
+        model_server_args = settings.args;
+        model_server_secrets = settings.secrets;
+        model_server_name = server.to_owned();
+    }
     if !options.dry {
         if let Some(id) = &options.account {
             crate::accounts::prepare_local_model(config, id, &command_name)?;
@@ -2329,10 +4331,13 @@ fn launch(
     #[cfg(unix)]
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let (mut base, mut resume): (Vec<String>, Vec<String>) = match command_name.as_str() {
-        "claude" | "kimi" => (
+        "claude" | "kimi" | "qwen" => (
             vec![command_name.clone()],
             vec![command_name.clone(), "-c".into()],
         ),
+        // WhiteWh fork: Hermes's `-c` continues its newest session anywhere,
+        // not this folder's; a resume names the exact session instead.
+        "hermes" => (vec!["hermes".into()], Vec::new()),
         "codex" => (
             vec!["codex".into()],
             vec!["codex".into(), "resume".into(), "--last".into()],
@@ -2347,23 +4352,54 @@ fn launch(
         ),
         _ => (vec![command.into()], Vec::new()),
     };
-    let launcher = Path::new(&directory).join(format!("run_{command_name}.sh"));
-    if !options.bare && !directory.is_empty() && platform::executable(&launcher) {
-        base[0] = launcher.to_string_lossy().into_owned();
+    // U60: the server's model is this launch's flag (Claude takes its model from
+    // the environment, which the settings above already set).
+    if command_name == "codex" {
+        base.extend(model_server_args.iter().cloned());
+    }
+    // The owner, 2026-11-02: Claude's args (the /model picker's --settings file)
+    // reached no command line, so its picker offered one model. They apply to a
+    // start and to a resume alike. A Claude account whose own settings point at
+    // a gateway (GB10) gets the gateway's models the same way.
+    if command_name == "claude" {
+        if options.model_server.is_none() {
+            let home = account_environment
+                .iter()
+                .find_map(|line| line.strip_prefix("CLAUDE_CONFIG_DIR="))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&config.home).join(".claude"));
+            if let Some(server) = crate::state::model_servers::account_gateway(&home) {
+                let model = options.model.clone().unwrap_or_default();
+                if let Some(path) = crate::state::model_servers::picker_settings(config, &server, &model) {
+                    model_server_args.extend(["--settings".to_owned(), path.to_string_lossy().into_owned()]);
+                }
+            }
+        }
+        base.extend(model_server_args.iter().cloned());
         if !resume.is_empty() {
-            resume[0] = base[0].clone();
+            resume.extend(model_server_args.iter().cloned());
         }
     }
+    let program = if command_name == "sh" && cfg!(windows) { base.len() } else { 1 };
+    crate::project_launcher::apply(&directory, &command_name, options.bare, program, &mut base, &mut resume)
+        .map_err(|error| Error::new(1, error))?;
     if let Some(id) = &options.resume_id {
         base.extend([
             match command_name.as_str() {
                 "codex" => "resume",
                 "claude" => "--resume",
                 "kimi" => "--session",
+                "qwen" | "hermes" => "--resume",
                 _ => unreachable!(),
             }
             .into(),
-            id.clone(),
+            if command_name == "hermes" {
+                state::hermes_native_id(id).ok_or_else(|| {
+                    Error::new(1, format!("hgs knows no Hermes session for conversation {id}"))
+                })?
+            } else {
+                id.clone()
+            },
         ]);
     }
     let mut auto = options.resume && !options.fresh && options.resume_id.is_none();
@@ -2382,22 +4418,12 @@ fn launch(
                 .to_string_lossy()
                 .into_owned()
         });
-        let escaped: String = directory
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        auto = fs::read_dir(Path::new(&history_root).join(escaped))
-            .ok()
-            .is_some_and(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-            });
+        auto = claude_history_exists(Path::new(&history_root), &directory);
     }
     if !options.extra.is_empty() {
         match command_name.as_str() {
             "codex" => auto = false,
-            "claude"
+            "claude" | "qwen"
                 if options
                     .extra
                     .iter()
@@ -2419,17 +4445,25 @@ fn launch(
             resume.extend(options.extra.clone());
         }
     }
+    let tracked_permissions = matches!(command_name.as_str(), "claude" | "codex" | "kimi" | "qwen")
+        && env::var("HGS_TRACKING").as_deref() != Ok("0");
     if let Some(mode) = options.permissions.as_deref() {
-        crate::accounts::apply_permissions(&command_name, mode, &mut base);
-        if !resume.is_empty() {
-            crate::accounts::apply_permissions(&command_name, mode, &mut resume);
+        // A tracked agent receives the symbolic choice through
+        // HGS_PERMISSION_MODE; the lifecycle applies and revalidates it on every
+        // resume. Untracked and dry-run launches still need concrete argv.
+        if !tracked_permissions || options.dry {
+            let values = crate::accounts::permission_args(&command_name, mode)?;
+            crate::accounts::apply_permission_values(&command_name, &values, &mut base);
+            if !resume.is_empty() {
+                crate::accounts::apply_permission_values(&command_name, &values, &mut resume);
+            }
         }
     }
     // Capture the account defaults in the new conversation's launch recipe.
     // Saved resumes/forks and explicit native choices retain their own settings.
     if !existing && !auto && options.resume_id.is_none()
         && (options.fresh || !binding_exists(config, &session)?)
-        && ["codex", "claude", "kimi"].contains(&command_name.as_str()) {
+        && ["codex", "claude", "kimi", "qwen"].contains(&command_name.as_str()) {
         crate::accounts::apply_model_defaults(config, options.account.as_deref().unwrap_or(""), &command_name, &mut base)?;
     }
     if options.remote_control {
@@ -2445,33 +4479,6 @@ fn launch(
     #[cfg(unix)]
     let supervisor_environment = account_environment
         .iter().chain(&hint_environment).cloned().collect::<Vec<_>>();
-    // The Unix login shell is the pane's root process. On Windows PowerShell
-    // runs under `--run` as well: the host starts every root process as a new
-    // process group, which ignores Ctrl+C together with everything it starts,
-    // and only the supervisor turns Ctrl+C back on for its child (spec D11).
-    let command = if command_name == "sh" && cfg!(unix) {
-        base
-    } else {
-        #[cfg(unix)]
-        let mut words = vec![
-            shell,
-            "-lic".into(),
-            crate::accounts::supervisor_script(&supervisor_environment),
-            executable.clone(),
-        ];
-        // The supervisor starts directly, with the session's variables, which
-        // carry the account (spec D8).
-        #[cfg(windows)]
-        let mut words = vec![executable.clone(), "--run".to_owned()];
-        if auto {
-            words.push(resume.len().to_string());
-            words.extend(resume);
-        } else {
-            words.push("0".into());
-        }
-        words.extend(base);
-        words
-    };
     if existing {
         if options.dry {
             if !options.detached && config.tab {
@@ -2508,6 +4515,12 @@ fn launch(
         environment.push(format!("HGS_LAUNCH_ID={id}"));
     }
     environment.extend(account_environment);
+    // The record names the server; the key reaches the agent only through the
+    // private file `hgs --run` reads and removes.
+    if !model_server_name.is_empty() {
+        environment.push(format!("HGS_MODEL_SERVER={model_server_name}"));
+        environment.push(format!("HGS_MODEL_SERVER_MODEL={}", options.model.as_deref().unwrap_or_default()));
+    }
     environment.extend(hint_environment);
     environment.extend(platform::gui_env());
     if !options.fresh
@@ -2526,13 +4539,61 @@ fn launch(
         if options.dry {
             state_args.push("--dry-run".into());
         }
+        if let Some(mode) = options.permissions.as_deref() {
+            env::set_var("HGS_PERMISSION_MODE", mode);
+        }
         let rc = state_command("resume", &state_args)?;
+        if options.permissions.is_some() {
+            env::remove_var("HGS_PERMISSION_MODE");
+        }
         return if rc == 0 && !options.detached && !options.dry {
             attach(config, &session, client, false)
         } else {
             Ok(rc)
         };
     }
+    let tracked = matches!(command_name.as_str(), "claude" | "codex" | "kimi" | "qwen" | "hermes")
+        && env::var("HGS_TRACKING").as_deref() != Ok("0");
+    let allocation = tracked.then(state::launch_identity::Allocation::fresh);
+    let helper = if tracked && !options.dry {
+        Some(state::launch_identity::helper::Observed::probe(&executable))
+    } else {
+        None
+    };
+    let count = match (&helper, &allocation) {
+        (Some(helper), Some(allocation)) => helper
+            .count(allocation.session(), allocation.run(), if auto { resume.len() } else { 0 })
+            .map_err(|error| Error::new(1, error))?,
+        _ => if auto { resume.len().to_string() } else { "0".into() },
+    };
+    // The Unix login shell is the pane's root process. On Windows PowerShell
+    // runs under `--run` as well: the host starts every root process as a new
+    // process group, which ignores Ctrl+C together with everything it starts,
+    // and only the supervisor turns Ctrl+C back on for its child (spec D11).
+    let command = if command_name == "sh" && cfg!(unix) {
+        base
+    } else {
+        #[cfg(unix)]
+        let mut words = {
+            let (program, flags) = crate::accounts::supervisor_shell(&shell);
+            vec![
+                program.into(),
+                flags.into(),
+                crate::accounts::supervisor_script(program, &supervisor_environment),
+                executable.clone(),
+            ]
+        };
+        // The supervisor starts directly, with the session's variables, which
+        // carry the account (spec D8).
+        #[cfg(windows)]
+        let mut words = vec![executable.clone(), "--run".to_owned()];
+        words.push(count);
+        if auto {
+            words.extend(resume);
+        }
+        words.extend(base);
+        words
+    };
     let mut spec = LaunchSpec {
         name: session.clone(),
         cwd: directory,
@@ -2550,11 +4611,24 @@ fn launch(
         println!("{}", terminal().describe(&DryRun::Launch(&spec)));
         return Ok(0);
     }
-    if matches!(command_name.as_str(), "claude" | "codex" | "kimi")
-        && env::var("HGS_TRACKING").as_deref() != Ok("0")
-    {
+    // U60 (#709 L1): the key file is written only here, right before the
+    // backend launch, and removed if that launch fails; `hgs --run` removes it
+    // on success. The resume branch above returned before this point, and a
+    // dry-run returned before it too, so neither leaves a file.
+    let mut secret_path: Option<std::path::PathBuf> = None;
+    if !model_server_secrets.is_empty() {
+        let path = crate::state::model_servers::write_secret_file(&config.state, &model_server_secrets)?;
+        spec.env.push(format!("HGS_MODEL_SERVER_ENV={}", path.display()));
+        secret_path = Some(path);
+    }
+    if tracked {
+        if let Some(mode) = options.permissions.as_deref() {
+            spec.env.push(format!("HGS_PERMISSION_MODE={mode}"));
+        }
         spec.env.extend([
             format!("HGS_SESSION={session}"),
+            // A new session's terminal is its label (zerus-ucck P3b).
+            format!("HGS_TERMINAL_NAME={session}"),
             format!("HGS_AGENT={command_name}"),
             format!(
                 "HGS_ACCOUNT_ID={}",
@@ -2562,7 +4636,10 @@ fn launch(
             ),
             format!("HGS_STATE_DIR={}", config.state.display()),
             format!("HGS_EXECUTABLE={executable}"),
-            "HGS_RUN_ID=".into(),
+            // An explicit live parent claim, otherwise the process-proven
+            // launcher; empty without either (zerus-sa9qn.2, zerus-cgl5w).
+            format!("{}={}", state::parent_link::ENV, state::parent_link::launcher_value().map_err(|e| Error::new(1, e))?),
+            "HGS_RESUME_SESSION_ID=".into(),
             "HGS_EXPECTED_ID=".into(),
             "HGS_ARCHIVE_ID=".into(),
             "HGS_FRESH_REPLACES=".into(),
@@ -2573,18 +4650,36 @@ fn launch(
             ),
             "HGS_TRACKING=1".into(),
         ]);
-        for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"] {
+        let allocation = allocation.as_ref().expect("tracked launch allocation");
+        let handoff = helper.as_ref().map_or_else(
+            || allocation.environment(),
+            |helper| helper.environment(allocation),
+        );
+        spec.env.extend(handoff.into_iter().map(|(key, value)| format!("{key}={value}")));
+        for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME", "QWEN_HOME"] {
             spec.env
                 .push(format!("{key}={}", env::var(key).unwrap_or_default()));
         }
     }
     if options.detached {
-        let rc = terminal().launch(&spec)?.code;
+        let rc = match terminal().launch(&spec) {
+            Ok(exit) => exit.code,
+            Err(error) => {
+                if let Some(path) = &secret_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
         if rc == 0 {
             if let Some(id) = &options.launch_id {
                 // A session that ends before a listing shows it still ends
                 // its launch's placeholder (`state::launches`).
-                if let Err(error) = state::launches::started(id, &session) {
+                let evidence=match &allocation {
+                    Some(allocation)=>state::launches::started_with_session(id,&session,allocation.session()),
+                    None=>state::launches::started(id,&session),
+                };
+                if let Err(error) = evidence {
                     eprintln!("hgs: cannot record launch {id}: {error}");
                 }
             }
@@ -2594,7 +4689,15 @@ fn launch(
     }
     let _tab = TabGuard::begin(config, &session, &platform::tab_color(config, "local"));
     let start = Instant::now();
-    let exit = terminal().launch(&spec)?;
+    let exit = match terminal().launch(&spec) {
+        Ok(exit) => exit,
+        Err(error) => {
+            if let Some(path) = &secret_path {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
+    };
     let rc = exit.code;
     if !report_startup_failure(&session)
         && !exit.server_died
@@ -2606,21 +4709,362 @@ fn launch(
     Ok(rc)
 }
 
+#[cfg(all(test, unix))]
+#[path = "cli/parent_scan_tests.rs"]
+mod parent_scan_tests;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_session_tags_reject_shell_syntax() {
+        for tag in ["bad$tag", "bad;tag", "bad\u{200b}tag"] {
+            let args = ["project", "--new", "-n", tag, "-d"].map(str::to_owned);
+            assert!(LaunchOptions::parse(&args, true).is_err(), "{tag:?}");
+            let old = ["project", "-n", tag, "-d"].map(str::to_owned);
+            assert!(LaunchOptions::parse(&old, true).is_ok(), "old names are selectors");
+        }
+    }
+    /// zerus-sa9qn.39: a pasted peer dry-run line reads the alias back as one
+    /// word and runs nothing, in sh (run) and fish (`fish_words`, modelled).
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_dry_run_prints_the_alias_as_one_inert_word() {
+        let flags = ["-o", "BatchMode=yes"].map(String::from);
+        let remote = "~/.local/bin/hgs ls --local --dry-run";
+        assert_eq!(super::dry_run_line(&flags, "nowhere", remote), format!("ssh -o BatchMode=yes nowhere {remote}"));
+        assert_eq!(super::dry_run_line(&flags, "~root", remote), format!("ssh -o BatchMode=yes '~root' {remote}"));
+        assert_eq!(super::dry_run_line(&flags, "=ls", remote), format!("ssh -o BatchMode=yes '=ls' {remote}"));
+        for alias in [
+            "nowhere",
+            "x;>pwned",
+            "$(>pwned)",
+            "`>pwned`",
+            "it's",
+            "a\"b;>pwned",
+            "x\\';>pwned;#",
+            "x'$(>pwned)'`>pwned`\"",
+            "~root",
+            "~",
+            "=ls",
+        ] {
+            let line = super::dry_run_line(&flags, alias, remote);
+            let head = line.strip_suffix(&format!(" {remote}")).unwrap();
+            assert_eq!(
+                crate::platform::fish_words(head),
+                Ok(["ssh", "-o", "BatchMode=yes", alias].map(String::from).to_vec()),
+                "{line}"
+            );
+            let folder = tempfile::tempdir().unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("ssh() {{ printf '%s\\0' \"$@\"; }}\n{line}"))
+                .current_dir(folder.path())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", folder.path())
+                .output()
+                .unwrap();
+            assert!(!folder.path().join("pwned").exists(), "{line} ran a payload");
+            let words: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(words.get(2).map(String::as_str), Some(alias), "{line}: {words:?}");
+            assert_eq!(words.len(), 7, "{line}: {words:?}");
+        }
+    }
+
+    #[test]
+    fn claude_history_uses_the_released_folder_cap_and_hash() {
+        // Golden folder names from VL/Pe/sre in Claude Code 2.1.322. Each
+        // case gets a separate history root so a cap-only implementation
+        // cannot accidentally find the 200-character boundary case's file.
+        let prefix = format!("-fixture-{}", "a".repeat(191));
+        let cases = [
+            (format!("/fixture/{}", "a".repeat(191)), prefix.clone()),
+            (format!("/fixture/{}", "a".repeat(192)), format!("{prefix}-ble0s5")),
+            (format!("/fixture/{}", "a".repeat(240)), format!("{prefix}-vis0vp")),
+            (format!("/fixture/{}b", "a".repeat(240)), format!("{prefix}-h9g0ab")),
+            (format!("/fixture/{}c", "a".repeat(240)), format!("{prefix}-h9g0aa")),
+            (format!("/fixture/{}", "😀".repeat(100)), format!("-fixture-{}-ix5129", "-".repeat(191))),
+        ];
+        for (directory, folder) in cases {
+            let history = tempfile::tempdir().unwrap();
+            assert!(!super::claude_history_exists(history.path(), &directory));
+            let path = history.path().join(folder);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("conversation.jsonl"), "{}\n").unwrap();
+            assert!(super::claude_history_exists(history.path(), &directory), "history not found for {directory}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_history_is_found_under_the_physical_path_of_a_symlinked_project() {
+        // zerus-ngeih: Claude names its folder after its physical cwd.
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().join("real project");
+        std::fs::create_dir(&physical).unwrap();
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&physical, &linked).unwrap();
+        let physical = std::fs::canonicalize(&physical).unwrap().to_string_lossy().into_owned();
+        let linked = linked.to_string_lossy().into_owned();
+        let history = root.path().join("projects");
+        let escape = |path: &str| path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+        assert!(!super::claude_history_exists(&history, &linked));
+        let folder = history.join(escape(&physical));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("notes.txt"), "").unwrap();
+        assert!(!super::claude_history_exists(&history, &linked), "only a saved conversation counts");
+        std::fs::write(folder.join("old.jsonl"), "{}\n").unwrap();
+        assert!(super::claude_history_exists(&history, &linked));
+        assert!(super::claude_history_exists(&history, &physical));
+        // History recorded under the configured path itself still counts.
+        let other = tempfile::tempdir().unwrap();
+        let raw = other.path().to_string_lossy().into_owned();
+        let folder = history.join(escape(&raw));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("old.jsonl"), "{}\n").unwrap();
+        assert!(super::claude_history_exists(&history, &raw));
+        assert!(!super::claude_history_exists(&history, &root.path().join("missing").to_string_lossy()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_archive_page_falls_back_on_a_peer_without_the_marker() {
+        // zerus-080n8, zerus-wzzr9: plain and machine-guarded calls alike.
+        let machine = "11111111-1111-4111-8111-111111111111";
+        let root = tempfile::tempdir().unwrap();
+        for guarded in [false, true] {
+            let mut args: Vec<String> = if guarded { vec!["--expect-machine".into(), machine.into()] } else { Vec::new() };
+            args.extend(["archives", "--json", "--bounded"].map(String::from));
+            let script = bounded_archive_script(&args, guarded);
+            for marker in [true, false] {
+                let home = root.path().join(format!("{guarded}-{marker}"));
+                let bin = home.join(".local/bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                let help = if marker { "echo '       archive-bounded-pages-v1';" } else { "" };
+                std::fs::write(bin.join("hgs"), format!("#!/bin/sh\nif [ \"$1\" = --help ]; then echo usage; echo '       guarded-create-v1'; {help} exit 0; fi\nprintf '%s\\n' \"$@\" > \"$HOME/called\"\n")).unwrap();
+                std::fs::set_permissions(bin.join("hgs"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+                let ran = std::process::Command::new("sh").arg("-c").arg(&script).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin").output().unwrap();
+                assert!(ran.status.success(), "{guarded} {marker}: {}", String::from_utf8_lossy(&ran.stderr));
+                let called = std::fs::read_to_string(home.join("called")).unwrap();
+                let expected: Vec<&str> = args.iter().map(String::as_str).filter(|arg| marker || *arg != "--bounded").collect();
+                assert_eq!(called.split_whitespace().collect::<Vec<_>>(), expected, "{guarded} {marker}");
+            }
+        }
+    }
+
+    /// zerus-t2hd0: with local sessions off, as on a Windows computer without
+    /// its session host, dispatch never resolves a label first, so each
+    /// command answers for itself: `native-ui dsh/p` and `a dsh/p` with the
+    /// native DeepSeek UI's refusal, `inspect` of a peer's reference by
+    /// routing to it, and the other session commands with their own
+    /// local-sessions refusal. A reference is never resolved as a label.
+    #[test]
+    fn label_resolution_never_answers_before_a_commands_own_refusal_or_routing() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let uri = "zerus://session?machine=11111111-2222-4333-8444-555555555555&host=peer&name=claude%2Fp&conversation=c1";
+        for (command, rest) in [
+            ("native-ui", args(&["dsh/p"])),
+            ("a", args(&["dsh/p"])),
+            ("inspect", args(&[uri])),
+            ("inspect", args(&["claude/p"])),
+            ("send", args(&["claude/p", "--json"])),
+        ] {
+            assert!(!super::resolves_label_first(command, &rest, true, false), "{command} {rest:?}");
+        }
+        // With local sessions on, a plain label resolves; a reference never.
+        assert!(super::resolves_label_first("native-ui", &args(&["dsh/p"]), true, true));
+        assert!(super::resolves_label_first("inspect", &args(&["claude/p"]), true, true));
+        assert!(!super::resolves_label_first("inspect", &args(&[uri]), true, true));
+        assert!(!super::resolves_label_first("inspect", &args(&[uri, "--local"]), true, true));
+        // Another computer resolves its own labels.
+        assert!(!super::resolves_label_first("inspect", &args(&["claude/p"]), false, true));
+    }
+
+    /// zerus-ucck P3c: every session command declares how it carries the
+    /// identities that select among sessions sharing a label, exactly once;
+    /// a new one fails here until it is classified.
+    #[test]
+    fn every_session_command_declares_its_guard() {
+        for command in super::SESSION_COMMANDS {
+            let lists = [super::REQUEST_GUARDED, super::FLAG_GUARDED, super::UNGUARDED, super::SELF_RESOLVED];
+            let count = lists.iter().filter(|list| list.contains(command)).count();
+            assert_eq!(count, 1, "{command} is classified {count} times");
+        }
+        for list in [super::REQUEST_GUARDED, super::FLAG_GUARDED, super::UNGUARDED, super::SELF_RESOLVED] {
+            for command in list {
+                assert!(super::SESSION_COMMANDS.contains(command), "{command} is not a session command");
+            }
+        }
+    }
+
+    /// zerus-ucck P3c: only a command classified as carrying its identities in
+    /// its request defers a shared label; any other, a new unclassified reader
+    /// included, refuses it at dispatch unless its command line carries them.
+    #[test]
+    fn an_unclassified_reader_refuses_a_shared_label() {
+        use crate::state::LabelGuard;
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(matches!(super::label_guard("new-reader", &args(&["claude/p"])), LabelGuard::None));
+        assert!(matches!(
+            super::label_guard("new-reader", &args(&["claude/p", "--json"])),
+            LabelGuard::None
+        ));
+        for command in super::REQUEST_GUARDED {
+            assert!(matches!(super::label_guard(command, &args(&["claude/p"])), LabelGuard::Request), "{command}");
+        }
+        for command in super::FLAG_GUARDED.iter().chain(super::UNGUARDED).chain(super::SELF_RESOLVED) {
+            assert!(matches!(super::label_guard(command, &args(&["claude/p"])), LabelGuard::None), "{command}");
+        }
+        assert!(matches!(
+            super::label_guard("terminate", &args(&["claude/p", "--expected-run-id", "run-twin"])),
+            LabelGuard::Given { ref run, ref conversation } if run == "run-twin" && conversation.is_empty()
+        ));
+    }
+
     use super::*;
+
+    /// #1355 review: every command whose usage takes a session first accepts
+    /// `--session-id`; internal entry points and the local person-only
+    /// acknowledgement keep their own exact session-name contracts.
+    #[test]
+    fn every_command_that_takes_a_session_first_accepts_a_session_id() {
+        let pattern = regex::Regex::new(
+            r"hgs (?:\[@host\] |@host )?(?:--expect-machine ID )?([a-z_-]+) <session>",
+        )
+        .unwrap();
+        let mut usage: Vec<&str> = pattern
+            .captures_iter(USAGE)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        usage.sort_unstable();
+        usage.dedup();
+        assert!(usage.len() >= 25, "{usage:?}");
+        let internal = ["notify", "paste", "acknowledge-input"];
+        for command in usage.iter().filter(|command| !internal.contains(command)) {
+            assert!(SESSION_COMMANDS.contains(command), "{command}");
+        }
+        // Forms the usage writes without `<session>` first.
+        for command in [
+            "kill",
+            "rename",
+            "archive",
+            "terminate",
+            "pause",
+            "resume",
+            "send-now",
+            "native-ui",
+            "__dsh-ui-url",
+        ] {
+            assert!(SESSION_COMMANDS.contains(&command), "{command}");
+        }
+        for command in internal.iter().chain(&["task", "subagent", "ls", "search"]) {
+            assert!(!SESSION_COMMANDS.contains(command), "{command}");
+        }
+    }
+
+    /// #1355 review: a peer receives `--session-id` only after listing the
+    /// selector and what the command, or the command a guarded call wraps,
+    /// needs already.
+    #[test]
+    fn a_selector_needs_every_marker_its_call_needs() {
+        let id = "3f2a9c1d-0b4e-4d6a-9c1d-2e3f4a5b6c7d";
+        let args = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        let names = |markers: Vec<Marker>| -> Vec<&'static str> {
+            markers.into_iter().map(|marker| match marker { Marker::Line(m) | Marker::Text(m) => m }).collect()
+        };
+        assert!(selector_markers("inspect", &args(&["codex/p/a"])).unwrap().is_none());
+        assert_eq!(names(selector_markers("inspect", &args(&["--session-id", id])).unwrap().unwrap()), [SELECTOR]);
+        assert_eq!(names(selector_markers("hooks", &args(&["--session-id", id, "--json"])).unwrap().unwrap()),
+            ["hooks-health-v1", SELECTOR]);
+        assert_eq!(names(selector_markers("notifications", &args(&["--session-id", id, "--json"])).unwrap().unwrap()),
+            ["session-notifications-v1", SELECTOR]);
+        let machine = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(names(selector_markers("--expect-machine", &args(&[machine, "inspect", "--session-id", id])).unwrap().unwrap()),
+            ["guarded-create-v1", SELECTOR]);
+        assert_eq!(names(selector_markers("--expect-machine", &args(&[machine, "session-action-status", "--session-id", id, "--json"])).unwrap().unwrap()),
+            ["guarded-create-v1", "lifecycle-receipt-status-v1", SELECTOR]);
+        assert!(selector_markers("--expect-machine", &args(&[machine, "inspect", "codex/p/a"])).unwrap().is_none());
+        assert_eq!(selector_markers("--expect-machine", &args(&[machine, "inspect", "--session-id", "NOT"])).unwrap_err().code, 2);
+        // zerus-ucck P1c: a reference needs the reference selector; inspect
+        // keeps its existing read-only reference path.
+        let reference = "zerus://session?machine=11111111-1111-4111-8111-111111111111&host=peer&name=codex%2Fp%2Fa&conversation=c";
+        assert_eq!(names(selector_markers("send", &args(&[reference, "--json"])).unwrap().unwrap()), [REFERENCE_SELECTOR]);
+        assert_eq!(names(selector_markers("hooks", &args(&[reference, "--json"])).unwrap().unwrap()),
+            ["hooks-health-v1", REFERENCE_SELECTOR]);
+        assert_eq!(names(selector_markers("--expect-machine", &args(&[machine, "send", reference, "--json"])).unwrap().unwrap()),
+            ["guarded-create-v1", REFERENCE_SELECTOR]);
+        assert!(selector_markers("inspect", &args(&[reference])).unwrap().is_none());
+        // Everything the CLI forwards to a peer with a selector carries it.
+        for command in SESSION_COMMANDS {
+            assert!(selector_markers(command, &args(&["--session-id", id])).unwrap().is_some(), "{command}");
+        }
+    }
+
+    /// A peer command that fails while it is prepared ends its message with
+    /// the contract text the desktop reads: nothing reached the peer.
+    #[test]
+    fn a_failed_preparation_says_nothing_was_sent() {
+        assert_eq!(
+            not_forwarded("studio", "Remote SSH request timed out"),
+            "studio unreachable: Remote SSH request timed out; no remote operation was sent"
+        );
+        // A message that already ends with it is not doubled.
+        assert_eq!(
+            not_forwarded("studio", "Could not identify the command shell on studio; no remote operation was sent"),
+            "studio unreachable: Could not identify the command shell on studio; no remote operation was sent"
+        );
+        assert_eq!(
+            not_forwarded("studio", "ssh: connect to host studio port 22: Connection timed out.\r\n"),
+            "studio unreachable: ssh: connect to host studio port 22: Connection timed out; no remote operation was sent"
+        );
+        assert!(not_forwarded("studio", "x").ends_with(NOT_FORWARDED));
+    }
+
+    /// WhiteWh fork: the channel runs the peer's argv as the ssh path would.
+    #[test]
+    fn the_channel_runs_the_forwarded_arguments() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let words = args(&["send", "claude/p", "--session-id", "id", "--json"]);
+        assert_eq!(channel_args("send", &words), words);
+        assert_eq!(
+            channel_args("analytics", &args(&["analytics", "--json"])),
+            args(&["analytics", "--json", "--read-only"])
+        );
+    }
+
+    #[test]
+    fn remote_rules_are_forwarded_without_a_terminal_or_launch_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { home:String::new(),dir:dir.path().into(),state:dir.path().join("state"),selves:vec!["self".into()],
+            peers:vec!["peer".into()],base_peers:vec![],peers_from_environment:false,machines:Default::default(),tab:false,tab_colors:String::new() };
+        for windows in [false,true] {
+            crate::windows_peer::record(&config,"peer",windows).unwrap();
+            for op in ["get","set","migrate"] {
+                assert_eq!(remote(&config,"peer","rules",&[op.into(),"--json".into()],true).unwrap(),0);
+                let (flags,line) = REMOTE_DRY_PLAN.with(|plan| plan.borrow_mut().take().unwrap());
+                assert!(flags.iter().any(|flag|flag=="BatchMode=yes"));
+                assert!(!flags.iter().any(|flag|flag=="-t"));
+                assert!(line.contains("iron-rules-v1") && line.contains("rules") && line.contains(op),"{line}");
+                assert!(!line.contains("--client") && !line.contains("__state"),"{line}");
+                assert_eq!(crate::peer_channel::routed("rules", &[op.into(),"--json".into()]),Some(true));
+            }
+        }
+    }
 
     #[test]
     fn repository_preparation_does_not_admit_session_commands_on_control_consoles() {
         for command in ["ls", "machine", "presence", "swarm", "project", "account",
-            "speech", "analytics", "graph", "wait", "team", "mobile", "hooks", "repository"] {
+            "speech", "analytics", "graph", "wait", "team", "mobile", "hooks", "repository", "session-action-status", "subagent"] {
             assert!(!needs_local_sessions(command), "{command}");
         }
         for command in ["a", "kill", "send", "send-now", "send-cancel", "inspect", "history",
             "history-projection", "processes", "terminal", "session-action", "interrupt",
             "clear-context", "compact-context", "answer", "effort", "settings", "recovery",
             "read", "notifications", "voice", "schedules", "attachment", "file-read",
-            "claude", "codex", "kimi", "sh", "resume", "pause", "fork", "reference",
+            "claude", "codex", "kimi", "qwen", "sh", "resume", "pause", "fork", "reference",
             "archive", "terminate", "dirs", "worktrees", "git-status", "__state", "__host",
             "repository-git-worker", "Repository", "repository-extra", ""] {
             assert!(needs_local_sessions(command), "{command}");
@@ -2735,7 +5179,7 @@ mod tests {
     }
 
     #[test]
-    fn inside_a_session_only_tmux_is_named_and_a_launch_is_refused_even_detached() {
+    fn inside_a_session_only_tmux_is_named_and_only_a_detached_launch_starts() {
         // Unix keeps tmux's wording byte for byte.
         assert_eq!(
             nested_refusal(true, Some("sh/MyProj/work-1"), None),
@@ -2752,6 +5196,10 @@ mod tests {
         assert_eq!(
             nested_refusal(true, None, Some("resume -d")),
             "already inside tmux; use resume -d or open a new tab"
+        );
+        assert_eq!(
+            nested_refusal(true, Some("sh/MyProj/work-1"), Some(DETACHED_LAUNCH)),
+            "already inside tmux session sh/MyProj/work-1; use --new -d or open a new tab"
         );
         // A Windows host session is named as the host resolves it, without tmux.
         assert_eq!(
@@ -2770,9 +5218,14 @@ mod tests {
             nested_refusal(false, None, Some("resume -d")),
             "already inside a session; use resume -d or open a new tab"
         );
+        assert_eq!(
+            nested_refusal(false, Some("sh/MyProj/work-1"), Some(DETACHED_LAUNCH)),
+            "already inside session sh/MyProj/work-1; use --new -d or open a new tab"
+        );
 
-        // On either platform a launch inside a session is refused with or
-        // without -d, as inside tmux; a dry run is not.
+        // On either platform a launch inside a session starts only detached,
+        // as `fork -d` and `resume -d` do: one that would attach this terminal
+        // is refused and names the detached form; a dry run is not refused.
         struct Inside;
         impl TerminalBackend for Inside {
             fn inside(&self) -> bool {
@@ -2788,19 +5241,61 @@ mod tests {
             let args = words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
             LaunchOptions::parse(&args, dry)
         };
+        // What `hgs guide launch` tells agents to run, and shorter forms.
+        let id = "0b6f4c9e-3c1d-4b8f-9a35-6f2e2d6f6a10";
+        let guide = ["/abs/MyProj", "--new", "-n", "x", "-d", "--launch-id", id];
+        let guide = [&guide[..], &["--", "prompt"]].concat();
+        let detached: [&[&str]; 3] = [
+            &guide,
+            &["MyProj", "--new", "-n", "x", "-d"],
+            &["MyProj", "-n", "x", "-d"],
+        ];
+        let without_d = guide.iter().copied().filter(|word| *word != "-d");
+        let without_d = without_d.collect::<Vec<_>>();
+        let attached: [&[&str]; 3] = [
+            &without_d,
+            &["MyProj", "--new", "-n", "x"],
+            &["MyProj", "-n", "x"],
+        ];
         state::backend::with_fake(&Inside, || {
-            for words in [&["MyProj", "-n", "x", "-d"][..], &["MyProj", "-n", "x"]] {
+            for words in detached {
+                assert!(launch(words, false).unwrap().detached, "{words:?}");
+            }
+            let options = launch(detached[0], false).unwrap();
+            assert!(options.new_only);
+            assert_eq!(options.launch_id.as_deref(), Some(id));
+            assert_eq!(options.extra, ["prompt"]);
+            for words in attached {
                 let error = launch(words, false).err().unwrap();
-                assert_eq!(error.code, 2);
+                assert_eq!(error.code, 2, "{words:?}");
                 assert_eq!(
                     error.message,
-                    nested_refusal(cfg!(unix), Some("sh/MyProj/work-1"), None)
+                    nested_refusal(cfg!(unix), Some("sh/MyProj/work-1"), Some(DETACHED_LAUNCH))
                 );
+                assert!(launch(words, true).is_ok(), "{words:?}");
             }
-            assert!(launch(&["MyProj", "-n", "x", "-d"], true).is_ok());
+            // The other launch rules still apply to a detached launch there.
+            for words in [
+                &["MyProj", "-n", "x", "-d", "--launch-id", id][..],
+                &["MyProj", "--new", "-n", "x/y", "-d"],
+                &["MyProj", "--new", "-c", "-d"],
+            ] {
+                assert_eq!(launch(words, false).err().unwrap().code, 1, "{words:?}");
+            }
+            // Attaching names no detached form.
+            let error = nested_guard(false, None).err().unwrap();
+            assert_eq!(error.code, 2);
+            assert_eq!(
+                error.message,
+                nested_refusal(cfg!(unix), Some("sh/MyProj/work-1"), None)
+            );
+            assert!(nested_guard(true, None).is_ok());
         });
         state::backend::with_fake(&Outside, || {
-            assert!(launch(&["MyProj", "-n", "x", "-d"], false).is_ok());
+            for words in detached.into_iter().chain(attached) {
+                assert!(launch(words, false).is_ok(), "{words:?}");
+            }
+            assert!(nested_guard(false, None).is_ok());
         });
     }
 
@@ -2828,16 +5323,66 @@ mod tests {
         assert!(resume_stands(1, 0, 5, true));
     }
 
+    /// zerus-3u5yu (3): the service says it resolves a window Route's kept
+    /// fields, so an older one can be told apart before a plan is staged.
+    #[test]
+    fn usage_advertises_the_team_placement_marker() {
+        let marker = zerus_client_core::desktop::team_person_actions::PLACEMENT_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == marker));
+    }
+
     #[test]
     fn usage_names_tmux_only_where_it_hosts_the_sessions() {
         // Unix keeps tmux's text byte for byte, capability markers included.
         assert_eq!(usage_text(true), USAGE);
+        let clone_marker = zerus_client_core::desktop::creation_clone::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == clone_marker));
+        let worktree_marker = zerus_client_core::desktop::creation_worktree::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == worktree_marker));
+        let launch_marker = zerus_client_core::desktop::creation_launch::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == launch_marker));
+        let message_marker = zerus_client_core::desktop::task_message::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == message_marker));
+        let task_marker = zerus_client_core::desktop::task_start_reconcile::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == task_marker));
+        let send_marker = zerus_client_core::desktop::deferred_send::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == send_marker));
+        let route_marker = zerus_client_core::desktop::question_route::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == route_marker));
+        let answer_marker = zerus_client_core::desktop::deferred_answer::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == answer_marker));
+        let teams_person = zerus_client_core::desktop::team_person::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == teams_person));
+        let teams_person_actions = zerus_client_core::desktop::team_person_actions::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == teams_person_actions));
+        let phase_marker = zerus_client_core::desktop::deferred_answer::UPDATE_PHASE_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == phase_marker));
+        let compact_marker = zerus_client_core::desktop::compact_to_send::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == compact_marker));
+        let resume_marker = zerus_client_core::desktop::session_resume::HELP_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == resume_marker));
+        let observe_marker = zerus_client_core::desktop::session_resume::OBSERVE_MARKER;
+        assert!(USAGE.lines().any(|line| line.trim() == observe_marker));
         // Windows has no `hgs paste`, `hgs clip` or `hgs notify`, no Ctrl+V
-        // that pulls a peer's image, and its dry runs print the host's
-        // requests; every other line stays as it is.
+        // that pulls a peer's image, and no POSIX creation-clone executor.
+        // Its dry runs print the host's requests; every other line stays as is.
         let neutral = usage_text(false);
         assert!(!neutral.contains("tmux"), "{neutral}");
         assert!(!neutral.contains("Ctrl+V"), "{neutral}");
+        assert!(!neutral.contains("worktrees program-"), "{neutral}");
+        for marker in [zerus_client_core::worktree_programs::custody::HELP_MARKER, zerus_client_core::worktree_programs::presentation::HELP_MARKER, zerus_client_core::worktree_programs::stop::HELP_MARKER, zerus_client_core::worktree_programs::cleanup::HELP_MARKER] {
+            assert!(USAGE.lines().any(|line| line.trim() == marker));
+            assert!(!neutral.lines().any(|line| line.trim() == marker));
+        }
+        assert!(!neutral.lines().any(|line| line.trim() == clone_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == worktree_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == task_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == send_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == answer_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == teams_person));
+        assert!(!neutral.lines().any(|line| line.trim() == teams_person_actions));
+        assert!(!neutral.lines().any(|line| line.trim() == phase_marker));
+        assert!(!neutral.lines().any(|line| line.trim() == compact_marker));
         assert_eq!(
             neutral,
             USAGE
@@ -2853,6 +5398,87 @@ mod tests {
                     "       hgs notify [--bell] <session> [text]   event for the tray (no tray = no-op)\n",
                     ""
                 )
+                .replace(
+                    "       Desktop creation clone ABI: desktop-creation-clone-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop Teams Person ABI: desktop-team-person-v1\n       Desktop Teams Person actions ABI: desktop-team-person-actions-v2\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop creation worktree ABI: desktop-creation-worktree-v1\n       Desktop creation worktree receipt control: future-fence-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop creation launch ABI: desktop-creation-launch-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message ABI: desktop-task-message-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message references: desktop-task-message-reference-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message input review: desktop-task-message-input-review-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred send ABI: desktop-deferred-send-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop question route: route-questions-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred answer ABI: desktop-deferred-answer-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop Teams Person ABI: desktop-team-person-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop Teams Person actions ABI: desktop-team-person-actions-v2\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop Teams Person placement fields: desktop-team-person-placement-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred answer update phase: desktop-deferred-answer-update-phase-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred compact to send ABI: desktop-deferred-compact-to-send-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred session resume ABI: desktop-deferred-session-resume-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred session resume Codex readiness: desktop-deferred-session-resume-codex-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task start reconcile ABI: desktop-task-start-reconcile-v1\n",
+                    ""
+                )
+                .replace("       hgs [@host] worktrees program-holder --json   bounded read-only native checkout custody (stdin)\n", "")
+                .replace("       Worktree program custody ABI: worktree-program-custody-v1\n", "")
+                .replace("       Worktree program presentation ABI: worktree-program-presentation-v1\n", "")
+                .replace("       hgs worktrees program-stop --json   original native-confirmed program stop (private stdin)\n", "")
+                .replace("       hgs worktrees program-stop-status --json   original result only, never replay (stdin)\n", "")
+                .replace("       Worktree program stop ABI: worktree-program-stop-v1\n", "")
+                .replace("       hgs worktrees program-cleanup --json   original live Remove continuation (private stdin)\n", "")
+                .replace("       hgs worktrees program-cleanup-status --json   original removal result only (stdin)\n", "")
+                .replace("       Worktree program cleanup ABI: worktree-program-cleanup-v1\n", "")
                 .replace(
                     "  --dry-run  print the tmux/ssh command\n",
                     "  --dry-run  print the session-host/ssh command\n"
@@ -2888,12 +5514,98 @@ mod tests {
     }
 
     #[test]
+    fn only_linux_advertises_the_creation_worktree_and_task_message_executors() {
+        let marker = zerus_client_core::desktop::creation_worktree::HELP_MARKER;
+        let message = zerus_client_core::desktop::task_message::HELP_MARKER;
+        let references = zerus_client_core::desktop::task_message::REFERENCE_HELP_MARKER;
+        let review = zerus_client_core::desktop::task_message::review::HELP_MARKER;
+        let send = zerus_client_core::desktop::deferred_send::HELP_MARKER;
+        let route = zerus_client_core::desktop::question_route::HELP_MARKER;
+        let answer = zerus_client_core::desktop::deferred_answer::HELP_MARKER;
+        let phase = zerus_client_core::desktop::deferred_answer::UPDATE_PHASE_MARKER;
+        let compact = zerus_client_core::desktop::compact_to_send::HELP_MARKER;
+        let resume = zerus_client_core::desktop::session_resume::HELP_MARKER;
+        let observe = zerus_client_core::desktop::session_resume::OBSERVE_MARKER;
+        let clone = zerus_client_core::desktop::creation_clone::HELP_MARKER;
+        assert_eq!(advertised(usage_text(true), true), USAGE);
+        let mac = advertised(usage_text(true), false);
+        assert!(!mac.lines().any(|line| line.trim() == marker));
+        assert!(!mac.lines().any(|line| line.trim() == message));
+        assert!(!mac.lines().any(|line| line.trim() == references));
+        assert!(!mac.lines().any(|line| line.trim() == review));
+        assert!(!mac.lines().any(|line| line.trim() == send));
+        assert!(!mac.lines().any(|line| line.trim() == route));
+        assert!(!mac.lines().any(|line| line.trim() == answer));
+        assert!(!mac.lines().any(|line| line.trim() == phase));
+        assert!(!mac.lines().any(|line| line.trim() == compact));
+        assert!(!mac.lines().any(|line| line.trim() == resume));
+        assert!(!mac.lines().any(|line| line.trim() == observe));
+        assert!(mac.lines().any(|line| line.trim() == clone), "clone stays POSIX");
+        assert_eq!(
+            mac,
+            USAGE
+                .replace(
+                    "       Desktop creation worktree ABI: desktop-creation-worktree-v1\n       Desktop creation worktree receipt control: future-fence-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message ABI: desktop-task-message-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message references: desktop-task-message-reference-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop task message input review: desktop-task-message-input-review-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred send ABI: desktop-deferred-send-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop question route: route-questions-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred answer ABI: desktop-deferred-answer-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred answer update phase: desktop-deferred-answer-update-phase-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred compact to send ABI: desktop-deferred-compact-to-send-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred session resume ABI: desktop-deferred-session-resume-v1\n",
+                    ""
+                )
+                .replace(
+                    "       Desktop deferred session resume Codex readiness: desktop-deferred-session-resume-codex-v1\n",
+                    ""
+                )
+        );
+        for marker in [
+            marker, message, references, review, send, answer, phase, compact, resume, observe,
+        ] {
+            assert_eq!(
+                help_text().lines().any(|line| line.trim() == marker),
+                cfg!(target_os = "linux")
+            );
+        }
+    }
+
+    #[test]
     fn usage_lists_opencode_effort_and_the_explicit_service_start() {
         let usage = usage_text(true);
         // `--effort` is an OpenCode launch option that hgs refuses without
         // `--model` or with an empty value; omitting it keeps the model's default.
         assert!(usage.contains(
-            "\n  --effort VARIANT   OpenCode effort; needs --model, one of that model's effort_options (omit for the model's default)\n"
+            "\n  --effort VARIANT   OpenCode or DeepSeek effort; needs --model, one of that model's effort_options (omit for the model's default)\n"
         ), "{usage}");
         // The only explicit start of the shared service; inspection never starts it.
         assert!(usage.contains(
@@ -2956,5 +5668,76 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.code, 1);
         assert_eq!(error.message, state::backend::INVALID_SESSION_ID.text());
+    }
+
+    /// A session reference's verified hop is a route to another computer
+    /// too: a person-only command is refused there for an agent before any
+    /// ssh, and the person's goes on (zerus-ppd26.12).
+    #[test]
+    fn a_reference_hop_checks_person_only_commands_before_ssh() {
+        let config = Config {
+            home: String::new(),
+            dir: PathBuf::new(),
+            state: PathBuf::new(),
+            selves: vec!["local".into()],
+            peers: vec!["peer".into()],
+            base_peers: Vec::new(),
+            peers_from_environment: false,
+            machines: Default::default(),
+            tab: false,
+            tab_colors: String::new(),
+        };
+        let machine = Some("55555555-5555-4555-8555-555555555555");
+        let args = ["zerus://session".to_owned(), "--json".to_owned()];
+        for command in PERSON_ONLY_FORWARDED {
+            TEST_AGENT.with(|agent| agent.set(Some(true)));
+            let refused = remote_via(&config, "peer", command, &args, true, machine).unwrap_err();
+            assert_eq!(refused.code, 1, "{command}");
+            assert!(
+                refused.message.contains("would act as the person"),
+                "{command}: {}",
+                refused.message
+            );
+            TEST_AGENT.with(|agent| agent.set(Some(false)));
+            assert_eq!(
+                remote_via(&config, "peer", command, &args, true, machine).unwrap(),
+                0,
+                "{command}"
+            );
+        }
+        TEST_AGENT.with(|agent| agent.set(None));
+    }
+
+    /// WhiteWh fork: a team member on another computer still reports, asks and
+    /// reads its attempt on the lead's computer; every other team operation of
+    /// an agent stays refused there.
+    #[test]
+    fn a_member_on_another_computer_reports_asks_and_reads_its_attempt() {
+        let args = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        TEST_AGENT.with(|agent| agent.set(Some(true)));
+        for op in ["report", "ask", "current"] {
+            assert!(person_only_forwarding("team", &args(&[op, "--json"])).is_ok(), "{op}");
+        }
+        for words in [&["accept", "--json"][..], &["report"], &["status", "--json"], &["report", "--json", "extra"]] {
+            let refused = person_only_forwarding("team", &args(words)).unwrap_err();
+            assert!(refused.message.contains("would act as the person"), "{words:?}");
+        }
+        TEST_AGENT.with(|agent| agent.set(None));
+        assert!(member_team_input(br#"{"attempt":"a1","text":"done"}"#).is_ok());
+        assert!(member_team_input(br#"{"attempt":"a1","by":"human"}"#).is_err(), "never as the person");
+        assert!(member_team_input(br#"{"text":"done"}"#).is_err(), "an attempt is named");
+        assert!(member_team_input(br#"{"attempt":"  "}"#).is_err());
+        assert!(member_team_input(b"[1]").is_err());
+    }
+
+    /// WhiteWh fork: only a launch that never attaches a terminal here may go
+    /// through a Windows peer's channel.
+    #[test]
+    fn only_a_detached_launch_uses_the_channel() {
+        let args = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        assert!(channel_launch("claude", &args(&["/w", "--new", "-d", "--", "Ready.\nrules"])));
+        assert!(!channel_launch("claude", &args(&["/w", "--new", "--", "-d"])), "an agent's -d is not hgs's");
+        assert!(channel_launch("dsh", &args(&["/w", "--new"])));
+        assert!(!channel_launch("send", &args(&["s", "-d"])));
     }
 }

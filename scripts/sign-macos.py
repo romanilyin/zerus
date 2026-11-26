@@ -16,8 +16,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from macos_stapler import run_stapler
+from macos_release import LEGACY_QT_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_ENTITLEMENTS = ROOT / "packaging/macos/Zerus.entitlements"
@@ -109,8 +111,18 @@ def create_disk_image(app, image):
         staging.mkdir()
         subprocess.run(["ditto", str(app), str(staging / "Zerus.app")], check=True)
         (staging / "Applications").symlink_to("/Applications")
-        subprocess.run(["hdiutil", "create", "-volname", "Zerus", "-fs", "HFS+", "-format", "UDZO",
-                        "-srcfolder", str(staging), str(image)], check=True)
+        command = ["hdiutil", "create", "-volname", "Zerus", "-fs", "HFS+", "-format", "UDZO",
+                   "-srcfolder", str(staging), str(image)]
+        for delay in (2, 5, None):
+            result = subprocess.run(command, capture_output=True, text=True)
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            if result.returncode == 0:
+                break
+            if delay is None or "Resource busy" not in result.stdout + result.stderr:
+                result.check_returncode()
+            image.unlink(missing_ok=True)
+            time.sleep(delay)
 
 
 def notary_credentials(key_file, key_id, issuer):
@@ -201,7 +213,10 @@ def main():
     info = plistlib.loads((args.app / "Contents/Info.plist").read_bytes())
     if info.get("CFBundleShortVersionString") != args.version or info.get("ZerusReleaseVersion") != release:
         parser.error("the bundle version does not match --version and --release")
-    qt_version = json.loads((ROOT / "packaging/macos/qt.json").read_text())["qt_version"]
+    if info.get("ZerusGUI") != "tauri":
+        parser.error("only Zerus Next bundles can be newly signed")
+    # Legacy update clients require this syntactically valid compatibility field.
+    qt_version = LEGACY_QT_VERSION
     work = args.output.with_name(args.output.name + ".signing")
     app = work / "Zerus.app"
     subprocess.run(["ditto", str(args.app), str(app)], check=True)

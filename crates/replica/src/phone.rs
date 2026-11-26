@@ -12,13 +12,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod upload;
+pub use upload::{Ack as UploadAck, Source as UploadSource};
+
 /// The update bytes one answer carries; base64 and JSON keep it under the relay's 1 MiB.
 pub const PAGE: usize = 512 * 1024;
 /// The most updates one request carries; a phone sends the rest in its next.
 pub const MAX_UPDATES: usize = 256;
-/// The largest document a phone puts together from parts: twice the 4 MiB a
-/// task document may reach.
-const MAX_ASSEMBLY: usize = 2 * (crate::MAX_DOCUMENT + crate::MAX_ATTACHMENT_TOTAL.div_ceil(3) * 4);
+/// The largest document a phone puts together from parts; attachment edits
+/// keep task documents within the same bound.
+const MAX_ASSEMBLY: usize = crate::MAX_TASK_DOCUMENT;
 
 /// One document's updates on the wire: `task` is its UUID, or none for the
 /// project document; `bytes` are base64.
@@ -161,6 +164,8 @@ pub struct Part {
 /// remains for the phone, what this computer holds of its view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload: Option<UploadAck>,
     pub schema: u32,
     pub imported: usize,
     pub refused: Vec<Damaged>,
@@ -222,6 +227,38 @@ fn part(update: &Update, offset: usize) -> Part {
 /// what this computer holds of the phone's view, so the phone can send what
 /// it lacks. Merges are idempotent, so a repeated request is safe.
 pub fn answer(store: &ProjectStore, request: Request) -> Result<Answer> {
+    answer_with(store, request, &mut StoreInventories(store))
+}
+
+/// Where an answer's inventories come from: the store's own
+/// ([`ProjectStore::phone_inventory`], [`ProjectStore::live_inventory`]) or an
+/// index of it the caller keeps current, which must give the same values.
+pub trait Inventories {
+    /// What a phone holding `theirs` is answered from, after the request's
+    /// updates were imported.
+    fn phone(&mut self, theirs: &Inventory) -> Result<Inventory>;
+    /// The digest of what a phone holds, once the answer is made.
+    fn live_digest(&mut self) -> Result<String>;
+}
+
+struct StoreInventories<'a>(&'a ProjectStore);
+
+impl Inventories for StoreInventories<'_> {
+    fn phone(&mut self, theirs: &Inventory) -> Result<Inventory> {
+        self.0.phone_inventory(theirs)
+    }
+
+    fn live_digest(&mut self) -> Result<String> {
+        Ok(self.0.live_inventory()?.0.digest())
+    }
+}
+
+/// [`answer`], with the inventories read from `inventories`.
+pub fn answer_with(
+    store: &ProjectStore,
+    request: Request,
+    inventories: &mut dyn Inventories,
+) -> Result<Answer> {
     request.check()?;
     if request.project != store.project_id() {
         return Err(Error::new(format!(
@@ -234,11 +271,22 @@ pub fn answer(store: &ProjectStore, request: Request) -> Result<Answer> {
         .into_iter()
         .map(|update| update.decode("invalid base64 in an update"))
         .collect::<Result<Vec<_>>>()?;
-    let imported = store.import_updates(updates)?;
+    let (upload, updates) = if updates.iter().any(|update| upload::is_frame(&update.bytes)) {
+        if updates.len() != 1 {
+            return Err(Error::new("a task upload frame must be alone"));
+        }
+        let (ack, update) = upload::receive(store, updates.into_iter().next().expect("one frame"))?;
+        (Some(ack), update.into_iter().collect())
+    } else {
+        (None, updates)
+    };
+    let partial = upload.as_ref().is_some_and(|ack| !ack.complete);
+    let imported = store.import_mobile_updates(updates)?;
     let range = request.range.unwrap_or_default();
     let theirs = request.inventory;
-    let ours = range.narrow(store.phone_inventory(&theirs)?);
+    let ours = range.narrow(inventories.phone(&theirs)?);
     let mut answered = Answer {
+        upload,
         schema: 1,
         imported: imported.changed,
         refused: imported.refused,
@@ -248,11 +296,15 @@ pub fn answer(store: &ProjectStore, request: Request) -> Result<Answer> {
         digest: String::new(),
         inventory: None,
     };
+    if partial {
+        answered.digest = inventories.live_digest()?;
+        return Ok(answered);
+    }
     match request.resume {
         Some(resume) => {
             // The whole update again: its parts continue while it is unchanged.
             let wanted = document(resume.task);
-            let (whole, _) = store.updates_for(&only(&ours, &wanted), &theirs, usize::MAX)?;
+            let (whole, _) = store.updates_for_phone(&only(&ours, &wanted), &theirs, usize::MAX)?;
             if let Some(update) = whole.into_iter().find(|u| u.document == wanted) {
                 let same =
                     sha256(&update.bytes) == resume.sha256 && resume.offset < update.bytes.len();
@@ -261,7 +313,7 @@ pub fn answer(store: &ProjectStore, request: Request) -> Result<Answer> {
             }
         }
         None => {
-            let (page, more) = store.updates_for(&ours, &theirs, PAGE)?;
+            let (page, more) = store.updates_for_phone(&ours, &theirs, PAGE)?;
             match page.as_slice() {
                 [update] if update.bytes.len() > PAGE => {
                     answered.part = Some(part(update, 0));
@@ -277,7 +329,7 @@ pub fn answer(store: &ProjectStore, request: Request) -> Result<Answer> {
     if answered.part.is_none() && answered.updates.is_empty() {
         answered.inventory = Some(ours);
     }
-    answered.digest = store.live_inventory()?.0.digest();
+    answered.digest = inventories.live_digest()?;
     Ok(answered)
 }
 
@@ -337,6 +389,9 @@ struct Assembly {
 /// inventory shows nothing the phone still has to send. Each call opens
 /// nothing itself: the caller passes the store, under its lock.
 pub struct Exchange {
+    uploads: bool,
+    outbound: Option<upload::Outbound>,
+    awaiting_upload: Option<UploadAck>,
     budget: Budget,
     /// The ranges still to settle; the first is the current one.
     ranges: Vec<Range>,
@@ -352,6 +407,10 @@ pub struct Exchange {
     /// Tasks the phone asks for although it does not hold them, such as a
     /// Done task the person opens; they arrive whole and are then held.
     wanted: BTreeSet<String>,
+    /// A refused shallow copy gets at most one fresh empty-version fetch
+    /// per exchange. Its files stay in place until that copy covers them.
+    refresh: BTreeSet<String>,
+    refreshed: BTreeSet<String>,
     requests: usize,
 }
 
@@ -374,8 +433,27 @@ impl Exchange {
         Self::with_budget(Budget::default())
     }
 
+    /// Opt in only when this exact target host advertises task_media_upload_v1.
+    pub fn with_uploads() -> Self {
+        Self::with_upload_budget(Budget::default())
+    }
+
+    /// The same opt-in with explicit, still page-bounded request limits.
+    pub fn with_upload_budget(budget: Budget) -> Self {
+        Self {
+            uploads: true,
+            ..Self::with_budget(Budget {
+                push_bytes: budget.push_bytes.min(PAGE),
+                ..budget
+            })
+        }
+    }
+
     pub fn with_budget(budget: Budget) -> Self {
         Self {
+            uploads: false,
+            outbound: None,
+            awaiting_upload: None,
             budget,
             ranges: vec![Range::default()],
             computer: None,
@@ -385,6 +463,8 @@ impl Exchange {
             unsent: BTreeSet::new(),
             refused_here: BTreeSet::new(),
             wanted: BTreeSet::new(),
+            refresh: BTreeSet::new(),
+            refreshed: BTreeSet::new(),
             requests: 0,
         }
     }
@@ -402,6 +482,11 @@ impl Exchange {
 
     /// The next request, or none once every range is settled.
     pub fn next_request(&mut self, store: &ProjectStore) -> Result<Option<Request>> {
+        if self.awaiting_upload.is_some() {
+            return Err(Error::new(
+                "the task upload still needs its exact acknowledgement",
+            ));
+        }
         if self.ranges.is_empty() {
             return Ok(None);
         }
@@ -414,18 +499,26 @@ impl Exchange {
         }
         let (held, _) = store.inventory()?;
         let inventory = self.fit(held);
-        let updates = match (self.queued.take(), self.computer.take()) {
-            (Some(queued), computer) => {
-                self.computer = computer;
-                queued
+        let updates = if self.outbound.is_some() {
+            self.queued = None;
+            self.upload_frame()?
+        } else {
+            match (self.queued.take(), self.computer.take()) {
+                (Some(queued), computer) => {
+                    self.computer = computer;
+                    queued
+                }
+                (None, Some(theirs)) => {
+                    let updates = self.push(store, &inventory, &theirs)?;
+                    self.computer = Some(theirs);
+                    updates
+                }
+                (None, None) => Vec::new(),
             }
-            (None, Some(theirs)) => {
-                let updates = self.push(store, &inventory, &theirs)?;
-                self.computer = Some(theirs);
-                updates
-            }
-            (None, None) => Vec::new(),
         };
+        if let Some(outbound) = &self.outbound {
+            self.awaiting_upload = Some(outbound.frame(self.budget.push_bytes)?.1);
+        }
         self.requests += 1;
         let range = self.ranges[0].clone();
         // A task asked for and not held goes with an empty version: the
@@ -433,6 +526,9 @@ impl Exchange {
         let mut asked = inventory;
         for uuid in self.wanted.iter().filter(|uuid| range.contains(uuid)) {
             asked.tasks.entry(uuid.clone()).or_default();
+        }
+        for uuid in self.refresh.iter().filter(|uuid| range.contains(uuid)) {
+            asked.tasks.insert(uuid.clone(), Version::new());
         }
         Ok(Some(Request {
             schema: 1,
@@ -459,6 +555,22 @@ impl Exchange {
                 answer.schema
             )));
         }
+        match (&self.awaiting_upload, &answer.upload) {
+            (Some(expected), Some(actual)) if expected == actual => {
+                let outbound = self.outbound.as_mut().expect("an outstanding source");
+                outbound.offset = actual.offset;
+                if actual.complete {
+                    self.outbound = None;
+                }
+                self.awaiting_upload = None;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::new(
+                    "the task upload acknowledgement does not match its source and offset",
+                ))
+            }
+        }
         let mut updates = answer
             .updates
             .into_iter()
@@ -479,12 +591,38 @@ impl Exchange {
                 "the computer's answer brought nothing but said more remains",
             ));
         }
-        let imported = store.import_updates(updates)?;
+        let received: BTreeSet<_> = updates
+            .iter()
+            .filter_map(|update| match &update.document {
+                Document::Task(uuid) => Some(uuid.clone()),
+                Document::Project => None,
+            })
+            .collect();
+        let imported = store.import_phone_updates(updates, &self.refresh)?;
+        for uuid in received {
+            if self.refresh.remove(&uuid)
+                && !imported.refused.iter().any(|refused| refused.uuid == uuid)
+            {
+                self.skip.remove(&uuid);
+                self.refused_here.remove(&uuid);
+            }
+        }
+        let mut refreshing = false;
+        for uuid in &imported.refresh {
+            if self.refreshed.insert(uuid.clone()) {
+                self.refresh.insert(uuid.clone());
+                // Do not push local edits while checking whether the fresh
+                // copy contains them. A missing operation keeps this copy.
+                self.skip.insert(uuid.clone());
+                refreshing = true;
+            }
+        }
         self.skip
             .extend(answer.refused.iter().map(|damaged| damaged.uuid.clone()));
         // An answer that changes nothing and only brings what this replica
         // already refused would come back the same until the budget runs out.
-        if brought > 0
+        if !refreshing
+            && brought > 0
             && imported.changed == 0
             && !imported.refused.is_empty()
             && imported
@@ -500,10 +638,25 @@ impl Exchange {
         }
         self.refused_here
             .extend(imported.refused.iter().map(|damaged| damaged.uuid.clone()));
-        self.computer = answer.inventory.map(|theirs| self.ranges[0].narrow(theirs));
+        if !self.refresh.is_empty()
+            && answer.inventory.as_ref().is_some_and(|inventory| {
+                self.refresh
+                    .iter()
+                    .any(|uuid| !inventory.tasks.contains_key(uuid))
+            })
+        {
+            return Err(Error::failed(
+                "the fresh task copy is unavailable; the local copy is kept for a person's review",
+            ));
+        }
+        self.computer = if self.refresh.is_empty() {
+            answer.inventory.map(|theirs| self.ranges[0].narrow(theirs))
+        } else {
+            None
+        };
         self.queued = None;
         let mut settled = false;
-        if self.part.is_none() && !answer.more {
+        if self.refresh.is_empty() && self.part.is_none() && !answer.more {
             if let Some(theirs) = self.computer.take() {
                 let (held, _) = store.inventory()?;
                 let ours = self.ranges[0].narrow(held);
@@ -577,12 +730,24 @@ impl Exchange {
 
     /// The phone's updates the computer lacks of `ours`, within the budget;
     /// a document too large for any request is named and never sent.
+    fn upload_frame(&self) -> Result<Vec<WireUpdate>> {
+        let (update, _) = self
+            .outbound
+            .as_ref()
+            .expect("a frozen upload")
+            .frame(self.budget.push_bytes)?;
+        Ok(vec![WireUpdate::encode(&update)])
+    }
+
     fn push(
         &mut self,
         store: &ProjectStore,
         ours: &Inventory,
         theirs: &Inventory,
     ) -> Result<Vec<WireUpdate>> {
+        if self.outbound.is_some() {
+            return self.upload_frame();
+        }
         let mut ours = ours.clone();
         loop {
             for name in &self.skip {
@@ -595,6 +760,16 @@ impl Exchange {
             let (mut page, _) = store.updates_for(&ours, theirs, self.budget.push_bytes)?;
             if let [update] = page.as_slice() {
                 if update.bytes.len() > self.budget.push_bytes {
+                    if self.uploads {
+                        if let Document::Task(uuid) = &update.document {
+                            self.outbound = Some(upload::Outbound::new(
+                                store.project_id(),
+                                uuid,
+                                update.bytes.clone(),
+                            )?);
+                            return self.upload_frame();
+                        }
+                    }
                     let name = key(&update.document);
                     self.unsent.insert(name.clone());
                     self.skip.insert(name);

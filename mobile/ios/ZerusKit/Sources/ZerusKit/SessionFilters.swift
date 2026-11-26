@@ -21,7 +21,18 @@ public struct SessionGroup: Hashable, Sendable, Identifiable {
     public let name: String
     public let color: String
     public let sessions: [Session]
+    /// The group's cards, child sessions nested under their parents (ChildSessions.nest); a group
+    /// built without nesting lists each session.
+    public var cards: [SessionCardEntry]
     public var id: String { key.key }
+
+    public init(key: ProjectKey, name: String, color: String, sessions: [Session], cards: [SessionCardEntry]? = nil) {
+        self.key = key
+        self.name = name
+        self.color = color
+        self.sessions = sessions
+        self.cards = cards ?? sessions.map { SessionCardEntry(session: $0) }
+    }
 }
 
 /// Native session semantics ported from Android `SessionFilters` (desktop SessionPresentation.h).
@@ -54,9 +65,13 @@ public enum SessionFilters {
                 ["uncertain", "blocked", "exhausted"].contains(recovery))
     }
 
+    /// A keep-warm ping is running: the agent works, but not on the person's turn (desktop core
+    /// `keep_warm_turn`; Android `KeepWarmPresentation.turnActive`, #1716).
+    public static func keepWarmTurn(_ session: Session) -> Bool { session.raw.object("keep_warm")?["turn_active"] == .bool(true) }
+
     public static func working(_ session: Session, _ online: Bool) -> Bool {
         !archived(session) && currentActivity(session, online) && (session.raw.string("activity") == "busy" || backgroundIdle(session)) &&
-            !needsAction(session)
+            !needsAction(session) && !keepWarmTurn(session)
     }
 
     static func positiveCount(_ value: JSON?) -> Bool {
@@ -105,7 +120,7 @@ public enum SessionFilters {
 
     public static func replyInProgress(_ session: Session, _ online: Bool) -> Bool {
         let raw = session.raw
-        return currentActivity(session, online) && (raw.string("activity") == "busy" || positiveCount(raw.object("process_work")?["count"]) ||
+        return currentActivity(session, online) && !keepWarmTurn(session) && (raw.string("activity") == "busy" || positiveCount(raw.object("process_work")?["count"]) ||
             positiveCount(activeChildren(raw)) || raw.string("activity") == "idle" && raw.string("phase") == "idle" && hasCoordinationWait(session))
     }
 
@@ -187,15 +202,24 @@ public enum SessionFilters {
         return result
     }
 
+    /// Needs attention as the status filters list and count it (desktop filterAttention, zerus-sa9qn.18): a quiet
+    /// supervised child's unread reply, retry or provider limit waits for its parent, so only the person's own Review
+    /// later mark lists it. Every other row keeps needsAttention: a child with a request only the person can answer is
+    /// never quiet, and a muted session stays listed.
+    public static func filterAttention(_ session: Session, _ online: Bool) -> Bool {
+        guard ChildSessions.quiet(session.raw) else { return needsAttention(session, online) }
+        return !archived(session) && (session.raw.bool("review_later") || session.raw.bool("mobile_review_later"))
+    }
+
     public static func active(_ session: Session, _ online: Bool, hasDraft: Bool = false) -> Bool {
-        !archived(session) && (hasDraft || needsAttention(session, online) || working(session, online) || scheduled(session, online) ||
+        !archived(session) && (hasDraft || filterAttention(session, online) || working(session, online) || scheduled(session, online) ||
             replyInProgress(session, online) && session.raw.string("activity") == "idle" && session.raw.string("phase") == "idle")
     }
 
     public static func matches(_ session: Session, _ filter: SessionFilter, _ online: Bool, hasDraft: Bool = false) -> Bool {
         switch filter {
         case .all: !archived(session)
-        case .attention: needsAttention(session, online)
+        case .attention: filterAttention(session, online)
         case .active: active(session, online, hasDraft: hasDraft)
         case .saved: !archived(session) && state(session) != "running"
         case .archive: archived(session)
@@ -242,6 +266,10 @@ public enum SessionFilters {
         switch raw.string("phase") {
         case "error": return "Error"
         case "interrupted": return "Interrupted"
+        default: break
+        }
+        if keepWarmTurn(session) { return "Warming cache" }
+        switch raw.string("phase") {
         case "compacting": return "Compacting"
         case "starting": return "Starting"
         case "tool": return "Using a tool"
@@ -288,25 +316,37 @@ public enum SessionFilters {
         return result
     }
 
-    public static func counts(_ sessions: [Session], _ machines: [Machine], drafts: Set<String> = []) -> [SessionFilter: Int] {
+    /// The one rule a status tab's list, its count and the machine chooser share (zerus-sa9qn.19): the filter, and for
+    /// Archive the loaded date window [from, until) (desktop archiveListed).
+    public static func listed(_ session: Session, _ filter: SessionFilter, _ online: Bool, hasDraft: Bool = false,
+                              archiveRange: ArchiveRange = ArchiveRange()) -> Bool {
+        guard matches(session, filter, online, hasDraft: hasDraft) else { return false }
+        guard filter == .archive else { return true }
+        let at = session.raw.double("archived_at", default: 0)
+        return at >= Double(archiveRange.from) && at < Double(archiveRange.until)
+    }
+
+    public static func counts(_ sessions: [Session], _ machines: [Machine], drafts: Set<String> = [],
+                              archiveRange: ArchiveRange = ArchiveRange()) -> [SessionFilter: Int] {
         let online = Set(machines.filter(\.online).map(\.key))
         var counts = Dictionary(uniqueKeysWithValues: SessionFilter.allCases.map { ($0, 0) })
         for row in sessions {
             let isOnline = online.contains(row.target.machineKey)
             let hasDraft = drafts.contains(row.target.key)
-            for filter in SessionFilter.allCases where matches(row, filter, isOnline, hasDraft: hasDraft) { counts[filter]! += 1 }
+            for filter in SessionFilter.allCases where listed(row, filter, isOnline, hasDraft: hasDraft, archiveRange: archiveRange) { counts[filter]! += 1 }
         }
         return counts
     }
 
     /// Chooser counts precede machine selection and text search, retaining project/state scope.
     public static func machineCounts(_ sessions: [Session], _ machines: [Machine], _ filter: SessionFilter,
-                                     drafts: Set<String> = [], project: ProjectKey? = nil) -> [MachineKey: Int] {
+                                     drafts: Set<String> = [], project: ProjectKey? = nil,
+                                     archiveRange: ArchiveRange = ArchiveRange()) -> [MachineKey: Int] {
         var result: [MachineKey: Int] = [:]
         for machine in machines { result[machine.key] = 0 }
         let online = Set(machines.filter(\.online).map(\.key))
         for session in sessions where (project == nil || session.projectKey == project) &&
-            matches(session, filter, online.contains(session.target.machineKey), hasDraft: drafts.contains(session.target.key)) {
+            listed(session, filter, online.contains(session.target.machineKey), hasDraft: drafts.contains(session.target.key), archiveRange: archiveRange) {
             result[session.target.machineKey, default: 0] += 1
         }
         return result
@@ -354,22 +394,37 @@ public struct DesktopSessionBadge: Sendable, Hashable {
 
 /// Native predicates and precedence from SessionCardDelegate.h; colors from SessionStatusBadge.h.
 public enum DesktopSessionPalette {
+    static func attention(_ session: Session, _ online: Bool) -> Bool {
+        let raw = session.raw
+        return raw.bool("review_later") || raw.bool("mobile_review_later") ||
+            online && !raw.bool("attention_acknowledged") && (SessionFilters.needsAction(session) || childAttention(session, online))
+    }
+
+    /// The badge kind before a mute or a supervising parent grays it.
+    public static func nativeKind(_ session: Session, _ online: Bool) -> DesktopBadgeKind {
+        let working = SessionFilters.working(session, online)
+        if attention(session, online) { return detailKind(session, online) == .error ? .error : .attention }
+        if working { return SessionFilters.backgroundIdle(session) ? .background : .working }
+        if SessionFilters.visibleUnreadReply(session, online) { return .unread }
+        if online && SessionFilters.waitingIdle(session) { return .waiting }
+        if SessionFilters.scheduled(session, online) { return .scheduled }
+        if online && SessionFilters.state(session) == "paused" && !SessionFilters.archived(session) { return .paused }
+        return .neutral
+    }
+
     public static func badge(_ session: Session, _ online: Bool) -> DesktopSessionBadge {
         let raw = session.raw
         let state = SessionFilters.status(session, online)
-        let attention = raw.bool("review_later") || raw.bool("mobile_review_later") ||
-            online && !raw.bool("attention_acknowledged") && (SessionFilters.needsAction(session) || childAttention(session, online))
+        let attention = Self.attention(session, online)
         let working = SessionFilters.working(session, online)
         let unread = SessionFilters.visibleUnreadReply(session, online)
-        let kind: DesktopBadgeKind
-        if attention { kind = detailKind(session, online) == .error ? .error : .attention }
-        else if working { kind = SessionFilters.backgroundIdle(session) ? .background : .working }
-        else if unread { kind = .unread }
-        else if online && SessionFilters.waitingIdle(session) { kind = .waiting }
-        else if SessionFilters.scheduled(session, online) { kind = .scheduled }
-        else if online && SessionFilters.state(session) == "paused" && !SessionFilters.archived(session) { kind = .paused }
-        else { kind = .neutral }
-        let displayKind: DesktopBadgeKind = SessionNotificationPreferences.muted(session) && [.attention,.unread].contains(kind) ? .neutral : kind
+        let kind = nativeKind(session, online)
+        // Muted, or quiet under a live parent (spec 2.1): requests and replies gray instead of amber.
+        // A quiet child's error is its parent's to handle, gray too; an explicitly muted error stays
+        // red (desktop badgeKind, zerus-nlck0).
+        let muted = SessionNotificationPreferences.muted(session), quiet = ChildSessions.quiet(raw)
+        let displayKind: DesktopBadgeKind = (muted || quiet) && [.attention,.unread].contains(kind) || quiet && !muted && kind == .error
+            ? .neutral : kind
         let caption: String
         if working { caption = raw.string("phase") == "compacting" ? "Compacting" : (SessionFilters.backgroundIdle(session) ? "Background" : "Working") }
         else if kind == .waiting { caption = SessionFilters.waitingLabel(session, includeProducer: false, compact: true) }

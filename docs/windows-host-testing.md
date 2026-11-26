@@ -253,11 +253,23 @@ output as it comes, written with `WriteConsoleW`; the console keeps its own
 scrollback, as there is no alternate screen around the session. The pane takes
 the size of the client that was active last, and an attached launch starts the
 session at the console's size. Inside a session (`HGS_HOST_PANE` is set), `hgs a`
-and a launch with or without `-d` are refused with exit 2, as inside tmux, but
-without naming tmux (`already inside session NAME; open a new tab`, or `already
+and a launch without `-d` are refused with exit 2, as inside tmux, but without
+naming tmux (`already inside session NAME; open a new tab` for `hgs a`, `already
+inside session NAME; use --new -d or open a new tab` for a launch, or `already
 inside a session; ...` when the host cannot name it). `fork` and `resume` without
 `-d` are refused the same way (`already inside a session; use fork -d or open a new
-tab`); `fork -d` and `resume -d` still start their sessions from there.
+tab`). A launch with `-d`, `fork -d` and `resume -d` start their sessions from
+there without touching the console. The new session starts from this process's
+environment without the caller's session variables (`SESSION_CONTEXT` in
+`src/state/backend/host.rs`, which also drops what Claude Code tells the commands
+it runs about its own session: `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`,
+`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_MESSAGING_SOCKET`,
+`CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SESSION_ATTENDED`,
+`CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`), and
+a launch never passes on the caller's account profile. A session that kept
+`CLAUDE_CODE_CHILD_SESSION` would run as a child of the launching conversation:
+Claude Code then saves no transcript for it, so it cannot be resumed and reports
+no usage. Claude Code settings such as `CLAUDE_CODE_PROMPT_CACHE_TTL` are kept.
 
 | Keys | What happens |
 |---|---|
@@ -430,6 +442,41 @@ drops the test variables and installs into its temporary profile.
   `in_job` in the hello: the host must have broken away. A job that forbids
   breakaway makes `__host call --start` fail instead of starting a host that would
   end with that job.
+
+## CI wrapper deadlines and retained installer artifacts
+
+`scripts/ci/outside-job.py` gives the outside test copy its own execution deadline,
+including WMI startup. It writes directly to a regular log file. On expiration it
+records a bounded process snapshot before the existing fixture-tree/image
+cleanup; cleanup shares 120 seconds, with up to 30 seconds per utility plus
+bounded native exit observation. The step follower allows 30 seconds for the
+copy to start cleanup, then uses that same cleanup deadline for its fallback.
+A growing log is read in 16 KiB chunks, so following it cannot postpone the next
+deadline check indefinitely.
+
+WMI launch, taskkill and PowerShell diagnostics use a private utility worker.
+Before its fixed one-byte release, the parent assigns it to a non-breakaway
+kill-on-close Job Object. Output uses regular files, not captured pipes or the
+step's inherited output handles. Timeout terminates the whole utility job and
+observes its active process count, without `communicate()` or an unbounded
+`Popen` context-manager wait. This avoids CPython's Windows post-timeout pipe
+read, which otherwise waits for descendants retaining stdout/stderr. Native
+Windows controls and Unix controls cover both a timed-out utility and a utility
+that exits successfully while its grandchild retains both outputs.
+
+The connector's `--custody-only` path retains its existing behavior: timeout
+leaves the original fixture/copy and its uncertain outcome in custody, with no
+PID/tree/image cleanup or new child deadline. No product job escape or process
+policy changes follow from this CI harness.
+
+The Windows job uploads `windows-x86_64-<sha>` immediately after packaging,
+before installer survival. Release assembly still requires successful checks;
+retention never makes a failed test pass. The following `always()` upload stores
+`windows-installer-logs-<sha>` separately, including the unbuffered test log,
+process diagnostics and Inno setup logs written directly into the artifact tree.
+Thus even a runner-level cancellation cannot lose the already retained zip and
+installer. Host kernel/filesystem stalls or runner loss can still prevent the
+later diagnostics upload; no in-process Python timeout can preempt those.
 
 ## Survival tests
 

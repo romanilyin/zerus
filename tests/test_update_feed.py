@@ -38,7 +38,7 @@ def archive(packages):
 
 
 class FakeGitHub:
-    def __init__(self,android=False,nightly=False,windows=False,stable='0.37.0'):
+    def __init__(self,android=False,nightly=False,windows=False,stable='0.37.0',installer=False):
         self.calls=[];self.commit=COMMIT;self.rows=[];self.blobs={}
         if android:
             tag='android-dev-1';version='0.1.7';package=b'checked apk fixture';source=b'checked source fixture'
@@ -54,6 +54,10 @@ class FakeGitHub:
             payload={f'zerus-{version}-aur.tar.gz':archive(packages),f'zerus-{version}-arch-x86_64.tar.gz':b'binary tar'}
             if windows:
                 self.info['windows_portable']=f'zerus-{version}-windows-x86_64.zip';payload[self.info['windows_portable']]=b'portable zip'
+            if installer:
+                setup=f'zerus-{version}-windows-x86_64-setup.exe'
+                self.info['windows_installer']={'asset':setup,'portable_sha256':hashlib.sha256(payload[self.info['windows_portable']]).hexdigest()}
+                payload[setup]=b'MZinstaller'
             if not nightly:payload[f'zerus-{version}-source.tar.gz']=b'source tar'
             for name,actual in packages.items():
                 if name!='zerus-git':payload[f'{name}-{actual}-x86_64.pkg.tar.zst']=b'package '+name.encode()
@@ -76,6 +80,73 @@ class FakeGitHub:
         digest=hashlib.sha256(raw).hexdigest()
         feed.require(len(raw)==row['size'] and row.get('digest')=='sha256:'+digest,'Fake upstream byte mismatch')
         return digest
+
+
+class SharedUpdateFeedContractTest(unittest.TestCase):
+    """The production builder and Next parse the same inert catalog values.
+
+    Payloads are tiny synthetic bytes, not distributable archives or signing
+    evidence. Trusted-origin URLs are data only; no client or fetch is created.
+    """
+
+    @staticmethod
+    def build_catalog(case, root):
+        producer = case['producer']
+        info = producer['info']
+        payloads = {name: text.encode('utf-8')
+                    for name, text in producer['payloads'].items()}
+        payloads['release-info.json'] = (
+            json.dumps(info, sort_keys=True, separators=(',', ':')) + '\n'
+        ).encode('utf-8')
+        files = {}
+        sums = {}
+        for name, raw in payloads.items():
+            path = root / name
+            path.write_bytes(raw)
+            files[name] = path
+            sums[name] = hashlib.sha256(raw).hexdigest()
+        checksums = ''.join(f'{digest}  {name}\n'
+                            for name, digest in sorted(sums.items())).encode('ascii')
+        release = copy.deepcopy(producer['release'])
+        release['assets'] = [
+            {'id': index, 'name': name, 'size': len(raw), 'state': 'uploaded',
+             'digest': 'sha256:' + hashlib.sha256(raw).hexdigest(),
+             'browser_download_url': (
+                 f'https://github.com/{feed.REPOSITORY}/releases/download/'
+                 f'{release["tag_name"]}/{name}')}
+            for index, (name, raw) in enumerate(
+                sorted({**payloads, 'SHA256SUMS': checksums}.items()), 1)
+        ]
+        return feed.build_feed(release, info, files, sums,
+                               producer['package_versions'], producer['commit'])
+
+    def test_production_builder_matches_shared_next_catalogs(self):
+        path = (SCRIPTS.parent / 'client/core/tests/fixtures/'
+                'update-feed-contract.json')
+        contract = json.loads(path.read_text())
+        self.assertEqual(contract['schema'], 1)
+        self.assertEqual({case['name'] for case in contract['cases']},
+                         {'stable-v1', 'stable-v1-additive-macos-windows'})
+        with tempfile.TemporaryDirectory() as temporary:
+            for case in contract['cases']:
+                with self.subTest(case=case['name']):
+                    root = Path(temporary) / case['name']
+                    root.mkdir()
+                    catalog = self.build_catalog(case, root)
+                    self.assertEqual(catalog, case['catalog'])
+                    self.assertEqual(catalog['schemaVersion'], 1)
+                    self.assertEqual({item['kind'] for item in catalog['artifacts']},
+                                     {'source', 'linux-archive', 'arch-package'})
+                    self.assertTrue(all(item['name'] not in {
+                        case['producer']['info'].get('windows_portable'),
+                        case['producer']['info'].get('windows_installer', {}).get('asset'),
+                    } for item in catalog['artifacts']))
+                    if 'macos' in catalog:
+                        self.assertEqual(catalog['macos']['qt_version'],
+                                         case['producer']['info']['macos']['qt_version'])
+                        self.assertEqual(len(catalog['macos']['downloads']), 2)
+                        self.assertTrue(all(item['os'] != 'macos'
+                                            for item in catalog['artifacts']))
 
 
 class MirrorTest(unittest.TestCase):
@@ -219,6 +290,21 @@ class MirrorTest(unittest.TestCase):
         self.assertTrue((self.root/'downloads/v0.37.0/SHA256SUMS').is_file())
         # Retrying the same release changes nothing and downloads nothing.
         self.client.calls.clear();self.run_mirror();self.assertEqual(self.client.calls,[])
+    def test_windows_installer_stays_on_github_with_exact_zip_binding_and_immutable_retry(self):
+        for nightly in (False,True):
+            with self.subTest(nightly=nightly):
+                self.client=FakeGitHub(nightly=nightly,windows=True,installer=True)
+                channel='nightly' if nightly else 'stable'
+                tag=self.client.release['tag_name'];name=self.client.info['windows_installer']['asset']
+                self.root.mkdir(exist_ok=True);self.run_mirror(True,'desktop/'+channel)
+                published=json.loads((self.root/('updates/v1/desktop/'+channel+'.json')).read_text())
+                self.assertNotIn(name,self.client.calls)
+                self.assertNotIn(name,[row['name'] for row in published['artifacts']])
+                self.assertFalse((self.root/'downloads'/tag/name).exists())
+                self.client.calls.clear();self.run_mirror(True,'desktop/'+channel)
+                self.assertEqual(self.client.calls,[])
+                self.client.info['windows_installer']['portable_sha256']='b'*64;self.client.seal()
+                with self.assertRaises(ValueError):self.run_mirror(True,'desktop/'+channel)
     def test_stable_feed_moves_from_a_release_without_the_zip_to_one_with_it(self):
         # 0.42.2 and earlier have no Windows zip; the release after it carries one.
         self.client=FakeGitHub(stable='0.42.2');self.root.mkdir();self.run_mirror();path=self.root/'updates/v1/desktop/stable.json'

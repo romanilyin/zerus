@@ -38,6 +38,27 @@ gains the exact command and, after the answer, who answered.
   selects the deny option; Zerus then sends the text to the member as one
   message: `"Lead: denied <tool>: <text>"`. A deny without text works as
   before. An allow ignores text.
+- A request Zerus cannot answer (its card has `"can_answer": false`, such as
+  Kimi's Edit and Write approvals, which Kimi takes only in its Terminal
+  panel) is kept as the member's `terminal_question`. The lead's inbox names
+  it once (`terminal_question`, with the card's reason and "tell the owner"),
+  and the owner's attention list shows it at once (`permission_terminal`;
+  `hgs team waiting` lists it as `permission_escalated` with action
+  `open_terminal`). It clears when the session stops asking. Owner,
+  2026-11-04: such an approval waited half an hour with an idle lead.
+  A lead's `hgs team answer` that the native side refuses as Terminal-only
+  ("Another Kimi request is waiting. Answer in Terminal.") moves the
+  request the same way at once; nothing was answered, and the error says so.
+- Owner, 2026-11-05: an agent whose process exited while its terminal stays
+  open (`process_state: "exited"`, Agent exited) is a stopped session for the
+  team, never live. `restart_crashed` (on by default from 2026-11-05, for stored teams too) restarts the lead
+  too, and a running team whose lead's session stopped is on the owner's
+  attention list at once (`lead_stopped`, action `resume_lead`).
+- Owner, 2026-11-05: the lead's inbox message lists permissions and questions
+  first (each stops its member) and asks the lead to answer them all before
+  it ends its turn. One the lead was told of and still has not answered after
+  3 minutes is told once more when the lead is free ("STILL UNANSWERED"),
+  marked `remind:<key>` in the told keys while it stays open.
 
 ```json
 {"request_id":"UUID","team":"ID","member":"frontend","question_id":"Q",
@@ -91,6 +112,27 @@ gains the exact command and, after the answer, who answered.
   the template stores `"profile_widening":{"member","from","to"}` and the plan
   cannot be approved until the owner confirms it in the desktop (an approve
   without `"confirm_widening": true` from the owner is refused).
+- Task 154 (owner, 2026-11-07): every profile maps to each agent's real mode
+  and a sixth profile, `operate`, launches and inspects sessions, reads
+  terminals and runs a worker. DeepSeek takes `read-only`, `workspace-write`
+  or `danger-full-access` presets (read; write/build/commit; network/operate),
+  Codex the same sandboxes with `on-request` approval, Kimi plan mode for
+  read, Claude its permission mode. An empty profile keeps the account's
+  mode. `permissions` takes the solo launch's selection: provider, bypass,
+  auto (not DeepSeek) or `native:{...}`. A member's capabilities follow its
+  sandbox: a Codex or DeepSeek workspace sandbox runs at Low integrity
+  outside the session host, so it edits, builds (through Zerus) and commits
+  but launches no session, reads no terminal and runs no worker. A task's
+  needs are its `needs` list, else what its words ask (sessions, terminals,
+  worker). Plan validation (error kind `rights`) and the hand-out (the task
+  waits on `rights`) refuse a member that lacks one, naming the members who
+  can and the `{"kind":"rights",...}` card that fixes it. `hgs team rights`
+  changes a member's rights, also while its session runs: the lead narrows,
+  widening is the owner's (or the card). A running member is paused once
+  idle and launched again under its name without `--new`, which resumes its
+  conversation with the new `--permissions`. A QA role defaults to `operate`
+  and a merger to `commit` (a catalog role's own `permissions_profile` wins);
+  a role default is not widening. Status shows each member's `rights`.
 - B5, the lead's own session: when Zerus starts a lead (or adopts a session as
   lead) it allows `hgs team answer` and `hgs team reply` for that session:
   Claude through `--allowedTools "Bash(hgs team answer:*)" "Bash(hgs team reply:*)"`

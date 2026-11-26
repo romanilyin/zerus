@@ -64,7 +64,6 @@ fn bounded(value: &Value, max: usize, empty: bool) -> bool {
         (empty || !s.is_empty()) && s.len() <= max && !s.chars().any(char::is_control)
     })
 }
-#[cfg(unix)]
 pub(crate) fn validate_request(value: &Value) -> Result<()> {
     prepare_request(value).map(|_| ())
 }
@@ -128,8 +127,9 @@ struct Store {
 }
 impl Store {
     fn open_at(directory: &Path) -> Result<Self> {
-        private_dir(directory)?;
-        // #569: made private again when only too open, else reported.
+        // #526/#569: owner-only at creation, never trusted to inherit it; a
+        // store only too open is made private again, else reported.
+        crate::platform::owner_only_dir(directory).map_err(err)?;
         if !crate::private_stores::ensure(directory, crate::platform::Private::Directory)
             .map_err(err)?
         {
@@ -518,6 +518,9 @@ fn record(name: &str) -> Result<Value> {
     }
 }
 fn checked(name: &str, request: &Value) -> Result<Value> {
+    // zerus-ucck P3c: the request's identities select among sessions that
+    // share the label.
+    expect(name, string(request, "expected_run_id"), string(request, "expected_conversation_id"))?;
     let value = record(name)?;
     if value["run_id"] != request["expected_run_id"]
         || value["conversation_id"] != request["expected_conversation_id"]
@@ -821,7 +824,7 @@ fn current(job: &Value) -> Result<Value> {
     }
     let mut candidates = records()?.into_iter().filter(matches).collect::<Vec<_>>();
     // DSH bindings are separate; inspect only private bounded manifests.
-    for entry in ["dsh/bindings","opencode/bindings"].into_iter().flat_map(|directory| fs::read_dir(root().join(directory)))
+    for entry in ["dsh/bindings","opencode/bindings","dsh/sessions","opencode/sessions"].into_iter().flat_map(|directory| fs::read_dir(root().join(directory)))
         .flatten()
         .flatten()
         .take(10000)
@@ -1173,7 +1176,15 @@ fn step(store: &Store, config: &crate::config::Config, mut job: Value) -> Result
     Ok(())
 }
 fn native_refusal(error: &str) -> (&'static str, &'static str) {
-    if error.contains("previous input has not been confirmed") {
+    const NOT_READY: (&str, &str) = (
+        "agent_not_ready",
+        "The original agent could not accept this message yet. Check Activity or Terminal; the recording is preserved.",
+    );
+    // The guarded busy refusal is a readiness wait even when its detail
+    // mentions a draft, input mode or a choice. Receipts govern replay elsewhere.
+    if error.starts_with("agent busy:") {
+        NOT_READY
+    } else if error.contains("previous input has not been confirmed") {
         ("previous_input_pending","Waiting for the agent to confirm its previous input. Check the conversation or Terminal.")
     } else if error.contains("draft, dialog")
         || error.contains("input mode")
@@ -1191,7 +1202,7 @@ fn native_refusal(error: &str) -> (&'static str, &'static str) {
             "The original agent is stopped. Voice delivery does not resume agents automatically.",
         )
     } else {
-        ("agent_not_ready","The original agent could not accept this message yet. Check Activity or Terminal; the recording is preserved.")
+        NOT_READY
     }
 }
 /// The installed service runs `hgs voice worker` under this unit or label.
@@ -1262,6 +1273,7 @@ fn worker() -> Result<i32> {
     }
 }
 fn ensure_worker() -> Result<()> {
+    let executable = crate::self_exec::current().map_err(err)?;
     #[cfg(target_os = "linux")]
     if home()
         .join(".config/systemd/user/hgs-voice.service")
@@ -1278,7 +1290,7 @@ fn ensure_worker() -> Result<()> {
     if crate::status::locked(&worker_lock()) || service_worker::waiting(&standby_lock()) {
         return Ok(());
     }
-    let mut cmd = Command::new(std::env::current_exe().map_err(err)?);
+    let mut cmd = Command::new(executable);
     cmd.args(["voice", "worker"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1291,6 +1303,18 @@ fn ensure_worker() -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_image_refuses_before_service_activation() {
+        crate::self_exec::private_probe("state::voice::tests::service_activation_probe");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by test_image_refuses_before_service_activation"]
+    fn service_activation_probe() {
+        crate::self_exec::probe_child("state::voice::tests::service_activation_probe");
+        assert_eq!(ensure_worker().unwrap_err(), crate::self_exec::TEST_IMAGE);
+    }
     const ID: &str = "11111111-1111-4111-8111-111111111111";
     #[test]
     fn video_acceptance_keeps_one_durable_media_identity_and_audio_fallback() {
@@ -1540,6 +1564,29 @@ mod tests {
         assert_eq!(store.get(ID).unwrap().unwrap()["state"], "cancelled");
         assert!(!cancel_job(&mut cancelled));
         assert_eq!(store.audio(ID).unwrap(), wav(&[0, 0]));
+    }
+    #[test]
+    fn native_busy_diagnostics_keep_the_readiness_code_and_message() {
+        let expected = (
+            "agent_not_ready",
+            "The original agent could not accept this message yet. Check Activity or Terminal; the recording is preserved.",
+        );
+        for error in [
+            "agent busy: terminal queue prompt is unrecognized or contains a draft; wait for the agent or open Terminal; nothing was submitted",
+            "agent busy: terminal has a draft, dialog, or unrecognized prompt",
+            "agent busy: terminal is not in the expected agent input mode; waiting for a choice",
+        ] {
+            assert_eq!(native_refusal(error), expected, "{error}");
+        }
+        for (error, code) in [
+            ("terminal has a draft, dialog, or unrecognized prompt", "native_input_blocked"),
+            ("terminal is not in the expected agent input mode", "native_input_blocked"),
+            ("the previous input has not been confirmed", "previous_input_pending"),
+            ("agent is waiting for approval", "native_choice_pending"),
+            ("the original agent is not running; resume it", "agent_stopped"),
+        ] {
+            assert_eq!(native_refusal(error).0, code, "{error}");
+        }
     }
     #[test]
     fn native_crash_boundary_never_replays() {

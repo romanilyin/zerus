@@ -1,3 +1,7 @@
+> Qt baseline commands and paths below are historical measurements. The Qt
+> harness has been removed at retirement; retain the recorded JSON for comparison,
+> and use the maintained Tauri harness for new runs. Do not rebuild an old Qt GUI.
+
 # Client measurement and the Qt comparison
 
 Tooling for Beads `zerus-5wmh.4`: frame pacing, input-to-frame latency, session
@@ -44,6 +48,16 @@ Each scenario runs a 2 s warm-up and three 10 s runs; the worst run counts.
 | `session-open` | `openSession(i)` alternating between two rows, until the task after the next frame's paint |
 | `input-latency` | `pointerdown` on a probe to the next rAF after the state change (and to after its paint); synthetic events at a random phase, or real clicks |
 
+Scrolling uses instant 16 px writes, independently of CSS smooth scrolling.
+Activity first sends wheel intent through its normal handler to release end-follow;
+layout scroll events alone intentionally cannot release that pin. Each timed run
+records accepted positions, their span and total travel as `scroll_travel`, using
+bounded counters. A run with frames but no traversal is skipped. The native
+`scripts/activity-bench-smoke.html` control also checks that the production
+virtualizer changes its mounted range and leaves valid geometry. Diagnostics
+retries the native display rate when Run starts, because its first probe can
+precede window mapping; an explicitly chosen manual budget stays manual.
+
 The worst pacing run is the one failing the most criteria, then with the larger
 shares of slow frames; the worst timing run has the highest p95. The criteria
 (`passes`) follow the spec: T = 1000 / display Hz, mean within T ± 1%, median
@@ -51,10 +65,9 @@ within T ± 0.5 ms, at least 99% of intervals at most 1.5 T, at most 0.2% above
 2.5 T, under 1% in 15.0-18.5 ms. On a display that itself runs in that band
 (60 Hz) the band check is not applicable.
 
-T must come from the native side (`NSScreen.maximumFramesPerSecond` on macOS,
-`platform::macos::screen_max_fps`), passed to `Diagnostics` as `displayHz`. The
-rAF estimate is a fallback for other platforms only: on macOS it reads 60 exactly
-when WebKit caps rendering.
+T comes from the native display-rate probe when available, passed to
+`Diagnostics` as `displayHz`. The rAF estimate is a fallback when that probe is
+unavailable; it can report the engine's cap instead of the display's actual rate.
 
 In the app, mount `Diagnostics` with the app's scroll containers and session
 opener, plus optional `displayHz`, `metrics` (the `metrics` command) and `save`.
@@ -109,6 +122,22 @@ engine's cost, not a display.
    (`window_display_id`); at least 117.6 Hz or the harness is invalid. Criterion 2
    (a window capture of at least 117.6 changed frames per second) needs a screen
    recording and is outside this panel.
+
+## Native renderer startup evidence
+
+On Linux the client records one `renderer observed` JSON entry in its startup
+stderr (captured by the installed launcher's tray log). Diagnostics shows the
+same snapshot. `requested` is the existing renderer decision; `overrides` lists
+the relevant process environment after that decision, with unrecognized values
+redacted to `other`. `observed.hardware_acceleration_policy` comes from the main
+webview's public WebKitGTK settings API when the page reports startup readiness
+(or Diagnostics first requests the snapshot). Reloading the
+page keeps the original snapshot and does not write another entry.
+
+The public API does not expose the composited layer tree or the selected backing
+buffer transport, so both observations remain explicitly `unavailable`. An
+`always` policy does not establish either observation. The diagnostic changes
+no renderer policy, environment, Inspector configuration or permission.
 
 ## WebKitGTK display rate on Linux
 
@@ -338,6 +367,59 @@ descendants at the start and end of the window, and RSS (and PSS on Linux) at th
 end. It records process names only, never command lines or paths, and never
 signals or attaches to the process. "Idle" means no input from the harness; the
 GUI keeps following its live sessions meanwhile, and the owner may be using it.
+
+## Activity pass in replay mode
+
+A real catalog does not always hold an Activity that scrolls: on the 120 Hz Mac
+`activity-scroll` was skipped as nothing to scroll. The measurement therefore has
+two passes in the same display window:
+
+- the **live pass** (no `ZERUS_CLIENT_REPLAY`) measures the real session list
+  (`list-scroll`) and, when a live session happens to scroll, `activity-scroll`;
+- the **replay pass** measures Activity: the same auto run with
+  `ZERUS_CLIENT_REPLAY` set to `client/fixtures/replay.ndjson`, whose session
+  `run:000001-run` holds 1100 synthetic events.
+
+Replay never touches real data: read marks go to a separate file and actions stay
+blocked without a fake `ZERUS_CLIENT_HGS`. In replay mode the run tries every
+session of the catalog (a live run tries 16 at most), reads older pages with
+`activity.loadOlder` and keeps the first session that scrolls 2000 px, so the
+choice does not depend on list order. The report holds a top-level
+`activity_source` object (`replay`, `events`, `scroll_px`, `older_pages`; counts
+only), `measure-report.py` prints it in the run details, and the run logs
+`activity source: replay, N events, M px, K older pages`. A skipped scroll
+scenario says how far it scrolled, for example `nothing to scroll (12 px)`.
+
+Build the binary with the frontend embedded (a plain `cargo build --release`
+loads the dev server URL and never starts the run): `npm run build`, then in
+`client/src-tauri` `cargo +1.99.1 build --release --locked --features tauri/custom-protocol`.
+
+Linux, headless (never a window on a desktop), from the repository root:
+
+```sh
+env -u DISPLAY WAYLAND_DISPLAY=zerus-none GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 ZERUS_CLIENT_HEADLESS=1 \
+  xvfb-run -a -s "-screen 0 1440x900x24" \
+  env ZERUS_CLIENT_PERF=auto ZERUS_CLIENT_PERF_OUT="$PWD/replay-linux.json" ZERUS_CLIENT_PERF_LABEL=linux-replay \
+      ZERUS_CLIENT_PERF_REPRESENTATIVE=0 ZERUS_CLIENT_REPLAY="$PWD/client/fixtures/replay.ndjson" \
+      client/src-tauri/target/release/zerus-client
+```
+
+macOS, a bundle of the release build with its own identifier (never the
+installed app's or the Phase 2 build's), started by `open` in the console session
+like the Qt bench above. `open --env` passes the variables and every path is
+absolute:
+
+```sh
+client/bench/mac-bundle.sh client/src-tauri/target/release/zerus-client bundles/ZerusPerfReplay.app dev.zerus.next.perfreplay
+open -n -W --stdout "$PWD/replay.out" --stderr "$PWD/replay.err" \
+  --env ZERUS_CLIENT_PERF=auto --env ZERUS_CLIENT_PERF_OUT="$PWD/replay-mac.json" \
+  --env ZERUS_CLIENT_PERF_LABEL=mac-replay --env ZERUS_CLIENT_REPLAY="$PWD/client/fixtures/replay.ndjson" \
+  bundles/ZerusPerfReplay.app
+```
+
+Run the live pass in the same window with the same bundle and without the
+`ZERUS_CLIENT_REPLAY` variable (and another `--env ZERUS_CLIENT_PERF_OUT`). Put
+both reports on one page with `measure-report.py`.
 
 ## Recorded results
 

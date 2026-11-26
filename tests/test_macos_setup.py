@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import re
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ SETUP_SCRIPTS = _package.SETUP_SCRIPTS
 CONNECTOR_MARKER = runpy.run_path(str(ROOT / "scripts/install-mobile-connector-service.py"))["AGENT_MARKER"]
 LABELS = {
     "session": "com.hgdev.hgs.user-session",
+    "desktop": "com.hgdev.hgs-desktop",
     "tray": "com.hgdev.hgs-tray",
     "recovery": "com.hgdev.hgs-recovery",
     "swarm": "com.hgdev.hgs-swarm",
@@ -35,7 +37,11 @@ touch "$state"
 case "$1" in
   print)
     case "$2" in
-      gui/*/*) grep -qx "${2##*/}" "$state" ;;
+      gui/*/*)
+        grep -qx "${2##*/}" "$state" || exit 113
+        if [ "${2##*/}" = com.hgdev.hgs-desktop ]; then
+          "$HGS_EXECUTABLE" desktop fixture-launchctl-print
+        fi ;;
       *) exit 0 ;;
     esac ;;
   bootstrap) basename "$3" .plist >> "$state" ;;
@@ -60,17 +66,35 @@ class MacSetup(unittest.TestCase):
         for name in ("hgs", "hgs-tray", "zerus-mobile-connector"):
             (macos / name).write_text("#!/bin/sh\n# synthetic bundled executable\n")
             (macos / name).chmod(0o755)
+        (macos / "hgs").write_text(f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / "tests")!r})
+from test_macos_desktop_service import Commands
+binary = Path(os.environ.get("HGS_EXECUTABLE", sys.argv[0]))
+command = Commands(Path(os.environ["HOME"]), binary)
+if sys.argv[1:] == ["desktop", "fixture-launchctl-print"]:
+    command.loaded = True
+    result = command(["launchctl", "print", "gui/fixture/desktop"])
+elif sys.argv[1:3] in (["desktop", "registration"], ["desktop", "status"]):
+    result = command([str(binary), *sys.argv[1:]])
+else:
+    sys.exit(0)
+print(result.stdout, end="")
+''')
         shutil.copy2(ROOT / "hgs_state.py", setup / "hgs_state.py")
         for name in SETUP_SCRIPTS:
             shutil.copy2(ROOT / "scripts" / name, setup / name)
-        shutil.copy2(ROOT / "tray/packaging/com.hgdev.hgs-tray.plist", setup / "com.hgdev.hgs-tray.plist")
+        shutil.copy2(ROOT / "packaging/desktop/com.hgdev.hgs-tray.plist", setup / "com.hgdev.hgs-tray.plist")
         shutil.copy2(SCRIPT, self.app / "Contents/Resources/bin/zerus-setup")
         self.tools = self.root / "tools"
         self.tools.mkdir()
-        (self.tools / "launchctl").write_text(FAKE_LAUNCHCTL)
-        (self.tools / "launchctl").chmod(0o755)
         self.log = self.root / "launchctl.log"
         self.state = self.root / "launchctl.state"
+        fake = FAKE_LAUNCHCTL.replace('"$ZERUS_TEST_LAUNCHCTL_LOG"', shlex.quote(str(self.log))).replace(
+            '"$ZERUS_TEST_LAUNCHCTL_STATE"', shlex.quote(str(self.state)))
+        (self.tools / "launchctl").write_text(fake)
+        (self.tools / "launchctl").chmod(0o755)
 
     def run_setup(self, *arguments, check=True):
         environment = {
@@ -78,7 +102,12 @@ class MacSetup(unittest.TestCase):
             "PATH": f"{self.tools}:/usr/bin:/bin",
             "ZERUS_TEST_LAUNCHCTL_LOG": str(self.log),
             "ZERUS_TEST_LAUNCHCTL_STATE": str(self.state),
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
+        for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+                    "XDG_RUNTIME_DIR", "TMPDIR", "TMUX_TMPDIR"):
+            directory = self.root / "private" / key.lower(); directory.mkdir(parents=True, exist_ok=True)
+            environment[key] = str(directory)
         result = subprocess.run([sys.executable, str(self.app / "Contents/Resources/bin/zerus-setup"), *arguments],
                                 env=environment, capture_output=True, text=True, timeout=60)
         if check:
@@ -94,7 +123,7 @@ class MacSetup(unittest.TestCase):
     def test_tray_agent_template_runs_as_an_interactive_job(self):
         # Without ProcessType launchd starts the GUI as a daemon and clamps all its
         # threads below ordinary CPU load; the whole window then stops responding.
-        template = re.sub(r"<!--.*?-->", "", (ROOT / "tray/packaging/com.hgdev.hgs-tray.plist").read_text(), flags=re.S)
+        template = re.sub(r"<!--.*?-->", "", (ROOT / "packaging/desktop/com.hgdev.hgs-tray.plist").read_text(), flags=re.S)
         self.assertEqual(plistlib.loads(template.encode()).get("ProcessType"), "Interactive")
 
     def test_default_setup_creates_links_into_the_bundle(self):
@@ -105,10 +134,14 @@ class MacSetup(unittest.TestCase):
             self.assertEqual(link.resolve(), (self.app / target).resolve())
 
     @unittest.skipUnless(sys.platform == "darwin", "LaunchAgents are installed on macOS only")
-    def test_default_setup_installs_only_the_session_bridge(self):
+    def test_default_setup_installs_session_bridge_and_aqua_desktop(self):
         self.run_setup()
         definition = plistlib.loads(self.agent("session").read_bytes())
         self.assertEqual(Path(definition["ProgramArguments"][0]), (self.app / "Contents/MacOS/hgs").resolve())
+        desktop = plistlib.loads(self.agent("desktop").read_bytes())
+        self.assertEqual(desktop["Label"], LABELS["desktop"])
+        self.assertEqual(desktop["LimitLoadToSessionType"], "Aqua")
+        self.assertEqual(desktop["ProgramArguments"][-1], "--launchd")
         for kind in ("tray", "recovery", "swarm"):
             self.assertFalse(self.agent(kind).exists(), kind)
 
@@ -119,7 +152,10 @@ class MacSetup(unittest.TestCase):
         calls = len(self.launchctl_calls())
         self.run_setup("--autostart", "--workers")
         after = {path: path.stat().st_mtime_ns for path in (self.home / "Library/LaunchAgents").iterdir()}
-        self.assertEqual(before, after)
+        self.assertEqual(before.keys(), after.keys())
+        for path in before:
+            with self.subTest(path=path.name):
+                self.assertEqual(before[path], after[path])
         repeated = self.launchctl_calls()[calls:]
         self.assertFalse([call for call in repeated if call.split()[0] in {"bootout", "kickstart", "bootstrap"}], repeated)
 
@@ -277,7 +313,7 @@ class MacSetup(unittest.TestCase):
             self.assertFalse(self.agent(kind).exists(), kind)
         boot_outs = [call for call in self.launchctl_calls() if call.startswith("bootout")]
         self.assertEqual({call.rsplit("/", 1)[1] for call in boot_outs} & set(LABELS.values()),
-                         {LABELS["session"], LABELS["recovery"], LABELS["swarm"]})
+                         {LABELS["session"], LABELS["desktop"], LABELS["recovery"], LABELS["swarm"]})
 
     def test_remove_keeps_foreign_items(self):
         directory = self.home / ".local/bin"

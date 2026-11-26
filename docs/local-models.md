@@ -27,6 +27,104 @@ Windows the start command splits at spaces outside double quotes, so paths keep
 their backslashes. Such an account reports **Local model** instead of plan
 limits and needs no sign-in.
 
+## Qwen Code (WhiteWh fork)
+
+`hgs qwen PROJECT` starts Qwen Code (the `qwen` CLI, 0.27.4 or later) as a tracked
+agent beside Claude Code, Codex and Kimi: its hooks track the session's state, a
+session resumes with `qwen --resume ID`, Zerus's bypass mode passes
+`--approval-mode yolo`, and its account folder is `QWEN_HOME` (`~/.qwen` for
+`native-qwen`, listed wherever `qwen` is installed). An account of
+`--provider qwen` signs in inside Qwen Code itself (`/auth`).
+
+Zerus starts Qwen Code with its scrollback rendering: `ui.useTerminalBuffer` is
+false in a defaults file that `QWEN_CODE_SYSTEM_DEFAULTS_PATH` names
+(`qwen-defaults.json` in the state folder). Qwen Code's default "virtualized
+history" redraws the whole screen on every frame and tracks the mouse, so in a
+Zerus terminal a wheel scroll moved both views and the pane shook. Measured with
+Qwen Code 0.27.4 behind the Windows session host, a streamed answer costs about
+53 KB/s of terminal output in the virtualized view and 21 KB/s with scrollback
+rendering, and a typed character 5.8 KB against 1 KB. The setting is read when
+Qwen Code starts: a session started before it (or by an older `hgs` on a peer)
+keeps the virtualized view until it is restarted. There, scrolling is Qwen
+Code's own: the wheel, Page Up/Down, Shift+Up/Down and Ctrl+Home/End, which
+Terminal passes on while a program draws the whole screen (see the Terminal
+keys in `docs/reference.md`). With scrollback rendering, Terminal scrolls its
+own lines, which on a Windows computer include what the session printed before
+the terminal connected. The user's own
+Qwen settings still override it, and a `QWEN_CODE_SYSTEM_DEFAULTS_PATH` the user
+set is kept. The same file adds a bare `Agent` ask rule: Qwen Code otherwise
+starts a subagent without asking, and the rule asks before every launch whatever
+its description. Qwen Code unions ask rules across settings files; YOLO still
+runs without asking. A Qwen subscription account shows its plan (Lite, Plus or Pro) in
+the composer's chip; Qwen reports its credits only once they run out.
+
+Activity, conversation history and search read the person's prompts and the
+model's replies (without its thoughts or tool calls) from Qwen Code's
+`projects/<folder>/chats/<id>.jsonl`. Clear input reads and clears its draft, and
+`/clear` and `/compact` run in its composer. Accounts and team members choose its
+`--approval-mode` (Plan, Default, Auto edit, Auto, YOLO; the account's own mode is
+`tools.approvalMode` in its settings); team rights map read to Plan, write to
+Default and the wider profiles to Auto edit. Usage analytics count Qwen Code under
+`other` until every client knows the provider.
+
+A Qwen Code account on a model server keeps the server in its own
+`settings.json`, as Qwen Code writes it:
+
+```json
+{
+  "env": {"GB10_API_KEY": "sk-..."},
+  "modelProviders": {"openai": [{"id": "qwen3.8-flash-next", "name": "qwen3.8-flash-next",
+    "baseUrl": "http://192.0.2.79:4000/v1", "envKey": "GB10_API_KEY"}]},
+  "security": {"auth": {"selectedType": "openai"}},
+  "model": {"name": "qwen3.8-flash-next"}
+}
+```
+
+Such an account reports the model server's address as its `gateway`, so a client
+shows the server's speed instead of limits (Model servers in `docs/reference.md`).
+
+## Hermes Agent (WhiteWh fork)
+
+Zerus starts Hermes Agent (Nous Research, verified with 0.23.2 on Windows) as
+a tracked terminal agent: `hgs hermes DIRECTORY`, or Hermes in New session once
+`hermes` is on the computer's PATH. Hermes keeps its own provider and model in
+its home (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` elsewhere, or
+`HERMES_HOME`); set them there with `hermes setup` or `hermes model`. For a
+model on GB10, choose the custom OpenAI-compatible provider with the gateway's
+`/v1` address. The native account is `native-hermes`; its permissions stay in
+Hermes's configuration, and `--yolo` in a launch's arguments skips its
+approvals.
+
+- **Hooks.** Hermes runs shell hooks from its configuration and deep-merges a
+  managed layer over the user's file. Zerus never edits `config.yaml`: a
+  session it starts gets `HERMES_MANAGED_DIR` naming Zerus's own layer
+  (`hermes-managed/config.yaml` in the hgs state), which holds only hgs's
+  `__state hook`, and adds those exact `(event, command)` pairs to Hermes's
+  consent list (`shell-hooks-allowlist.json`). An administrator's managed
+  scope (`HERMES_MANAGED_DIR` or `/etc/hermes`) stays in force; such a session
+  is not tracked by hooks. The layer replaces a hook the user configured for
+  the same Hermes event while Zerus's runtime serves it.
+- **One runtime per home.** Hermes 0.23 runs every client's turns in a runtime
+  shared by its home, started with the first client's environment, so a
+  hook's own variables may belong to another session. A fresh start therefore
+  opens `hermes chat -c zerus-SESSION_ID-RUN --create-if-missing`; a hook finds
+  its session by that title in Hermes's `state.db`, and a session Zerus did not
+  start is ignored. A runtime started outside Zerus (another `hermes` running
+  before it) has no hgs hooks until it exits; Hermes ends an idle runtime after
+  ten minutes.
+- **Status and Activity.** Hermes's events become the ones Zerus tracks:
+  `pre_llm_call` the prompt, `on_session_end` the turn's end, the tool calls,
+  and an approval (`pre_approval_request`) or a clarifying question waiting
+  for you. Zerus keeps each session's turns in a Claude-format transcript
+  (`hermes-transcripts/CONVERSATION.jsonl`) whose first line names the Hermes
+  session; the conversation is a UUID derived from Hermes's `local-…` id, and
+  Resume opens that session with `--resume`.
+- **Input.** Zerus types into Hermes's prompt only when it is empty (`❯` below
+  its rule with only the italic placeholder). A busy turn's prompt would
+  redirect the turn and an approval's would answer it, so a message waits for
+  the turn to end. Answer approvals and questions in Terminal; Fork, Clear and
+  Compact are not available for Hermes yet.
+
 ## Codex on an Ollama model
 
 The agent and the inference provider are separate choices. Codex owns tools,

@@ -20,9 +20,9 @@ use super::{
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "usage: hgs session-host install | status | start | stop | uninstall [--json]";
+pub const USAGE: &str = "usage: hgs session-host install | status | start | stop | uninstall | keep | autostart on|off|status [--json]";
 /// The line `hgs --help` adds on Windows.
-pub const HELP: &str = "       hgs session-host install | status | start | stop | uninstall [--json]   local sessions on this Windows computer (start: a host that stays for SSH peers)\n";
+pub const HELP: &str = "       hgs session-host install | status | start | stop | uninstall | keep | autostart on|off|status [--json]   local sessions on this Windows computer (start: a host that stays for SSH peers; keep, autostart: without the desktop app)\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -32,6 +32,13 @@ pub enum Action {
     Start,
     Stop,
     Uninstall,
+    // WhiteWh fork: no desktop app on this computer (src/host/keeper.rs).
+    Keep,
+    /// The detached keeper itself (internal).
+    KeepRun,
+    AutostartOn,
+    AutostartOff,
+    AutostartStatus,
 }
 
 /// A parsed `hgs session-host` command line.
@@ -43,8 +50,22 @@ pub struct Request {
 
 /// The request in `args` (after `session-host`), None when they are not one.
 pub fn parse(args: &[String]) -> Option<Request> {
-    let (action, options) = args.split_first()?;
+    let (action, mut options) = args.split_first()?;
+    if action == "keep" && options.len() == 1 && options[0] == "--run" {
+        return Some(Request { action: Action::KeepRun, json: false });
+    }
     let action = match action.as_str() {
+        "keep" => Action::Keep,
+        "autostart" => {
+            let (choice, rest) = options.split_first()?;
+            options = rest;
+            match choice.as_str() {
+                "on" => Action::AutostartOn,
+                "off" => Action::AutostartOff,
+                "status" => Action::AutostartStatus,
+                _ => return None,
+            }
+        }
         "install" => Action::Install,
         "start" => Action::Start,
         "status" => Action::Status,
@@ -205,6 +226,7 @@ pub fn install_json(report: &InstallReport, layout: &Layout, version: &str) -> V
         changed,
         removed,
         kept,
+        lore,
     } = &report.cli;
     let ImageReport {
         image,
@@ -235,8 +257,25 @@ pub fn install_json(report: &InstallReport, layout: &Layout, version: &str) -> V
             "removed_aside": removed,
             "kept_aside": kept.iter().map(|path| shown(path)).collect::<Vec<_>>(),
         },
+        // Task #420: what staging lore did; a newer or richer one stays.
+        "lore": lore_json(lore),
         "image": staged,
+        "frontend": report.frontend.as_ref().map(|binding| json!({
+            "path": shown(&binding.frontend.path),
+            "cli_current": true,
+            "frontend_current": true,
+        })),
     })
+}
+
+/// Task #420: the lore outcome of an install.
+fn lore_json(lore: &staging::LoreStage) -> Value {
+    match lore {
+        staging::LoreStage::Absent => json!({"action":"absent"}),
+        staging::LoreStage::Same => json!({"action":"unchanged"}),
+        staging::LoreStage::Installed { backup } => json!({"action":"installed","backup":backup.as_deref().map(shown)}),
+        staging::LoreStage::Kept { reason } => json!({"action":"kept","reason":reason}),
+    }
 }
 
 /// `install` for a person.
@@ -260,6 +299,17 @@ pub fn install_text(report: &InstallReport, layout: &Layout, version: &str) -> S
             "Only one file of the bundled ConPTY pair (conpty.dll, OpenConsole.exe) sits next to \
              this hgs.exe; the session host uses inbox ConPTY.\n",
         );
+    }
+    // Task #420: a newer or richer lore stays; a replaced one keeps a .bak.
+    match &report.cli.lore {
+        staging::LoreStage::Kept { reason } => text.push_str(&format!(
+            "  lore        kept the installed lore: {reason}\n"
+        )),
+        staging::LoreStage::Installed { backup: Some(backup) } => text.push_str(&format!(
+            "  lore        updated; the previous one is kept as {}\n",
+            backup.display()
+        )),
+        _ => {}
     }
     if !report.cli.kept.is_empty() {
         text.push_str(&format!(
@@ -303,6 +353,10 @@ pub struct Status {
     /// The image `current` names.
     pub image: Option<Image>,
     pub host: Host,
+    /// The app bound to the staged CLI, whether the binding still names that
+    /// CLI, and whether the file at the app's path is still the bound app.
+    /// Informational only; admission proves the pair itself.
+    pub frontend: Option<(PathBuf, bool, bool)>,
 }
 
 impl Status {
@@ -327,6 +381,7 @@ impl Status {
             },
             image,
             host: host.found(enabled),
+            frontend: crate::desktop::portable_frontend::status(layout),
         }
     }
 
@@ -343,6 +398,11 @@ impl Status {
             },
             "image": self.image.as_ref().map(image_json),
             "host": self.host.json(),
+            "frontend": self.frontend.as_ref().map(|(path, cli, frontend)| json!({
+                "path": shown(path),
+                "cli_current": cli,
+                "frontend_current": frontend,
+            })),
         })
     }
 
@@ -382,7 +442,7 @@ impl Status {
 }
 
 #[cfg(windows)]
-pub(crate) use self::native::{dispatch, local_host};
+pub(crate) use self::native::{dispatch, host_state, local_host, start_resident};
 
 #[cfg(windows)]
 mod native {
@@ -474,6 +534,11 @@ mod native {
                 Ok(0)
             }
             Action::Start => start(&config.state, request.json),
+            Action::Keep => crate::host::keeper::keep(config, &layout, request.json),
+            Action::KeepRun => crate::host::keeper::run(config, &layout),
+            Action::AutostartOn => crate::host::keeper::autostart(config, &layout, Some(true), request.json),
+            Action::AutostartOff => crate::host::keeper::autostart(config, &layout, Some(false), request.json),
+            Action::AutostartStatus => crate::host::keeper::autostart(config, &layout, None, request.json),
             Action::Stop => stop(&config.state, request.json),
             Action::Uninstall => uninstall(&layout, &config.state, request.json),
         }
@@ -481,10 +546,31 @@ mod native {
 
     fn install(layout: &Layout, json: bool) -> Result<i32> {
         let source = std::env::current_exe()?;
-        let report = staging::install(layout, &source, VERSION)
-            .map_err(|error| Error::new(1, format!("cannot enable local sessions: {error}")))?;
+        // Only the app beside this hgs, starting it outside any agent tree,
+        // records itself as this CLI's portable frontend.
+        let report = staging::install_bound(
+            layout,
+            &source,
+            VERSION,
+            crate::desktop::portable_frontend::record,
+        )
+        .map_err(|error| Error::new(1, format!("cannot enable local sessions: {error}")))?;
+        // Task #227: an install or update restarted the sessions; one sweep
+        // gives the attempts a restart left unconfirmed back to their members.
+        if let Err(error) = crate::state::teams::dispatcher::recover_after_update() {
+            eprintln!("hgs: the team recovery sweep after the install failed: {error}");
+        }
         if json {
-            print_json(&install_json(&report, layout, VERSION));
+            let mut value = install_json(&report, layout, VERSION);
+            // Task #43: why the app beside this hgs was not bound.
+            if report.frontend.is_none() {
+                if let Some(reason) = crate::desktop::portable_frontend::last_refusal() {
+                    // Task #53: its fixed code, which the app logs and names.
+                    value["frontend_refusal_code"] = serde_json::json!(crate::desktop::portable_frontend::refusal_code(&reason));
+                    value["frontend_refusal"] = serde_json::json!(reason);
+                }
+            }
+            print_json(&value);
         } else {
             print!("{}", install_text(&report, layout, VERSION));
         }
@@ -496,21 +582,10 @@ mod native {
     /// can start sessions here: an SSH session itself never starts the host.
     /// A host that already runs is left as it is.
     fn start(state: &Path, json: bool) -> Result<i32> {
-        if !platform::local_sessions() {
-            return Err(Error::new(1, "Local sessions are not enabled on this computer: run hgs session-host install first."));
-        }
-        let running = matches!(query(state), Host::Running { .. });
-        if !running {
-            // The host takes this process's environment (D8).
-            // SAFETY: set before any thread of this short-lived command starts.
-            unsafe { std::env::set_var(crate::host::registry::RESIDENT_ENV, "1") };
-            std::fs::create_dir_all(state)?;
-            let state = platform::canonical(state)?;
-            client::connect_or_start(&state, Role::Cli, &|| {
-                crate::host::gate::host_image(&state).map_err(client::ClientError::Start)
-            })
-            .map_err(|error| Error::new(1, format!("cannot start the session host: {error}")))?;
-        }
+        // The host takes this process's environment (D8).
+        // SAFETY: set before any thread of this short-lived command starts.
+        unsafe { std::env::set_var(crate::host::registry::RESIDENT_ENV, "1") };
+        let running = !start_resident(state)?;
         if json {
             print_json(&json!({"was_running": running, "running": true}));
         } else if running {
@@ -519,6 +594,30 @@ mod native {
             println!("The session host runs and stays until hgs session-host stop.");
         }
         Ok(0)
+    }
+
+    /// A host that stays, started unless one runs; true when this call
+    /// started it. The caller has set `RESIDENT_ENV`, which the host takes
+    /// from this process's environment (D8).
+    pub(crate) fn start_resident(state: &Path) -> Result<bool> {
+        if !platform::local_sessions() {
+            return Err(Error::new(1, "Local sessions are not enabled on this computer: run hgs session-host install first."));
+        }
+        if matches!(query(state), Host::Running { .. }) {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(state)?;
+        let state = platform::canonical(state)?;
+        client::connect_or_start(&state, Role::Cli, &|| {
+            crate::host::gate::host_image(&state).map_err(client::ClientError::Start)
+        })
+        .map_err(|error| Error::new(1, format!("cannot start the session host: {error}")))?;
+        Ok(true)
+    }
+
+    /// The host's state word as `status` finds it, never starting one.
+    pub(crate) fn host_state(state: &Path) -> &'static str {
+        query(state).found(platform::local_sessions()).state()
     }
 
     fn stop(state: &Path, json: bool) -> Result<i32> {
@@ -625,13 +724,17 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_actions_and_json_parse() {
+    fn only_the_known_actions_and_json_parse() {
         for (words, action) in [
             (&["install"][..], Action::Install),
             (&["status"], Action::Status),
             (&["start"], Action::Start),
             (&["stop"], Action::Stop),
             (&["uninstall"], Action::Uninstall),
+            (&["keep"], Action::Keep),
+            (&["autostart", "on"], Action::AutostartOn),
+            (&["autostart", "off"], Action::AutostartOff),
+            (&["autostart", "status"], Action::AutostartStatus),
         ] {
             assert_eq!(
                 parse(&args(words)),
@@ -644,6 +747,8 @@ mod tests {
             with_json.push("--json".into());
             assert_eq!(parse(&with_json), Some(Request { action, json: true }));
         }
+        // The detached keeper's own line, which no one types.
+        assert_eq!(parse(&args(&["keep", "--run"])), Some(Request { action: Action::KeepRun, json: false }));
         // `hgs --help` on Windows names exactly what parses.
         assert!(HELP.contains(USAGE.trim_start_matches("usage: ")));
         for words in [
@@ -654,6 +759,9 @@ mod tests {
             &["install", "--json", "--json"],
             &["status", "extra"],
             &["stop", "-d"],
+            &["autostart"],
+            &["autostart", "maybe"],
+            &["keep", "--run", "--json"],
         ] {
             assert_eq!(parse(&args(words)), None, "{words:?}");
         }
@@ -691,6 +799,7 @@ mod tests {
         assert_eq!(value["cli"]["sha256"], Value::Null);
         assert_eq!(value["image"], Value::Null);
         assert_eq!(value["host"], json!({"state": "not-installed"}));
+        assert_eq!(value["frontend"], Value::Null);
         assert!(empty.text().contains("not enabled"));
 
         let source = dir.path().join("build").join(staging::EXECUTABLE);
@@ -705,6 +814,8 @@ mod tests {
         assert_eq!(value["image"]["pair"], "absent");
         assert_eq!(value["image"]["conpty"], "inbox");
         assert_eq!(value["image"]["name"], report.image.image.name);
+        // A plain install records no app binding.
+        assert_eq!(value["frontend"], Value::Null);
         assert!(install_text(&report, &layout, "1.2.3").starts_with("Local sessions are enabled"));
 
         let stopped = Status::gather(&layout, Host::Stopped);

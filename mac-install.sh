@@ -5,6 +5,7 @@
 # Optional reverse peer: HGS_MAC_PEER (existing SSH alias), or also set
 # HGS_MAC_PEER_HOST to add a new SSH entry. HGS_MAC_PEER_USER, HGS_MAC_PEER_KEY
 # and HGS_MAC_PEER_COLOR are optional. No machine-specific defaults are supplied.
+# HGS_MAC_GUI=client selects the desktop GUI; source installs build Zerus Next.
 set -euo pipefail
 host=""; with_tray=1
 for a in "$@"; do
@@ -50,14 +51,27 @@ ssh -o BatchMode=yes "$host" 'mkdir -p ~/.local/bin ~/.local/src/hgs/.rust-build
 # Replace these entries rather than unpacking over them: a file deleted or moved
 # here (src/platform.rs became src/platform/mod.rs) would otherwise stay on the Mac
 # and break its build. target/ is kept for incremental builds.
-# The mobile connector, the relay and crypto libraries it links and the replica crate are
-# named file by file, so no Linux target/ of theirs travels either.
+# The mobile connector, the relay and crypto libraries it links, the replica crate and
+# the desktop crates hgs takes by path are named file by file, so no Linux target/ of
+# theirs travels either.
 sources=(Cargo.toml Cargo.lock build.rs .cargo src scripts install.sh hgs hgs_state.py tests README.md LICENSE THIRD_PARTY_NOTICES.md docs mac-install.sh tmux.conf .gitignore
   services/mobile/connector/Cargo.toml services/mobile/connector/Cargo.lock services/mobile/connector/.cargo
   services/mobile/connector/src services/mobile/relay/Cargo.toml services/mobile/relay/src
   services/mobile/crypto/Cargo.toml services/mobile/crypto/src
+  services/mobile/windows-private/Cargo.toml services/mobile/windows-private/src
   crates/replica/Cargo.toml crates/replica/Cargo.lock crates/replica/.cargo crates/replica/src
-  crates/watch-protocol/Cargo.toml crates/watch-protocol/Cargo.lock crates/watch-protocol/.cargo crates/watch-protocol/src)
+  crates/lore-bin/Cargo.toml crates/lore-bin/Cargo.lock crates/lore-bin/src
+  crates/watch-protocol/Cargo.toml crates/watch-protocol/Cargo.lock crates/watch-protocol/.cargo crates/watch-protocol/src
+  client/core/Cargo.toml client/core/src
+  crates/content-search/Cargo.toml crates/content-search/src
+  crates/desktop-catalog/Cargo.toml crates/desktop-catalog/src
+  crates/desktop-ledger/Cargo.toml crates/desktop-ledger/src
+  crates/desktop-migration/Cargo.toml crates/desktop-migration/src
+  crates/desktop-read-policy/Cargo.toml crates/desktop-read-policy/src
+  crates/file-lock/Cargo.toml crates/file-lock/src
+  crates/team-plan/Cargo.toml crates/team-plan/src
+  crates/freedesktop-notify/Cargo.toml crates/freedesktop-notify/src
+  crates/presence-sampler/Cargo.toml crates/presence-sampler/src)
 tar czf - -C "$here" "${sources[@]}" \
   | ssh -o BatchMode=yes "$host" "cd ~/.local/src/hgs/.rust-build && rm -rf ${sources[*]} && tar xzf -"
 # install.sh builds the mobile connector only on request (HGS_MOBILE_CONNECTOR=1)
@@ -72,7 +86,7 @@ bash "$HOME/.local/src/hgs/.rust-build/install.sh"
 # Old callbacks and saved launch paths still refer to this checkout. Only publish
 # their entry points after a working native binary exists, using atomic renames.
 cd "$HOME/.local/src/hgs/.rust-build"
-copy="Cargo.toml Cargo.lock build.rs .cargo src crates scripts install.sh tests README.md LICENSE THIRD_PARTY_NOTICES.md docs mac-install.sh tmux.conf .gitignore"
+copy="Cargo.toml Cargo.lock build.rs .cargo src crates client/core/Cargo.toml client/core/src scripts install.sh tests README.md LICENSE THIRD_PARTY_NOTICES.md docs mac-install.sh tmux.conf .gitignore"
 (cd .. && rm -rf $copy)
 tar cf - $copy | tar xf - -C ..
 for entry in hgs hgs_state.py; do
@@ -124,10 +138,25 @@ REMOTE
 # Каталог назначения постоянный (~/.local/src/hgs, как в README для линукса), а не /tmp:
 # там переживает build/, поэтому повторный прогон собирается инкрементально, а install.sh
 # по cdhash бандла видит, что ничего не изменилось, и не дёргает живой LaunchAgent.
-# DEV_VERSION sits beside tray/: its CMake reads the Dev base version from there.
-tar czf - -C "$here" --exclude='tray/build' --exclude='tray/.cache' tray DEV_VERSION \
-  | ssh -o BatchMode=yes "$host" 'mkdir -p ~/.local/src/hgs && tar xzf - -C ~/.local/src/hgs'
-# PATH неинтерактивного ssh на маке — без Homebrew; cmake/brew tray/install.sh ищет сам
+# The Tauri client's sources travel too, so packaging/desktop/install.sh can build it
+# (HGS_MAC_GUI=client), with
+# VERSION, crates/watch-protocol and the desktop read-policy and migration crates,
+# which client/core and client/src-tauri take by path. Source folders are replaced;
+# their build caches stay. A numbered Dev build needs a clean Git checkout on the
+# Mac instead (docs/macos-distribution.md).
+# Cargo resolves target-specific dependency manifests on the Mac too, including
+# the Linux notification adapter.
+tar czf - -C "$here" \
+  --exclude='client/node_modules' --exclude='client/dist' --exclude='client/*/target' \
+  --exclude='client/src-tauri/gen' \
+  packaging/desktop client crates/watch-protocol/Cargo.toml crates/watch-protocol/src \
+  crates/desktop-read-policy/Cargo.toml crates/desktop-read-policy/src \
+  crates/desktop-migration/Cargo.toml crates/desktop-migration/src \
+  crates/file-lock/Cargo.toml crates/file-lock/src \
+  crates/team-plan/Cargo.toml crates/team-plan/src \
+  crates/freedesktop-notify/Cargo.toml crates/freedesktop-notify/src DEV_VERSION VERSION \
+  | ssh -o BatchMode=yes "$host" 'mkdir -p ~/.local/src/hgs && cd ~/.local/src/hgs && rm -rf client/src client/core/src client/media/src client/src-tauri/src client/src-tauri/capabilities crates/watch-protocol/src crates/desktop-read-policy/src crates/desktop-migration/src crates/file-lock/src crates/team-plan/src crates/freedesktop-notify/src && tar xzf -'
+# PATH неинтерактивного ssh на маке — без Homebrew; npm packaging/desktop/install.sh ищет сам
 # (find_tool в его маковской ветке). Signing uses the Mac's existing keychain;
 # an optional exact identity selector travels as one literal environment value.
-ssh -o BatchMode=yes "$host" "HGS_MACOS_SIGN_IDENTITY=$(shq "${HGS_MACOS_SIGN_IDENTITY:-}") bash ~/.local/src/hgs/tray/install.sh"
+ssh -o BatchMode=yes "$host" "HGS_MAC_CLI_BUILD=~/.local/src/hgs/.rust-build/target/release/hgs HGS_MACOS_SIGN_IDENTITY=$(shq "${HGS_MACOS_SIGN_IDENTITY:-}") HGS_MAC_GUI=$(shq "${HGS_MAC_GUI:-client}") bash ~/.local/src/hgs/packaging/desktop/install.sh"

@@ -41,6 +41,18 @@ pub(crate) const SWAP_VERBS: &[&str] = &[
 /// N15: what the owner says when raising the member cap, English and Russian.
 pub(crate) const MAX_VERBS: &[&str] = &["max", "maximum", "limit", "cap", "лимит", "максимум", "макс", "предел"];
 
+/// U54: what the owner says to relaunch a member's session.
+pub(crate) const RELAUNCH_VERBS: &[&str] = &["relaunch", "restart", "start", "запусти", "запустите", "перезапусти", "перезапустите", "перезапустить"];
+
+/// Owner feedback 2026-11-04 (16): "перезапусти их на additional аккаунте"
+/// names the members the lead asked about without naming each one. For a
+/// relaunch or a swap, one of these words names every member of the request;
+/// the operation's verb is still required.
+pub(crate) const EVERYONE_WORDS: &[&str] = &["all", "everyone", "everybody", "them", "each", "всех", "все", "их", "каждого", "каждый", "весь"];
+
+/// U49: the words that ask a member to drain, English and Russian.
+pub(crate) const DRAIN_PHRASES: &[&str] = &["drain", "remove", "вывед", "убери", "убрать"];
+
 /// U32: what the owner's sentence must contain for one roster change: one of
 /// `phrases` (for an add, the verb "add"/"добав" instead), every token in
 /// `all` (a number), one of `verbs`, and one of `names` (the member).
@@ -51,6 +63,22 @@ pub(crate) struct WordRule {
     pub add: bool,
     pub verbs: &'static [&'static str],
     pub names: Vec<String>,
+    /// U56: a sentence that meets the rule, which a refusal names.
+    pub expect: String,
+}
+
+/// U56: the sentence an approval expects, as a refusal names it: the plan's,
+/// or phase `n`'s ("phase N approved" as well as the plan phrases).
+pub(crate) fn approval_sentence(phase: Option<u32>) -> String {
+    match phase {
+        None => "\"plan approved\" (or \"план принят\")".to_owned(),
+        Some(n) => format!("\"phase {n} approved\" (or \"фаза {n} принята\", \"next phase plan approved\")"),
+    }
+}
+
+/// U56: phase `n` is approved by its own sentence too.
+fn phase_phrases(n: u32) -> [String; 2] {
+    [format!("phase {n} approved"), format!("фаза {n} принята")]
 }
 
 impl WordRule {
@@ -72,7 +100,7 @@ const NUMBER_WORDS: &[(&str, usize)] = &[
 const ROLE_ALIASES: &[(&[&str], &[&str])] = &[
     (&["backend", "бэкенд"], &["backend", "бэкенд", "бэкендер"]),
     (&["frontend", "фронт"], &["frontend", "фронт", "фронтенд"]),
-    (&["qa", "tester", "test", "тестер", "тестировщик"], &["qa", "test", "тест", "тестер"]),
+    (&["qa", "tester", "test", "тестер", "тестировщик"], &["qa", "test", "тест", "тестер", "tester"]),
     (&["reviewer", "review", "ревью"], &["reviewer", "review", "ревью", "ревьюер"]),
     (&["expert", "эксперт"], &["expert", "эксперт"]),
 ];
@@ -124,6 +152,13 @@ pub(crate) fn add_count(text: &str) -> usize {
 /// A sentence that names a role names *this* member's role: "a DeepSeek
 /// frontender" is not a Backend. An agent or model word alone is enough only
 /// when no other role is named.
+/// Feedback 16: whether the owner's sentence names every member at once
+/// ("перезапусти их", "relaunch them all").
+pub(crate) fn says_everyone(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    EVERYONE_WORDS.iter().any(|word| if word.is_ascii() { has_token(&lowered, word) } else { alias_in(&lowered, word) })
+}
+
 pub(crate) fn names_member(text: &str, role: &str, agent: &str, model: &str) -> bool {
     let lowered = text.to_lowercase();
     let named: Vec<usize> = ROLE_ALIASES
@@ -211,6 +246,17 @@ fn verb_in(lowered: &str, verb: &str) -> bool {
     }
 }
 
+/// U49: a value the sentence must name; a count may be said as a number word
+/// ("add two backends" names 2, as "add 2 backends" does).
+fn needed_in(lowered: &str, value: &str) -> bool {
+    let value = value.to_lowercase();
+    if has_token(lowered, &value) {
+        return true;
+    }
+    let Ok(number) = value.parse::<usize>() else { return false };
+    NUMBER_WORDS.iter().any(|(word, n)| *n == number && has_token(lowered, word))
+}
+
 /// U26/N10: a whole token, not a substring ("add" does not match "address").
 fn has_token(haystack: &str, token: &str) -> bool {
     if token.is_empty() {
@@ -243,37 +289,59 @@ pub(crate) fn verify_roster(team: &Team, input: &Value, rule: &WordRule, now: f6
     let lead = team.member(&team.lead).context("The team has no lead")?;
     let session = lead.session.as_ref().context("The lead has no session to check the owner's word in")?;
     let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
-    verify_scan(&db, &session.name, &session.conversation_id, text, now, rule_scan(rule, true))
+    let earlier = earlier_name(session);
+    // Task #21 (owner, 2026-11-05): the lead quotes words of the owner's
+    // message ("relaunch hgs" from "relaunch hgs, relaunch ui2"); the whole
+    // message no longer has to match. The checks still read the whole message.
+    verify_scan(&db, &session.name, &session.conversation_id, &earlier, text, now, rule_scan(rule, false))
 }
 
 /// The fixture-testable roster check.
 #[cfg(test)]
 pub(crate) fn verify_roster_in(db: &Connection, name: &str, conversation: &str, text: &str, rule: &WordRule, now: f64) -> anyhow::Result<OwnerWord> {
-    verify_scan(db, name, conversation, text, now, rule_scan(rule, true))
+    verify_scan(db, name, conversation, "", text, now, rule_scan(rule, false))
 }
 
 fn rule_scan(rule: &WordRule, exact: bool) -> ScanOptions<'_> {
-    ScanOptions { phrases: rule.phrases, needed: &rule.all, exact, add: rule.add, verbs: rule.verbs, names: &rule.names, accept: None, after: 0.0 }
+    let expect = if rule.expect.is_empty() { "the roster phrase and the change it names".to_owned() } else { format!("\"{}\"", rule.expect) };
+    ScanOptions { phrases: rule.phrases, needed: &rule.all, exact, add: rule.add, verbs: rule.verbs, names: &rule.names, accept: None, after: 0.0, expect }
 }
 
 /// Checks the lead's `owner_word` request against the lead session's events
-/// and returns the quote to store.
-pub(crate) fn verify(team: &Team, input: &Value, now: f64) -> anyhow::Result<OwnerWord> {
+/// and returns the quote to store: a plan approval, or phase `phase`'s.
+pub(crate) fn verify(team: &Team, input: &Value, phase: Option<u32>, now: f64) -> anyhow::Result<OwnerWord> {
     let text = input["text"]
         .as_str()
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .context("owner_word.text is required: quote the owner's sentence")?;
+        .with_context(|| format!("owner_word.text is required: quote the owner's sentence, which says {}", approval_sentence(phase)))?;
     let lead = team.member(&team.lead).context("The team has no lead")?;
     let session = lead.session.as_ref().context("The lead has no session to check the owner's word in")?;
     let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
-    verify_in(&db, &session.name, &session.conversation_id, text, now)
+    let earlier = earlier_name(session);
+    verify_approval(&db, &session.name, &session.conversation_id, &earlier, text, phase, now)
 }
 
 /// The verification against one events database, so it is tested with a
 /// fixture instead of the live state.
+#[cfg(test)]
 pub(crate) fn verify_in(db: &Connection, name: &str, conversation: &str, text: &str, now: f64) -> anyhow::Result<OwnerWord> {
-    verify_scan(db, name, conversation, text, now, ScanOptions { phrases: KEY_PHRASES, needed: &[], exact: false, add: false, verbs: &[], names: &[], accept: None, after: 0.0 })
+    verify_approval(db, name, conversation, "", text, None, now)
+}
+
+/// U56: a phase approval also takes "phase N approved" for its own phase,
+/// and a refusal names the sentence it expects.
+#[cfg(test)]
+pub(crate) fn verify_approval_in(db: &Connection, name: &str, conversation: &str, text: &str, phase: Option<u32>, now: f64) -> anyhow::Result<OwnerWord> {
+    verify_approval(db, name, conversation, "", text, phase, now)
+}
+
+fn verify_approval(db: &Connection, name: &str, conversation: &str, earlier: &str, text: &str, phase: Option<u32>, now: f64) -> anyhow::Result<OwnerWord> {
+    let own = phase.map(phase_phrases);
+    let mut phrases: Vec<&str> = KEY_PHRASES.to_vec();
+    phrases.extend(own.iter().flatten().map(String::as_str));
+    let expect = approval_sentence(phase);
+    verify_scan(db, name, conversation, earlier, text, now, ScanOptions { phrases: &phrases, needed: &[], exact: false, add: false, verbs: &[], names: &[], accept: None, after: 0.0, expect })
 }
 
 /// U29: the owner asks to add a task to a running phase, naming it by number
@@ -295,6 +363,11 @@ fn named_phases(lowered: &str) -> Vec<u32> {
 }
 
 fn asks_to_add(lowered: &str, phase: u32) -> bool {
+    // C1: a refusal never asks: "не добавляй задачу в текущую фазу" is not the
+    // owner asking for an addition.
+    if negated(lowered) {
+        return false;
+    }
     let adds = has_token(lowered, "add") || lowered.contains("добав");
     let task = lowered.contains("task") || lowered.contains("задач");
     let current = ["current phase", "running phase", "this phase", "текущ", "идущ", "эту фаз", "этой фаз"]
@@ -304,12 +377,98 @@ fn asks_to_add(lowered: &str, phase: u32) -> bool {
     adds && task && (names.contains(&phase) || (names.is_empty() && current))
 }
 
+/// C1: a confirmation is a short affirmative sentence, never a refusal and
+/// never an unrelated sentence that happens to say "ok". The longest one may
+/// be; a paragraph is not an answer to the warning.
+const CONFIRM_CHARS: usize = 160;
+
+/// C1: words that make a sentence a refusal in either language.
+fn negated(lowered: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "no", "not", "never", "dont", "doesnt", "didnt", "wont", "wouldnt", "cant", "cannot", "couldnt", "shouldnt",
+        "stop", "cancel", "не", "нет", "ни", "нельзя", "никогда", "отмена", "отмени", "хватит", "стоп",
+    ];
+    let words: Vec<&str> = lowered.split(|ch: char| !ch.is_alphanumeric()).filter(|word| !word.is_empty()).collect();
+    if words.iter().any(|word| NEGATIONS.contains(word)) {
+        return true;
+    }
+    // The tokenizer splits an apostrophe off ("don't" is "don" and "t").
+    ["don't", "doesn't", "didn't", "won't", "wouldn't", "can't", "couldn't", "shouldn't"]
+        .iter()
+        .any(|form| lowered.contains(form))
+}
+
+/// C1/N2: the words a confirmation may add after its first one: the addition
+/// itself, politeness, and the phase this warning is about.
+const CONFIRM_WORDS: &[&str] = &[
+    "add", "confirm", "confirmed", "it", "now", "please", "the", "task", "to", "in", "current", "running", "this",
+    "да", "добавь", "подтверждаю", "ок", "ok", "okay", "окей", "в", "на", "текущую", "текущей", "эту", "этой", "идущ",
+];
+
+/// C1/N2: the rest of a confirmation may only name the addition, politeness and
+/// the phase itself; "add it to the next phase", "after the review", "later" or
+/// another number are not confirmations of this warning.
+fn confirmation_rest(words: &[&str], phase: u32) -> bool {
+    let number = phase.to_string();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        if word == "phase" || word.starts_with("фаз") {
+            if words.get(i + 1).is_some_and(|next| *next == number.as_str()) {
+                i += 2;
+                continue;
+            }
+            if i > 0 && matches!(words[i - 1], "current" | "running" | "this" | "текущую" | "текущей" | "эту" | "этой" | "идущ") {
+                i += 1;
+                continue;
+            }
+            return false;
+        }
+        if word == number.as_str() || CONFIRM_WORDS.contains(&word) {
+            i += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// C1: a confirmation is a bare yes/да/ok/confirm/add, or a short sentence that
+/// starts with one and names only the addition. "No, don't add it" and "не
+/// добавляй" are refusals, and "ok, what's the status?" is not an answer.
 fn confirms(lowered: &str, phase: u32) -> bool {
-    let yes = ["add", "confirm", "confirmed", "yes", "ok", "okay", "да"].iter().any(|token| has_token(lowered, token))
-        || lowered.contains("подтвер")
-        || lowered.contains("добав");
+    let text = lowered.trim().trim_matches(|ch: char| ch.is_whitespace() || ".,!?;:\"'()[]{}…".contains(ch));
+    if text.is_empty() || text.chars().count() > CONFIRM_CHARS || negated(text) {
+        return false;
+    }
     // A confirmation naming another phase is not this one's.
-    yes && named_phases(lowered).iter().all(|n| *n == phase)
+    if named_phases(text).iter().any(|n| *n != phase) {
+        return false;
+    }
+    let add = has_token(text, "add") || text.contains("добав");
+    let confirm = has_token(text, "confirm") || has_token(text, "confirmed") || text.contains("подтвер");
+    let bare = matches!(
+        text,
+        "yes" | "да" | "ok" | "okay" | "ок" | "окей" | "sure" | "confirm" | "confirmed" | "add" | "add it" | "добавь"
+            | "подтверждаю"
+    );
+    if bare {
+        return true;
+    }
+    let words: Vec<&str> = text.split(|ch: char| !ch.is_alphanumeric()).filter(|word| !word.is_empty()).collect();
+    let Some(first) = words.first().copied() else { return false };
+    let prefix = matches!(
+        first,
+        "yes" | "да" | "sure" | "confirm" | "confirmed" | "подтверждаю" | "add" | "добавь" | "ok" | "okay" | "ок" | "окей"
+    );
+    if !prefix {
+        return false;
+    }
+    // "ok"/"ок" alone is an answer only with the addition named.
+    if matches!(first, "ok" | "okay" | "ок" | "окей") && !(add || confirm) {
+        return false;
+    }
+    confirmation_rest(&words[1..], phase)
 }
 
 /// U29: verifies the owner's request (or confirmation) for an addition to
@@ -323,10 +482,12 @@ pub(crate) fn verify_phase(team: &Team, input: &Value, phase: u32, kind: PhaseWo
     let lead = team.member(&team.lead).context("The team has no lead")?;
     let session = lead.session.as_ref().context("The lead has no session to check the owner's word in")?;
     let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
-    verify_phase_in(&db, &session.name, &session.conversation_id, text, phase, kind, after, now)
+    let earlier = earlier_name(session);
+    verify_phase_answer(&db, &session.name, &session.conversation_id, &earlier, text, phase, kind, after, now)
 }
 
 /// The fixture-testable U29 check.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_phase_in(
     db: &Connection,
@@ -338,14 +499,147 @@ pub(crate) fn verify_phase_in(
     after: f64,
     now: f64,
 ) -> anyhow::Result<OwnerWord> {
+    verify_phase_answer(db, name, conversation, "", text, phase, kind, after, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_phase_answer(
+    db: &Connection,
+    name: &str,
+    conversation: &str,
+    earlier: &str,
+    text: &str,
+    phase: u32,
+    kind: PhaseWord,
+    after: f64,
+    now: f64,
+) -> anyhow::Result<OwnerWord> {
     let accept = move |lowered: &str| match kind {
         PhaseWord::Request => asks_to_add(lowered, phase),
         PhaseWord::Confirm => confirms(lowered, phase),
     };
-    verify_scan(db, name, conversation, text, now, ScanOptions { phrases: &[], needed: &[], exact: false, add: false, verbs: &[], names: &[], accept: Some(&accept), after })
+    // C1: a confirmation is the owner's whole sentence, never a fragment of a
+    // longer one; a request may be quoted from a sentence that also explains it.
+    let exact = matches!(kind, PhaseWord::Confirm);
+    let expect = phase_word_sentence(phase, kind);
+    verify_scan(db, name, conversation, earlier, text, now, ScanOptions { phrases: &[], needed: &[], exact, add: false, verbs: &[], names: &[], accept: Some(&accept), after, expect: expect.clone() })
         .with_context(|| match kind {
-            PhaseWord::Request => format!("The owner has not asked to add a task to phase {phase} (name the phase or say the current phase)"),
-            PhaseWord::Confirm => format!("The owner has not confirmed the addition to phase {phase} after the warning"),
+            PhaseWord::Request => format!("The owner has not asked to add a task to phase {phase}: quote the owner's sentence that says {expect}"),
+            PhaseWord::Confirm => format!("The owner has not confirmed the addition to phase {phase} after the warning: quote the owner's newer sentence {expect}"),
+        })
+}
+
+/// U56: the sentence an addition to a running phase expects.
+fn phase_word_sentence(phase: u32, kind: PhaseWord) -> String {
+    match kind {
+        PhaseWord::Request => format!("\"add a task to phase {phase}\" (or \"to the current phase\")"),
+        PhaseWord::Confirm => "\"yes, add it\" (or \"да, добавь\")".to_owned(),
+    }
+}
+
+/// U39/U42: what the owner says to change an accepted phase on the lead's
+/// request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseChange {
+    Discard,
+    ToDraft,
+    /// U63 (owner, 2026-10-31): an edit, an addition or a move of an
+    /// accepted phase.
+    Edit,
+    /// U63: removing the lead's own pause of the phase.
+    Unpause,
+    /// U63: whether the owner accepts the phase.
+    Acceptance,
+    /// U63: the owner's acceptance of the phase itself.
+    Accept,
+}
+
+/// The verbs of a discard, English whole and Russian at a word start.
+const DISCARD_VERBS: &[&str] = &["discard", "drop", "remove", "delete", "scrap", "cancel", "отмен", "удали", "убери", "выброс", "выкин"];
+/// The words of a return to a draft.
+const DRAFT_WORDS: &[&str] = &["draft", "drafts", "redraft", "черновик"];
+/// U63: the verbs of an edit, an addition or a move of a phase.
+const EDIT_VERBS: &[&str] = &[
+    "edit", "change", "rename", "move", "add", "reorder", "update", "replace", "remove", "rework",
+    "измен", "поменя", "перенес", "передвин", "добав", "редакт", "переимен", "передела", "убери", "удали",
+];
+/// U63: the verbs that end a pause by themselves.
+const UNPAUSE_VERBS: &[&str] = &["unpause", "resume", "continue", "unblock", "возобнов", "продолж", "сними паузу", "снять паузу", "сними с паузы"];
+/// U63: the words of who accepts a phase.
+const ACCEPTANCE_WORDS: &[&str] = &["acceptance", "приемк", "приёмк"];
+/// U63: the verbs of the owner's acceptance.
+const ACCEPT_VERBS: &[&str] = &["accept", "accepted", "прими", "принима", "принят"];
+
+/// The owner's sentence names phase `phase` and the change; a refusal never
+/// authorizes a change (#595 C1).
+fn asks_phase_change(lowered: &str, phase: u32, change: PhaseChange) -> bool {
+    if negated(lowered) {
+        return false;
+    }
+    let words = match change {
+        PhaseChange::Discard => DISCARD_VERBS,
+        PhaseChange::ToDraft => DRAFT_WORDS,
+        PhaseChange::Edit => EDIT_VERBS,
+        PhaseChange::Unpause => {
+            // "remove the pause of phase 3" says the change too.
+            let removes = (verb_in(lowered, "remove") || verb_in(lowered, "lift") || verb_in(lowered, "убери"))
+                && (lowered.contains("pause") || lowered.contains("пауз"));
+            return named_phases(lowered).contains(&phase) && (removes || UNPAUSE_VERBS.iter().any(|word| verb_in(lowered, word)));
+        }
+        PhaseChange::Acceptance => ACCEPTANCE_WORDS,
+        PhaseChange::Accept => {
+            // The acceptance itself, not a sentence about who accepts.
+            if ACCEPTANCE_WORDS.iter().any(|word| verb_in(lowered, word)) {
+                return false;
+            }
+            ACCEPT_VERBS
+        }
+    };
+    named_phases(lowered).contains(&phase) && words.iter().any(|word| verb_in(lowered, word))
+}
+
+/// U39/U42: verifies the owner's word for discarding phase `phase`, or for
+/// returning it to a draft: a fresh sentence of the lead's own session that
+/// names the phase and the change.
+pub(crate) fn verify_phase_change(team: &Team, input: &Value, phase: u32, change: PhaseChange, now: f64) -> anyhow::Result<OwnerWord> {
+    let text = input["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .context("owner_word.text is required: quote the owner's sentence")?;
+    let lead = team.member(&team.lead).context("The team has no lead")?;
+    let session = lead.session.as_ref().context("The lead has no session to check the owner's word in")?;
+    let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
+    let earlier = earlier_name(session);
+    verify_phase_change_words(&db, &session.name, &session.conversation_id, &earlier, text, phase, change, now)
+}
+
+/// The fixture-testable phase change check. #595 C1: the quote is the owner's
+/// whole sentence, never a fragment of one that also refuses it.
+#[cfg(test)]
+pub(crate) fn verify_phase_change_in(db: &Connection, name: &str, conversation: &str, text: &str, phase: u32, change: PhaseChange, now: f64) -> anyhow::Result<OwnerWord> {
+    verify_phase_change_words(db, name, conversation, "", text, phase, change, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_phase_change_words(db: &Connection, name: &str, conversation: &str, earlier: &str, text: &str, phase: u32, change: PhaseChange, now: f64) -> anyhow::Result<OwnerWord> {
+    let accept = move |lowered: &str| asks_phase_change(lowered, phase, change);
+    let expect = match change {
+        PhaseChange::Discard => format!("\"discard phase {phase}\""),
+        PhaseChange::ToDraft => format!("\"return phase {phase} to a draft\""),
+        PhaseChange::Edit => format!("\"change phase {phase}: ...\""),
+        PhaseChange::Unpause => format!("\"remove the pause of phase {phase}\""),
+        PhaseChange::Acceptance => format!("\"phase {phase} needs my acceptance\""),
+        PhaseChange::Accept => format!("\"phase {phase} accepted\""),
+    };
+    verify_scan(db, name, conversation, earlier, text, now, ScanOptions { phrases: &[], needed: &[], exact: true, add: false, verbs: &[], names: &[], accept: Some(&accept), after: 0.0, expect: expect.clone() })
+        .with_context(|| match change {
+            PhaseChange::Discard => format!("The owner has not asked to discard phase {phase}: quote the owner's whole sentence, such as {expect}"),
+            PhaseChange::ToDraft => format!("The owner has not asked to return phase {phase} to a draft: quote the owner's whole sentence, such as {expect}"),
+            PhaseChange::Edit => format!("The owner has not asked to change phase {phase}: quote the owner's whole sentence, such as {expect}"),
+            PhaseChange::Unpause => format!("The owner has not asked to remove the pause of phase {phase}: quote the owner's whole sentence, such as {expect}"),
+            PhaseChange::Acceptance => format!("The owner has not said who accepts phase {phase}: quote the owner's whole sentence, such as {expect}"),
+            PhaseChange::Accept => format!("The owner has not accepted phase {phase}: quote the owner's whole sentence, such as {expect}"),
         })
 }
 
@@ -363,24 +657,82 @@ struct ScanOptions<'a> {
     accept: Option<&'a dyn Fn(&str) -> bool>,
     /// U29: the sentence must be newer than this time.
     after: f64,
+    /// U56: the sentence the refusal names.
+    expect: String,
 }
+
+/// The name a renamed session's journal keeps: `hgs rename` anchors
+/// events.sqlite3 to the name the session had when its journal began
+/// (`journal_name`), while the team's `SessionRef` follows `hgs ls` to the
+/// current one. Each agent keeps its record in its own store; without a
+/// rename, or without a record, there is no earlier name and the current one
+/// is the only identity.
+fn earlier_name(session: &SessionRef) -> String {
+    let record = if super::super::dsh::exists(&session.name) {
+        super::super::dsh::binding(&session.name).ok()
+    } else if super::super::opencode::exists(&session.name) {
+        super::super::opencode::binding(&session.name).ok()
+    } else {
+        crate::state::storage::read(&session.name).ok()
+    };
+    let Some(record) = record else { return String::new() };
+    record["journal_name"]
+        .as_str()
+        .filter(|journal| !journal.is_empty() && *journal != session.name.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// One event row of the scan: its sequence, conversation and payload.
+fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+
+/// Task #21 (owner, 2026-11-05): the scan reads the main session's messages
+/// only, as the `events_main_messages` partial index keeps them; tool calls
+/// and subagent events no longer push the owner's message out of the last
+/// 200 rows. The words stay exactly the index's, so SQLite uses it.
+const MAIN_MESSAGES: &str = " AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main') AND json_extract(payload, '$.type') IN ('UserPromptSubmit','UserPromptQueued','UserMessage','TurnStarted','QuestionAnswered','AgentMessage','Stop')";
 
 fn verify_scan(
     db: &Connection,
     name: &str,
     conversation: &str,
+    earlier: &str,
     text: &str,
     now: f64,
     options: ScanOptions<'_>,
 ) -> anyhow::Result<OwnerWord> {
     ensure!(!name.is_empty(), "The lead's session has no name to check the owner's word in");
     ensure!(!text.trim().is_empty(), "owner_word.text is required: quote the owner's sentence");
-    let mut statement = db
-        .prepare("SELECT seq, conversation, payload FROM events WHERE name = ?1 ORDER BY seq DESC LIMIT 200")
-        .context("The session events cannot be read")?;
-    let rows = statement
-        .query_map([name], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
-        .context("The session events cannot be read")?;
+    // `hgs rename` anchors the session's journal to the name it had when the
+    // journal began (`journal_name`): events.sqlite3 keeps the owner's
+    // "plan approved" under "work-7c91e747" while the team records the name
+    // `hgs ls` shows, "Worker". The earlier name is only meaningful for the
+    // same conversation: without one, read the current name alone. The
+    // conversation filter stays in SQL, on the events_session index.
+    let use_earlier = !earlier.is_empty() && !conversation.is_empty();
+    let mut statement = if conversation.is_empty() {
+        db.prepare(&format!("SELECT seq, conversation, payload FROM events WHERE name = ?1{MAIN_MESSAGES} ORDER BY seq DESC LIMIT 200"))
+    } else if use_earlier {
+        db.prepare(&format!(
+            "SELECT seq, conversation, payload FROM events WHERE name IN (?1, ?2) AND conversation = ?3{MAIN_MESSAGES} ORDER BY seq DESC LIMIT 200",
+        ))
+    } else {
+        db.prepare(&format!("SELECT seq, conversation, payload FROM events WHERE name = ?1 AND conversation = ?2{MAIN_MESSAGES} ORDER BY seq DESC LIMIT 200"))
+    }
+    .context("The session events cannot be read")?;
+    let rows = if conversation.is_empty() {
+        statement.query_map([name], event_row).context("The session events cannot be read")?
+    } else if use_earlier {
+        statement.query_map([name, earlier, conversation], event_row).context("The session events cannot be read")?
+    } else {
+        statement.query_map([name, conversation], event_row).context("The session events cannot be read")?
+    };
+    // Task #21: a quote that is a whole message names that message, even when
+    // a newer message contains it; a part of a message is taken only when no
+    // message is the whole quote.
+    let mut partial: Option<OwnerWord> = None;
     for row in rows {
         let (seq, event_conversation, payload) = row.context("The session events cannot be read")?;
         if !conversation.is_empty() && event_conversation != conversation {
@@ -405,12 +757,26 @@ fn verify_scan(
             continue;
         }
         let detail = event["detail"].as_str().unwrap_or_default().trim();
+        // Injected policy is never an owner statement. Preserve only the
+        // person's text, and then apply the ordinary origin/envelope checks.
+        let detail = if detail.starts_with("[Iron rules") {
+            match detail.find("\n[/Iron rules]") {
+                Some(at) if at <= 65536 => detail[at + "\n[/Iron rules]".len()..].trim(),
+                _ => "",
+            }
+        } else { detail };
+
         // Only the person speaks in a `UserPromptSubmit` event: a team message,
         // a task notification or an attachment-only entry is not the owner.
         if detail.is_empty() || detail.starts_with("[Zerus") || detail.starts_with("[attachment") || detail.starts_with('<') {
             continue;
         }
         let lowered = detail.to_lowercase();
+        // #595 N1/C1: a refusal never authorizes any owner word, whatever the
+        // rule: "Don't remove backend2" and "не отменяй фазу 3" are not words.
+        if negated(&lowered) {
+            continue;
+        }
         let said = if let Some(accept) = options.accept {
             accept(&lowered)
         } else if options.add {
@@ -434,18 +800,160 @@ fn verify_scan(
         if !said {
             continue;
         }
-        if if options.exact { detail.trim() != text.trim() } else { !detail.contains(text) } {
+        let whole = detail.trim() == text.trim();
+        if !whole && (options.exact || !detail.contains(text)) {
             continue;
         }
-        if !options.needed.iter().all(|value| has_token(&lowered, &value.to_lowercase())) {
+        if !options.needed.iter().all(|value| needed_in(&lowered, value)) {
             continue;
         }
-        return Ok(OwnerWord { text: detail.to_owned(), at, event: seq });
+        let word = OwnerWord { text: detail.to_owned(), at, event: seq };
+        if whole {
+            return Ok(word);
+        }
+        partial.get_or_insert(word);
     }
+    if let Some(word) = partial {
+        return Ok(word);
+    }
+    // U56: the refusal names the sentence this operation expects.
     anyhow::bail!(
-        "The owner's word is not in the lead session's last 30 minutes: no such prompt contains the sentence, \
-         the roster phrase and the change it names"
+        "The owner's word is not in the lead session's last 30 minutes (expected words like {}); propose the change instead (hgs guide team-propose) and the owner allows it with a click",
+        options.expect
     )
+}
+
+/// Task #279 (owner, 2026-11-08): an owner message judged as the owner typing,
+/// with its time and text: a main `UserPromptSubmit` of the lead's session,
+/// never an injected policy or a team notification. Shared by the citation
+/// check and the message list.
+fn owner_message(event: &Value) -> Option<(f64, String)> {
+    if event["type"] != "UserPromptSubmit" {
+        return None;
+    }
+    if !matches!(event["agent_id"].as_str().unwrap_or_default(), "" | "main") {
+        return None;
+    }
+    if event["origin"].as_str().is_some_and(|origin| !origin.is_empty())
+        || event["turn_origin"].as_str().is_some_and(|origin| !origin.is_empty())
+    {
+        return None;
+    }
+    let at = event["at"].as_f64().unwrap_or(0.0);
+    if at <= 0.0 {
+        return None;
+    }
+    let detail = event["detail"].as_str().unwrap_or_default().trim();
+    let detail = if detail.starts_with("[Iron rules") {
+        match detail.find("\n[/Iron rules]") {
+            Some(found) if found <= 65536 => detail[found + "\n[/Iron rules]".len()..].trim(),
+            _ => "",
+        }
+    } else {
+        detail
+    };
+    if detail.is_empty() || detail.starts_with("[Zerus") || detail.starts_with("[attachment") || detail.starts_with('<') {
+        return None;
+    }
+    Some((at, detail.to_owned()))
+}
+
+/// The owner's words with every run of white space one space and lowercased.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Task #279 (owner, 2026-11-08): an owner message cited by its id and quote,
+/// at any age. The lead finds the rule in the lead session's journal
+/// (`hgs team decisions --json {"action":"owner-messages"}` lists the messages
+/// and their ids) and quotes it; Zerus verifies that message is the owner's and
+/// that the quote is in it. A negation is not refused here: a standing rule
+/// often says "no push" or "never touch".
+pub(crate) fn verify_cited(team: &Team, message: &Value) -> anyhow::Result<OwnerWord> {
+    let lead = team.member(&team.lead).context("The team has no lead")?;
+    let session = lead.session.as_ref().context("The lead has no session to check the owner's message in")?;
+    let earlier = earlier_name(session);
+    let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
+    verify_cited_in(&db, &session.name, &session.conversation_id, &earlier, message)
+}
+
+/// The fixture-testable citation check.
+pub(crate) fn verify_cited_in(db: &Connection, name: &str, conversation: &str, earlier: &str, message: &Value) -> anyhow::Result<OwnerWord> {
+    let id = message["id"]
+        .as_i64()
+        .or_else(|| message["id"].as_str().and_then(|text| text.trim().parse().ok()))
+        .filter(|id| *id > 0)
+        .context("owner_message.id is the owner message's id in the lead session's journal (hgs team decisions --json {\"action\":\"owner-messages\"} lists them)")?;
+    let quote = message["quote"].as_str().map(str::trim).filter(|quote| !quote.is_empty()).context("owner_message.quote is the owner's own words from that message")?;
+    anyhow::ensure!(quote.chars().count() <= 2000, "An owner message quote is at most 2000 characters");
+    let mut names: Vec<&str> = vec![name];
+    if !earlier.is_empty() && !conversation.is_empty() {
+        names.push(earlier);
+    }
+    let wanted = flat(quote);
+    for row_name in names {
+        let mut statement = db.prepare("SELECT conversation, payload FROM events WHERE seq = ?1 AND name = ?2").context("The session events cannot be read")?;
+        let rows = statement.query_map(rusqlite::params![id, row_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)));
+        let Ok(rows) = rows else { continue };
+        for row in rows {
+            let (event_conversation, payload) = row.context("The session events cannot be read")?;
+            if !conversation.is_empty() && event_conversation != conversation {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(&payload) else { continue };
+            let Some((at, detail)) = owner_message(&event) else { continue };
+            if flat(&detail).contains(&wanted) {
+                return Ok(OwnerWord { text: detail, at, event: id });
+            }
+            anyhow::bail!("The owner message {id} does not contain that quote: quote its own words (the message says \"{}\")", clip_chars(&flat(&detail), 200));
+        }
+    }
+    anyhow::bail!("The owner message {id} is not in the lead session's journal: hgs team decisions --json {{\"action\":\"owner-messages\"}} lists the owner's messages with their ids")
+}
+
+/// A bounded one-line quote for a refusal.
+fn clip_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(limit.saturating_sub(1)).collect::<String>())
+    }
+}
+
+/// Task #279: the lead session's owner messages, newest first, read-only: the
+/// ids and words a decision cites.
+pub(crate) fn messages(team: &Team, limit: usize) -> anyhow::Result<Vec<Value>> {
+    let lead = team.member(&team.lead).context("The team has no lead")?;
+    let session = lead.session.as_ref().context("The lead has no session to read the owner's messages from")?;
+    let earlier = earlier_name(session);
+    let db = super::super::journal::event_db().map_err(|error| anyhow::anyhow!("The session events are unavailable: {error}"))?;
+    let names: Vec<&str> = if earlier.is_empty() || session.conversation_id.is_empty() {
+        vec![session.name.as_str()]
+    } else {
+        vec![session.name.as_str(), earlier.as_str()]
+    };
+    let mut found: Vec<(i64, f64, String)> = Vec::new();
+    for row_name in names {
+        let mut statement = db
+            .prepare("SELECT seq, payload FROM events WHERE name = ?1 AND conversation = ?2 ORDER BY seq DESC LIMIT 500")
+            .context("The session events cannot be read")?;
+        let rows = statement.query_map(rusqlite::params![row_name, session.conversation_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)));
+        let Ok(rows) = rows else { continue };
+        for row in rows.flatten() {
+            let (seq, payload) = row;
+            let Ok(event) = serde_json::from_str::<Value>(&payload) else { continue };
+            if let Some((at, text)) = owner_message(&event) {
+                found.push((seq, at, text));
+            }
+        }
+    }
+    found.sort_by_key(|found| std::cmp::Reverse(found.0));
+    found.dedup_by_key(|(seq, _, _)| *seq);
+    Ok(found
+        .into_iter()
+        .take(limit.clamp(1, 200))
+        .map(|(id, at, text)| serde_json::json!({"id":id,"at":at,"text":clip_chars(&text, 400)}))
+        .collect())
 }
 
 #[cfg(test)]
@@ -471,6 +979,79 @@ mod tests {
 
     fn prompt(at: f64, detail: &str) -> Value {
         serde_json::json!({"type":"UserPromptSubmit","at":at,"agent_id":"","detail":detail})
+    }
+
+    /// U56: a refused word names the sentence its operation expects, and a
+    /// phase approval takes "phase N approved" for its own phase only.
+    #[test]
+    fn a_refused_word_names_the_expected_sentence() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "please continue"));
+        let error = verify_in(&db, "claude/x/lead", "c1", "please continue", 2000.0).unwrap_err().to_string();
+        assert!(error.contains("\"plan approved\" (or \"план принят\")"), "{error}");
+        assert!(!error.contains("roster"), "{error}");
+        let error = verify_approval_in(&db, "claude/x/lead", "c1", "please continue", Some(3), 2000.0).unwrap_err().to_string();
+        assert!(error.contains("\"phase 3 approved\""), "{error}");
+        // The phase's own sentence approves that phase, in either language.
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Phase 3 approved, go"));
+        add(&db, "claude/x/lead", "c1", prompt(2001.0, "фаза 4 принята"));
+        assert!(verify_approval_in(&db, "claude/x/lead", "c1", "Phase 3 approved", Some(3), 2010.0).is_ok());
+        assert!(verify_approval_in(&db, "claude/x/lead", "c1", "фаза 4 принята", Some(4), 2010.0).is_ok());
+        // Another phase's sentence, a plan approval and a refusal do not.
+        assert!(verify_approval_in(&db, "claude/x/lead", "c1", "Phase 3 approved", Some(4), 2010.0).is_err());
+        assert!(verify_approval_in(&db, "claude/x/lead", "c1", "Phase 3 approved", None, 2010.0).is_err());
+        add(&db, "claude/x/lead", "c1", prompt(2002.0, "phase 5 approved? no, not yet"));
+        assert!(verify_approval_in(&db, "claude/x/lead", "c1", "phase 5 approved", Some(5), 2010.0).is_err());
+        // A roster rule names its own sentence; phase changes and additions too.
+        let rule = WordRule { phrases: ROSTER_PHRASES, verbs: REMOVE_VERBS, names: vec!["dev".into()], expect: "remove dev".into(), ..Default::default() };
+        let error = verify_roster_in(&db, "claude/x/lead", "c1", "please continue", &rule, 2010.0).unwrap_err().to_string();
+        assert!(error.contains("\"remove dev\""), "{error}");
+        let error = verify_phase_change_in(&db, "claude/x/lead", "c1", "please continue", 2, PhaseChange::Discard, 2010.0).unwrap_err().to_string();
+        assert!(error.contains("\"discard phase 2\""), "{error}");
+        let error = verify_phase_change_in(&db, "claude/x/lead", "c1", "please continue", 2, PhaseChange::Accept, 2010.0).unwrap_err().to_string();
+        assert!(error.contains("\"phase 2 accepted\""), "{error}");
+        let error = verify_phase_in(&db, "claude/x/lead", "c1", "please continue", 2, PhaseWord::Request, 0.0, 2010.0).unwrap_err().to_string();
+        assert!(error.contains("\"add a task to phase 2\""), "{error}");
+    }
+
+    /// U63 (owner, 2026-10-31): the sentences that let the lead change an
+    /// accepted phase, remove its own pause, set who accepts a phase and
+    /// accept one name the phase and the change; another change does not.
+    #[test]
+    fn the_owners_phase_control_words_name_the_phase_and_the_change() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Move phase 3 before phase 2"));
+        add(&db, "claude/x/lead", "c1", prompt(2001.0, "Remove the pause of phase 3"));
+        add(&db, "claude/x/lead", "c1", prompt(2002.0, "Pause phase 4"));
+        add(&db, "claude/x/lead", "c1", prompt(2003.0, "Phase 3 needs my acceptance"));
+        add(&db, "claude/x/lead", "c1", prompt(2004.0, "Phase 3 accepted"));
+        add(&db, "claude/x/lead", "c1", prompt(2005.0, "сними паузу с фазы 5"));
+        let check = |text: &str, phase: u32, change: PhaseChange| verify_phase_change_in(&db, "claude/x/lead", "c1", text, phase, change, 2010.0).is_ok();
+        assert!(check("Move phase 3 before phase 2", 3, PhaseChange::Edit));
+        assert!(check("Remove the pause of phase 3", 3, PhaseChange::Unpause));
+        assert!(check("сними паузу с фазы 5", 5, PhaseChange::Unpause));
+        assert!(!check("Pause phase 4", 4, PhaseChange::Unpause));
+        assert!(check("Phase 3 needs my acceptance", 3, PhaseChange::Acceptance));
+        assert!(!check("Phase 3 needs my acceptance", 3, PhaseChange::Accept));
+        assert!(check("Phase 3 accepted", 3, PhaseChange::Accept));
+        assert!(!check("Phase 3 accepted", 4, PhaseChange::Accept));
+        assert!(!check("Phase 3 accepted", 3, PhaseChange::Edit));
+    }
+
+    #[test]
+    fn injected_iron_rules_never_supply_the_owners_word() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0,
+            "[Iron rules: follow every one]\n1. plan approved\n[/Iron rules]\n\nHello"));
+        assert!(verify_in(&db, "claude/x/lead", "c1", "plan approved", 2010.0).is_err());
+        add(&db, "claude/x/lead", "c1", prompt(2001.0,
+            "[Iron rules: follow every one]\n1. Keep changes local\n[/Iron rules]\n\nplan approved"));
+        assert_eq!(verify_in(&db, "claude/x/lead", "c1", "plan approved", 2010.0).unwrap().text, "plan approved");
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0,
+            "[Iron rules: follow every one]\n1. Keep changes local\n[/Iron rules]\n\n[Zerus team] plan approved"));
+        assert!(verify_in(&db, "claude/x/lead", "c1", "plan approved", 2010.0).is_err());
     }
 
     #[test]
@@ -516,7 +1097,33 @@ mod tests {
         assert!(verify_in(&db, "claude/x/lead", "c1", "plan approved", 2000.0).is_ok());
         // A lead on another computer cannot be checked here.
         let team = Team { lead: "lead".into(), ..Default::default() };
-        assert!(verify(&team, &serde_json::json!({"text":"plan approved"}), 2000.0).is_err());
+        assert!(verify(&team, &serde_json::json!({"text":"plan approved"}), None, 2000.0).is_err());
+    }
+
+    /// Owner (2026-11-01): the earlier journal name is read only with a
+    /// conversation id, and the conversation filter is in SQL before the 200
+    /// row limit, so newer events of another conversation cannot hide it.
+    #[test]
+    fn the_owner_word_scan_bounds_the_conversation_and_the_earlier_name() {
+        let db = database();
+        add(&db, "claude/x/work-7c91e747", "c1", prompt(2000.0, "plan approved"));
+        assert!(
+            verify_approval(&db, "claude/x/Worker", "", "claude/x/work-7c91e747", "plan approved", None, 2010.0).is_err(),
+            "no conversation, no earlier name"
+        );
+        assert!(
+            verify_approval(&db, "claude/x/Worker", "c1", "claude/x/work-7c91e747", "plan approved", None, 2010.0).is_ok(),
+            "the same conversation finds it"
+        );
+        let db = database();
+        add(&db, "claude/x/Worker", "c1", prompt(2000.0, "plan approved"));
+        for i in 0..200 {
+            add(&db, "claude/x/Worker", "other", prompt(3000.0 + i as f64, "not the owner"));
+        }
+        assert!(
+            verify_approval(&db, "claude/x/Worker", "c1", "", "plan approved", None, 2010.0).is_ok(),
+            "the conversation is filtered before the 200 row limit"
+        );
     }
 
     fn roster_rule(all: &[&str]) -> WordRule {
@@ -532,12 +1139,12 @@ mod tests {
     fn member_rule(verbs: &'static [&'static str], id: &str, role: &str) -> WordRule {
         let mut names = vec![id.to_owned()];
         names.extend(role_aliases(role).iter().map(|alias| (*alias).to_owned()));
-        WordRule { phrases: ROSTER_PHRASES, all: Vec::new(), add: false, verbs, names }
+        WordRule { phrases: ROSTER_PHRASES, all: Vec::new(), add: false, verbs, names, expect: String::new() }
     }
 
     /// N15: the cap change, naming the number the owner said.
     fn max_rule(cap: u64) -> WordRule {
-        WordRule { phrases: ROSTER_PHRASES, all: vec![cap.to_string()], add: false, verbs: MAX_VERBS, names: Vec::new() }
+        WordRule { phrases: ROSTER_PHRASES, all: vec![cap.to_string()], add: false, verbs: MAX_VERBS, names: Vec::new(), expect: String::new() }
     }
 
     #[test]
@@ -590,6 +1197,95 @@ mod tests {
         // "address" is not "add".
         add(&db, "claude/x/lead", "c1", prompt(1070.0, "Address the task in phase 3"));
         assert!(request("Address the task in phase 3", 3).is_err());
+    }
+
+    /// C1 (#511): a refusal never confirms or asks, an unrelated sentence with
+    /// "ok" is not the answer to the warning, and the quote is the whole
+    /// sentence, never a fragment of it.
+    #[test]
+    fn a_refusal_never_confirms_a_phase_addition() {
+        let db = database();
+        for (at, said) in [
+            (2000.0, "Please add a task to phase 3: the hotfix"),
+            (2010.0, "Yes, add it"),
+            (2020.0, "Confirmed, add it now"),
+            (2030.0, "да, добавь"),
+            (2040.0, "подтверждаю"),
+            (2045.0, "ок, добавь"),
+            (2050.0, "No, don't add it"),
+            (2060.0, "не добавляй"),
+            (2070.0, "ok, what's the status"),
+            (2080.0, "No, don't add a task to phase 3"),
+            (2090.0, "не добавляй задачу в текущую фазу"),
+        ] {
+            add(&db, "claude/x/lead", "c1", prompt(at, said));
+        }
+        let request = |text: &str| verify_phase_in(&db, "claude/x/lead", "c1", text, 3, PhaseWord::Request, 0.0, 2100.0);
+        let confirm = |text: &str| verify_phase_in(&db, "claude/x/lead", "c1", text, 3, PhaseWord::Confirm, 1990.0, 2100.0);
+        // The real confirmations, in both languages, still work.
+        for said in ["Yes, add it", "Confirmed, add it now", "да, добавь", "подтверждаю", "ок, добавь"] {
+            confirm(said).unwrap_or_else(|error| panic!("{said}: {error}"));
+        }
+        // A refusal never confirms.
+        for said in ["No, don't add it", "не добавляй"] {
+            let error = confirm(said).unwrap_err().to_string();
+            assert!(error.contains("has not confirmed"), "{said}: {error}");
+        }
+        // An unrelated sentence with "ok" in it is not the answer.
+        let error = confirm("ok, what's the status").unwrap_err().to_string();
+        assert!(error.contains("has not confirmed"), "{error}");
+        // The quote is the whole sentence: a fragment is not the owner's word.
+        assert!(confirm("add it").is_err());
+        assert!(confirm("Yes, add it to phase 3").is_err());
+        // A request is never a refusal.
+        request("Please add a task to phase 3").unwrap();
+        for said in ["No, don't add a task to phase 3", "не добавляй задачу в текущую фазу"] {
+            let error = request(said).unwrap_err().to_string();
+            assert!(error.contains("has not asked"), "{said}: {error}");
+        }
+    }
+
+    /// #595 N2: a deferral or a redirection is not a confirmation, even when it
+    /// starts with yes/sure/add; the phase this warning is about may be named.
+    #[test]
+    fn a_deferral_never_confirms_a_phase_addition() {
+        let db = database();
+        for (at, said) in [
+            (2000.0, "Please add a task to phase 3"),
+            (2010.0, "Add it to the next phase instead"),
+            (2020.0, "Yes, but after the review"),
+            (2030.0, "sure, later"),
+            (2040.0, "yes, add it now"),
+            (2050.0, "yes, add it to phase 3"),
+            (2060.0, "да, добавь в текущую фазу"),
+        ] {
+            add(&db, "claude/x/lead", "c1", prompt(at, said));
+        }
+        let confirm = |text: &str| verify_phase_in(&db, "claude/x/lead", "c1", text, 3, PhaseWord::Confirm, 1990.0, 2100.0);
+        for said in ["Add it to the next phase instead", "Yes, but after the review", "sure, later"] {
+            let error = confirm(said).unwrap_err().to_string();
+            assert!(error.contains("has not confirmed"), "{said}: {error}");
+        }
+        for said in ["yes, add it now", "yes, add it to phase 3", "да, добавь в текущую фазу"] {
+            confirm(said).unwrap_or_else(|error| panic!("{said}: {error}"));
+        }
+    }
+
+    /// #595 N1: a refusal never authorizes a roster, scale or drain word in any
+    /// language, while the plain sentence still does.
+    #[test]
+    fn a_refusal_never_authorizes_a_roster_word() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Don't remove backend2"));
+        add(&db, "claude/x/lead", "c1", prompt(2010.0, "Please remove backend2"));
+        let rule = member_rule(&["remove"], "backend2", "Backend");
+        let error = verify_roster_in(&db, "claude/x/lead", "c1", "Don't remove backend2", &rule, 2020.0).unwrap_err().to_string();
+        assert!(error.contains("owner's word"), "{error}");
+        assert!(verify_roster_in(&db, "claude/x/lead", "c1", "Please remove backend2", &rule, 2020.0).is_ok());
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "не надо добавлять второго тестера"));
+        let error = verify_roster_in(&db, "claude/x/lead", "c1", "не надо добавлять второго тестера", &add_rule(), 2010.0).unwrap_err().to_string();
+        assert!(error.contains("owner's word"), "{error}");
     }
 
     #[test]
@@ -675,5 +1371,56 @@ mod tests {
         // "добавь бэкенда для фазы 3" is one add: 3 is the phase, not a count.
         assert_eq!(add_count("добавь бэкенда для фазы 3"), 1);
         assert_eq!(add_count("add a backend for phase 3"), 1);
+        // U49: a scale names the role in the plural too.
+        assert!(names_member("add two backends", "Backend", "codex", ""));
+        assert!(names_member("add two testers", "Tester", "claude", ""));
+    }
+
+    #[test]
+    fn a_count_may_be_said_as_a_number_word() {
+        // U49: the word rule asks for the count; "two" names 2 as "2" does.
+        let rule = WordRule { phrases: &[], all: vec!["2".into()], add: true, ..Default::default() };
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Please add two backend members to the roster"));
+        verify_roster_in(&db, "claude/x/lead", "c1", "Please add two backend members to the roster", &rule, 2010.0).unwrap();
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Please add three backend members to the roster"));
+        assert!(verify_roster_in(&db, "claude/x/lead", "c1", "Please add three backend members to the roster", &rule, 2010.0).is_err());
+        // A count written as a word does not authorize another count.
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "Please add 2 backend members to the roster"));
+        verify_roster_in(&db, "claude/x/lead", "c1", "Please add 2 backend members to the roster", &rule, 2010.0).unwrap();
+    }
+
+    /// Task #21 (owner, 2026-11-05): "relaunch hgs, relaunch ui2" authorizes
+    /// each relaunch it names with the lead quoting just that part, and a
+    /// member the message does not name is still refused.
+    #[test]
+    fn one_message_names_several_relaunches_and_each_quote_is_part_of_it() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "relaunch hgs, relaunch ui2"));
+        for (quote, id) in [("relaunch hgs", "hgs"), ("relaunch ui2", "ui2"), ("relaunch hgs, relaunch ui2", "ui2")] {
+            verify_roster_in(&db, "claude/x/lead", "c1", quote, &member_rule(RELAUNCH_VERBS, id, "Frontend"), 2010.0)
+                .unwrap_or_else(|error| panic!("{quote}: {error}"));
+        }
+        assert!(verify_roster_in(&db, "claude/x/lead", "c1", "relaunch hgs", &member_rule(RELAUNCH_VERBS, "core", "Backend"), 2010.0).is_err());
+        // A quote that is not in the message is not the owner's word.
+        assert!(verify_roster_in(&db, "claude/x/lead", "c1", "relaunch core", &member_rule(RELAUNCH_VERBS, "hgs", "Frontend"), 2010.0).is_err());
+    }
+
+    /// Task #21: the owner's message is found behind more than 200 tool and
+    /// subagent events of the lead's session.
+    #[test]
+    fn the_owners_message_is_found_behind_many_tool_events() {
+        let db = database();
+        add(&db, "claude/x/lead", "c1", prompt(2000.0, "relaunch hgs"));
+        for n in 0..450 {
+            let tool = serde_json::json!({"type":"PostToolUse","at":2001.0 + f64::from(n) / 100.0,"agent_id":"","detail":"relaunch hgs"});
+            add(&db, "claude/x/lead", "c1", tool);
+            add(&db, "claude/x/lead", "c1", serde_json::json!({"type":"UserPromptSubmit","at":2001.0,"agent_id":"sub-1","detail":"x"}));
+        }
+        verify_roster_in(&db, "claude/x/lead", "c1", "relaunch hgs", &member_rule(RELAUNCH_VERBS, "hgs", "Frontend"), 2010.0).unwrap();
     }
 }
+
+

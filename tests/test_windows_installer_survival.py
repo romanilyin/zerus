@@ -13,9 +13,11 @@ image. An upgrade must leave that host, its session, the staged CLI and the
 images alone, install the zip's files byte for byte and remove files an older
 version left; the uninstaller removes only the installed files. A junction
 inside the folder stops an upgrade before anything changes, and never leads
-its clean-up to files outside. Run it outside the CI step's job
-(scripts/ci/outside-job.py), as the host suites run.
+its clean-up to files outside. A folder that already holds files it does not
+own (an extracted portable zip) stops Setup too. Run it outside the CI step's
+job (scripts/ci/outside-job.py), as the host suites run.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 
 import test_windows_host as windows_host
 from test_windows_host import HIDDEN, LIMIT
@@ -38,14 +41,81 @@ UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F1B0C52-
 SETUP_LIMIT = 300
 
 
+def installer_environment(isolated, original):
+    """Keep Windows shell folders real while hgs uses its private HOME/HGS roots."""
+    result = dict(isolated)
+    for key in ('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH'):
+        if key in original:
+            result[key] = original[key]
+        else:
+            result.pop(key, None)
+    return result
+
+
+def set_privileges(states):
+    """Enable or disable this process token's privileges ({name: enabled}).
+
+    Returns the prior state of each privilege that changed, to pass back later.
+    A child process starts with a copy of this token, so Setup inherits the
+    result. A privilege the token does not hold is left alone.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
+        ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD)]
+    enabled_flag, adjust, query, not_all_assigned = 0x2, 0x20, 0x8, 1300
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), adjust | query, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    prior = {}
+    try:
+        for name, enabled in states.items():
+            luid = LUID()
+            if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            wanted = TOKEN_PRIVILEGES(1, (LUID_AND_ATTRIBUTES * 1)(
+                LUID_AND_ATTRIBUTES(luid, enabled_flag if enabled else 0)))
+            before = TOKEN_PRIVILEGES()
+            size = wintypes.DWORD()
+            if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(wanted), ctypes.sizeof(before),
+                                                  ctypes.byref(before), ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.get_last_error()
+            if error not in (0, not_all_assigned):
+                raise ctypes.WinError(error)
+            if error == 0 and before.PrivilegeCount:
+                prior[name] = bool(before.Privileges[0].Attributes & enabled_flag)
+    finally:
+        kernel32.CloseHandle(token)
+    return prior
+
+
 def registered():
     """DisplayVersion and InstallLocation of the HKCU uninstall entry, or None."""
     import winreg
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
-            return {name: winreg.QueryValueEx(key, name)[0] for name in ("DisplayVersion", "InstallLocation")}
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
     except FileNotFoundError:
         return None
+    with key:
+        return {name: winreg.QueryValueEx(key, name)[0] for name in ("DisplayVersion", "InstallLocation")}
 
 
 @unittest.skipUnless(os.name == "nt" and INSTALLER, "needs Windows and HGS_TEST_INSTALLER")
@@ -54,46 +124,116 @@ class Installer(windows_host.HostCase):
         super().setUp()
         for key in ("HGS_HOST_IMAGE", "HGS_HOST_ALLOW_UNSTAGED"):
             del self.env[key]
+        self.backend_tracking = False
+        self.backend_clean = True
+        self.backend_request = str(uuid.uuid4())
+        self.env['HGS_CONFIG_DIR'] = str(self.home / '.config' / 'hgs')
+        self.installer_env = installer_environment(self.env, os.environ)
         self.setup_exe = Path(INSTALLER).resolve()
         self.assertTrue(self.setup_exe.is_file(), self.setup_exe)
         self.assertTrue(PORTABLE_ZIP and Path(PORTABLE_ZIP).is_file(), "HGS_TEST_PORTABLE_ZIP")
         self.assertIsNone(registered(), "Zerus is already installed for this user")
         expected = tempfile.TemporaryDirectory(prefix="zerus-expected-")
         self.addCleanup(expected.cleanup)
-        self.record, self.expected = windows_installer.stage(PORTABLE_ZIP, Path(expected.name))
+        self.record, self.expected = windows_installer.stage(
+            PORTABLE_ZIP, Path(expected.name), os.environ.get("HGS_TEST_INSTALLER_VERSION") or None)
         self.app = self.root / "Zerus"
         self.cli = self.home / ".local" / "bin" / "hgs.exe"
         self.images = self.home / ".local" / "share" / "hgs" / "host"
         self.marker = self.home / ".config" / "hgs" / "local-sessions"
         self.shortcut = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Zerus.lnk"
         self.logs = 0
+        help_result = subprocess.run([str(windows_host.HGS), '--help'], env=self.env,
+                                     capture_output=True, text=True, timeout=LIMIT, creationflags=HIDDEN)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.backend_tracking = (self.record.get('desktop') == 'tauri'
+                                 and 'desktop-notification-registration-v1' in help_result.stdout)
+        if self.backend_tracking:
+            self.assertEqual(windows_installer.sha256(windows_host.HGS), self.expected['hgs.exe'])
+            self.assertFalse(self.backend('registration', 'status')['registered'], 'Keep an existing backend task')
+            self.assertFalse(self.backend('notification-registration', 'status')['registered'], 'Keep an existing Toast registration')
         # Registered last, so it runs first: the host and its sessions stop afterwards.
+        self.addCleanup(self.cleanup_backend)
         self.addCleanup(self.uninstall_if_installed)
 
-    # The installer and the uninstaller run with the runner's own environment:
-    # Inno Setup finds the profile's folders through the shell, not HGS_*.
+    # Do not give Inno Setup the host fixture's synthetic USERPROFILE: its shell
+    # folder expansion must match the real shortcut assertion. hgs prefers HOME,
+    # which stays private along with its explicit config/state roots.
+
+    def backend(self, command, operation):
+        args = [str(windows_host.HGS), 'desktop', command, operation, '--json']
+        if command == 'notification-registration' and operation == 'remove':
+            args += ['--request-id', self.backend_request]
+        print(f"installer survival: {self._testMethodName}: {command} {operation}", flush=True)
+        result = subprocess.run(args, env=self.env, capture_output=True, text=True,
+                                encoding='utf-8', timeout=75, creationflags=HIDDEN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertLessEqual(len(result.stdout.encode('utf-8')), 65536)
+        return json.loads(result.stdout)
+
+    def cleanup_backend(self):
+        if not self.backend_tracking or self.backend_clean:
+            return
+        try:
+            # No service was started in this fixture: only the maintained
+            # no-service/no-state removal is allowed. Never bypass a refusal.
+            if self.backend('notification-registration', 'status')['registered']:
+                self.assertFalse(self.backend('notification-registration', 'remove')['registered'])
+            if self.backend('registration', 'status')['registered']:
+                self.assertFalse(self.backend('registration', 'remove')['registered'])
+            self.assertFalse(self.backend('notification-registration', 'status')['registered'])
+            self.assertFalse(self.backend('registration', 'status')['registered'])
+            self.backend_clean = True
+        except Exception:
+            print('Backend cleanup uncertain; keep private CLI/profile:', self.root, file=sys.stderr)
+            raise
+
+    def cleanup_temp(self):
+        try:
+            app_kept = getattr(self, 'app', None) is not None and registered() is not None
+        except OSError:
+            app_kept = True
+        if not getattr(self, 'backend_clean', True) or app_kept:
+            self.temp._finalizer.detach()
+            print('Private profile retained for backend registration review:', self.root, file=sys.stderr)
+            if app_kept:
+                self.fail('UI uninstall is not confirmed; private installer profile retained')
+            return
+        super().cleanup_temp()
 
     def setup(self):
         """Setup's exit code and log."""
         self.logs += 1
-        log = self.root / f"setup-{self.logs}.log"
+        log_root = Path(os.environ.get("HGS_TEST_INSTALLER_LOG_DIR", self.root))
+        log_root.mkdir(parents=True, exist_ok=True)
+        log = log_root / f"{self.unique}-setup-{self.logs}.log"
+        print(f"installer survival: {self._testMethodName}: setup {self.logs}", flush=True)
+        if self.backend_tracking:
+            self.backend_clean = False  # Unknown delivery keeps the selected paths.
         result = subprocess.run([str(self.setup_exe), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-                                 f"/DIR={self.app}", f"/LOG={log}"], stdin=subprocess.DEVNULL, capture_output=True,
+                                 f"/DIR={self.app}", f"/LOG={log}"], env=self.installer_env, stdin=subprocess.DEVNULL, capture_output=True,
                                 timeout=SETUP_LIMIT, creationflags=HIDDEN)
         return result.returncode, log.read_text(encoding="utf-8", errors="replace") if log.is_file() else "(no log)"
 
     def install(self):
         code, text = self.setup()
         self.assertEqual(code, 0, text[-4000:])
+        if self.backend_tracking:
+            self.assertTrue(self.backend('registration', 'status')['registered'])
+            self.assertTrue(self.backend('notification-registration', 'status')['registered'])
         return text
 
     def uninstall(self):
         uninstaller = self.app / "uninstall" / "unins000.exe"
         self.assertTrue(uninstaller.is_file(), uninstaller)
+        print(f"installer survival: {self._testMethodName}: uninstall", flush=True)
         result = subprocess.run([str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-                                stdin=subprocess.DEVNULL, capture_output=True, timeout=SETUP_LIMIT,
+                                env=self.installer_env, stdin=subprocess.DEVNULL, capture_output=True, timeout=SETUP_LIMIT,
                                 creationflags=HIDDEN)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if self.backend_tracking:
+            self.assertTrue(self.backend('registration', 'status')['registered'])
+            self.assertTrue(self.backend('notification-registration', 'status')['registered'])
         # The uninstaller continues from a copy of itself in the temporary folder
         # and removes its own files last.
         self.wait_for("the uninstall", lambda: registered() is None and not any(
@@ -101,9 +241,7 @@ class Installer(windows_host.HostCase):
 
     def uninstall_if_installed(self):
         if registered() is not None and (self.app / "uninstall" / "unins000.exe").is_file():
-            subprocess.run([str(self.app / "uninstall" / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES",
-                            "/NORESTART"], stdin=subprocess.DEVNULL, capture_output=True, timeout=SETUP_LIMIT,
-                           creationflags=HIDDEN)
+            self.uninstall()
 
     def run_installed(self, name, *args):
         result = subprocess.run([str(self.app / name), *args], env=self.env, stdin=subprocess.DEVNULL,
@@ -120,12 +258,35 @@ class Installer(windows_host.HostCase):
         self.keys(pane, {"literal": f"echo {marker}"}, {"named": "Enter"})
         self.wait_for(marker, lambda: self.capture(pane).count(marker) >= 2)
 
+    def check_shortcut_identity(self):
+        # Test-only Shell automation reads the real Inno-created link. hgs
+        # never creates a shortcut or invokes an interpreter for registration.
+        folder=str(self.shortcut.parent).replace("'","''")
+        name=self.shortcut.name.replace("'","''")
+        script=("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$s=New-Object -ComObject Shell.Application;"
+                "$i=$s.Namespace('"+folder+"').ParseName('"+name+"');"
+                "[Console]::WriteLine($i.ExtendedProperty('System.AppUserModel.ID'));"
+                "[Console]::WriteLine($i.ExtendedProperty('System.AppUserModel.ToastActivatorCLSID'))")
+        command=[str(Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'),
+                 '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',
+                 base64.b64encode(script.encode('utf-16le')).decode('ascii')]
+        result=subprocess.run(command,stdin=subprocess.DEVNULL,capture_output=True,timeout=20,env=self.installer_env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertLessEqual(len(result.stdout),4096)
+        lines=result.stdout.decode('utf-8-sig').splitlines()
+        self.assertEqual(len(lines),2,lines)
+        self.assertEqual(lines[0],'com.hgdev.hgs-tray')
+        self.assertEqual(lines[1].strip('{}').upper(),'0F0F70A2-1D40-47D8-AC5E-D6A9B789605F')
+
     def test_upgrade_and_uninstall_leave_the_session_host_and_staged_files_alone(self):
         version = self.record["version"]
-        self.install()
+        setup_log = self.install()
         self.assertEqual(windows_installer.problems(self.app, self.expected), [])
         self.assertEqual(registered(), {"DisplayVersion": version, "InstallLocation": str(self.app) + "\\"})
-        self.assertTrue(self.shortcut.is_file(), self.shortcut)
+        self.assertTrue(self.shortcut.is_file(), f"{self.shortcut}\n{setup_log[-8000:]}")
+        if self.record.get("desktop") == "tauri":
+            self.check_shortcut_identity()
+
         record = json.loads((self.app / windows_installer.INSTALLATION).read_text(encoding="utf-8"))
         self.assertEqual((record["kind"], record["version"]), ("installer", version))
         self.assertEqual(self.run_installed("hgs-tray.exe", "--version"), f"Zerus {self.record['product_version']}")
@@ -141,6 +302,7 @@ class Installer(windows_host.HostCase):
         before = self.staged()
 
         # Files an older version shipped and this one does not.
+        (self.app / "platforms").mkdir(exist_ok=True)
         (self.app / "platforms" / "qstale.dll").write_bytes(b"older Qt plugin")
         (self.app / "avcodec-60.dll").write_bytes(b"older FFmpeg")
         (self.app / "oldplugins").mkdir()
@@ -216,6 +378,62 @@ class Installer(windows_host.HostCase):
         self.assertEqual(list(real.iterdir()), [])
         self.assertIsNone(registered())
 
+
+    def test_setup_refuses_a_non_empty_folder_it_does_not_own(self):
+        # An extracted portable zip is the likely case: Setup must not mix its
+        # payload into files it would neither own nor clean up.
+        sentinels = {self.app / "hgs-tray.exe": b"an extracted portable build",
+                     self.app / "translations" / "qt_lg.qm": b"an older Qt translation"}
+        for path, data in sentinels.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        code, log = self.setup()
+        self.assertEqual(code, 7, log[-4000:])
+        self.assertIn("is not empty and is not a Zerus installation folder", log)
+        self.assertEqual(sorted(path for path in self.app.rglob("*") if path.is_file()), sorted(sentinels))
+        for path, data in sentinels.items():
+            self.assertEqual(path.read_bytes(), data, path)
+        self.assertIsNone(registered())
+        # Folders alone, as an uninstall can leave them, do not stop Setup.
+        for path in sentinels:
+            path.unlink()
+        self.assertTrue((self.app / "translations").is_dir())
+        self.install()
+        self.assertEqual(windows_installer.problems(self.app, self.expected), [])
+
+    def test_setup_refuses_a_folder_it_cannot_list(self):
+        # A folder Setup cannot list might hide a link or foreign files: refuse,
+        # never treat it as empty.
+        locked = self.app / "locked"
+        locked.mkdir(parents=True)
+        # FindFirstFile opens a folder with backup intent, so a token whose
+        # backup or restore privilege is enabled lists it whatever its ACL says.
+        # The CI suite runs elevated through WMI with both enabled. Disable them
+        # for this process; Setup, started from it, inherits that state.
+        prior = set_privileges({"SeBackupPrivilege": False, "SeRestorePrivilege": False})
+        self.addCleanup(set_privileges, prior)
+        user = subprocess.run(["whoami"], capture_output=True, text=True, timeout=LIMIT,
+                              creationflags=HIDDEN).stdout.strip()
+        icacls = str(Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe")
+        deny = subprocess.run([icacls, str(locked), "/deny", f"{user}:(RD)"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=LIMIT, creationflags=HIDDEN)
+        self.assertEqual(deny.returncode, 0, deny.stdout + deny.stderr)
+        # Runs before the case's own clean-up removes its folder.
+        self.addCleanup(lambda: subprocess.run([icacls, str(locked), "/remove:d", user], stdin=subprocess.DEVNULL,
+                                               capture_output=True, timeout=LIMIT, creationflags=HIDDEN))
+        try:
+            os.listdir(locked)
+        except PermissionError:
+            pass
+        else:
+            privileges = subprocess.run(["whoami", "/priv"], capture_output=True, text=True, timeout=LIMIT,
+                                        creationflags=HIDDEN).stdout
+            self.fail("This token still lists a folder that denies it List:\n" + privileges)
+        code, log = self.setup()
+        self.assertEqual(code, 7, log[-4000:])
+        self.assertIn("cannot be listed", log)
+        self.assertEqual(os.listdir(self.app), ["locked"])
+        self.assertIsNone(registered())
 
 if __name__ == "__main__":
     unittest.main()

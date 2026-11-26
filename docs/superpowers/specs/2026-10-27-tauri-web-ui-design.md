@@ -24,7 +24,7 @@ design work reaches the product.
 | Visual base | The WhiteWh fork prototype's *base style* only: fonts, radii, density, motion. None of its specific solutions or runtime. Since round 4 the palette is Qt's (below) |
 | Session list | Today's Zerus structure, sizes and cards. Only the prototype's nested tree lines are borrowed, for the existing one-level subagent nesting |
 | Parity | Every function of the current Qt GUI, including those the prototype lacks |
-| Orchestration | No fork orchestrator (teams, phases, task graph, iron rules, cache hold, designer). Zerus Tasks are redesigned in the new style |
+| Orchestration | Replaced on 2026-11-11 by owner decision D1 of `2026-11-11-agent-teams-design.md`: Agent Teams (teams, then phases, the task graph and the designer) come in by milestones, behind a per-computer preview that is off by default; the first milestone is the queue team, described in `docs/agent-teams.md`. Iron rules and cache hold stay excluded. Zerus Tasks are redesigned in the new style |
 | Navigation | The main screen switcher stays on the side |
 | Scope | No new features from the prototype. The skin system is the one requested addition |
 | Process | A mocked-data design is reviewed and approved before implementation |
@@ -106,8 +106,8 @@ tagged by `t`; `Control` tagged by `op`), documented in `docs/reference.md`,
 - One stream per computer whose CLI prints the marker. While it is live the
   client stops polling that computer's listing and follows the selected
   session's Activity through it. A stream that fails or stays silent for 30 s
-  restarts after 5 s, 15 s, 60 s and then every 5 minutes, and the client polls
-  meanwhile. The existing `ZERUS_EVENT_STREAM=0` and `dataPlane/eventStream=false`
+  restarts after the reconnect schedule (by default 1 s, 2 s, 5 s, then every
+  10 s; configurable, see docs/reference.md), and the client polls meanwhile. The existing `ZERUS_EVENT_STREAM=0` and `dataPlane/eventStream=false`
   switches keep it on polling.
 - The server re-lists all rows every 5 s as a safety net (owner decision,
   2026-10-27), so the client needs no listing poll of its own while live.
@@ -447,3 +447,21 @@ Owner decisions, 2026-10-28:
   at the Mac and is not used for the verdict. Real-display runs now start only in
   a window the owner gives (Mac), or on arch when the session is unlocked, a
   screen is on and the desktop has had no input for 2 minutes; input stops them.
+
+Mac switch, 2026-10-28 (plan `docs/superpowers/plans/2026-10-28-tauri-client-mac-switch.md`):
+
+- The client replaces Qt on the Mac as Zerus with Qt's identity
+  (`com.hgdev.hgs-tray`, executable `hgs-tray`, `~/Applications/hgs-tray.app`).
+  This supersedes, for the Mac, "A distinct bundle identifier from the Qt app"
+  and the rule that binary names and paths must not collide with `hgs-tray`.
+- Single instance follows Qt's protocol (lock, socket `hgs-tray`, `show` and
+  `sessions` lines) instead of `tauri-plugin-single-instance` (row 298): the
+  maintained updater waits on Qt's socket path and would roll back otherwise.
+- The menu keeps Qt's entries except Refresh (every computer streams) and the
+  update entries (no update controller yet, row 300); update notices follow in
+  `zerus-5wmh.12.4`. The main-thread watchdog (row 297) is Qt's, and the status
+  item is never updated while its menu is open.
+- The client's data directory follows the running bundle's identifier. At the
+  switch its settings are seeded once, read-only, from Qt's (except the client's
+  own `client/` settings, the microphone and automatic approvals, which stay
+  off), and read marks start fresh.

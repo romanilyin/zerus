@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Read-only content search, isolated bindings/transcripts and no agent processes."""
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -25,12 +26,16 @@ class ContentSearch(unittest.TestCase):
                         HGS_STATE_DIR=str(self.state), HGS_SELF="fixture", HGS_PEERS="")
         for key in ("TMUX", "TMUX_PANE", "HGS_RUN_ID", "HGS_SESSION"):
             self.env.pop(key, None)
+        if os.name == "nt":
+            # Admit __state only for this explicitly isolated fixture. No host
+            # is installed or started, and the real Windows profile stays out.
+            self.env.update(USERPROFILE=str(self.root), HGS_HOST_ALLOW_UNSTAGED="1")
 
     def binding(self, name, text, archive=False, agent="codex"):
         sid = str(uuid.uuid4())
         path = self.root / (sid + ".jsonl")
         path.write_text(json.dumps({"type": "event_msg", "timestamp": "2026-01-01T10:00:00Z",
-                                   "payload": {"type": "agent_message", "message": text}}, ensure_ascii=False) + "\n")
+                                   "payload": {"type": "agent_message", "message": text}}, ensure_ascii=False) + "\n", encoding="utf-8")
         record = dict(version=1, name=name, agent=agent, cwd="/work/project", run_id=str(uuid.uuid4()),
                       conversation_id=sid, transcript=str(path), updated=42)
         if archive:
@@ -45,7 +50,7 @@ class ContentSearch(unittest.TestCase):
 
     def run_search(self, *args, check=True):
         result = subprocess.run([str(HGS), "__state", "search", *args], env=self.env,
-                                capture_output=True, text=True, timeout=8)
+                                capture_output=True, text=True, encoding="utf-8", timeout=8)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)
@@ -53,7 +58,10 @@ class ContentSearch(unittest.TestCase):
 
     def snapshot(self):
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for path in self.root.rglob("*") if path.is_file()}
+                for path in self.root.rglob("*") if path.is_file()
+                # Search may prepare its disposable cache. Every canonical
+                # binding, archive, provider transcript and journal stays exact.
+                and not path.is_relative_to(self.state / "content-search-v1")}
 
     def test_same_name_archive_and_active_are_distinct_and_read_only(self):
         active, _ = self.binding("codex/project/task", "Current МИГРАЦИЯ")
@@ -68,9 +76,29 @@ class ContentSearch(unittest.TestCase):
                          {active["conversation_id"], archived["conversation_id"]})
         self.assertEqual(before, self.snapshot())
 
+    def test_search_obeys_published_name_routes_and_ignores_unpublished_bindings(self):
+        name = 'codex/project/routed'
+        current, current_path = self.binding(name, 'Current visible content')
+        other_transcript = self.root / 'other.jsonl'
+        other_transcript.write_text(json.dumps(dict(type='event_msg', timestamp='2026-01-01T10:00:00Z',
+            payload=dict(type='agent_message', message='Unpublished binding content'))) + '\n')
+        other = dict(current, run_id=str(uuid.uuid4()), conversation_id=str(uuid.uuid4()),
+                     transcript=str(other_transcript))
+        bindings = self.state / 'bindings'
+        bindings.mkdir()
+        (bindings / current_path.name).write_text(json.dumps(other))
+        self.assertEqual(self.run_search('--query', 'Unpublished binding content')['results'], [])
+        routes = self.state / 'name_routes'
+        routes.mkdir()
+        (routes / current_path.name).write_text('{}')
+        self.assertEqual(self.run_search('--query', 'Current visible content')['results'], [])
+        hits = self.run_search('--query', 'Unpublished binding content')['results']
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]['run_id'], other['run_id'])
+
     def test_journal_and_provider_duplicate_are_one_public_message(self):
         record, _ = self.binding("codex/project", "Резервная копия успешно завершена")
-        with sqlite3.connect(self.state / "events.sqlite3") as db:
+        with closing(sqlite3.connect(self.state / "events.sqlite3")) as db, db:
             db.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, name TEXT, conversation TEXT, payload TEXT)")
             payload = dict(type="Stop", at=1767261601, detail="Резервная копия успешно…", agent_id="")
             db.execute("INSERT INTO events(name,conversation,payload) VALUES (?,?,?)",
@@ -79,6 +107,22 @@ class ContentSearch(unittest.TestCase):
         self.assertEqual(len(result["results"]), 1)
         self.assertEqual(result["results"][0]["content"], "Резервная копия успешно завершена")
         self.assertEqual(result["results"][0]["source"], "codex_transcript")
+
+    def test_archive_hits_carry_recorded_accounts_and_exact_folder_scopes_without_writes(self):
+        repo = self.root / "repo"
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=self.env)
+        folder = repo / "subfolder"
+        folder.mkdir()
+        record, path = self.binding("codex/example/old", "needle public history", archive=True)
+        record.update(account_id="recorded-work", agent_home=str(self.root / "old-profile"), cwd=str(folder))
+        path.write_text(json.dumps(record))
+        before = self.snapshot()
+        session = self.run_search("--query", "needle")["results"][0]["session"]
+        self.assertEqual(session["account_id"], "recorded-work")
+        self.assertEqual(session["account_home"], record["agent_home"])
+        self.assertEqual(Path(session["cwd_canonical"]), folder.resolve())
+        self.assertEqual(Path(session["git_root"]), repo.resolve())
+        self.assertEqual(before, self.snapshot())
 
     def test_missing_transcript_keeps_snapshot_and_marks_partial_coverage(self):
         record, binding = self.binding("codex/project", "unrelated")
@@ -89,6 +133,19 @@ class ContentSearch(unittest.TestCase):
         self.assertEqual(result["unavailable_sessions"], 1)
         self.assertEqual(result["results"][0]["source"], "snapshot")
         self.assertEqual(result["results"][0]["at"], 42)
+
+    def test_search_keeps_the_quiet_keep_warm_public_snapshots(self):
+        record, path = self.binding('codex/example/quiet', 'Unused public transcript')
+        record.update(prompt='Internal keep-warm prompt', last_message='Internal keep-warm response',
+                      turn_started=40, last_event_at=42,
+                      keep_warm_quiet=dict(prompt='Visible earlier request', last_message='Visible earlier answer'))
+        path.write_text(json.dumps(record))
+        before = self.snapshot()
+        for internal in ('Internal keep-warm prompt', 'Internal keep-warm response'):
+            self.assertEqual(self.run_search('--query', internal)['results'], [])
+        for public in ('Visible earlier request', 'Visible earlier answer'):
+            self.assertEqual(len(self.run_search('--query', public)['results']), 1)
+        self.assertEqual(before, self.snapshot())
 
     def test_kimi_bound_main_history_only(self):
         record, binding = self.binding("kimi/project", "unused", agent="kimi")

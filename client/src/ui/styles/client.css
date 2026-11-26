@@ -2,13 +2,23 @@
    showed with fixed data (reading, older pages, other screens) and the cost of
    long transcripts. */
 @layer components {
-  /* Off-screen Activity items skip layout and paint until they scroll into view. */
-  .act-col > .act-msg, .act-col > .act-tools, .act-col > .act-thinking, .act-col > .act-notice { content-visibility: auto; contain-intrinsic-size: auto 72px; }
+  /* Keyed rows retain their measured layout while the user scrolls.
+     Estimated content-visibility sizes shift earlier rows as items unskip. */
+  /* zerus-5wmh.83: live appends must be visible when the end pin follows them.
+     A tall new row starting at opacity zero blanks the whole transcript. */
+  .act-col [id^="item-"] { animation: none; }
+  /* zerus-agv9: an opened task's result, document and journal are read in
+     place, without an entrance. On the arch WebKit the end of an opacity
+     entrance presents one frame near its start opacity, so the text blinked
+     once it had appeared (scripts/task-view-flicker-smoke.html). */
+  .tv-content .act-msg, .tv-content .tv-doc, .tv-content .tv-event { animation: none; }
   .act-older { padding: 4px 2px; text-align: center; }
   /* Groups that hold an approval or a failure read in the warning colour, as in Qt. */
   .act-tools.warn .act-tools-head b { color: var(--z-color-warn); }
+  /* A keep-warm ping is not the person's message: one quiet, borderless line. */
+  .act-tools.warm { border-color: transparent; padding-top: 2px; padding-bottom: 2px; color: var(--z-color-dim); }
+  .act-tools.warm .act-tools-head b { font-weight: normal; color: var(--z-color-dim); }
   .act-live b { min-width: 0; }
-  .later-screen { flex: 1; align-self: center; }
   /* Settings so far (ui/components/SettingsScreen.tsx): the mockup's rows (design/webui styles/settings.css). */
   .set-scroll { flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; }
   .set-content { max-width: 850px; padding: 22px 28px 48px; display: flex; flex-direction: column; gap: 14px; }

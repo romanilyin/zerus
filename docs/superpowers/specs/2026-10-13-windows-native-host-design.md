@@ -380,7 +380,9 @@ login PATH applies and the supervisor becomes the pane's root process. On Window
   the S3 dialog fixtures in M4;
 - `HGS_HOST_PANE` and `HGS_HOST_SESSION` replace `TMUX_PANE` and the session name
   lookup (`src/state/lifecycle.rs:95-117`); the nested guard checks them as it
-  checks `$TMUX` today.
+  checks `$TMUX` today. It refuses only what would attach the console there
+  (`hgs a`, a launch, fork or resume without `-d`); detached ones start beside
+  the enclosing session.
 
 **Agent resolution.** `PATHEXT` lookup (`platform::which`) finds the program. An npm
 shim (`.cmd`) is resolved to `node.exe <script>` only when it matches the exact npm
@@ -666,6 +668,14 @@ Implemented in M4.2: the request is protocol 1's `recovery_worker` (capability
 the first one and stops it when it exits. A host that does not know the request
 (an older one) is treated like no host; the next request reaches its successor.
 The M3 variable `HGS_HOST_RECOVERY_WORKER` is gone.
+
+WhiteWh fork, task #33: protocol 1's `caller_session` names the session whose
+root process or job holds the connection's own client (the PID from
+`GetNamedPipeClientProcessId` at authentication, never one a request names), with
+its pane and run marker; `not_found` outside every session, `unsupported` on an
+older host. The CLI asks it only when its ancestry walk to the session's owner
+breaks (a Git Bash wrapper's exec), and accepts it only for the exact session,
+pane and run its environment names.
 
 ### D15. Paths and files
 

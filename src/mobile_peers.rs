@@ -1,14 +1,25 @@
 //! Mobile reaches the local machine or one enabled, directly configured SSH peer.
 //! The remote shell sees only fixed helper commands; native argv travels as data.
-use crate::{cli, config::Config, machines, platform, swarm};
+use crate::{cli, config::Config, swarm};
+#[cfg(unix)]
+use crate::{machines, platform};
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(unix)]
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(any(unix, test))]
+use serde_json::json;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
+    io::{Read, Seek},
+};
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::{
+    collections::BTreeSet,
     fs,
-    io::{Read, Seek, Write},
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -19,20 +30,35 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
+#[cfg(any(unix, test))]
+use std::time::Duration;
+
+#[cfg(windows)]
+mod windows;
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_ERROR: usize = 64 * 1024;
+#[cfg(unix)]
 const MAX_PEERS: usize = 32;
+#[cfg(unix)]
 const CAPABILITY: &str = "mobile-peer ABI 1";
+#[cfg(unix)]
 const IDENTITY_HELPER: &str = "~/.local/bin/hgs swarm __mobile-peer-identity --json";
+#[cfg(unix)]
 const LOCAL_HELPER: &str = "~/.local/bin/hgs swarm __mobile-peer-local --json";
+#[cfg(unix)]
 const REMEMBERED: &str = "swarm/mobile-peers.json";
+#[cfg(unix)]
 const REMEMBERED_LOCK: &str = "swarm/mobile-peers.lock";
+#[cfg(unix)]
 const REMEMBERED_BYTES: u64 = 64 * 1024;
+#[cfg(unix)]
 static TRANSPORT_STOP: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Helper {
@@ -42,6 +68,7 @@ enum Helper {
     OwnIdentity,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransportRequest {
@@ -53,6 +80,7 @@ struct TransportRequest {
     deadline_ms: u64,
 }
 
+#[cfg(unix)]
 fn monotonic_ms() -> Result<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -65,10 +93,12 @@ fn monotonic_ms() -> Result<u64> {
     Ok(time.tv_sec as u64 * 1000 + time.tv_nsec as u64 / 1_000_000)
 }
 
+#[cfg(unix)]
 extern "C" fn stop_transport(_: libc::c_int) {
     TRANSPORT_STOP.store(true, Ordering::Relaxed);
 }
 
+#[cfg(unix)]
 enum CaptureMode {
     Supervisor,
     OwnedSsh { parent_pid: u32, deadline_ms: u64 },
@@ -83,6 +113,7 @@ struct LocalRequest {
     payload: Option<Value>,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerRequest {
@@ -102,6 +133,7 @@ struct Identity {
 }
 
 /// An identity this gateway itself verified through one configured alias.
+#[cfg(unix)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Verified {
@@ -110,6 +142,7 @@ struct Verified {
 }
 
 /// Last verified peer identities, bound to the local identity that observed them.
+#[cfg(unix)]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Remembered {
@@ -126,6 +159,7 @@ fn text(value: &str, max: usize, empty: bool) -> bool {
     (empty || !value.is_empty()) && value.len() <= max && !value.chars().any(char::is_control)
 }
 
+#[cfg(any(unix, test))]
 fn alias(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -135,6 +169,7 @@ fn alias(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
 
+#[cfg(unix)]
 fn direct(config: &Config, via: &str) -> bool {
     alias(via)
         && !config.is_self(via)
@@ -178,6 +213,60 @@ fn options<'a>(
         }
     }
     Ok(result)
+}
+
+/// The help line (`cli::USAGE`) once [`selects_session`] holds (zerus-ucck
+/// P1c-2b); the connector reads it.
+#[cfg(test)]
+const SESSION_ID_MARKER: &str = "mobile-peer-session-id-v1";
+
+/// The scoped JSON commands whose session a phone mutation may also select
+/// by ID.
+const SESSION_ID_COMMANDS: &[&str] = &[
+    "send",
+    "send-now",
+    "answer",
+    "interrupt",
+    "settings",
+    "clear-context",
+    "compact-context",
+    "session-action",
+];
+
+/// The `session-action` actions that may; restore never does.
+const SESSION_ID_ACTIONS: &[&str] = &[
+    "pause",
+    "resume",
+    "rename",
+    "fork",
+    "archive",
+    "forget",
+    "terminate",
+    "remove_queued",
+];
+
+/// A listed command's `[session, --session-id, ID, --json]` with a canonical
+/// session ID, for a live session only: never an archived conversation, and
+/// a `session-action` only for a listed action. The selection itself is the
+/// CLI's own (`--session-id`), verified at every reader.
+fn selects_session(op: &str, rest: &[String], payload: Option<&Value>) -> bool {
+    let [name, flag, id, json] = rest else {
+        return false;
+    };
+    SESSION_ID_COMMANDS.contains(&op)
+        && session(name)
+        && flag == "--session-id"
+        && crate::state::session_id::canonical(id)
+        && uuid(id)
+        && json == "--json"
+        && payload.is_some_and(|payload| {
+            payload.get("archive_id").is_none()
+                && (op != "session-action"
+                    || payload
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .is_some_and(|action| SESSION_ID_ACTIONS.contains(&action)))
+        })
 }
 
 fn scoped(payload: &Option<Value>) -> Result<()> {
@@ -234,6 +323,55 @@ fn read_mark(payload: &Option<Value>) -> Result<()> {
     Ok(())
 }
 
+/// New-label auxiliary calls carry one fixed selector immediately after the
+/// session. Validate the original CLOSED command shape using a temporary argv;
+/// dispatch retains the original selector. This does not admit a new operation
+/// or reinterpret a status/recovery/actor plan.
+fn selected_auxiliary(request: &LocalRequest) -> Result<Option<LocalRequest>> {
+    const AUXILIARY: &[&str] = &[
+        "inspect",
+        "processes",
+        "history",
+        "history-projection",
+        "terminal",
+        "hooks",
+        "read",
+        "notifications",
+        "file-read",
+        "attachment",
+        "voice",
+    ];
+    let [command, name, flag, id, tail @ ..] = request.argv.as_slice() else {
+        return Ok(None);
+    };
+    if !AUXILIARY.contains(&command.as_str()) || flag != "--session-id" {
+        return Ok(None);
+    }
+    ensure!(
+        session(name) && crate::state::session_id::canonical(id),
+        "invalid native session ID"
+    );
+    ensure!(
+        !tail
+            .iter()
+            .any(|word| matches!(word.as_str(), "--archive" | "--session-id")),
+        "ambiguous or archived session ID selection"
+    );
+    ensure!(
+        request
+            .payload
+            .as_ref()
+            .is_none_or(|p| p.get("archive_id").is_none()),
+        "archived session ID selection"
+    );
+    Ok(Some(LocalRequest {
+        schema: request.schema,
+        target_machine_id: request.target_machine_id.clone(),
+        argv: [vec![command.clone(), name.clone()], tail.to_vec()].concat(),
+        payload: request.payload.clone(),
+    }))
+}
+
 /// Validate complete argv shapes before calling the CLI's permissive legacy dispatcher.
 /// Session operations retain their native scoped-payload validation and receipts.
 fn validate(request: &LocalRequest) -> Result<()> {
@@ -251,6 +389,34 @@ fn validate(request: &LocalRequest) -> Result<()> {
         request.payload.as_ref().is_none_or(Value::is_object),
         "native payload must be an object"
     );
+    // The negotiated mode changes receipt semantics only. Validate its exact
+    // argv after removing this one flag using the existing scoped send ABI.
+    if let [command, tail @ ..] = args.as_slice() {
+        if command == "send" && tail.iter().any(|arg| arg == "--delivery-outcome-v2") {
+            ensure!(
+                matches!(tail,
+                [name, mode, json] if session(name) && mode == "--delivery-outcome-v2" && json == "--json")
+                    || matches!(tail, [name, flag, id, mode, json] if session(name) && flag == "--session-id"
+                    && crate::state::session_id::canonical(id) && mode == "--delivery-outcome-v2" && json == "--json"),
+                "invalid negotiated send outcome argv"
+            );
+            let legacy = LocalRequest {
+                schema: request.schema,
+                target_machine_id: request.target_machine_id.clone(),
+                argv: request
+                    .argv
+                    .iter()
+                    .filter(|arg| *arg != "--delivery-outcome-v2")
+                    .cloned()
+                    .collect(),
+                payload: request.payload.clone(),
+            };
+            return validate(&legacy);
+        }
+    }
+    if let Some(original_shape) = selected_auxiliary(request)? {
+        return validate(&original_shape);
+    }
     let op = args[0].as_str();
     let rest = &args[1..];
     let no_payload = || -> Result<()> {
@@ -261,6 +427,24 @@ fn validate(request: &LocalRequest) -> Result<()> {
         Ok(())
     };
     match op {
+        "__state" => {
+            ensure!(
+                rest.len() == 4
+                    && rest[0] == "delivery"
+                    && rest[1] == "receipt"
+                    && session(&rest[2])
+                    && rest[3] == "--json",
+                "delivery requires the exact receipt read ABI"
+            );
+            scoped(&request.payload)?;
+            ensure!(
+                request
+                    .payload
+                    .as_ref()
+                    .is_some_and(|p| p["expected_machine_id"] == request.target_machine_id),
+                "original receipt computer changed"
+            );
+        }
         "analytics" => {
             ensure!(rest == ["--json"], "analytics requires its fixed JSON ABI");
             let payload = request.payload.as_ref().context("analytics payload is required")?;
@@ -349,8 +533,8 @@ fn validate(request: &LocalRequest) -> Result<()> {
                 ensure!(rest.len() == 4 && rest[2] == "--request-id" && uuid(&rest[3]),
                     "directory creation requires an exact request UUID");
                 let path = &rest[1];
-                let leaf = path.rsplit('/').next().unwrap_or("");
-                ensure!(path.starts_with('/') && text(path, 4096, false)
+                let leaf = path.rsplit(|c| c == '/' || cfg!(windows) && c == '\\').next().unwrap_or("");
+                ensure!(std::path::Path::new(path).is_absolute() && text(path, 4096, false)
                     && !matches!(leaf, "" | "." | ".."), "invalid directory creation path");
             } else {
                 ensure!(rest.len() == 1 && session(&rest[0]), "invalid directory request");
@@ -420,7 +604,8 @@ fn validate(request: &LocalRequest) -> Result<()> {
                 let parent = values["--parent"];
                 ensure!(
                     parent == "~" && command == "check"
-                        || parent.starts_with('/') && !parent.starts_with("//"),
+                        || std::path::Path::new(parent).is_absolute()
+                            && !parent.starts_with("//") && !parent.starts_with("\\\\"),
                     "repository parent must be absolute"
                 );
                 let name = values["--name"];
@@ -516,12 +701,19 @@ fn validate(request: &LocalRequest) -> Result<()> {
             );
             let flags = options(
                 &rest[1..],
-                &["--skip-processes"],
+                &["--skip-processes", "--current-read"],
                 &["--archive", "--agent", "--after"],
             )?;
             if let Some(after) = flags.get("--after") {
                 ensure!(after.parse::<u64>().is_ok(), "invalid history cursor");
             }
+            // As in the CLI, only a main inspection names what a read mark
+            // may acknowledge now.
+            ensure!(
+                !flags.contains_key("--current-read")
+                    || !(flags.contains_key("--archive") || flags.contains_key("--agent")),
+                "current read is only for a main inspection"
+            );
             if let Some(id) = flags.get("--archive") {
                 ensure!(uuid(id), "invalid archive UUID");
             }
@@ -577,7 +769,8 @@ fn validate(request: &LocalRequest) -> Result<()> {
         "history" | "history-projection" | "terminal" | "session-action" | "send" | "send-now" | "settings" | "answer"
         | "interrupt" | "clear-context" | "compact-context" | "effort" | "file-read" => {
             ensure!(
-                rest.len() == 2 && session(&rest[0]) && rest[1] == "--json",
+                (rest.len() == 2 && session(&rest[0]) && rest[1] == "--json")
+                    || selects_session(op, rest, request.payload.as_ref()),
                 "native operation requires scoped JSON"
             );
             scoped(&request.payload)?;
@@ -678,12 +871,14 @@ fn session(value: &str) -> bool {
     text(value, 4096, false) && !value.starts_with(['-', '@'])
 }
 
+#[cfg(unix)]
 struct Output {
     code: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
+#[cfg(unix)]
 fn nonblocking(fd: i32) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     ensure!(
@@ -693,6 +888,7 @@ fn nonblocking(fd: i32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_pipe<T: Read>(pipe: &mut Option<T>, bytes: &mut Vec<u8>, cap: usize) -> Result<()> {
     let Some(reader) = pipe.as_mut() else {
         return Ok(());
@@ -719,6 +915,7 @@ fn read_pipe<T: Read>(pipe: &mut Option<T>, bytes: &mut Vec<u8>, cap: usize) -> 
 
 /// No reader threads or blocking joins: inherited pipe descriptors cannot extend
 /// the whole deadline. Only this owned helper/SSH child is stopped on failure.
+#[cfg(unix)]
 fn capture_control(
     mut command: Command,
     input: &[u8],
@@ -828,6 +1025,7 @@ fn capture_control(
     result
 }
 
+#[cfg(unix)]
 fn transport(
     via: &str,
     helper: Helper,
@@ -835,6 +1033,9 @@ fn transport(
     deadline: Instant,
     cap: usize,
 ) -> Result<Output> {
+    // Sample the wire clock first: the conversion may shorten, never renew,
+    // the caller's absolute budget while preparation/serialization runs.
+    let now_ms = monotonic_ms()?;
     let remaining = deadline
         .saturating_duration_since(Instant::now())
         .as_millis();
@@ -848,15 +1049,16 @@ fn transport(
         helper,
         request,
         parent_pid: std::process::id(),
-        deadline_ms: monotonic_ms()? + remaining as u64,
+        deadline_ms: now_ms + remaining as u64,
     };
     let bytes = serde_json::to_vec(&envelope)?;
     ensure!(bytes.len() <= MAX_BYTES, "mobile request is too large");
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(crate::self_exec::current()?);
     command.args(["swarm", "__mobile-peer-transport", "--json"]);
     capture_control(command, &bytes, deadline, cap, CaptureMode::Supervisor)
 }
 
+#[cfg(unix)]
 fn supervise() -> Result<i32> {
     // This helper performs no native operations itself. It owns exactly one
     // SSH/identity child and survives cancellation of the gateway wrapper.
@@ -867,6 +1069,7 @@ fn supervise() -> Result<i32> {
         );
     }
     let envelope: TransportRequest = input()?;
+    let started = Instant::now();
     let now = monotonic_ms()?;
     ensure!(
         envelope.schema == 1
@@ -881,6 +1084,10 @@ fn supervise() -> Result<i32> {
                 <= transport_budget(envelope.helper, envelope.request.as_ref()).as_millis(),
         "invalid mobile transport deadline"
     );
+    // The wire clock is rounded down to milliseconds. Discard that partial
+    // millisecond so converting back to Instant cannot extend the wire budget.
+    let remaining = (envelope.deadline_ms - now).saturating_sub(1);
+    let deadline = started + Duration::from_millis(remaining);
     let config = Config::load()?;
     let (command, bytes, cap) = match envelope.helper {
         Helper::OwnIdentity => {
@@ -888,7 +1095,7 @@ fn supervise() -> Result<i32> {
                 envelope.via.is_empty() && envelope.request.is_none(),
                 "invalid local identity transport"
             );
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = Command::new(crate::self_exec::current()?);
             command.args(["swarm", "__mobile-peer-identity", "--json"]);
             (command, vec![], 4096)
         }
@@ -902,7 +1109,7 @@ fn supervise() -> Result<i32> {
             } else {
                 (IDENTITY_HELPER, 4096)
             };
-            (ssh(&config, &envelope.via, helper), vec![], cap)
+            (ssh(&config, &envelope.via, helper, deadline)?, vec![], cap)
         }
         Helper::Local => {
             ensure!(
@@ -914,7 +1121,7 @@ fn supervise() -> Result<i32> {
                 .context("missing mobile transport request")?;
             validate(&request)?;
             (
-                ssh(&config, &envelope.via, LOCAL_HELPER),
+                ssh(&config, &envelope.via, LOCAL_HELPER, deadline)?,
                 serde_json::to_vec(&request)?,
                 MAX_BYTES,
             )
@@ -925,11 +1132,10 @@ fn supervise() -> Result<i32> {
             && !TRANSPORT_STOP.load(Ordering::Relaxed),
         "mobile transport parent changed"
     );
-    let remaining = envelope.deadline_ms.saturating_sub(monotonic_ms()?);
     let output = capture_control(
         command,
         &bytes,
-        Instant::now() + Duration::from_millis(remaining),
+        deadline,
         cap,
         CaptureMode::OwnedSsh {
             parent_pid: envelope.parent_pid,
@@ -941,8 +1147,12 @@ fn supervise() -> Result<i32> {
     Ok(output.code)
 }
 
-fn ssh(config: &Config, via: &str, helper: &str) -> Command {
-    let mut command = crate::platform::ssh();
+#[cfg(unix)]
+fn ssh(config: &Config, via: &str, helper: &str, deadline: Instant) -> Result<Command> {
+    // Each helper is a fixed source constant; request bytes stay on stdin.
+    let words: Vec<_> = helper.strip_prefix("~/.local/bin/hgs ").context("invalid fixed peer helper")?.split_whitespace().collect();
+    let helper = crate::remote_shell::hgs_within(config, via, &words, deadline)?;
+    let mut command = crate::ssh_bytes::command(&helper)?;
     command.args([
         "-T",
         "-o",
@@ -956,9 +1166,10 @@ fn ssh(config: &Config, via: &str, helper: &str) -> Command {
     ]);
     command.args(machines::ssh_options(config, via));
     command.arg(via).arg(helper);
-    command
+    Ok(command)
 }
 
+#[cfg(unix)]
 fn supported(via: &str, deadline: Instant) -> Result<()> {
     let output = transport(
         via,
@@ -983,6 +1194,7 @@ fn own_identity(config: &Config) -> Result<Identity> {
     })
 }
 
+#[cfg(unix)]
 fn identity(output: Output) -> Result<Identity> {
     ensure!(output.code == 0, "mobile peer unavailable");
     let identity: Identity = serde_json::from_slice(&output.stdout)?;
@@ -993,6 +1205,7 @@ fn identity(output: Output) -> Result<Identity> {
     Ok(identity)
 }
 
+#[cfg(unix)]
 fn verified(id: &Verified, local: &str) -> bool {
     uuid(&id.machine_id) && id.machine_id != local && text(&id.name, 256, false)
 }
@@ -1001,6 +1214,7 @@ fn verified(id: &Verified, local: &str) -> bool {
 /// damaged record, or one observed under another local identity (a copied or
 /// reset configuration), is ignored. It only describes offline routes; it never
 /// authorizes dispatch, whose destination verifies its own UUID again.
+#[cfg(unix)]
 fn remembered(config: &Config, local: &str) -> BTreeMap<String, Verified> {
     let record = fs::File::open(config.dir.join(REMEMBERED))
         .ok()
@@ -1025,6 +1239,7 @@ fn remembered(config: &Config, local: &str) -> BTreeMap<String, Verified> {
 /// Keep currently direct aliases and replace the identities verified just now.
 /// A removed or disabled edge forgets its identity. Writes happen only on a
 /// change; a writer that keeps the lock beyond a brief wait postpones this one.
+#[cfg(unix)]
 fn remember(
     config: &Config,
     local: &str,
@@ -1080,6 +1295,7 @@ fn remember(
     swarm::replace(&config.dir.join(REMEMBERED), &serde_json::to_vec(&record)?)
 }
 
+#[cfg(unix)]
 fn discovery(config: &Config) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let local = identity(transport(
@@ -1167,8 +1383,17 @@ fn discovery(config: &Config) -> Result<Value> {
 
 fn local(config: &Config, request: LocalRequest) -> Result<i32> {
     validate(&request)?;
+    let machine = if request
+        .argv
+        .get(..2)
+        .is_some_and(|v| v == ["__state", "delivery"])
+    {
+        crate::state::lifecycle_receipt_machine(config).map_err(anyhow::Error::msg)?
+    } else {
+        swarm::local_node_id(config)?
+    };
     ensure!(
-        swarm::local_node_id(config)? == request.target_machine_id,
+        machine == request.target_machine_id,
         "mobile target identity changed; refresh computers"
     );
     // Rebind stdin to a private anonymous file, then invoke the existing native
@@ -1178,19 +1403,25 @@ fn local(config: &Config, request: LocalRequest) -> Result<i32> {
         serde_json::to_writer(&mut input, &payload)?;
     }
     input.rewind()?;
+    ensure!(input.metadata()?.len() <= MAX_BYTES as u64, "native payload is too large");
+    #[cfg(unix)]
     ensure!(
         unsafe { libc::dup2(input.as_raw_fd(), libc::STDIN_FILENO) } >= 0,
         "cannot prepare native input"
     );
+    #[cfg(windows)]
+    windows::bind(input)?;
     cli::dispatch(request.argv).map_err(anyhow::Error::new)
 }
 
+#[cfg(any(unix, test))]
 fn peer_budget(argv: &[String]) -> Duration {
     let acquisition = argv.first().is_some_and(|op| op == "repository")
         && argv.get(1).is_some_and(|op| op == "clone");
     Duration::from_secs(if acquisition { 80 } else { 30 })
 }
 
+#[cfg(unix)]
 fn transport_budget(helper: Helper, request: Option<&LocalRequest>) -> Duration {
     if matches!(helper, Helper::Local) {
         if let Some(request) = request.filter(|request| validate(request).is_ok()) {
@@ -1199,6 +1430,10 @@ fn transport_budget(helper: Helper, request: Option<&LocalRequest>) -> Duration 
     }
     Duration::from_secs(30)
 }
+
+/// An agent's `mobile-peer` call (zerus-ppd26.11).
+#[cfg(unix)]
+const AGENT_REFUSED: &str = "hgs mobile-peer forwards a phone's request, which the other computer runs as the person; an agent never forwards one";
 
 fn execute(config: &Config, args: &[String]) -> Result<i32> {
     ensure!(
@@ -1210,13 +1445,20 @@ fn execute(config: &Config, args: &[String]) -> Result<i32> {
             println!("{}", serde_json::to_string(&own_identity(config)?)?);
             Ok(0)
         }
+        #[cfg(unix)]
         "mobile-peers" => {
             println!("{}", discovery(config)?);
             Ok(0)
         }
         "__mobile-peer-local" => local(config, input()?),
+        #[cfg(unix)]
         "__mobile-peer-transport" => supervise(),
+        #[cfg(unix)]
         "mobile-peer" => {
+            // The peer's __mobile-peer-local runs the phone's request as the
+            // person, so an agent's process never forwards one; the
+            // connector's own call carries no agent marker (zerus-ppd26.11).
+            ensure!(!crate::cli::agent_caller(), AGENT_REFUSED);
             let request: PeerRequest = input()?;
             let config = &Config::load()?;
             ensure!(
@@ -1267,6 +1509,41 @@ pub(crate) fn dispatch(config: &Config, args: &[String]) -> cli::Result<i32> {
 mod tests {
     use super::*;
     const ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn negotiated_send_preserves_scoped_and_selected_abis_only() {
+        for selector in [false, true] {
+            let mut argv = vec!["send".to_owned(), "codex/example/send".into()];
+            if selector {
+                argv.extend(["--session-id".into(), ID.into()]);
+            }
+            argv.extend(["--delivery-outcome-v2".into(), "--json".into()]);
+            let request = LocalRequest {
+                schema: 1,
+                target_machine_id: ID.into(),
+                argv,
+                payload: Some(
+                    json!({"request_id":ID,"expected_run_id":"run","expected_conversation_id":"conversation","text":"original"}),
+                ),
+            };
+            assert!(validate(&request).is_ok());
+            for extra in [
+                "--archive",
+                "--delivery-outcome-v2",
+                "--new",
+                "--session-id",
+            ] {
+                let mut changed = LocalRequest {
+                    schema: 1,
+                    target_machine_id: ID.into(),
+                    argv: request.argv.clone(),
+                    payload: request.payload.clone(),
+                };
+                changed.argv.insert(2, extra.into());
+                assert!(validate(&changed).is_err(), "{extra}");
+            }
+        }
+    }
 
     #[test]
     fn repository_acquisition_only_admits_exact_native_actions() {
@@ -1339,13 +1616,259 @@ mod tests {
         LocalRequest {
             schema: 1,
             target_machine_id: ID.into(),
-            argv: argv.iter().map(|v| (*v).into()).collect(),
+            // Native drive-rooted equivalents for absolute fixture paths.
+            argv: argv.iter().map(|v| {
+                if cfg!(windows) && v.starts_with('/') && !v.starts_with("//") {
+                    format!("C:{v}")
+                } else { (*v).into() }
+            }).collect(),
             payload,
         }
     }
 
     fn scope() -> Value {
         json!({"request_id":ID,"expected_run_id":"run","expected_conversation_id":"conversation"})
+    }
+
+    /// A peer connector learns `--current-read` from the peer's own help and
+    /// adds it to every main inspection (zerus-a4mub.9). Like the CLI, which
+    /// names a current read only for a main inspection, an archive or
+    /// subagent inspection never carries it.
+    #[test]
+    fn a_main_inspection_may_name_its_current_read() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for argv in [
+            vec!["inspect", "codex/project", "--current-read"],
+            vec!["inspect", "dsh/project", "--after", "12", "--current-read"],
+            vec!["inspect", "opencode/project", "--skip-processes", "--current-read"],
+            vec!["inspect", "codex/project", "--session-id", sid, "--current-read"],
+        ] {
+            validate(&request(&argv, None)).unwrap();
+            assert!(validate(&request(&argv, Some(scope()))).is_err(), "{argv:?}");
+        }
+        for argv in [
+            vec!["inspect", "codex/project", "--current-read", "--current-read"],
+            vec!["inspect", "codex/project", "--current-read", "yes"],
+        ] {
+            assert!(validate(&request(&argv, None)).is_err(), "{argv:?}");
+        }
+    }
+
+    /// The scope check, not just the option list: each of these shapes is
+    /// valid without `--current-read`.
+    #[test]
+    fn an_archive_or_subagent_inspection_never_names_a_current_read() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for (plain, current) in [
+            (vec!["inspect", "codex/project", "--archive", ID], vec!["inspect", "codex/project", "--archive", ID, "--current-read"]),
+            (vec!["inspect", "codex/project", "--archive", ID], vec!["inspect", "codex/project", "--current-read", "--archive", ID]),
+            (vec!["inspect", "codex/project", "--agent", "child", "--skip-processes"],
+             vec!["inspect", "codex/project", "--agent", "child", "--skip-processes", "--current-read"]),
+            (vec!["inspect", "codex/project", "--agent", "child"], vec!["inspect", "codex/project", "--current-read", "--agent", "child"]),
+            (vec!["inspect", "codex/project", "--session-id", sid, "--agent", "child"],
+             vec!["inspect", "codex/project", "--session-id", sid, "--agent", "child", "--current-read"]),
+        ] {
+            validate(&request(&plain, None)).unwrap();
+            assert!(validate(&request(&current, None)).is_err(), "{current:?}");
+        }
+    }
+
+    #[test]
+    fn auxiliary_ids_validate_only_the_original_closed_shape_and_never_strip_at_dispatch() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for argv in [
+            vec!["inspect", "codex/project"],
+            vec![
+                "inspect",
+                "codex/project",
+                "--skip-processes",
+                "--after",
+                "12",
+            ],
+        ] {
+            let mut selected = argv[..2].to_vec();
+            selected.extend(["--session-id", sid]);
+            selected.extend_from_slice(&argv[2..]);
+            let input = request(&selected, None);
+            let unchanged = input.argv.clone();
+            validate(&input).unwrap();
+            assert_eq!(input.argv, unchanged);
+            assert!(
+                validate(&request(&argv, Some(scope()))).is_err(),
+                "inspect still has no payload"
+            );
+            assert!(validate(&request(&selected, Some(scope()))).is_err());
+        }
+        for argv in [
+            vec![
+                "inspect",
+                "codex/project",
+                "--session-id",
+                sid,
+                "--archive",
+                ID,
+            ],
+            vec![
+                "inspect",
+                "codex/project",
+                "--session-id",
+                sid,
+                "--session-id",
+                sid,
+            ],
+            vec![
+                "inspect",
+                "codex/project",
+                "--skip-processes",
+                "--session-id",
+                sid,
+            ],
+            vec!["inspect", "codex/project", "--session-id", "not-uuid"],
+            vec![
+                "session-action-status",
+                "codex/project",
+                "--session-id",
+                sid,
+                "--json",
+            ],
+            vec!["recovery", "action", "--session-id", sid, "--scoped-json"],
+        ] {
+            assert!(validate(&request(&argv, None)).is_err(), "{argv:?}");
+        }
+    }
+
+    /// zerus-ucck P1c-2b: a listed scoped command may select its live session
+    /// by a canonical ID in exactly one position; nothing else changes.
+    #[test]
+    fn a_session_id_is_accepted_only_after_the_session_of_listed_live_operations() {
+        const SESSION: &str = "3f2a9c1d-0b4e-4d6a-9c1d-2e3f4a5b6c7d";
+        fn selected(op: &str) -> [&str; 5] {
+            [op, "codex/project", "--session-id", SESSION, "--json"]
+        }
+        let action = |name: &str| {
+            let mut payload = scope();
+            payload["action"] = json!(name);
+            payload
+        };
+        for op in [
+            "send",
+            "send-now",
+            "answer",
+            "interrupt",
+            "settings",
+            "clear-context",
+            "compact-context",
+        ] {
+            assert!(
+                validate(&request(&selected(op), Some(scope()))).is_ok(),
+                "{op}"
+            );
+            // An archived conversation never selects by ID.
+            let mut archived = scope();
+            archived["archive_id"] = json!(ID);
+            assert!(
+                validate(&request(&selected(op), Some(archived))).is_err(),
+                "{op}"
+            );
+            assert!(validate(&request(&selected(op), None)).is_err(), "{op}");
+        }
+        for name in [
+            "pause",
+            "resume",
+            "rename",
+            "fork",
+            "archive",
+            "forget",
+            "terminate",
+            "remove_queued",
+        ] {
+            assert!(
+                validate(&request(&selected("session-action"), Some(action(name)))).is_ok(),
+                "{name}"
+            );
+            let mut archived = action(name);
+            archived["archive_id"] = json!(ID);
+            assert!(
+                validate(&request(&selected("session-action"), Some(archived))).is_err(),
+                "{name}"
+            );
+        }
+        for name in ["restore", "", "unknown"] {
+            assert!(
+                validate(&request(&selected("session-action"), Some(action(name)))).is_err(),
+                "{name}"
+            );
+        }
+        assert!(validate(&request(&selected("session-action"), Some(scope()))).is_err());
+        // New label-aware auxiliary reads retain the exact original scoped
+        // payload rules. Unlisted operation kinds still refuse the selector.
+        for op in [
+            "history",
+            "history-projection",
+            "terminal",
+            "file-read",
+        ] {
+            assert!(
+                validate(&request(&selected(op), Some(scope()))).is_ok(),
+                "{op}"
+            );
+        }
+        assert!(validate(&request(&selected("effort"), Some(scope()))).is_err());
+        // Only a canonical ID, once, right after the session.
+        for argv in [
+            vec![
+                "send",
+                "codex/project",
+                "--session-id",
+                &SESSION.to_uppercase(),
+                "--json",
+            ],
+            vec![
+                "send",
+                "codex/project",
+                "--session-id",
+                "not-an-id",
+                "--json",
+            ],
+            vec![
+                "send",
+                "codex/project",
+                "--session-id",
+                "00000000-0000-0000-0000-000000000000",
+                "--json",
+            ],
+            vec!["send", "codex/project", "--session-id", "", "--json"],
+            vec!["send", "codex/project", "--json", "--session-id", SESSION],
+            vec!["send", "--session-id", SESSION, "codex/project", "--json"],
+            vec!["send", "--session-id", SESSION, "--json"],
+            vec!["send", "codex/project", "--session-id", SESSION],
+            vec![
+                "send",
+                "codex/project",
+                "--session-id",
+                SESSION,
+                "--session-id",
+                SESSION,
+                "--json",
+            ],
+            vec!["send", "codex/project", "--session", SESSION, "--json"],
+            vec!["send", "@peer", "--session-id", SESSION, "--json"],
+            vec!["send", "-x", "--session-id", SESSION, "--json"],
+        ] {
+            assert!(
+                validate(&request(&argv, Some(scope()))).is_err(),
+                "{argv:?}"
+            );
+        }
+        // The name form is unchanged.
+        assert!(validate(&request(
+            &["send", "codex/project", "--json"],
+            Some(scope())
+        ))
+        .is_ok());
+        assert!(crate::cli::usage()
+            .lines()
+            .any(|line| line.trim() == SESSION_ID_MARKER));
     }
 
     #[test]
@@ -1817,6 +2340,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn fixture_config(dir: &std::path::Path) -> Config {
         Config {
             home: dir.to_str().unwrap().into(),
@@ -1832,6 +2356,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn known(machine_id: &str, name: &str) -> Verified {
         Verified {
             machine_id: machine_id.into(),
@@ -1840,6 +2365,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remembered_identities_follow_direct_edges_and_the_observing_identity() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let temp = tempfile::tempdir().unwrap();
@@ -1891,6 +2417,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn only_verified_local_swarm_bindings_are_identity_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let config = fixture_config(temp.path());
@@ -1920,6 +2447,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_transport_never_inherits_pipes_another_worker_is_still_creating() {
         // This thread stands in for another discovery worker that holds the
         // spawn turn between creating its pipes and marking them close-on-exec,

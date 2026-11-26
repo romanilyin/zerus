@@ -22,15 +22,20 @@ the clean checkout, and records both identities in `build-info.json`. The portab
 runtime checker verifies them again in its minimal environment.
 
 Production fork candidates never read the upstream update catalog or reuse a
-cached upstream catalog as a fork release. `ZERUS_FORK_FEED_URL` must be unset;
-a nonempty value fails configuration. No publisher, signing key, repository
-secret or external package channel is enabled by these changes. The inherited
+cached upstream catalog as a fork release. Keep `ZERUS_FORK_FEED_URL` unset;
+the Tauri distribution policy refuses foreign updates even when a WhiteWh feed
+is supplied accidentally. No publisher, signing key, repository secret or
+external package channel is enabled by these changes. The inherited
 upstream comparison tests use explicit local fixture transports.
 
 ## Assemble a matching candidate
 
 Build both executables from the same clean source commit with the pinned Rust
-and Qt dependencies. Produce and validate the Windows portable zip first. On
+and current Tauri dependencies. Use the maintained release-candidate and Windows
+portable checks; do not restore the retired Qt build. Produce and validate the
+Windows portable zip first. This strict Roman candidate route is separate from
+an explicitly selected official WhiteWh artifact and any separately recorded
+Linux-only source correction. On
 Linux, with the matching release receiver and cached locked Cargo dependencies:
 
 ```sh

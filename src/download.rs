@@ -62,7 +62,7 @@ pub fn dispatch(config: &Config, host: &str, args: &[String], dry: bool) -> Resu
     let (Some(path), Some(output)) = (path, output) else {
         return Err(usage());
     };
-    if !(path.starts_with('/') || path.starts_with("~/"))
+    if !(path.starts_with('/') || path.starts_with("~/") || windows_absolute(path))
         || path.len() > 32768
         || path.chars().any(char::is_control)
     {
@@ -124,7 +124,18 @@ pub fn dispatch(config: &Config, host: &str, args: &[String], dry: bool) -> Resu
         .arg("--")
         .arg(format!("{host}:{}", sftp_path(path)))
         .arg(temporary.path());
+    // WhiteWh fork: Windows OpenSSH's scp cannot write a file another handle
+    // holds open ("open local ...: Broken pipe"), so no peer file ever
+    // downloaded to a Windows computer. The handle closes for the transfer;
+    // the temporary path still removes the file on any failure.
+    let (held, temporary_path) = temporary.into_parts();
+    drop(held);
     transfer(command, Duration::from_secs(120))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary_path)?;
+    let temporary = tempfile::NamedTempFile::from_parts(file, temporary_path);
     platform::make_private(temporary.as_file())?;
     temporary.as_file().sync_all()?;
     let bytes = fs::metadata(temporary.path())?.len();
@@ -252,7 +263,17 @@ fn usage() -> Error {
     )
 }
 
+fn windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\')
+}
+
 fn sftp_path(path: &str) -> String {
+    let windows;
+    let path = if windows_absolute(path) {
+        windows = format!("/{}", path.replace('\\', "/"));
+        windows.as_str()
+    } else { path };
     let mut literal = String::new();
     for ch in path.chars() {
         if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
@@ -326,6 +347,11 @@ mod tests {
             "/files/report \\[1\\]\\*\\?.txt"
         );
         assert_eq!(sftp_path("~/file\\name"), "~/file\\\\name");
+        assert_eq!(sftp_path(r"C:\fixture folder\日本語\file [1].txt"), "/C:/fixture folder/日本語/file \\[1\\].txt");
+        assert!(windows_absolute(r"C:\fixture"));
+        assert!(windows_absolute("D:/fixture"));
+        assert!(!windows_absolute("C:relative"));
+        assert!(!windows_absolute("a/b"));
     }
     #[test]
     fn timeout_reaps_owned_transfer_and_reports_failure() {

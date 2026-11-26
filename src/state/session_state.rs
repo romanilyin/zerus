@@ -45,6 +45,13 @@ pub(super) fn decorate(sessions: &mut [Value]) {
     let builds = super::builds::running(at);
     let observed = observed_ttls();
     let mut accounts = HashMap::new();
+    // Task 97: the owner queue's alerts for the phone, a team's on its lead's
+    // row; read once per listing.
+    let leads: Vec<(String, String, String)> =
+        waiting.iter().filter(|w| w.lead).map(|w| (w.team.clone(), String::new(), w.name.clone())).collect();
+    let deferred = teams::owner_queue::mobile_items(&leads);
+    // Task 352: a session moved to another agent names the other session.
+    super::switch_provider::decorate(sessions);
     for session in sessions.iter_mut() {
         let team = waiting.iter().find(|w| {
             w.name == text(session, "name")
@@ -55,6 +62,32 @@ pub(super) fn decorate(sessions: &mut [Value]) {
         let key = format!("{}\n{}", text(session, "agent"), text(session, "account_home"));
         let ttl = accounts.entry(key).or_insert_with(|| cache_ttl(session, &observed)).clone();
         apply(session, ttl, team, at);
+        for alert in team.map(|team| team.alerts.as_slice()).unwrap_or_default() {
+            add_alert(session, alert);
+        }
+        let name = text(session, "name").to_owned();
+        for (_, _, alert) in deferred.iter().filter(|(host, row, _)| host.is_empty() && *row == name) {
+            add_alert(session, alert);
+        }
+    }
+}
+
+/// Task 95: the stalled lead's phone alert joins the row's `mobile_attention`
+/// (the relay pushes a new item once). A row whose own question already has an
+/// attention signature mixes the alert into it, so a read mark of that
+/// question never hides the alert; a null signature is never suppressed and
+/// stays null.
+pub(crate) fn add_alert(session: &mut Value, alert: &Value) {
+    use sha2::{Digest, Sha256};
+    let mut items = session["mobile_attention"].as_array().cloned().unwrap_or_default();
+    if items.iter().any(|item| item["question_id"] == alert["question_id"]) {
+        return;
+    }
+    items.push(alert.clone());
+    session["mobile_attention"] = json!(items);
+    if let Some(signature) = session["attention_signature"].as_str() {
+        let mixed = json!([signature, alert["question_id"], alert["question_hash"]]).to_string();
+        session["attention_signature"] = json!(format!("{:x}", Sha256::digest(mixed.as_bytes())));
     }
 }
 
@@ -67,6 +100,10 @@ fn apply(session: &mut Value, mut ttl: Value, team: Option<&teams::waiting::Wait
     let (state, reason) = compute(session, team.map(|team| (team.lead, team.reason.as_ref())), at);
     session["session_state"] = json!(state);
     session["state_reason"] = reason.unwrap_or(Value::Null);
+    if let Some(team) = team {
+        session["team_id"] = json!(team.team);
+        session["team_lead"] = json!(team.lead);
+    }
 }
 
 /// U30: the oldest `hgs run` build the session started that still runs.
@@ -80,9 +117,51 @@ fn build_of(session: &Value, builds: &[Value]) -> Option<Value> {
             "command":claim["command"],"since":claim["started"]}))
 }
 
+/// Task 117: the team store's read on every listing and inspection waits at
+/// most this long for a writer. The installed rollback-journal store made
+/// readers wait up to 10 s behind a team write, past the desktop's 5 s
+/// inspect limit ("Could not refresh activity: timed out").
+const TEAM_READ_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+/// A busy store answers with the last good reasons, at most this old.
+const TEAM_CACHE_SECONDS: f64 = 120.0;
+/// The last team read's milliseconds, for the inspection's phase timings.
+pub(crate) static TEAM_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn team_cache_path() -> std::path::PathBuf {
+    teams::store::path().with_file_name("waiting-cache.json")
+}
+
 fn team_reasons(at: f64) -> Vec<teams::waiting::Waiting> {
-    let Ok(store) = teams::store::Store::open(false) else { return Vec::new() };
-    store.active_teams(TEAMS_READ).map(|found| teams::waiting::reasons(&found, at)).unwrap_or_default()
+    let started = std::time::Instant::now();
+    let reasons = team_reasons_at(&teams::store::path(), &team_cache_path(), TEAM_READ_WAIT, at);
+    TEAM_READ_MS.store(started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    reasons
+}
+
+/// The reasons from the store at `store`, or, when it stays busy past `wait`,
+/// the last good ones saved at `cache` within `TEAM_CACHE_SECONDS`.
+pub(crate) fn team_reasons_at(store: &Path, cache: &Path, wait: std::time::Duration, at: f64) -> Vec<teams::waiting::Waiting> {
+    if !store.exists() {
+        return Vec::new();
+    }
+    let read = teams::store::Store::open_at(store, false)
+        .and_then(|found| {
+            found.busy_timeout(wait)?;
+            found.active_teams(TEAMS_READ)
+        });
+    match read {
+        Ok(found) => {
+            let reasons = teams::waiting::reasons(&found, at);
+            let _ = super::storage::atomic_private(cache, &json!({"at":at,"reasons":reasons}).to_string());
+            reasons
+        }
+        Err(_) => std::fs::read(cache)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|saved| at - saved["at"].as_f64().unwrap_or(0.0) <= TEAM_CACHE_SECONDS)
+            .and_then(|saved| serde_json::from_value(saved["reasons"].clone()).ok())
+            .unwrap_or_default(),
+    }
 }
 
 /// The last native event: the cache's last use, a keepalive turn included.
@@ -208,6 +287,77 @@ pub(crate) fn compute(session: &Value, team: Option<(bool, Option<&Value>)>, at:
     } else {
         ("cold", None)
     }
+}
+
+/// Task #13 (P2.2): the earliest moment after `at` at which a decorated row
+/// (`session_state`, `state_reason`, `last_active`, `cache_ttl`) reads
+/// otherwise by time alone: Cooling turns Cold when the cache TTL runs out, a
+/// tool call becomes a long operation at 30 s, and a "so far" text moves to
+/// its next minute. None when only an input can change it. `hgs watch`
+/// derives the row again then instead of listing every row on a timer.
+pub(crate) fn valid_until(session: &Value, at: f64) -> Option<f64> {
+    let mut next: Option<f64> = None;
+    let mut consider = |moment: f64| {
+        if moment > at {
+            next = Some(next.map_or(moment, |earlier: f64| earlier.min(moment)));
+        }
+    };
+    match text(session, "session_state") {
+        "working" => {
+            let started = session["tool_started"].as_f64().unwrap_or(0.0);
+            if !text(session, "current_tool").is_empty() && started > 0.0 {
+                consider(started + LONG_OPERATION_SECONDS);
+            }
+        }
+        "cooling" => {
+            let ttl = session["cache_ttl"]["seconds"].as_f64().unwrap_or(DEFAULT_TTL as f64);
+            consider(session["last_active"].as_f64().unwrap_or(0.0) + ttl);
+        }
+        _ => {}
+    }
+    let reason = &session["state_reason"];
+    if matches!(text(reason, "kind"), "long_operation" | "build" | "job") {
+        if let Some(since) = reason["since"].as_f64().filter(|since| *since > 0.0) {
+            // `minutes` shows whole minutes: the text moves at the next one.
+            let whole = ((at - since).max(0.0) / 60.0).floor();
+            consider(since + (whole + 1.0) * 60.0);
+        }
+    }
+    next
+}
+
+/// Task 115: a team member's session state from this contract, for
+/// `hgs team status` and its member card. A native question or permission the
+/// member waits on is Waiting for you even while the last tick still saw it
+/// busy; Kimi answers its Edit and Write approvals only in its Terminal panel,
+/// and its other permissions reach the lead. Otherwise the stored phase and
+/// activity decide, so an idle member reads Cooling/Cold rather than busy.
+pub(crate) fn member_state(member: &teams::model::Member) -> (&'static str, Option<Value>) {
+    let live = member.seen.is_some_and(|seen| seen.live);
+    let last = member.seen_event_at.or(member.seen.map(|seen| seen.at)).unwrap_or(0.0);
+    let mut session = json!({
+        "state": if live { "running" } else { "stopped" },
+        "process_state": if live { "running" } else { "exited" },
+        "activity": if member.seen_activity.is_empty() { "unknown" } else { member.seen_activity.as_str() },
+        "phase": member.seen_phase,
+        "current_tool": "",
+        "last_active": last,
+    });
+    if let Some(asked) = member.pending.as_ref().or(member.terminal_question.as_ref()) {
+        session["activity"] = json!("busy");
+        session["phase"] = json!(if asked.approval { "approval" } else { "input" });
+        return compute(&session, None, now());
+    }
+    // A native question phase is Waiting for you; the contract names it input.
+    if member.seen_phase == "question" {
+        session["phase"] = json!("input");
+    }
+    // DCB-svn report (2026-11-12): an error phase names the error, never "".
+    if member.seen_phase == "error" {
+        let detail = member.turn_failed.as_ref().map(|failure| failure.detail.as_str()).filter(|detail| !detail.is_empty());
+        session["activity_summary"] = json!(detail.unwrap_or("Provider error"));
+    }
+    compute(&session, None, now())
 }
 
 fn subagents(session: &Value, active: u64) -> Value {
@@ -353,6 +503,51 @@ pub(super) fn observe_ttl(account: &str, usage: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task #13 (P2.2): until `valid_until` a row's state and reason text do
+    /// not change by time alone, and at it they do; a row without a time
+    /// transition has none.
+    #[test]
+    fn valid_until_is_the_next_time_driven_change() {
+        let at = 1_000_000.0;
+        let decorated = |mut session: Value| {
+            let (state, reason) = compute(&session, None, at);
+            session["session_state"] = json!(state);
+            session["state_reason"] = reason.unwrap_or(Value::Null);
+            session
+        };
+        let seen = |session: &Value, moment: f64| {
+            let (state, reason) = compute(session, None, moment);
+            (state, reason.map(|reason| reason["text"].clone()))
+        };
+        let ttl = json!({"seconds":300});
+        let cases = [
+            json!({"state":"running","activity":"busy","phase":"tool","current_tool":"Bash","tool_started":at - 12.5,"last_active":at,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"busy","phase":"tool","current_tool":"Bash","tool_detail":"cargo build","tool_started":at - 95.0,"last_active":at,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"idle","phase":"idle","build":{"label":"tests","since":at - 30.0},"last_active":at - 10.0,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"idle","phase":"idle","process_work":{"count":1,"command":"npm run dev","started_at":at - 200.0},"last_active":at - 10.0,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"idle","phase":"idle","last_active":at - 290.0,"cache_ttl":ttl}),
+        ];
+        for case in cases {
+            let row = decorated(case.clone());
+            let until = valid_until(&row, at).unwrap_or_else(|| panic!("no deadline for {row}"));
+            let before = seen(&case, at);
+            let mut moment = at;
+            while moment < until {
+                assert_eq!(seen(&case, moment), before, "{case} at +{}", moment - at);
+                moment += 0.25;
+            }
+            assert_ne!(seen(&case, until), before, "{case} changes at +{}", until - at);
+        }
+        for quiet in [
+            json!({"state":"stopped","last_active":at,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"idle","phase":"idle","last_active":at - 400.0,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"idle","phase":"approval","last_active":at,"cache_ttl":ttl}),
+            json!({"state":"running","activity":"busy","phase":"thinking","last_active":at,"cache_ttl":ttl}),
+        ] {
+            assert_eq!(valid_until(&decorated(quiet.clone()), at), None, "{quiet}");
+        }
+    }
 
     const CONTRACT: &str = include_str!("../../mobile/android/app/src/test/resources/session-state-contract.json");
 
@@ -562,4 +757,120 @@ mod tests {
         apply(&mut row, ttl, None, 400.0);
         assert_eq!((row["session_state"].clone(), row["state_reason"].clone()), (json!("cold"), Value::Null));
     }
+
+    /// Task 95: a stalled lead's row carries the phone's alert item and the
+    /// owner's reason; a member's row does not, and a row whose own question
+    /// has a signature mixes the alert into it.
+    #[test]
+    fn a_stalled_lead_row_carries_the_phone_alert_and_the_owner_reason() {
+        use teams::model::{LeadStall, Member, MemberState, SessionRef, Team, TeamStatus};
+        let member = |id: &str| Member {
+            id: id.into(),
+            role: id.into(),
+            agent: "claude".into(),
+            state: MemberState::Active,
+            session: Some(SessionRef { host: "h".into(), name: format!("claude/p/{id}"), run_id: "r".into(), conversation_id: format!("c-{id}") }),
+            ..Default::default()
+        };
+        let stall = LeadStall { since: 100.0, reason: "rejected_tool".into(), items: 3, members: 2, oldest: 50.0, round: 2, notified_at: 3700.0, ..Default::default() };
+        let team = Team {
+            id: "t".into(),
+            name: "T".into(),
+            status: TeamStatus::Running,
+            lead: "lead".into(),
+            members: vec![member("lead"), member("web")],
+            lead_stall: Some(stall),
+            ..Default::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        crate::state::with_test_state_root(root.path(), || {
+            teams::store::Store::open(true).unwrap()
+                .create("11111111-1111-4111-8111-111111111111", &json!({}), team, vec![]).unwrap();
+            let at = now();
+            let row = |id: &str| json!({"name":format!("claude/p/{id}"),"conversation_id":format!("c-{id}"),
+                "agent":"claude","activity":"idle","phase":"interrupted","last_event_at":at - 30.0,"attention_signature":null});
+            let mut rows = vec![row("lead"), row("web")];
+            decorate(&mut rows);
+            let alert = &rows[0]["mobile_attention"][0];
+            assert_eq!(alert["kind"], "team_lead_stall");
+            assert_eq!(alert["question_id"], "team-lead-stall:t:2");
+            assert_eq!((alert["items"].clone(), alert["members"].clone()), (json!(3), json!(2)));
+            assert!(alert["question_hash"].as_str().is_some_and(|hash| hash.len() == 64));
+            // No question text leaves the computer, and a null signature stays null.
+            assert!(alert.get("title").is_none() && alert.get("detail").is_none());
+            assert!(rows[0]["attention_signature"].is_null());
+            assert_eq!(rows[0]["session_state"], "user");
+            assert_eq!(rows[0]["state_reason"]["kind"], "team_lead_stalled");
+            assert!(rows[1].get("mobile_attention").is_none());
+            // Decorating again adds nothing twice.
+            let mut again = rows[0].clone();
+            add_alert(&mut again, &rows[0]["mobile_attention"][0].clone());
+            assert_eq!(again["mobile_attention"].as_array().unwrap().len(), 1);
+            // The lead's own question keeps its card and its signature changes.
+            let mut asked = row("lead");
+            asked["attention_signature"] = json!("a".repeat(64));
+            asked["mobile_attention"] = json!([{"question_id":"q1","question_hash":"h1"}]);
+            add_alert(&mut asked, alert);
+            assert_eq!(asked["mobile_attention"].as_array().unwrap().len(), 2);
+            assert_ne!(asked["attention_signature"], json!("a".repeat(64)));
+        });
+    }
+
+    /// Task 115: the recorded Adventure team case. The Integrator (Kimi) showed
+    /// "Needs approval" in the session list while the team tick still stored it
+    /// busy/working, so `hgs team status` told the lead it was active. Its state
+    /// now comes from this contract: an open native approval is Waiting for you.
+    #[test]
+    fn a_kimi_member_waiting_on_an_approval_is_waiting_for_you_not_busy() {
+        use teams::model::{Member, MemberSeen, MemberState, PendingQuestion};
+        let stored = || Member {
+            id: "integrator".into(),
+            role: "Integrator".into(),
+            agent: "kimi".into(),
+            state: MemberState::Active,
+            seen: Some(MemberSeen { at: now() - 120.0, live: true }),
+            seen_phase: "working".into(),
+            seen_activity: "busy".into(),
+            seen_event_at: Some(now() - 120.0),
+            ..Default::default()
+        };
+        // Kimi answers its tool approvals in its Terminal panel; the stored
+        // pending approval outranks the phase the last tick saw.
+        let mut approval = stored();
+        approval.pending = Some(PendingQuestion {
+            question_id: "q".into(),
+            question_hash: "h".into(),
+            approval: true,
+            at: now(),
+            ..Default::default()
+        });
+        assert_eq!(
+            member_state(&approval),
+            ("user", Some(json!({"kind":"approval","text":"Needs approval"})))
+        );
+        // A Kimi question the lead cannot answer in the panel is the same wait.
+        let mut question = stored();
+        question.terminal_question = Some(PendingQuestion {
+            question_id: "q".into(),
+            question_hash: "h".into(),
+            at: now(),
+            ..Default::default()
+        });
+        assert_eq!(member_state(&question).0, "user");
+        assert_eq!(member_state(&question).1.unwrap()["kind"], "input");
+        // The contract's question phase is Waiting for you without a card.
+        let mut phase = stored();
+        phase.seen_phase = "question".into();
+        phase.seen_activity = "attention".into();
+        assert_eq!(member_state(&phase).0, "user");
+        // Without a question the stored phase decides: a busy tool works, and a
+        // stopped session is stopped, never waiting.
+        let mut working = stored();
+        working.seen_phase = "tool".into();
+        assert_eq!(member_state(&working), ("working", None));
+        let mut stopped = stored();
+        stopped.seen = Some(MemberSeen { at: now(), live: false });
+        assert_eq!(member_state(&stopped), ("stopped", None));
+    }
 }
+

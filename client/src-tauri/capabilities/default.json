@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "The main window of Zerus Next. App commands need no entry here; plugins are added per need.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "webviews": ["main"],
+  "permissions": ["core:default", "core:window:allow-start-dragging", "core:window:allow-internal-toggle-maximize"]
 }

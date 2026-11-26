@@ -160,9 +160,10 @@ class HintFixtureControls(unittest.TestCase):
         loader = unittest.TestLoader()
         with patch.dict(sys.modules, {'test_agent_hint_native': module}):
             for provider in ('Claude', 'Codex'):
+                case = getattr(module, 'NativeWindows' + provider + 'Hint')
                 names = ['test_agent_hint_native.NativeWindows' + provider + 'Hint.' + method
                          for method in fixture.CASE_METHODS]
-                suite = loader.loadTestsFromNames(names)
+                suite = loader.loadTestsFromNames(fixture.CASE_METHODS, module=case)
                 actual = [test.id() for group in suite for test in group]
                 self.assertEqual(actual, names)
                 self.assertEqual(loader.errors, [])
@@ -224,6 +225,19 @@ class HintFixtureControls(unittest.TestCase):
         self.assertFalse(fixture.hint_output(b''))
         with self.assertRaises(AssertionError):
             fixture.hint_output(json.dumps(dict(agent_hint='marked')).encode())
+
+    def test_hint_output_accepts_only_the_frozen_context_union_and_refuses_a_second_document(self):
+        combined = json.loads((Path(__file__).parent / 'fixtures/session-start-context.json').read_text(encoding='utf-8'))
+        raw = json.dumps(combined).encode()
+        self.assertTrue(fixture.hint_output(raw))
+        text = combined['hookSpecificOutput']['additionalContext']
+        combined['hookSpecificOutput']['additionalContext'] = text.removeprefix(fixture.HINT + '\n\n')
+        self.assertFalse(fixture.hint_output(json.dumps(combined).encode()))
+        combined['hookSpecificOutput']['additionalContext'] = fixture.HINT + '\n\nunexpected appended context'
+        with self.assertRaises(AssertionError):
+            fixture.hint_output(json.dumps(combined).encode())
+        with self.assertRaises(json.JSONDecodeError):
+            fixture.hint_output(raw + b'\n' + raw)
 
     def test_output_without_complete_forwarding_is_unknown(self):
         before, after = invocation(b'actual stdout')

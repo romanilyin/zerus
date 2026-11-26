@@ -14,7 +14,11 @@ const MESSAGE_IDS: usize = 256;
 /// Sections of an inspection that `state` leaves out: Activity rows travel as
 /// `events`, and process sets belong to a later topic.
 const NOT_STATE: [&str; 6] = ["events", "processes", "process_work", "cursor", "history_truncated", "replace_events"];
-const VOLATILE_STATE: [&[&str]; 2] = [&["goal_observed_at"], &["process_work", "sampled_at"]];
+/// Fields that differ on every inspection without anything having changed.
+/// Task #24: `timings_ms` (the inspection's own phase timings) made every
+/// refresh of a busy session send its whole `state` again, about 180 KB
+/// every 2 s, which held the stream's private memory growing.
+const VOLATILE_STATE: [&[&str]; 3] = [&["goal_observed_at"], &["process_work", "sampled_at"], &["timings_ms"]];
 
 /// One session the client follows.
 pub(super) struct Subscription {
@@ -38,6 +42,9 @@ pub(super) struct Subscription {
     pub more: bool,
     /// Frames were dropped: send `gap` and a tail snapshot once drained.
     pub resync: Option<&'static str>,
+    /// The first frames are still owed after a failed inspection: the cursor
+    /// to read after, when to read again and the wait that led there.
+    pub start: Option<(i64, Instant, std::time::Duration)>,
     /// The catalog listed the key at least once.
     pub listed: bool,
     /// The digest of the session's catalog row when last seen.
@@ -50,6 +57,12 @@ pub(super) struct Subscription {
     pub transcript_at: Instant,
     /// The `event` revision and digest of each message ID sent, oldest first.
     pub messages: VecDeque<(String, u64, Digest32)>,
+    /// P1.5: the token of the summary refresh running on a thread; only its
+    /// result applies.
+    pub inspecting: Option<u64>,
+    /// Moves to the one refresh worker while it runs; dropped with this
+    /// subscription rather than retained in a process-wide transcript cache.
+    pub index: Option<crate::state::watch_index::Index>,
 }
 
 impl Subscription {
@@ -69,12 +82,15 @@ impl Subscription {
             busy: false,
             more: false,
             resync: None,
+            start: None,
             listed: false,
             row: None,
             journal: None,
             transcript: None,
             transcript_at: Instant::now(),
             messages: VecDeque::new(),
+            inspecting: None,
+            index: Some(Default::default()),
         }
     }
 
@@ -231,6 +247,8 @@ mod tests {
         assert_eq!(value, json!({"name":"codex/p/t","phase":"idle","activity":"idle","goal_observed_at":5.0,"message_events":[]}));
         let mut later = value.clone();
         later["goal_observed_at"] = json!(6.0);
+        // Task #24: an inspection's own timings are no change either.
+        later["timings_ms"] = json!({"total":912,"summary":400,"questions":380});
         assert_eq!(state_digest(&value), state_digest(&later));
         later["phase"] = json!("working");
         assert_ne!(state_digest(&value), state_digest(&later));

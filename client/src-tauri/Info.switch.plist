@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Merged into the switch bundle's Info.plist (tauri.switch.conf.json).
+         Qt's arrangement: Launch Services shows en.lproj's Zerus only while this
+         unlocalized name equals the bundle folder, hgs-tray.app. -->
+    <key>CFBundleName</key>              <string>Zerus</string>
+    <key>CFBundleDisplayName</key>       <string>hgs-tray</string>
+    <key>LSHasLocalizedDisplayName</key> <true/>
+    <key>CFBundleDevelopmentRegion</key> <string>en</string>
+    <key>CFBundleIconFile</key>          <string>hgs-zerus-swarm.icns</string>
+    <key>CFBundleIconName</key>          <string>hgs-zerus-swarm</string>
+    <!-- No LSUIElement (zerus-v5ft5): the bundle launches as a regular app, so
+         Mission Control moves its window between desktop Spaces as for any other
+         app. The client keeps the menu-bar-only mode at run time instead: an
+         Accessory policy whenever no window is open (lifecycle::prepare and
+         sync_policy). A start without a window may show the Dock icon briefly. -->
+    <key>NSMicrophoneUsageDescription</key><string>Zerus records your voice when you start dictation and sends it to your selected speech computer for recognition.</string>
+    <key>NSCameraUsageDescription</key><string>Zerus records video messages when you hold the video recording button.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Zerus opens your agent sessions in Terminal.</string>
+    <!-- packaging/desktop/update-installed.py tells the clients apart by this key. -->
+    <key>ZerusGUI</key>                  <string>tauri</string>
+    <key>HGSDesktopNotificationHostABI</key> <string>desktop-notification-host-v1</string>
+</dict>
+</plist>

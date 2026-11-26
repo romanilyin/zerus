@@ -23,11 +23,16 @@ impl FakeHgs {
         std::fs::create_dir_all(&dir).unwrap();
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let script = dir.join("hgs");
-        std::fs::copy(manifest.join("tests/support/fake_hgs.py"), &script).unwrap();
+        // A symlink to the checked-in (executable) script, never a copy:
+        // writing a new executable while another test thread forks lets the
+        // child inherit the write fd, and exec then fails with ETXTBSY. The
+        // fake finds its config beside the link, not beside the target.
         #[cfg(unix)]
+        std::os::unix::fs::symlink(manifest.join("tests/support/fake_hgs.py"), &script).unwrap();
+        #[cfg(not(unix))]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::copy(manifest.join("tests/support/fake_hgs.py"), &script).unwrap();
+            std::fs::copy(env!("CARGO_BIN_EXE_fake-hgs-launcher"), dir.join("hgs.exe")).unwrap();
         }
         let config = json!({"fixtures": manifest.join("tests/fixtures"), "hosts": hosts});
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
@@ -36,7 +41,14 @@ impl FakeHgs {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.dir.join("hgs")
+        #[cfg(unix)]
+        {
+            self.dir.join("hgs")
+        }
+        #[cfg(not(unix))]
+        {
+            self.dir.join("hgs.exe")
+        }
     }
 
     pub fn touch(&self, name: &str) {
@@ -44,8 +56,9 @@ impl FakeHgs {
     }
 
     pub fn log(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.dir.join("log.ndjson"))
-            .unwrap()
+        let log = std::fs::read_to_string(self.dir.join("log.ndjson")).unwrap();
+        let complete = log.rsplit_once('\n').map_or("", |(lines, _)| lines);
+        complete
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
@@ -78,9 +91,42 @@ impl FakeHgs {
     }
 
     pub fn eofs(&self, host: &str) -> usize {
-        self.log()
-            .into_iter()
-            .filter(|entry| entry["host"] == host && entry.get("eof").is_some())
+        self.receipts("stdin-eof", host)
+    }
+
+    pub fn serve_ready(&self, host: &str) -> bool {
+        self.receipts("serve-ready", host) > 0
+    }
+
+    fn receipts(&self, event: &str, host: &str) -> usize {
+        use std::io::Read;
+        std::fs::read_dir(&self.dir)
+            .unwrap()
+            .take(1024)
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{event}-"))
+            })
+            .filter_map(|entry| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(entry.path())
+                    .ok()?
+                    .take(4097)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > 4096 {
+                    return None;
+                }
+                // A writer may not have closed its new receipt yet. A partial
+                // record proves nothing; the next bounded poll can observe it.
+                serde_json::from_slice::<Value>(&bytes).ok()
+            })
+            .filter(|entry| {
+                entry["schema"] == 1 && entry["event"] == event && entry["host"] == host
+            })
             .count()
     }
 }

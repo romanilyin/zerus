@@ -1,5 +1,6 @@
 """Durable worker and terminal delivery contracts, with private fake agents only."""
 import json
+import hook_caller_fixtures
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ class Recovery(unittest.TestCase):
     write_record=fixtures.InputTransport.write_record
     screen=fixtures.InputTransport.screen
     received=fixtures.InputTransport.received
+    claude_composer=fixtures.InputTransport.claude_composer
 
     def command(self,*args,payload=None,ok=True):
         result=subprocess.run([str(fixtures.HGS),*args],env=self.env,text=True,capture_output=True,
@@ -31,7 +33,9 @@ class Recovery(unittest.TestCase):
         self.record.update(agent=agent,phase='error',activity='attention',recovery_user_at=1,
             provider_error=dict(type='StopFailure',source='provider_hook',message_id='failure',at=time.time(),detail='503 Service unavailable',error_kind='provider'))
         self.write_record()
-        if agent=='claude':self.screen('\x1b[2J\x1b[H❯ ','2:0')
+        # Claude shows a paste in its composer and records the submitted row; hgs
+        # counts a Claude delivery only on that native proof (zerus-iitw8).
+        if agent=='claude':self.claude_composer();self.screen('\x1b[2J\x1b[H❯ ','2:0')
         if agent=='kimi':self.screen('\x1b[2J\x1b[H ╭──────────────╮\r\n │ >          │\r\n ╰──────────────╯\x1b[2;6H','5:1')
         directory=self.state/'recovery';directory.mkdir(exist_ok=True)
         self.policy=directory/'policy.json'
@@ -40,8 +44,9 @@ class Recovery(unittest.TestCase):
     def inspect(self):return self.command('inspect',self.name)
     def tick(self):self.command('recovery','tick')
     def hook(self,kind,**values):
-        result=subprocess.run([str(fixtures.HGS),'__state','hook'],env=dict(self.env,HGS_SESSION=self.name,HGS_RUN_ID=self.run_id),
-            input=json.dumps(dict(hook_event_name=kind,session_id=self.conversation_id,**values)),text=True,capture_output=True,timeout=10)
+        event=dict(hook_event_name=kind,session_id=self.conversation_id,**values)
+        env=dict(self.env,HGS_TEST_BIN=str(fixtures.HGS),HGS_SESSION=self.name,HGS_RUN_ID=self.run_id)
+        result=hook_caller_fixtures.run(self,event,env)
         self.assertEqual(result.returncode,0,result.stderr)
 
     def exercise(self,agent):
@@ -237,6 +242,53 @@ class Recovery(unittest.TestCase):
         for detail in ('429 insufficient quota','429 monthly quota exhausted','429 billing limit'):
             self.hook('StopFailure',error_message=detail,error_type='quota')
             self.tick();self.assertFalse(self.inspect().get('recovery'));self.assertEqual(self.received(),b'')
+
+    def test_kimi_structured_hook_evidence_is_manual_without_a_job_or_input(self):
+        self.prepare('kimi')
+        window="You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."
+        for detail in (window, '429 '+window):
+            for code in ({'code':'insufficient_quota','message':'billing account exhausted'},
+                         401, ['provider_policy'], None, False):
+                with self.subTest(detail=detail,code=code):
+                    self.hook('StopFailure',error_type='APIProviderRateLimitError',error_message=detail,error=code)
+                    for _ in range(2):
+                        self.tick();info=self.inspect()
+                        self.assertEqual(info['recovery_error_class'],'manual')
+                        self.assertFalse(info.get('recovery'));self.assertEqual(self.received(),b'')
+                        self.assertEqual(list((self.state/'recovery/jobs').glob('*.json')),[])
+                        self.assertIn('native_error_code',info['provider_error'])
+                        self.assertIsNone(info['provider_error']['native_error_code'])
+                        self.assertEqual(info['provider_error']['detail'],detail)
+        for kind in ({'code':'provider_policy'}, 401, ['provider_policy'], None, False):
+            with self.subTest(error_type=kind):
+                self.hook('StopFailure',error_type=kind,error_message='429 '+window)
+                self.tick();info=self.inspect()
+                self.assertEqual(info['recovery_error_class'],'manual')
+                self.assertFalse(info.get('recovery'));self.assertEqual(self.received(),b'')
+                self.assertEqual(list((self.state/'recovery/jobs').glob('*.json')),[])
+                self.assertIn('native_error_type',info['provider_error'])
+                self.assertIsNone(info['provider_error']['native_error_type'])
+
+    def kimi_hook_window_recovers_once(self, prefix):
+        self.prepare('kimi')
+        detail=prefix+"You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."
+        self.hook('StopFailure',error_type='APIProviderRateLimitError',error_message=detail)
+        self.tick();info=self.inspect();job=info['recovery']
+        self.assertEqual(info['provider_error']['detail'],detail)
+        self.assertEqual(info['provider_error']['error_kind'],'rate_limit')
+        self.assertEqual((job['state'],job['class'],job['attempt']),('waiting','rate_limit',0))
+        self.assertEqual(self.received(),b'')
+        self.command('recovery','action',payload=dict(name=self.name,id=job['id'],action='now'))
+        self.tick();self.wait_for(lambda:self.received().endswith(b'\r'));raw=self.received()
+        self.assertEqual(raw.count(b'\r'),1);self.assertIn(b'[HGS automatic recovery]',raw)
+        self.hook('UserPromptSubmit',prompt=self.inspect()['recovery']['receipt']['text'])
+        self.hook('Stop',last_assistant_message='Fixture answer');self.tick()
+        info=self.inspect();self.assertEqual(info['recovery']['state'],'succeeded')
+        self.assertEqual((info['run_id'],info['conversation_id']),(self.run_id,self.conversation_id))
+        self.tick();self.assertEqual(self.received(),raw)
+
+    def test_kimi_typed_window_hook_recovers_once(self):self.kimi_hook_window_recovers_once('')
+    def test_kimi_legacy_window_hook_recovers_once(self):self.kimi_hook_window_recovers_once('429 ')
 
     def test_kimi_explicit_permanent_hook_types_override_the_complete_rolling_message(self):
         self.prepare('kimi')

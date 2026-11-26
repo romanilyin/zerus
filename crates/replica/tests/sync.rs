@@ -12,6 +12,73 @@ fn store(root: &Path) -> ProjectStore {
     ProjectStore::open(root, "project-1").unwrap()
 }
 
+// Data-only pre-cutover writers, for the transport/concurrency controls below.
+// Current native replicas must separately adopt their source's admitted seal.
+fn legacy_store(root: &Path) -> ProjectStore {
+    ProjectStore::open_phone(root, "project-1").unwrap()
+}
+
+#[test]
+fn ordinary_updates_do_not_adopt_a_native_cutover() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (store(a.path()), store(b.path()));
+    let task = add(&a, "Adoption is separate from data replication");
+    let imported = b
+        .import_updates(vec![Update {
+            document: Document::Task(task.uuid().into()),
+            bytes: task.snapshot().unwrap(),
+        }])
+        .unwrap();
+    assert_eq!(imported.changed, 0);
+    assert_eq!(imported.refused.len(), 1);
+    assert!(imported.refused[0].error.contains("has not adopted"));
+    assert!(b.load(task.uuid()).is_err());
+}
+
+#[test]
+fn native_replicas_exchange_changes_after_source_bound_adoption() {
+    const SOURCE: &str = "00000000-0000-4000-8000-000000000001";
+    const RECEIVER: &str = "00000000-0000-4000-8000-000000000002";
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (store(a_root.path()), store(b_root.path()));
+    let task = add(&a, "Current native replicas");
+    let (seal, bytes) = a.export_cutover(task.uuid()).unwrap();
+    let (capture, _) = b.prepare_cutover(task.uuid(), RECEIVER).unwrap();
+    b.catch_up_cutover(
+        &bytes,
+        &capture,
+        SOURCE,
+        &ProjectStore::store_id(a_root.path()).unwrap(),
+        &seal.identity(),
+    )
+    .unwrap();
+    let mut here = a.load(task.uuid()).unwrap();
+    here.comment("After the shared seal", &Actor::Person, 2)
+        .unwrap();
+    a.save(&mut here).unwrap();
+    replicate(&a, &b, 1 << 20);
+    let mut there = b.load(task.uuid()).unwrap();
+    there.set_stage(Stage::Backlog, &Actor::Person, 3).unwrap();
+    b.save(&mut there).unwrap();
+    replicate(&b, &a, 1 << 20);
+    assert_eq!(a.inventory().unwrap().0, b.inventory().unwrap().0);
+    assert_eq!(
+        a.load(task.uuid()).unwrap().stage().unwrap(),
+        Stage::Backlog
+    );
+    assert_eq!(
+        a.load(task.uuid())
+            .unwrap()
+            .view()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|e| e.kind == "comment")
+            .count(),
+        1
+    );
+}
+
 fn add(store: &ProjectStore, text: &str) -> TaskDoc {
     let mut task = TaskDoc::create(NewTask {
         project: store.project_id(),
@@ -68,7 +135,7 @@ fn texts(store: &ProjectStore) -> Vec<String> {
 #[test]
 fn two_replicas_meet_and_then_agree() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, b) = (store(a.path()), store(b.path()));
+    let (a, b) = (legacy_store(a.path()), legacy_store(b.path()));
     add(&a, "Add rate limiting");
     add(&a, "Document the setup");
     let mut doc = a.project().unwrap();
@@ -114,7 +181,7 @@ fn two_replicas_meet_and_then_agree() {
 #[test]
 fn edits_made_on_both_sides_merge() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, b) = (store(a.path()), store(b.path()));
+    let (a, b) = (legacy_store(a.path()), legacy_store(b.path()));
     let task = add(&a, "Add rate limiting");
     replicate(&a, &b, 1 << 20);
     let mut here = a.load(task.uuid()).unwrap();
@@ -143,7 +210,7 @@ fn edits_made_on_both_sides_merge() {
 #[test]
 fn updates_come_in_pages_and_a_large_document_alone() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, b) = (store(a.path()), store(b.path()));
+    let (a, b) = (legacy_store(a.path()), legacy_store(b.path()));
     for n in 0..6 {
         add(&a, &noise(&n.to_string(), 2000));
     }
@@ -176,7 +243,7 @@ fn a_document_that_cannot_be_imported_is_refused_alone() {
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
     );
-    let (a, b) = (store(here.path()), store(there.path()));
+    let (a, b) = (legacy_store(here.path()), legacy_store(there.path()));
     let good = add(&a, "Add rate limiting");
     let foreign = ProjectStore::open(other.path(), "project-2").unwrap();
     let stranger = add(&foreign, "Elsewhere");
@@ -225,7 +292,7 @@ fn a_document_that_cannot_be_imported_is_refused_alone() {
 #[test]
 fn a_damaged_copy_is_set_aside_for_a_good_one() {
     let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, b) = (store(here.path()), store(there.path()));
+    let (a, b) = (legacy_store(here.path()), legacy_store(there.path()));
     let task = add(&a, "Add rate limiting");
     replicate(&a, &b, 1 << 20);
     let file = task_file(there.path(), task.uuid());
@@ -263,12 +330,28 @@ fn cache_file(root: &Path) -> PathBuf {
         .join("inventory.json")
 }
 
+/// Writes the inventory cache as this build does: with the mark that says a
+/// schema-repairing build wrote it. A cache without it is never trusted.
+fn write_cache(root: &Path, bytes: &[u8]) {
+    let cache = cache_file(root);
+    fs::write(&cache, bytes).unwrap();
+    fs::write(
+        cache.with_file_name("inventory.repaired"),
+        format!(
+            "schema-repair-3 proof-budget-1 mark-{} {:x}\n",
+            zerus_replica::MARK_FORMAT,
+            Sha256::digest(bytes)
+        ),
+    )
+    .unwrap();
+}
+
 /// Changes one task's remembered entry in the inventory cache.
 fn remember(root: &Path, uuid: &str, change: impl FnOnce(&mut serde_json::Value)) {
     let mut cache: serde_json::Value =
         serde_json::from_slice(&fs::read(cache_file(root)).unwrap()).unwrap();
     change(&mut cache["tasks"][uuid]);
-    fs::write(cache_file(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+    write_cache(root, &serde_json::to_vec(&cache).unwrap());
 }
 
 #[test]
@@ -347,7 +430,7 @@ fn an_inventory_that_claims_too_much_is_refused_and_then_healed() {
     // A replica that names changes it lacks gets updates it cannot apply; they
     // are refused, and the next exchange with its true inventory heals it.
     let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, b) = (store(here.path()), store(there.path()));
+    let (a, b) = (legacy_store(here.path()), legacy_store(there.path()));
     let task = add(&a, "Add rate limiting");
     replicate(&a, &b, 1 << 20);
     let mut changed = a.load(task.uuid()).unwrap();
@@ -387,7 +470,11 @@ fn the_inventory_reads_a_task_again_only_when_its_files_change() {
     // While the task's files stay as they were, the cached version is used as is.
     let text = fs::read_to_string(&cache).unwrap();
     let peer = first.tasks[task.uuid()].keys().next().unwrap().clone();
-    fs::write(&cache, text.replace(&format!("\"{peer}\""), "\"7\"")).unwrap();
+    let edited = text.replace(&format!("\"{peer}\""), "\"7\"");
+    // A cache another binary wrote, without this build's mark, is read again.
+    fs::write(&cache, &edited).unwrap();
+    assert!(!a.inventory().unwrap().0.tasks[task.uuid()].contains_key("7"));
+    write_cache(root.path(), edited.as_bytes());
     assert!(a.inventory().unwrap().0.tasks[task.uuid()].contains_key("7"));
     // A change to them reads the task again.
     let mut task = a.load(task.uuid()).unwrap();
@@ -459,7 +546,10 @@ fn the_live_inventory_leaves_done_tasks_out() {
 #[test]
 fn the_phone_view_keeps_what_the_phone_holds() {
     let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (a, phone) = (store(a_root.path()), store(b_root.path()));
+    let (a, phone) = (
+        legacy_store(a_root.path()),
+        ProjectStore::open_phone(b_root.path(), "project-1").unwrap(),
+    );
     let live = add(&a, "Add rate limiting");
     let mut done = add(&a, "Measure first");
     replicate(&a, &phone, 1 << 20);
@@ -533,4 +623,56 @@ fn the_view_trusts_the_remembered_stage_of_unchanged_files() {
         .0
         .tasks
         .contains_key(task.uuid()));
+}
+
+#[test]
+fn a_task_and_the_project_report_the_versions_their_inventory_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    assert!(store.project_version().unwrap().is_empty());
+    let first = add(&store, "Add rate limiting");
+    let mut second = add(&store, "Document the setup");
+    second.comment("More detail", &Actor::Person, 2).unwrap();
+    store.save(&mut second).unwrap();
+    let mut doc = store.project().unwrap();
+    doc.set_settings(&Settings {
+        agent_limit: 3,
+        ..doc.settings()
+    })
+    .unwrap();
+    store.save_project(&doc).unwrap();
+    let (inventory, _) = store.inventory().unwrap();
+    assert_eq!(store.project_version().unwrap(), inventory.project);
+    assert!(!inventory.project.is_empty());
+    for task in [&first, &second] {
+        let loaded = store.load(task.uuid()).unwrap();
+        assert_eq!(&loaded.inventory_version(), &inventory.tasks[task.uuid()]);
+    }
+}
+
+#[test]
+fn negative_cache_rows_from_the_old_proof_policy_are_revalidated() {
+    let root = tempfile::tempdir().unwrap();
+    let a = store(root.path());
+    let task = add(&a, "Still a valid task");
+    settle_all(root.path());
+    a.inventory().unwrap();
+    let cache = cache_file(root.path());
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    value["tasks"][task.uuid()]["error"] =
+        "the original task floor cannot be proved from its full history".into();
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&cache, &bytes).unwrap();
+    fs::write(
+        cache.with_file_name("inventory.repaired"),
+        format!(
+            "schema-repair-2 mark-{} {:x}\n",
+            zerus_replica::MARK_FORMAT,
+            Sha256::digest(&bytes)
+        ),
+    )
+    .unwrap();
+    let (inventory, damaged) = a.inventory().unwrap();
+    assert!(damaged.is_empty());
+    assert!(inventory.tasks.contains_key(task.uuid()));
 }

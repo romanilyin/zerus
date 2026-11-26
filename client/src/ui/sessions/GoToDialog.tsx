@@ -1,0 +1,97 @@
+import { TextInput } from "../lib/TextField";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { keys } from "../../store/shortcuts";
+import { activateGoTo, closeGoTo, goToAnchor, goToItems, goToOrigin } from "../../store/goTo";
+import { goToMessages, openGoToMessage, setGoToMessageQuery } from "../../store/goToMessages";
+import { GoToKind, goToDetails, goToFrame, goToKey, goToKindLabel, rankGoTo, visibleGoToRows, type GoToItem, type GoToKeyState } from "./goTo";
+import { Icon } from "../lib/icons";
+import { tr } from "../../i18n";
+
+export function GoToDialog() {
+  let field: HTMLInputElement | undefined;
+  let frame: HTMLDivElement | undefined;
+  const [query, setQuery] = createSignal("");
+  const [current, setCurrent] = createSignal(0);
+  const [start, setStart] = createSignal(0);
+  const closeState: GoToKeyState = { typed: [] };
+  // Task 423: sessions by name and ID, then the messages that match.
+  const ranked = createMemo(() => {
+    const found = rankGoTo(goToItems(), query());
+    return query().trim().startsWith(">") ? found : [...found, ...goToMessages().map((message) => message.item)];
+  });
+  const activate = (item: GoToItem) => {
+    if (item.kind !== GoToKind.Message) { activateGoTo(item); return; }
+    const message = goToMessages().find((candidate) => candidate.item.id === item.id);
+    closeGoTo(false);
+    if (message) openGoToMessage(message);
+  };
+  // Task 423: opened from the title-bar search, the palette lies over that field.
+  const frame_ = createMemo(() => {
+    const field = goToAnchor();
+    return field ? goToFrame(field, { width: innerWidth, height: innerHeight }) : undefined;
+  });
+  const visible = createMemo(() => visibleGoToRows(ranked(), current(), 12, start()));
+  createEffect(() => {
+    const next = visible().start;
+    if (next !== start()) setStart(next);
+  });
+  createEffect(() => {
+    if (!goToOrigin()) { setGoToMessageQuery(""); return; }
+    setQuery("");
+    setGoToMessageQuery("");
+    setCurrent(0);
+    setStart(0);
+    closeState.typed = [];
+    queueMicrotask(() => field?.focus());
+    const outside = (event: MouseEvent) => { if (!frame?.contains(event.target as Node)) closeGoTo(); };
+    const t = setTimeout(() => addEventListener("mousedown", outside));
+    onCleanup(() => {
+      clearTimeout(t);
+      removeEventListener("mousedown", outside);
+    });
+  });
+  const onKey = (event: KeyboardEvent) => {
+    const action = goToKey(event, closeState, keys("go.anywhere"));
+    if (action === "none") return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (action === "close") { closeGoTo(); return; }
+    if (action === "hold") return;
+    const count = ranked().length;
+    if (action === "up") setCurrent(Math.max(0, current() - 1));
+    else if (action === "down") setCurrent(Math.min(Math.max(0, count - 1), current() + 1));
+    else if (action === "pageUp") setCurrent(Math.max(0, current() - 10));
+    else if (action === "pageDown") setCurrent(Math.min(Math.max(0, count - 1), current() + 10));
+    else if (action === "activate") {
+      const item = ranked()[current()];
+      if (item) activate(item);
+    }
+  };
+  return (
+    <Show when={goToOrigin()}>
+      <div class={frame_() ? "goto-scrim anchored" : "goto-scrim"} data-shortcut-context="none">
+        <div class={frame_() ? "goto anchored" : "goto"} ref={frame} role="dialog" aria-label={tr("Search sessions, IDs and messages")}
+          data-anchored={frame_() ? "1" : undefined}
+          style={frame_() ? { left: `${frame_()!.left}px`, top: `${frame_()!.top}px`, width: `${frame_()!.width}px`, "--goto-field-h": `${frame_()!.height}px` } : undefined}>
+          <div class="goto-field">
+            <Icon name="search" size={15} />
+            <TextInput ref={field} value={query()} placeholder={tr("Search sessions, IDs and messages…")} title={tr("Type > for commands")}
+              onInput={(event) => { setQuery(event.currentTarget.value); setGoToMessageQuery(event.currentTarget.value); setCurrent(0); }} onKeyDown={onKey} />
+            <span class="kbd">Esc</span>
+          </div>
+          <ul class="goto-list" role="listbox" aria-label={tr("Results")}>
+            <For each={visible().rows} fallback={<li class="goto-empty">{tr("Nothing matches")}</li>}>{(item, index) => (
+              <li role="option" aria-selected={visible().start + index() === current()} classList={{ on: visible().start + index() === current() }}
+                onMouseEnter={() => setCurrent(visible().start + index())} onClick={() => activate(item)}>
+                <span class="goto-kind">{goToKindLabel(item.kind)}</span>
+                <span class="ell parts goto-text"><b>{item.title}</b><For each={goToDetails(item.detail)}>{(detail) => <span class="dim">{detail}</span>}</For></span>
+                <span class="grow" />
+                <Show when={item.chord}><span class="kbd">{item.chord}</span></Show>
+              </li>
+            )}</For>
+          </ul>
+        </div>
+      </div>
+    </Show>
+  );
+}

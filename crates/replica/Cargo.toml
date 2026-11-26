@@ -7,16 +7,30 @@ license = "MIT"
 description = "Replicated Zerus documents on Loro: the task schema, its rules and storage"
 publish = false
 
+[features]
+# Helpers that other crates' tests use to build documents only an older
+# replica writes (never enabled outside tests).
+test-support = []
+# Compatibility control: compile the current-schema reader without the
+# optional team field. Never enabled by production consumers.
+test-without-team = []
+
 [dependencies]
 base64 = "0.22"
 # The only crate in Zerus that imports Loro. Raise this pin deliberately: the
 # golden vectors in tests/vectors must still decode (see tests/vectors.rs).
 loro = { version = "=1.16.2", default-features = false }
 fs2 = "0.4"
+same-file = "1"
+zerus-file-lock = { path = "../file-lock" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_NONBLOCK for reading the change journal.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

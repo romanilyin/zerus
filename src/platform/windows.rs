@@ -62,10 +62,11 @@ use windows_sys::{
         },
         System::{
             Console::{
-                GenerateConsoleCtrlEvent, GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler,
-                SetConsoleMode, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
-                CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-                STD_OUTPUT_HANDLE,
+                FreeConsole, GenerateConsoleCtrlEvent, GetConsoleMode, GetConsoleProcessList,
+                GetConsoleWindow, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode,
+                SetStdHandle, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+                CTRL_SHUTDOWN_EVENT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE,
+                STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
             },
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First,
@@ -83,9 +84,10 @@ use windows_sys::{
             Threading::{
                 GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread,
                 QueryFullProcessImageNameW, ResumeThread, TerminateProcess, WaitForSingleObject,
-                CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-                CREATE_SUSPENDED, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+                CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP,
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+                THREAD_SUSPEND_RESUME,
             },
         },
         UI::Shell::CommandLineToArgvW,
@@ -210,7 +212,9 @@ fn prepared_path(path: &OsStr, first: Option<PathBuf>, last: &[PathBuf]) -> Opti
 /// stay in the state directory, and a host crash must not turn the computer back
 /// into a control console.
 pub fn local_sessions() -> bool {
-    crate::host::staging::enabled()
+    // Task #48: Codex's sandbox user cannot see the owner's marker, yet it
+    // runs inside one of this computer's sessions.
+    crate::host::staging::enabled() || super::foreign_sandbox()
 }
 /// Windows reports every exit as a code; crash statuses read as signals (see `exit_info`).
 pub fn code(status: ExitStatus) -> i32 {
@@ -275,7 +279,15 @@ pub fn agent_command(argv: &[String]) -> io::Result<Command> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found on PATH"))?;
     let (program, prefix) = resolve_program(&path)?;
     let mut command = Command::new(program);
-    command.args(prefix).args(arguments);
+    command.env_remove(crate::project_launcher::DATA_ENV);
+    if let Some((words, data)) = crate::project_launcher::windows_command(argv)? {
+        if !prefix.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a PowerShell project launcher needs a native PowerShell program"));
+        }
+        command.args(words).env(crate::project_launcher::DATA_ENV, data);
+    } else {
+        command.args(prefix).args(arguments);
+    }
     Ok(command)
 }
 /// What runs for the program file `path`, and the arguments before the caller's.
@@ -587,6 +599,10 @@ impl Spawned {
     pub fn terminate(&self) {
         self.job.terminate();
     }
+    /// Independent of the original child's exit: descendants must drain too.
+    pub(crate) fn wait_tree(&self, timeout: Duration) -> io::Result<bool> {
+        self.job.0.wait_empty(timeout)
+    }
     /// `Child::wait_with_output`; the job ends with the call.
     pub fn wait_with_output(self) -> io::Result<Output> {
         let (child, _job) = self.into_parts();
@@ -605,6 +621,7 @@ impl ChildJob {
 /// in the job too. A child that cannot join is ended before it has run. The
 /// command keeps `flags` as its creation flags afterwards.
 fn spawn_contained(command: &mut Command, flags: u32) -> io::Result<Spawned> {
+    let flags = console_flags(flags, console_attached());
     let job = Job::new(Limits::CHILD)?;
     let spawned = command.creation_flags(CREATE_SUSPENDED | flags).spawn();
     command.creation_flags(flags);
@@ -664,6 +681,11 @@ fn resume(pid: u32) -> io::Result<()> {
 /// group, so a console Ctrl+C reaches it.
 pub fn spawn(command: &mut Command) -> io::Result<Spawned> {
     spawn_contained(command, 0)
+}
+/// A service helper has the same suspended/job admission as other children,
+/// without opening a console on the interactive desktop.
+pub(crate) fn spawn_hidden(command: &mut Command) -> io::Result<Spawned> {
+    spawn_contained(command, CREATE_NO_WINDOW)
 }
 /// `spawn` in a process group of its own: a console Ctrl+C for the caller does
 /// not reach it (`own_process_group`).
@@ -1166,6 +1188,61 @@ pub fn owner_only_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// T-o8dps1: when another account owns the folder (no WRITE_DAC to change it
+/// with), only an administrator can add this user's entry. On the owner's
+/// explicit click this runs `icacls DIR /grant *<this user's SID>:(OI)(CI)F`
+/// through the UAC prompt and waits for it. The SID is this process's own, so
+/// an administrator account that approves the prompt never grants itself.
+/// Nothing takes ownership. The caller checks the rights again as this user.
+pub fn grant_full_control_elevated(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let sid = user_sid_string().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+    // A quoted argument may not end in a backslash: "D:\" would escape the quote.
+    let folder = path.display().to_string();
+    let folder = folder.trim_end_matches('\\');
+    let folder = if folder.ends_with(':') { format!("{folder}\\.") } else { folder.to_owned() };
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let icacls = system.join("System32").join("icacls.exe");
+    let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+    let file = wide_path(&icacls);
+    let parameters: Vec<u16> = format!("\"{folder}\" /grant *{sid}:(OI)(CI)F").encode_utf16().chain(Some(0)).collect();
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = parameters.as_ptr();
+    info.nShow = SW_HIDE;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let error = io::Error::last_os_error();
+        // ERROR_CANCELLED: the person declined the administrator prompt.
+        return Err(if error.raw_os_error() == Some(1223) {
+            io::Error::other("the administrator prompt was declined; nothing changed")
+        } else {
+            error
+        });
+    }
+    if info.hProcess.is_null() {
+        return Err(io::Error::other("Windows did not start icacls as administrator"));
+    }
+    let waited = unsafe { WaitForSingleObject(info.hProcess, 300_000) };
+    let mut code = 0u32;
+    let read = unsafe { GetExitCodeProcess(info.hProcess, &mut code) };
+    unsafe { CloseHandle(info.hProcess) };
+    if waited != WAIT_OBJECT_0 || read == 0 {
+        return Err(io::Error::other("icacls as administrator did not finish within five minutes"));
+    }
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "icacls as administrator could not change the folder (exit {code}); its rights may exclude administrators: \
+             take ownership in an administrator terminal (takeown /f \"{folder}\") only if that is your folder"
+        )));
+    }
+    Ok(())
+}
+
 /// U34: the one-line fix the owner gets when the sandbox cannot use a folder;
 /// None when this process already has both rights.
 pub fn sandbox_folder_problem(path: &Path) -> io::Result<Option<String>> {
@@ -1174,9 +1251,16 @@ pub fn sandbox_folder_problem(path: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let sid = user_sid_string().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+    // Without WRITE_DAC another account owns the folder, and only an
+    // administrator can add this user's entry (T-o8dps1).
+    let owner = if missing.contains(&"WRITE_DAC") {
+        "; another account owns it, so run this in an administrator terminal or choose Grant as administrator"
+    } else {
+        ""
+    };
     Ok(Some(format!(
         "the DeepSeek sandbox needs full control of {} (missing {}); fix it for this folder with:\n  \
-         icacls \"{}\" /grant *{}:(OI)(CI)F",
+         icacls \"{}\" /grant \"*{}:(OI)(CI)F\"{owner}",
         path.display(),
         missing.join(" and "),
         path.display(),
@@ -1203,6 +1287,107 @@ fn sid_string(sid: &[u8]) -> String {
     format!("S-{revision}-{authority}-{}", subs.join("-"))
 }
 
+/// Task #48: whether `path` belongs to another user account than this
+/// process's user. Codex's Windows sandbox runs an agent's commands as its own
+/// local user (`CodexSandboxOffline`), so the hgs state it reads is another
+/// user's. A folder owned by Administrators or SYSTEM (an elevated process
+/// made it) is no other user's; nor is one whose owner cannot be read.
+pub fn owned_by_another_user(path: &Path) -> bool {
+    let Some(me) = process::current_user() else { return false };
+    let wide = wide_path(path);
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out pointers are locals; the
+    // descriptor is freed by `Descriptor` and `owner` points into it.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != ERROR_SUCCESS || owner.is_null() {
+        return false;
+    }
+    let _descriptor = Descriptor(descriptor);
+    // SAFETY: `owner` is a valid SID inside the live descriptor.
+    unsafe {
+        if IsWellKnownSid(owner, WinLocalSystemSid) != 0 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 {
+            return false;
+        }
+        let length = GetLengthSid(owner) as usize;
+        std::slice::from_raw_parts(owner as *const u8, length) != me
+    }
+}
+
+/// Task #18: the integrity level a file or folder's mandatory label names (its
+/// RID: 0x1000 Low, 0x2000 Medium), or None when it carries no label, which
+/// Windows reads as Medium. An inherit-only entry labels children, not `path`.
+/// Windows starts an executable whose file is labeled Low at Low integrity,
+/// whatever its parent's level, and a Low process may not create anything in
+/// an ordinary (Medium) folder. Reading the label needs only READ_CONTROL.
+pub fn integrity_label(path: &Path) -> io::Result<Option<u32>> {
+    use windows_sys::Win32::Security::LABEL_SECURITY_INFORMATION;
+    const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+    let wide = wide_path(path);
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out pointers are locals; the
+    // descriptor is freed by `Descriptor` and `sacl` points into it.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sacl,
+            &mut descriptor,
+        )
+    };
+    if code != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let _descriptor = Descriptor(descriptor);
+    if sacl.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: `sacl` is a valid ACL inside the live descriptor.
+    let count = unsafe { (*sacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: index < AceCount of the valid ACL; `ace` points into it.
+        if unsafe { GetAce(sacl, index, &mut ace) } == 0 || ace.is_null() {
+            continue;
+        }
+        // SAFETY: every ACE starts with an ACE_HEADER.
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        if header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE || u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        // A label ACE is the header, a mask and the label SID: revision, a
+        // subauthority count, a 6-byte authority, then the subauthorities;
+        // the level is the last one.
+        let size = usize::from(header.AceSize);
+        // SAFETY: the ACE is `AceSize` bytes long inside the ACL.
+        let bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, size) };
+        let sid = bytes.get(8..).unwrap_or_default();
+        let subs = usize::from(sid.get(1).copied().unwrap_or(0));
+        let at = 8 + subs.saturating_sub(1) * 4;
+        if subs == 0 || sid.len() < at + 4 {
+            continue;
+        }
+        return Ok(Some(u32::from_le_bytes([sid[at], sid[at + 1], sid[at + 2], sid[at + 3]])));
+    }
+    Ok(None)
+}
+
 struct Descriptor(PSECURITY_DESCRIPTOR);
 impl Drop for Descriptor {
     fn drop(&mut self) {
@@ -1222,7 +1407,7 @@ impl Drop for Acl {
 /// A test folder whose DACL is only this user's Modify, as Authenticated Users
 /// Modify is inherited from the drive's root on a second drive.
 #[cfg(test)]
-fn set_modify_only(path: &Path) -> io::Result<()> {
+pub(crate) fn set_modify_only(path: &Path) -> io::Result<()> {
     let sid = process::current_user().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
     let access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
@@ -1308,7 +1493,15 @@ pub fn process_alive(pid: u32) -> bool {
 /// Volume and file index identify the file itself; creation times do not,
 /// because NTFS tunnelling gives a replacement under the same name the old one.
 pub fn file_identity(path: &Path) -> Option<FileIdentity> {
-    FileIdentity::of(&fs::File::open(path).ok()?).ok()
+    FileIdentity::of(&open_for_identity(path).ok()?).ok()
+}
+/// Opens a file or a directory for its identity, following links. Windows opens a
+/// directory only with backup semantics; `fs::metadata` opens paths the same way.
+fn open_for_identity(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 /// Not read on Windows: callers compare the file at the path they started from.
 pub fn image_identity() -> Option<FileIdentity> {
@@ -1321,7 +1514,7 @@ impl FileIdentity {
     }
     /// The identity and metadata of the file `path` names, following links.
     pub fn at(path: &Path) -> io::Result<(Self, fs::Metadata)> {
-        Self::with_metadata(&fs::File::open(path)?)
+        Self::with_metadata(&open_for_identity(path)?)
     }
     /// The identity of a file this process has open.
     pub fn of(file: &fs::File) -> io::Result<Self> {
@@ -1430,6 +1623,61 @@ pub fn gui_env() -> Vec<String> {
     Vec::new()
 }
 
+/// The desktop service never keeps a console of its own: closing that window or
+/// Windows Terminal tab would end it. Windows 11 24H2 and later allocate none
+/// (`consoleAllocationPolicy` in src/hgs.manifest); earlier releases create one
+/// for a logon task, which is released here before startup. A console that
+/// another process shares, such as the terminal it was started from, is kept.
+///
+/// Standard handles that named the released console are cleared: Windows would
+/// reuse their numbers for files opened later, and output written through a
+/// stale handle would land in those files. Cleared, it is discarded, and
+/// inherited child streams are empty.
+pub fn release_private_console() -> bool {
+    let window = !unsafe { GetConsoleWindow() }.is_null();
+    let mut processes = [0u32; 2];
+    let attached = unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+    if !super::private_console(window, attached) {
+        return false;
+    }
+    let console = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| {
+        let handle = unsafe { GetStdHandle(which) };
+        let mut mode = 0;
+        let named = !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { GetConsoleMode(handle, &mut mode) } != 0;
+        (which, named)
+    });
+    if unsafe { FreeConsole() } == 0 {
+        return false;
+    }
+    for (which, named) in console {
+        if named {
+            unsafe { SetStdHandle(which, std::ptr::null_mut()) };
+        }
+    }
+    true
+}
+/// Whether a console is attached to this process. The desktop service has none.
+fn console_attached() -> bool {
+    let mut processes = [0u32; 1];
+    (unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) }) != 0
+}
+/// The creation flags for a child of this process: a console program started by
+/// a process without a console would otherwise get a console window of its own
+/// (ssh.exe, a remote watch), so it gets a hidden one unless the caller chose.
+fn console_flags(flags: u32, attached: bool) -> u32 {
+    if attached || flags & (CREATE_NEW_CONSOLE | CREATE_NO_WINDOW | DETACHED_PROCESS) != 0 {
+        flags
+    } else {
+        flags | CREATE_NO_WINDOW
+    }
+}
+/// `Command::spawn` without a console window, for children of the desktop service.
+pub fn spawn_windowless(command: &mut Command) -> io::Result<Child> {
+    command.creation_flags(CREATE_NO_WINDOW).spawn()
+}
+
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// The console delivers Ctrl+C and Ctrl+Break to every attached process. The
 /// child (ssh.exe) handles them; hgs only waits for its exit. When the console
@@ -1455,6 +1703,14 @@ unsafe extern "system" fn interrupted(event: u32) -> i32 {
 /// runs in a job of its own (`spawn`), which ends once its output has been
 /// relayed.
 pub fn wait_interactive(command: &mut Command) -> Result<i32> {
+    wait_interactive_from(command, None)
+}
+/// A checked answer file uses the same overlapped SSH relay and console
+/// interrupt handling as ordinary forwarding, never a synchronous pipe.
+pub fn wait_interactive_with_input(command: &mut Command, input: fs::File) -> Result<i32> {
+    wait_interactive_from(command, Some(input))
+}
+fn wait_interactive_from(command: &mut Command, input: Option<fs::File>) -> Result<i32> {
     struct Handler;
     impl Drop for Handler {
         fn drop(&mut self) {
@@ -1466,7 +1722,7 @@ pub fn wait_interactive(command: &mut Command) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::Relaxed);
     // Never SetConsoleCtrlHandler(NULL, TRUE): children would inherit ignoring Ctrl+C.
     let _handler = (unsafe { SetConsoleCtrlHandler(Some(interrupted), 1) } != 0).then_some(Handler);
-    let relay = Relay::prepare(command, None)?;
+    let relay = Relay::prepare(command, input)?;
     let spawned = spawn(command);
     let pumps = relay.start(command);
     let mut child = spawned.map_err(|e| {
@@ -1560,9 +1816,9 @@ mod process {
             _ => Some(name),
         }
     }
-    /// Directories below the user profile inherit its owner-only ACL.
+    /// Protect only folders created by this call; existing ACLs stay unchanged.
     pub fn private_dir(path: &Path) -> io::Result<()> {
-        fs::create_dir_all(path)
+        owner_only_dir(path)
     }
     /// Open a reparse point (a symbolic link) itself; it is then not a regular file.
     pub fn refuse_link(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
@@ -1587,6 +1843,100 @@ mod process {
     /// `verify_private` for a file this process has open (for reading or writing).
     pub fn verify_private_file(file: &fs::File) -> io::Result<bool> {
         private_entry(file, Private::File)
+    }
+    /// Owner-only existing directory, checked through its pinned handle.
+    pub fn verify_private_directory(file: &fs::File) -> io::Result<bool> {
+        private_entry(file, Private::Directory)
+    }
+    /// WhiteWh fork: an existing directory this user owns that nobody else can
+    /// change: every ACE granting another principal access grants only reading
+    /// (no write, append, delete, child delete, attribute, ACL or owner change).
+    /// Codex grants its sandbox group read access on `~/.local`; that folder
+    /// stays usable as an ancestor of a private record, which itself must
+    /// still pass `verify_private_directory`/`verify_private_file`.
+    pub fn verify_guarded_directory(file: &fs::File) -> io::Result<bool> {
+        let info = file_information(file)?;
+        let attributes = info.dwFileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Ok(false);
+        }
+        guarded_security(file.as_raw_handle() as HANDLE)
+    }
+    /// Any access that lets a principal change an entry or the names below it.
+    const CHANGING_ACCESS: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0000_0010 // FILE_WRITE_EA
+        | 0x0000_0040 // FILE_DELETE_CHILD
+        | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x0200_0000 // MAXIMUM_ALLOWED
+        | 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000; // GENERIC_WRITE
+    fn guarded_security(handle: HANDLE) -> io::Result<bool> {
+        let user = current_user()
+            .ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        struct Descriptor(PSECURITY_DESCRIPTOR);
+        impl Drop for Descriptor {
+            fn drop(&mut self) {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+        let _descriptor = Descriptor(descriptor);
+        if owner.is_null() || unsafe { sid_bytes(owner) } != user {
+            return Ok(false);
+        }
+        if dacl.is_null() {
+            return Ok(false);
+        }
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+                || header.AceType == ACCESS_DENIED_ACE_TYPE
+            {
+                continue;
+            }
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                return Ok(false);
+            }
+            let allowed = ace as *const ACCESS_ALLOWED_ACE;
+            let sid = unsafe { std::ptr::addr_of!((*allowed).SidStart) } as PSID;
+            let trusted = unsafe {
+                sid_bytes(sid) == user
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                    || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+            };
+            if !trusted && unsafe { (*allowed).Mask } & CHANGING_ACCESS != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     fn private_entry(file: &fs::File, kind: Private) -> io::Result<bool> {
         let info = file_information(file)?;
@@ -1749,6 +2099,115 @@ mod process {
         }
         Ok(PrivateRepair::Repaired(open_aces))
     }
+    /// WhiteWh fork, task 176: why the entry at `path` is not private, in
+    /// words a person can act on: the folder's owner, or each access entry
+    /// that opens it, with its rights and whether it was inherited (Codex's
+    /// sandbox group gets read access on `~/.local`, which every folder below
+    /// inherits). None when it is private. Reads only; changes nothing.
+    pub fn describe_private(path: &Path, kind: Private) -> io::Result<Option<String>> {
+        let entry = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let info = file_information(&entry)?;
+        let attributes = info.dwFileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(Some("it is a link or reparse point".into()));
+        }
+        let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        match kind {
+            Private::Directory if !directory => return Ok(Some("it is not a folder".into())),
+            Private::File if directory => return Ok(Some("it is a folder, not a file".into())),
+            Private::File if info.nNumberOfLinks != 1 => return Ok(Some(format!("the file has {} links", info.nNumberOfLinks))),
+            _ => {}
+        }
+        let user = current_user().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+        let handle = entry.as_raw_handle() as HANDLE;
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        let _descriptor = Descriptor(descriptor);
+        if owner.is_null() {
+            return Ok(Some("it has no owner".into()));
+        }
+        let owner = unsafe { sid_bytes(owner) };
+        if owner != user {
+            return Ok(Some(format!("it is owned by {}", account_label(owner))));
+        }
+        if dacl.is_null() {
+            return Ok(Some("it has no access list, so everyone has full control".into()));
+        }
+        let mut open = Vec::new();
+        for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 || header.AceType == ACCESS_DENIED_ACE_TYPE {
+                continue;
+            }
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                open.push(format!("it has an access entry of type {}", header.AceType));
+                continue;
+            }
+            let allowed = ace as *const ACCESS_ALLOWED_ACE;
+            let sid = unsafe { std::ptr::addr_of!((*allowed).SidStart) } as PSID;
+            let trusted = unsafe {
+                sid_bytes(sid) == user
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                    || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+            };
+            if trusted {
+                continue;
+            }
+            // INHERITED_ACE: the entry came from a parent folder.
+            let inherited = u32::from(header.AceFlags) & 0x10 != 0;
+            open.push(format!(
+                "it grants {} {}{}",
+                account_label(unsafe { sid_bytes(sid) }),
+                rights_words(unsafe { (*allowed).Mask }),
+                if inherited { ", inherited from its parent folder" } else { "" }
+            ));
+        }
+        Ok((!open.is_empty()).then(|| open.join("; ")))
+    }
+    /// An access mask as icacls names it, with the mask itself.
+    fn rights_words(mask: u32) -> String {
+        const FULL: u32 = 0x001F_01FF;
+        const MODIFY: u32 = 0x0013_01BF;
+        const READ_EXECUTE: u32 = 0x0012_00A9;
+        const CHANGING: u32 = 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000;
+        let words = if mask & 0x1000_0000 != 0 || mask & FULL == FULL {
+            "full control (F)"
+        } else if mask & MODIFY == MODIFY {
+            "modify (M)"
+        } else if mask & 0x4000_0000 != 0 || mask & CHANGING != 0 {
+            "write access (W)"
+        } else if mask & READ_EXECUTE == READ_EXECUTE || mask & 0x2000_0000 != 0 {
+            "read and execute (RX)"
+        } else {
+            "read access (R)"
+        };
+        format!("{words}, mask 0x{mask:08X}")
+    }
     /// The owner of the entry behind `handle` and the accesses its DACL grants
     /// anyone but this user, SYSTEM, Administrators and OWNER RIGHTS.
     fn security(handle: HANDLE, user: &[u8]) -> io::Result<(Option<Vec<u8>>, Vec<String>)> {
@@ -1872,6 +2331,49 @@ mod process {
         }
         let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
         Some(unsafe { sid_bytes(user.User.Sid) }.to_vec())
+    }
+    /// WhiteWh fork (owner, 2026-11-17): an elevated administrator's token
+    /// names BUILTIN\Administrators as the default owner of what it creates.
+    /// Windows OpenSSH starts every command of such a user elevated, so a peer's
+    /// `hgs __peer serve` made the state folders Administrators' and the
+    /// private-store checks refused them: sends on that computer stalled ("could
+    /// not retain the pre-input refusal"). The process's new files and folders
+    /// belong to its own user instead, as for a session started on the desktop.
+    /// Answers whether the default owner was changed.
+    pub fn own_new_files() -> io::Result<bool> {
+        use windows_sys::Win32::Security::{SetTokenInformation, TokenOwner, TOKEN_ADJUST_DEFAULT, TOKEN_OWNER};
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Owned(token);
+        let read = |class| -> io::Result<Vec<u64>> {
+            let mut size = 0;
+            unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut size) };
+            if size == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+            if unsafe { GetTokenInformation(token.0, class, buffer.as_mut_ptr().cast(), size, &mut size) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(buffer)
+        };
+        let user = read(TokenUser)?;
+        let owner = read(TokenOwner)?;
+        let user_sid = unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid };
+        let owner_sid = unsafe { (*(owner.as_ptr() as *const TOKEN_OWNER)).Owner };
+        if unsafe { sid_bytes(owner_sid) == sid_bytes(user_sid) } {
+            return Ok(false);
+        }
+        let wanted = TOKEN_OWNER { Owner: user_sid };
+        if unsafe {
+            SetTokenInformation(token.0, TokenOwner, (&wanted as *const TOKEN_OWNER).cast(), std::mem::size_of::<TOKEN_OWNER>() as u32)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
     }
     pub(super) fn current_user() -> Option<&'static [u8]> {
         static USER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
@@ -2168,7 +2670,9 @@ mod process {
     pub fn current_directories() -> std::result::Result<Vec<(u32, PathBuf, String)>, String> {
         Err("Running processes cannot be inspected on this computer".into())
     }
-    pub fn worktree_processes(_deadline: std::time::Instant) -> std::result::Result<crate::platform::WorktreeProcesses, String> {
+    pub fn worktree_processes(
+        _deadline: std::time::Instant,
+    ) -> std::result::Result<crate::platform::WorktreeProcesses, String> {
         current_directories().map(Into::into)
     }
     /// Windows cannot list another process's open files without a driver; it can
@@ -2180,7 +2684,11 @@ mod process {
         Err(RunError::Unsupported)
     }
     /// Whether `pid` has the file at `path` open, as the Restart Manager reports it.
-    pub fn holds_open(pid: u32, path: &Path) -> std::result::Result<bool, RunError> {
+    pub fn holds_open(pid: u32, path: &Path) -> std::result::Result<crate::platform::OpenFiles, RunError> {
+        #[cfg(test)]
+        if let Some(reason) = crate::platform::forced_open_files_unknown() {
+            return Ok(crate::platform::OpenFiles::Unknown(reason));
+        }
         let check = |code: u32| {
             if code == ERROR_SUCCESS {
                 Ok(())
@@ -2198,7 +2706,12 @@ mod process {
         }
         let mut handle = 0;
         let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
-        check(unsafe { RmStartSession(&mut handle, 0, key.as_mut_ptr()) })?;
+        // A Restart Manager that does not start is not "not held": the answer is
+        // unknown, and the caller takes the conservative path instead of
+        // refusing on a check this host cannot make.
+        if let Err(error) = check(unsafe { RmStartSession(&mut handle, 0, key.as_mut_ptr()) }) {
+            return Ok(crate::platform::OpenFiles::Unknown(format!("the Restart Manager did not start: {error:?}")));
+        }
         let session = Session(handle);
         let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let files = [name.as_ptr()];
@@ -2213,15 +2726,13 @@ mod process {
                 std::ptr::null(),
             )
         })?;
-        let mut holders: Vec<RM_PROCESS_INFO> = Vec::new();
+        // A zero-length, null list makes some Windows builds answer
+        // ERROR_WRITE_FAULT (29) instead of the documented ERROR_MORE_DATA, so
+        // the first call gets a real buffer.
+        let mut holders: Vec<RM_PROCESS_INFO> = (0..8).map(|_| RM_PROCESS_INFO::default()).collect();
         loop {
             let (mut needed, mut count, mut reasons) = (0, holders.len() as u32, 0);
-            let list = if holders.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                holders.as_mut_ptr()
-            };
-            let code = unsafe { RmGetList(session.0, &mut needed, &mut count, list, &mut reasons) };
+            let code = unsafe { RmGetList(session.0, &mut needed, &mut count, holders.as_mut_ptr(), &mut reasons) };
             if code == ERROR_SUCCESS {
                 holders.truncate(count as usize);
                 break;
@@ -2231,9 +2742,14 @@ mod process {
             }
             holders = (0..needed).map(|_| RM_PROCESS_INFO::default()).collect();
         }
-        Ok(holders
+        Ok(if holders
             .iter()
-            .any(|holder| holder.Process.dwProcessId == pid))
+            .any(|holder| holder.Process.dwProcessId == pid)
+        {
+            crate::platform::OpenFiles::Held
+        } else {
+            crate::platform::OpenFiles::NotHeld
+        })
     }
 
     /// A process to stop, pinned by an open handle: Windows never gives its ID to
@@ -2411,9 +2927,9 @@ mod process {
     /// `prepare_environment`'s job allows that (spec D4); an enclosing job that
     /// forbids breakaway makes it fail.
     pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
-        command
-            .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .spawn()
+        spawn_unshared(
+            command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW),
+        )
             .map_err(|error| {
                 // WhiteWh fork: name the cause instead of a bare "access denied".
                 let program = Path::new(command.get_program());
@@ -2428,6 +2944,30 @@ mod process {
                     error
                 }
             })
+    }
+
+    /// Task #28 (4): a process meant to outlive this one starts without this
+    /// process's standard handles. Windows hands a child every inheritable
+    /// handle, not only the ones its STARTUPINFO names, and std starts children
+    /// with inheritance on: a detached `hgs run` runner kept the write end of
+    /// the caller's output pipe, so `hgs run --json` printed its answer but the
+    /// caller (PowerShell, Node) read no end of output until the build ended,
+    /// minutes later. This process's own standard handles stop being
+    /// inheritable before the spawn; a later child that inherits one gets a
+    /// duplicate std makes for it, so nothing else changes.
+    pub(crate) fn spawn_unshared(command: &mut Command) -> io::Result<Child> {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle takes a constant and returns a handle this
+            // process owns, null or INVALID_HANDLE_VALUE; only its flag changes.
+            let handle = unsafe { GetStdHandle(id) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                // Best effort: a console pseudo-handle refuses, and has nothing to leak.
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+        command.spawn()
     }
 
     type Reader = thread::JoinHandle<io::Result<Vec<u8>>>;
@@ -2681,6 +3221,45 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), b"{}");
     }
 
+    #[test]
+    fn private_creation_excludes_inherited_grants_and_preserves_existing_acls() {
+        let temp = tempfile::tempdir().unwrap();
+        let open = temp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        // Only this synthetic parent gains an inheritable Authenticated Users ACE.
+        assert!(Command::new("icacls").arg(&open)
+            .args(["/grant", "*S-1-5-11:(OI)(CI)M", "/Q"])
+            .stdout(Stdio::null()).status().unwrap().success());
+        let foreign = open.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        let existing = foreign.join("existing.json");
+        fs::write(&existing, b"unchanged").unwrap();
+        let acl = |path: &Path| {
+            let result = Command::new("icacls").arg(path).output().unwrap();
+            assert!(result.status.success());
+            result.stdout
+        };
+        let folder_acl = acl(&foreign);
+        let file_acl = acl(&existing);
+        private_dir(&foreign).unwrap();
+        private_open(fs::OpenOptions::new().write(true)).open(&existing).unwrap();
+        assert_eq!(acl(&foreign), folder_acl);
+        assert_eq!(acl(&existing), file_acl);
+        assert!(!verify_private(&foreign, Private::Directory).unwrap());
+        assert!(!verify_private(&existing, Private::File).unwrap());
+        assert_eq!(fs::read(&existing).unwrap(), b"unchanged");
+
+        let nested = open.join("new").join("nested");
+        private_dir(&nested).unwrap();
+        for folder in [open.join("new"), nested.clone()] {
+            assert!(verify_private(&folder, Private::Directory).unwrap());
+        }
+        let path = nested.join("created.json");
+        let file = private_open(fs::OpenOptions::new().write(true).create_new(true)).open(&path).unwrap();
+        assert!(verify_private_file(&file).unwrap());
+        assert!(verify_private(&path, Private::File).unwrap());
+    }
+
     /// U34: a folder that inherits Modify only has WRITE_DAC (the owner's
     /// implicit right) but no WRITE_OWNER, so the DeepSeek sandbox would fail;
     /// the grant adds this user's inheritable FullControl and the precheck then
@@ -2713,6 +3292,106 @@ mod tests {
         let file = member.join("inside.txt");
         fs::write(&file, "x").unwrap();
         assert!(missing_sandbox_rights(&file).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_child_of_a_process_without_a_console_gets_a_hidden_one() {
+        // A process with a console shares it (an interactive ssh, a terminal command).
+        assert_eq!(console_flags(0, true), 0);
+        assert_eq!(
+            console_flags(CREATE_NEW_PROCESS_GROUP, true),
+            CREATE_NEW_PROCESS_GROUP
+        );
+        // The desktop service has none: its children get no console window.
+        assert_eq!(console_flags(0, false), CREATE_NO_WINDOW);
+        assert_eq!(
+            console_flags(CREATE_NEW_PROCESS_GROUP, false),
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        );
+        // An explicit console choice stays the caller's.
+        for chosen in [CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, DETACHED_PROCESS] {
+            assert_eq!(console_flags(chosen, false), chosen);
+        }
+    }
+
+    #[test]
+    fn a_released_private_console_leaves_no_stale_standard_handles() {
+        use std::{io::Write, os::windows::io::IntoRawHandle};
+        use windows_sys::Win32::System::Console::AllocConsole;
+        const CHILD: &str = "HGS_TEST_PRIVATE_CONSOLE_CHILD";
+        if let Some(folder) = env::var_os(CHILD) {
+            // A console this process alone uses, as Windows gives a logon task
+            // before 24H2, with the standard handles naming it.
+            unsafe { FreeConsole() };
+            assert_ne!(
+                unsafe { AllocConsole() },
+                0,
+                "{}",
+                io::Error::last_os_error()
+            );
+            let open = |name: &str| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(name)
+                    .unwrap()
+                    .into_raw_handle()
+            };
+            let (input, output) = (open("CONIN$"), open("CONOUT$"));
+            for (which, handle) in [
+                (STD_INPUT_HANDLE, input),
+                (STD_OUTPUT_HANDLE, output),
+                (STD_ERROR_HANDLE, output),
+            ] {
+                assert_ne!(unsafe { SetStdHandle(which, handle) }, 0);
+            }
+            assert!(release_private_console());
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                assert!(
+                    unsafe { GetStdHandle(which) }.is_null(),
+                    "stale standard handle {which}"
+                );
+            }
+            // Files opened afterwards may get the old numbers; output never reaches them.
+            let folder = PathBuf::from(folder);
+            let files: Vec<fs::File> = (0..16)
+                .map(|n| fs::File::create(folder.join(format!("{n}.db"))).unwrap())
+                .collect();
+            println!("stale standard output");
+            eprintln!("stale standard error");
+            let _ = io::stdout().flush();
+            drop(files);
+            for n in 0..16 {
+                assert_eq!(
+                    fs::metadata(folder.join(format!("{n}.db"))).unwrap().len(),
+                    0
+                );
+            }
+            return;
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::windows::tests::a_released_private_console_leaves_no_stale_standard_handles",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, folder.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+        for n in 0..16 {
+            assert_eq!(
+                fs::metadata(folder.path().join(format!("{n}.db")))
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -3039,7 +3718,9 @@ mod tests {
 
     #[test]
     fn replacement_waits_for_a_reader_without_delete_sharing() {
+        use std::cell::Cell;
         use std::io::Write;
+        use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("catalog.json");
         fs::write(&target, b"old").unwrap();
@@ -3049,14 +3730,17 @@ mod tests {
             .share_mode(1)
             .open(&target)
             .unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            drop(reader);
-        });
+        let mut reader = Some(reader);
+        let clock = Cell::new(Instant::now());
+        let retries = Cell::new(0);
         let mut temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
         temporary.write_all(b"new").unwrap();
-        super::super::persist(temporary, &target).unwrap();
-        release.join().unwrap();
+        super::super::persist_with_wait(temporary, &target, || clock.get(), |delay| {
+            retries.set(retries.get() + 1);
+            drop(reader.take());
+            clock.set(clock.get() + delay);
+        }).unwrap();
+        assert!(retries.get() > 0, "the held reader caused a retry");
         assert_eq!(fs::read(&target).unwrap(), b"new");
 
         // A holder that never lets go fails within the bounded wait.
@@ -3067,9 +3751,13 @@ mod tests {
             .unwrap();
         let mut temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
         temporary.write_all(b"blocked").unwrap();
-        let started = std::time::Instant::now();
-        assert!(super::super::persist(temporary, &target).is_err());
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let started = clock.get();
+        assert!(super::super::persist_with_wait(temporary, &target, || clock.get(), |delay| {
+            clock.set(clock.get() + delay);
+        }).is_err());
+        let elapsed = clock.get() - started;
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(elapsed <= Duration::from_millis(1200), "retry budget plus one backoff");
         assert_eq!(fs::read(&target).unwrap(), b"new");
     }
 
@@ -3247,19 +3935,22 @@ mod tests {
         let other = dir.path().join("other.jsonl");
         fs::write(&path, b"{}\n").unwrap();
         fs::write(&other, b"{}\n").unwrap();
-        // The child holds the file as its standard input while it runs.
-        let mut child = Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdin(fs::File::open(&path).unwrap())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let held = holds_open(child.id(), &path);
-        let unrelated = holds_open(child.id(), &other);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(held.unwrap());
-        assert!(!unrelated.unwrap());
+        // The holder is a process the test controls: this test process itself
+        // keeps the file open, so no child program writes to a device and no
+        // OS error 29 depends on a child's console.
+        let held_open = fs::File::open(&path).unwrap();
+        let held = holds_open(std::process::id(), &path);
+        let unrelated = holds_open(std::process::id(), &other);
+        drop(held_open);
+        match (held, unrelated) {
+            (Ok(crate::platform::OpenFiles::Held), Ok(crate::platform::OpenFiles::NotHeld)) => {}
+            (Ok(crate::platform::OpenFiles::Unknown(reason)), _) => {
+                // A visible skip: this host's Restart Manager does not start, so
+                // the holder cannot be named here. Not a pass, not a failure.
+                eprintln!("skipped: the Restart Manager did not start on this computer ({reason})");
+            }
+            other => panic!("the Restart Manager answered {other:?}"),
+        }
     }
 
     #[test]
@@ -3350,6 +4041,20 @@ mod tests {
         fs::hard_link(&file, folder.join("second")).unwrap();
         assert!(!verify_private(&file, Private::File).unwrap());
         assert!(verify_private(&folder.join("missing"), Private::File).is_err());
+    }
+
+    #[test]
+    fn a_directory_has_an_identity_like_a_file() {
+        // Directories open only with backup semantics; the search catalog stamps them.
+        let dir = tempfile::tempdir().unwrap();
+        let (identity, metadata) = FileIdentity::at(dir.path()).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(file_identity(dir.path()), Some(identity));
+        fs::write(dir.path().join("file"), b"x").unwrap();
+        assert_eq!(
+            FileIdentity::at(dir.path()).unwrap().0.inode,
+            identity.inode
+        );
     }
 
     #[test]
@@ -3683,4 +4388,61 @@ mod tests {
         assert!(select_powershell(None, &[], |_| unreachable!()).is_err());
     }
 
+}
+
+/// Task #28 (4): `hgs run --json` printed its answer at once, yet the caller
+/// (PowerShell in a DeepSeek member, the lead's Node shell) waited minutes for
+/// the end of the output: the detached runner held the caller's pipe.
+#[cfg(test)]
+mod detach_tests {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const HELPER: &str = "platform::windows::detach_tests::detached_child_helper";
+
+    /// The helper side: it starts a ~30 s child the way `spawn_detached`
+    /// does (without the breakaway a test job may forbid) and exits at once.
+    #[test]
+    // This helper must exit before its child; the parent terminates that exact PID.
+    #[allow(clippy::zombie_processes)]
+    fn detached_child_helper() {
+        if std::env::var_os("HGS_TEST_DETACH_HELPER").is_none() {
+            return;
+        }
+        let mut sleeper = Command::new("ping");
+        sleeper.args(["-n", "30", "127.0.0.1"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let child = super::process::spawn_unshared(&mut sleeper).unwrap();
+        println!("sleeper {}", child.id());
+    }
+
+    #[test]
+    fn a_detached_child_leaves_the_callers_output_pipe() {
+        let started = Instant::now();
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([HELPER, "--exact", "--nocapture", "--test-threads=1"])
+            .env("HGS_TEST_DETACH_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = helper.spawn().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = output.read_to_string(&mut text);
+            let _ = sender.send(text);
+        });
+        // The helper exits within seconds; its output must end with it, not
+        // when the 30 s child it left behind ends.
+        let text = receiver.recv_timeout(Duration::from_secs(20));
+        let _ = child.wait();
+        if let Some(pid) = text.as_deref().ok().and_then(|text| text.split("sleeper ").nth(1)).and_then(|rest| rest.split_whitespace().next()) {
+            let _ = Command::new("taskkill").args(["/PID", pid, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        let text = text.expect("the caller's output stayed open while the detached child ran");
+        assert!(text.contains("sleeper "), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    }
 }

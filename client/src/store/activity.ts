@@ -1,4 +1,5 @@
 import { batch, createSignal } from "solid-js";
+import { tr } from "../i18n";
 import type { ActivityEvent, ActivityOut, ComputerId } from "../types";
 
 // The followed session's Activity: its events (oldest first, one per journal
@@ -30,7 +31,20 @@ export interface FollowRequest {
 export interface ActivityPort {
   follow(request: FollowRequest): Promise<void>;
   unfollow(computer: ComputerId, key: string): Promise<void>;
+  /**
+   * Asks for one page of the followed session's rows before journal seq
+   * `before`; the answer arrives as `older` outs. Resolves false when this
+   * source cannot page (the caller reads the old way).
+   */
+  older?(computer: ComputerId, key: string, before: number, limit: number): Promise<boolean>;
 }
+
+/**
+ * How long a follow may go without its first answer before the Activity says
+ * so and offers Retry, instead of reading forever (zerus-bz54l): a remote
+ * computer that stopped answering, for example.
+ */
+export const FIRST_PAGE_MS = 20_000;
 
 /** The newest events a subscription starts with (the server allows 100). */
 export const TAIL = 100;
@@ -38,6 +52,10 @@ export const TAIL = 100;
 const OLDER_SPAN = 200;
 /** A read that brings nothing older within this time counts as empty. */
 const OLDER_TIMEOUT_MS = 4000;
+/** The rows one older page asks for (the server allows 200). */
+export const OLDER_PAGE = 100;
+/** A page read that is not answered within this time ends without claiming the history is done. */
+export const OLDER_PAGE_TIMEOUT_MS = 15_000;
 
 /** A stable identity for an event: its journal seq, else its own keys. */
 export function eventKey(e: ActivityEvent): string {
@@ -45,11 +63,13 @@ export function eventKey(e: ActivityEvent): string {
   const voice = e.voice && typeof e.voice.id === "string" ? e.voice.id : "";
   if (e.source === "hgs_voice" && (voice || e.message_id)) return `v${voice || e.message_id}`;
   if (e.activity_key) return `k${e.activity_key}`;
+  if (e.message_id && (e.source === "codex_transcript" || e.source === "claude_transcript" || e.source === "kimi_wire" || e.source === "qwen_transcript")) return `p${e.source}:${e.type}:${e.message_id}`;
   if (e.source === "hgs_delivery" && e.message_id) return `r${e.message_id}`;
   return `t${e.type ?? ""}:${e.at ?? ""}:${(e.detail ?? "").slice(0, 48)}`;
 }
 
-const seqOf = (e: ActivityEvent) => (typeof e.seq === "number" && e.seq > 0 ? e.seq : undefined);
+/** An event's journal seq, when it has one (above 0). */
+export const seqOf = (e: ActivityEvent) => (typeof e.seq === "number" && e.seq > 0 ? e.seq : undefined);
 
 function payloadEvents(payload: unknown): { events: ActivityEvent[]; cursor?: number } {
   if (Array.isArray(payload)) return { events: payload as ActivityEvent[] };
@@ -64,23 +84,66 @@ function ordered(map: Map<string, ActivityEvent>): ActivityEvent[] {
   return list;
 }
 
+/**
+ * Task #437 (owner, 2026-11-09): a keep-warm turn never shows in Activity,
+ * history, a notification, an unread reply or a last-message preview. The host
+ * marks it (`turn_origin`/`origin`); a history written before the marks keeps
+ * the ping's envelope in the detail.
+ */
+export function keepWarmEvent(event: ActivityEvent): boolean {
+  const e = event as { turn_origin?: unknown; origin?: unknown; detail?: unknown };
+  if (e.turn_origin === "keep_warm" || e.origin === "cache_keepalive" || e.origin === "keep_warm") return true;
+  return typeof e.detail === "string" && e.detail.startsWith("<zerus-cache-keepalive>");
+}
+
 export function createActivity(port: ActivityPort) {
   const [target, setTarget] = createSignal<FollowTarget | undefined>();
   const [events, setEvents] = createSignal<readonly ActivityEvent[]>([]);
   const [summary, setSummary] = createSignal<Record<string, unknown> | undefined>();
+  const [transcriptSummary, setTranscriptSummary] = createSignal<Record<string, unknown> | undefined>();
+  const [displayKey, setDisplayKey] = createSignal<string | undefined>();
   const [ended, setEnded] = createSignal(false);
   const [loaded, setLoaded] = createSignal(false);
   const [loadingOlder, setLoadingOlder] = createSignal(false);
   const [olderDone, setOlderDone] = createSignal(false);
   /** Why the last follow failed (unknown computer, too many followed sessions, ...). */
   const [error, setError] = createSignal<string | undefined>();
+  /** The first answer did not come within FIRST_PAGE_MS; Retry subscribes again. */
+  const [stalled, setStalled] = createSignal(false);
+  let firstPage: ReturnType<typeof setTimeout> | undefined;
 
   let byKey = new Map<string, ActivityEvent>();
   let stateRev = -1;
   const revs = new Map<string, number>();
   let span = OLDER_SPAN;
   let olderFrom: number | undefined;
+  let olderAfter = 0;
   let olderTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The next `before` of a page read, from the last `older` answer. */
+  let olderCursor: number | undefined;
+  /** A token for the page read in flight; a retired read's late answers and timers are ignored. */
+  let paging: object | undefined;
+  let subscribed: FollowTarget | undefined;
+  /** Each follow and Retry is one read attempt: a retired one's late timers, failures and steps are ignored. */
+  let attempt = 0;
+  // One display-only bridge across a run change; routing always uses target().
+  let resuming: { conversation: string; previous: Map<string, ActivityEvent>; incoming: Map<string, ActivityEvent>; page: boolean; confirmed: boolean } | undefined;
+
+  const settleResume = () => {
+    if (resuming?.confirmed && resuming.page) {
+      resuming = undefined;
+      setTranscriptSummary(summary());
+    }
+  };
+
+  const newestSeq = (given: Map<string, ActivityEvent>) => {
+    let newest: number | undefined;
+    for (const e of given.values()) {
+      const seq = seqOf(e);
+      if (seq !== undefined && (newest === undefined || seq > newest)) newest = seq;
+    }
+    return newest;
+  };
 
   const oldestSeq = () => {
     let oldest: number | undefined;
@@ -95,12 +158,19 @@ export function createActivity(port: ActivityPort) {
     byKey = new Map();
     stateRev = -1;
     revs.clear();
+    resuming = undefined;
     span = OLDER_SPAN;
     olderFrom = undefined;
+    olderCursor = undefined;
+    paging = undefined;
     clearTimeout(olderTimer);
+    clearTimeout(firstPage);
     batch(() => {
+      setStalled(false);
       setEvents([]);
       setSummary(undefined);
+      setTranscriptSummary(undefined);
+      setDisplayKey(undefined);
       setEnded(false);
       setLoaded(false);
       setLoadingOlder(false);
@@ -116,14 +186,87 @@ export function createActivity(port: ActivityPort) {
     conversation_id: t.conversationId, after, tail: TAIL,
   });
 
-  /** Follows one session (the selected one); following another unfollows the previous. */
-  function follow(next: FollowTarget | undefined) {
+  /** Move routing now; subscribe after the native composer binds this run's key. */
+  function follow(next: FollowTarget | undefined, opened?: Promise<void>) {
     const prev = target();
     if (prev?.id === next?.id) return;
+    const conversation = summary()?.conversation_id || prev?.conversationId;
+    const continuing = !!prev && !!next && prev.computer === next.computer && prev.name === next.name
+      && typeof conversation === "string" && !!conversation && next.conversationId === conversation;
+    // A second resume must not promote an unconfirmed intermediate run's
+    // incoming page into the retained conversation or its resume cursor.
+    const retained = resuming && !resuming.confirmed ? resuming.previous : byKey;
+    const after = continuing ? newestSeq(retained) : undefined;
+    const mine = ++attempt;
+    subscribed = undefined;
     if (prev) void port.unfollow(prev.computer, prev.key).catch(() => {});
-    reset();
-    setTarget(next);
-    if (next) void port.follow(request(next)).catch((reason) => batch(() => { setError(String(reason)); setLoaded(true); }));
+    batch(() => {
+      if (continuing) {
+        if (retained !== byKey) { byKey = new Map(retained); setEvents(ordered(byKey)); }
+        resuming = { conversation, previous: new Map(retained), incoming: new Map(), page: false, confirmed: false };
+        stateRev = -1;
+        revs.clear();
+        clearTimeout(olderTimer);
+        olderFrom = undefined;
+        olderCursor = undefined;
+        paging = undefined;
+        setSummary(undefined);
+        setEnded(false);
+        setLoadingOlder(false);
+        setError(undefined);
+        // The earlier run's stall is not this run's: its read has not started yet.
+        clearTimeout(firstPage);
+        setStalled(false);
+      } else {
+        reset();
+        setDisplayKey(next?.id);
+      }
+      setTarget(next);
+    });
+    const subscribe = () => {
+      if (!next || target() !== next || attempt !== mine) return;
+      subscribed = next;
+      watchFirstPage(next, mine);
+      void port.follow(request(next, after)).catch((reason) => {
+        if (target() === next && attempt === mine) batch(() => { setError(String(reason)); setLoaded(true); });
+      });
+    };
+    // A failed composer does not prevent read-only Activity. The await orders
+    // subscription delivery only; it supplies no native readiness or authority.
+    if (opened) void opened.then(subscribe, subscribe);
+    else subscribe();
+  }
+
+  /** A follow whose first answer does not come in time ends in a visible state, not in reading forever. */
+  function watchFirstPage(next: FollowTarget, mine: number) {
+    clearTimeout(firstPage);
+    setStalled(false);
+    firstPage = setTimeout(() => { if (target() === next && attempt === mine && !loaded()) setStalled(true); }, FIRST_PAGE_MS);
+  }
+
+  /**
+   * Retry after a stalled first page (zerus-lxt6o): one new attempt for the
+   * same session. Only a stalled subscription that passed its composer
+   * barrier retries; the native side may deduplicate an unchanged follow, so
+   * it subscribes again only once the earlier one's unfollow settled.
+   */
+  function retry() {
+    const t = target();
+    if (!t || loaded() || !stalled() || subscribed !== t) return;
+    const mine = ++attempt;
+    const current = () => target() === t && attempt === mine;
+    subscribed = undefined;
+    clearTimeout(firstPage);
+    setStalled(false);
+    const again = () => {
+      if (!current()) return;
+      subscribed = t;
+      watchFirstPage(t, mine);
+      void port.follow(request(t)).catch((reason) => {
+        if (current()) batch(() => { setError(String(reason)); setLoaded(true); });
+      });
+    };
+    void port.unfollow(t.computer, t.key).then(again, again);
   }
 
   /** The finish of an older read: it either moved the oldest event back or doubles the reach. */
@@ -131,7 +274,7 @@ export function createActivity(port: ActivityPort) {
     if (olderFrom === undefined) return;
     clearTimeout(olderTimer);
     const oldest = oldestSeq();
-    const asked = Math.max(0, olderFrom - span);
+    const asked = olderAfter;
     if (oldest === undefined || oldest >= olderFrom) {
       if (asked === 0) setOlderDone(true);
       span *= 2;
@@ -140,17 +283,47 @@ export function createActivity(port: ActivityPort) {
     setLoadingOlder(false);
   };
 
-  /** Reads events before the oldest one shown, resuming the subscription from further back. */
-  function loadOlder() {
-    const t = target();
-    const oldest = oldestSeq();
-    if (!t || loadingOlder() || olderDone() || oldest === undefined) return;
-    if (oldest <= 1) { setOlderDone(true); return; }
+  /** The previous way: resume the subscription from further back, by a guessed span or from a visited window's start. */
+  function legacyOlder(t: FollowTarget, oldest: number, savedAfter?: number) {
     olderFrom = oldest;
     setLoadingOlder(true);
-    const after = Math.max(0, oldest - span);
+    const after = savedAfter !== undefined && Number.isSafeInteger(savedAfter)
+      ? Math.max(0, Math.min(oldest - 1, savedAfter)) : Math.max(0, oldest - span);
+    olderAfter = after;
     olderTimer = setTimeout(settleOlder, OLDER_TIMEOUT_MS);
     void port.follow(request(t, after)).catch(settleOlder);
+  }
+
+  /**
+   * Reads the rows before the oldest one shown: one page read when the server
+   * offers it, else the legacy way; a visited window is restored the legacy way.
+   */
+  function loadOlder(savedAfter?: number) {
+    const t = target();
+    const oldest = oldestSeq();
+    if (!t || subscribed !== t || loadingOlder() || olderDone() || oldest === undefined) return;
+    if (oldest <= 1) { setOlderDone(true); return; }
+    if (!port.older || savedAfter !== undefined) { legacyOlder(t, oldest, savedAfter); return; }
+    const token = {};
+    const mine = attempt;
+    paging = token;
+    setLoadingOlder(true);
+    const before = olderCursor !== undefined ? Math.min(olderCursor, oldest) : oldest;
+    const current = () => paging === token && target() === t && attempt === mine;
+    clearTimeout(olderTimer);
+    olderTimer = setTimeout(() => {
+      if (paging !== token) return;
+      paging = undefined;
+      setLoadingOlder(false);
+    }, OLDER_PAGE_TIMEOUT_MS);
+    const fallBack = () => {
+      if (!current()) return;
+      paging = undefined;
+      clearTimeout(olderTimer);
+      setLoadingOlder(false);
+      legacyOlder(t, oldest);
+    };
+    port.older(t.computer, t.key, before, OLDER_PAGE).then((sent) => { if (!sent) fallBack(); }, fallBack);
   }
 
   function applyActivity(outs: ActivityOut[]) {
@@ -164,29 +337,64 @@ export function createActivity(port: ActivityPort) {
         switch (out.kind) {
           case "events": {
             const { events: list } = payloadEvents(out.payload);
-            for (const e of list) byKey.set(eventKey(e), e);
+            for (const e of list) {
+              if (keepWarmEvent(e)) continue;
+              byKey.set(eventKey(e), e);
+              resuming?.incoming.set(eventKey(e), e);
+            }
+            if (resuming) { resuming.page = true; settleResume(); }
             changed = true;
             older = true;
             setLoaded(true);
             break;
           }
+          case "older": {
+            const p = (out.payload ?? {}) as { events?: ActivityEvent[]; cursor?: number; last?: boolean; more?: boolean };
+            for (const e of Array.isArray(p.events) ? p.events : []) {
+              if (keepWarmEvent(e)) continue;
+              byKey.set(eventKey(e), e);
+            }
+            changed = true;
+            if (typeof p.cursor === "number") olderCursor = p.cursor;
+            if (p.last === true && paging !== undefined) {
+              paging = undefined;
+              clearTimeout(olderTimer);
+              setLoadingOlder(false);
+              if (p.more !== true) setOlderDone(true);
+            }
+            break;
+          }
           case "replace": {
-            const { events: list } = payloadEvents(out.payload);
-            byKey = new Map(list.map((e) => [eventKey(e), e]));
+            const { events: all } = payloadEvents(out.payload);
+            const list = all.filter((e) => !keepWarmEvent(e));
+            const incoming = new Map(list.map((e) => [eventKey(e), e]));
+            if (resuming) {
+              resuming.incoming = incoming;
+              resuming.page = list.length > 0;
+              byKey = new Map([...resuming.previous, ...incoming]);
+              settleResume();
+            } else byKey = incoming;
             changed = true;
             setLoaded(true);
-            // A replaced window has no older pages to read by seq.
-            if (oldestSeq() === undefined) setOlderDone(true);
+            // A replaced window has no older pages to read by seq. A journal
+            // window that replaced the shown one (a gap) starts its pages
+            // again from its own oldest row: the earlier cursor lies further
+            // back and would skip what the replacement dropped.
+            olderCursor = undefined;
+            setOlderDone(oldestSeq() === undefined);
             break;
           }
           case "event": {
             const p = (out.payload ?? {}) as { id?: string; rev?: number; event?: ActivityEvent };
             if (!p.event || !p.id) break;
+            if (keepWarmEvent(p.event)) break;
             const rev = typeof p.rev === "number" ? p.rev : 0;
             if ((revs.get(p.id) ?? -1) >= rev) break;
             revs.set(p.id, rev);
             const existing = [...byKey.entries()].find(([, e]) => e.id === p.id || e.activity_key === p.id);
-            byKey.set(existing ? existing[0] : `i${p.id}`, p.event);
+            const key = existing ? existing[0] : `i${p.id}`;
+            byKey.set(key, p.event);
+            if (resuming) { resuming.incoming.set(key, p.event); resuming.page = true; settleResume(); }
             changed = true;
             break;
           }
@@ -196,6 +404,31 @@ export function createActivity(port: ActivityPort) {
             if (rev < stateRev) break;
             stateRev = rev;
             setSummary(p.value);
+            if (resuming && typeof p.value?.conversation_id === "string" && p.value.conversation_id) {
+              if (p.value.conversation_id !== resuming.conversation) {
+                byKey = resuming.incoming;
+                resuming = undefined;
+                setDisplayKey(t.id);
+                changed = true;
+              } else resuming.confirmed = true;
+            }
+            if (resuming) settleResume();
+            else setTranscriptSummary(p.value);
+            break;
+          }
+          case "connection": {
+            const p = (out.payload ?? {}) as { ready?: boolean; pending?: boolean; code?: string };
+            // Transport replacement can restart native state revisions. Keep
+            // the last transcript visible until its native snapshot arrives.
+            stateRev = -1;
+            if (!p.pending) setError(p.ready ? undefined : tr("Activity is unavailable from the desktop service. Retry to reconnect."));
+            if (!p.ready && !p.pending) {
+              setLoaded(true);
+              clearTimeout(olderTimer);
+              olderFrom = undefined;
+              paging = undefined;
+              setLoadingOlder(false);
+            }
             break;
           }
           case "ended":
@@ -209,7 +442,16 @@ export function createActivity(port: ActivityPort) {
     if (older && olderFrom !== undefined) settleOlder();
   }
 
-  return { target, events, summary, ended, loaded, loadingOlder, olderDone, error, follow, loadOlder, applyActivity };
+  /** The followed session's conversation: its inspection's, else the row's (Qt's m_details conversation_id). */
+  const attachmentScope = () => {
+    const t = target();
+    if (!t) return undefined;
+    const inspected = summary()?.conversation_id;
+    const conversation = typeof inspected === "string" && inspected ? inspected : t.conversationId ?? "";
+    return { computer: t.computer, name: t.name, conversation_id: conversation, archive_id: null };
+  };
+
+  return { target, displayKey, events, summary, transcriptSummary, ended, loaded, loadingOlder, olderDone, error, stalled, retry, follow, loadOlder, applyActivity, attachmentScope };
 }
 
 export type ActivityStore = ReturnType<typeof createActivity>;

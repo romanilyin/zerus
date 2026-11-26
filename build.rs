@@ -2,7 +2,8 @@ fn main() {
     fork_build_identity();
     println!("cargo:rerun-if-changed=src/macos_session.c");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        cc::Build::new().file("src/macos_session.c")
+        cc::Build::new()
+            .file("src/macos_session.c")
             .flag_if_supported("-Wno-deprecated-declarations")
             .compile("hgs_macos_session");
         for library in ["framework=Security", "framework=CoreFoundation", "bsm"] {
@@ -20,7 +21,10 @@ fn main() {
             .join("src")
             .join("hgs.manifest");
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
     }
 }
 

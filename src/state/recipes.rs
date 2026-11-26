@@ -22,6 +22,14 @@ pub(super) fn argv(record: &Value) -> Result<Vec<String>> {
 }
 
 pub(super) fn resume_argv(agent: &str, argv: &[String], sid: &str) -> Result<Vec<String>> {
+    // WhiteWh fork: a Hermes resume names Hermes's own session id.
+    let native;
+    let sid = if agent == super::hermes::AGENT && sid != "-" {
+        native = super::hermes::native_id(sid).ok_or_else(|| format!("hgs knows no Hermes session for conversation {sid}"))?;
+        native.as_str()
+    } else {
+        sid
+    };
     let value_flags: &[&str] = match agent {
         "claude" => &[
             "--model",
@@ -67,6 +75,22 @@ pub(super) fn resume_argv(agent: &str, argv: &[String], sid: &str) -> Result<Vec
             "--skills-dir",
             "--add-dir",
         ],
+        // Qwen Code 0.27.4's options that a resume keeps.
+        "qwen" => &[
+            "-m",
+            "--model",
+            "--approval-mode",
+            "--auth-type",
+            "--openai-base-url",
+            "--extensions",
+            "-e",
+            "--include-directories",
+            "--allowed-mcp-server-names",
+            "--allowed-tools",
+            "--exclude-tools",
+        ],
+        // Hermes Agent 0.23.2's options that a resume keeps.
+        "hermes" => &["-m", "--model", "--provider", "-t", "--toolsets"],
         _ => return Err(format!("unsupported agent: {agent}")),
     };
     let multi_flags: &[&str] = match agent {
@@ -105,20 +129,23 @@ pub(super) fn resume_argv(agent: &str, argv: &[String], sid: &str) -> Result<Vec
             "--include-non-interactive",
         ],
         "kimi" => &["-y", "--yolo", "--auto", "--plan"],
+        "qwen" => &["-y", "--yolo", "--sandbox", "-s", "--debug", "-d", "--chat-recording"],
+        "hermes" => &["--yolo"],
         _ => &[],
     };
-    let executable = argv.first().ok_or("saved agent executable is missing")?;
-    let mut result = vec![
-        executable.clone(),
+    argv.first().ok_or("saved agent executable is missing")?;
+    let program = crate::project_launcher::program_words(argv);
+    let mut result = argv[..program].to_vec();
+    result.extend([
         match agent {
             "codex" => "resume",
-            "claude" => "--resume",
+            "claude" | "qwen" | "hermes" => "--resume",
             _ => "--session",
         }
         .into(),
         sid.into(),
-    ];
-    let mut index = 1;
+    ]);
+    let mut index = program;
     while index < argv.len() {
         let argument = &argv[index];
         let key = argument.split('=').next().unwrap_or(argument);
@@ -189,7 +216,8 @@ pub(super) fn resume_argv(agent: &str, argv: &[String], sid: &str) -> Result<Vec
 /// original prompt; without its selector it starts a new conversation.
 pub(super) fn fresh_argv(agent: &str, argv: &[String]) -> Result<Vec<String>> {
     let mut argv = resume_argv(agent, argv, "-")?;
-    argv.drain(1..3);
+    let program = crate::project_launcher::program_words(&argv);
+    argv.drain(program..program + 2);
     Ok(argv)
 }
 
@@ -237,26 +265,58 @@ pub(super) fn verify_history(record: &Value, allow_error: bool) -> Result<()> {
         {
             return Err(format!("{name}: saved Kimi conversation no longer exists"));
         }
-    } else {
-        let path = Path::new(string(record, "transcript"));
-        if !path
-            .metadata()
-            .map(|metadata| metadata.is_file() && metadata.len() > 0)
-            .unwrap_or(false)
-        {
-            return Err(format!(
-                "{name}: persisted conversation is missing or empty"
-            ));
-        }
+    } else if !conversation_persisted(record) {
+        return Err(format!("{name}: persisted conversation is missing or empty"));
     }
     Ok(())
 }
+
+/// The conversation the restore's own history check would accept, for
+/// Claude and Codex (zerus-63rru.70): the confirmed conversation ID and a
+/// non-empty transcript, one metadata read. Kimi, DeepSeek and OpenCode
+/// keep today's decision and are never read here; the presentation gate in
+/// session_action reuses this same code, never a second rule.
+pub(super) fn conversation_persisted(record: &Value) -> bool {
+    if matches!(string(record, "agent"), "claude" | "codex" | "qwen") {
+        !string(record, "conversation_id").is_empty() && transcript_saved(record)
+    } else {
+        true
+    }
+}
+
+/// Whether the record's transcript (Claude's transcript, Codex's rollout) is
+/// a non-empty regular file: one metadata read, never its content.
+fn transcript_saved(record: &Value) -> bool {
+    #[cfg(test)]
+    crate::state::journal::read_order::note("transcript");
+    Path::new(string(record, "transcript"))
+        .metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+    #[test]
+    fn powershell_wrappers_keep_the_prefix_across_resume_and_fresh() {
+        let prefix = strings(&[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", r"C:\project\run_codex.ps1"]);
+        for agent in ["codex", "claude", "kimi"] {
+            let mut base = prefix.clone();
+            base.extend(strings(&["--model", "model-name", "prompt must not replay"]));
+            let resume = resume_argv(agent, &base, "same-id").unwrap();
+            assert_eq!(&resume[..7], prefix.as_slice());
+            assert_eq!(resume[8], "same-id");
+            assert_eq!(&resume[9..], ["--model", "model-name"]);
+            assert_eq!(fresh_argv(agent, &resume).unwrap(), [prefix.clone(), strings(&["--model", "model-name"])].concat());
+        }
+        let mut bad = prefix;bad.push("--unreviewed-option".into());
+        assert!(resume_argv("codex", &bad, "id").is_err());
     }
     #[test]
     fn fresh_launches_keep_options_without_conversation_or_prompt() {

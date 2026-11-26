@@ -49,6 +49,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
@@ -73,6 +74,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -304,7 +306,9 @@ class MainActivity : ComponentActivity() {
                         contentDescription = "Refresh"
                         if (!conversationObscured) conversationLoad?.let { stateDescription = it.text }
                     }) {
-                    Icon(Icons.Default.Refresh, null)
+                    if(selected != null && conversationLoad?.spinner == true && !conversationObscured)
+                        CircularProgressIndicator(Modifier.size(20.dp),color = Mint,strokeWidth = 2.dp)
+                    else Icon(Icons.Default.Refresh, null)
                 }
                 if (selected == null) IconButton(onClick = { keyboard?.hide(); settings = true }, modifier = Modifier.semantics {
                     if (updateState.sessionId >= 0) stateDescription = "Installation pending"
@@ -333,8 +337,10 @@ class MainActivity : ComponentActivity() {
             // the secondary tools return when editing ends, while refresh stays visible.
             if (selected != null && WindowInsets.ime.getBottom(LocalDensity.current) == 0)
                 SessionHeaderTools(model,selected,onDetails = { sessionDetails = true }) { messageJump = it }
-            if (selected != null) ConversationRefreshStatus(model, conversationLoad)
-            if (model.error.isNotBlank()) Surface(color = Color(0xFF3A2821), modifier = Modifier.fillMaxWidth()) {
+            if (selected != null) ConversationReadTiming(model, conversationLoad)
+            // The open conversation's own read failure is shown, with its details, by its status strip.
+            if (model.error.isNotBlank() && (selected == null || model.conversationReadFailure(selected.target).isBlank()))
+                Surface(color = Color(0xFF3A2821), modifier = Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(model.error, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                     IconButton(onClick = { model.clearError() }) { Icon(Icons.Default.Close, "Dismiss error") }
@@ -378,17 +384,24 @@ class MainActivity : ComponentActivity() {
             TextButton(onClick = { model.review(draft); review = null }) { Text("Prepare again") }
             TextButton(onClick = { model.checkReceipt(draft); review = null }) { Text("Check receipt") }
         }, dismissButton = { TextButton(onClick = { review = null }) { Text("Cancel") } }) }
-    reviewOutgoing?.let { message -> ZerusAlertDialog(onDismissRequest = { reviewOutgoing = null }, title = { Text("Review delivery") },
+    reviewOutgoing?.let { message ->
+        val canDismiss = !message.deliveryDismissed && message.status in listOf("uncertain", "failed")
+        ZerusAlertDialog(onDismissRequest = { reviewOutgoing = null }, title = { Text("Review delivery") },
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(if (message.status == "uncertain") "This message may already have reached ${message.target.session}. Check its receipt and conversation before preparing another send."
+            Text(if (message.status == "uncertain") "This message may already have reached ${message.target.session}. Check its receipt and conversation for confirmation."
+                else if (message.error.isNotBlank()) message.error
                 else "This message was not accepted. Review it before trying again.")
             if (message.text.isNotBlank()) SelectionContainer { Text(message.text, maxLines = 8, overflow = TextOverflow.Ellipsis) }
             AttachmentRows(message.attachments.map(Attachment::displayed), message.target, model)
-            Text("Your current composition is kept in Saved drafts. Preparing again does not send the message.", color = Muted, style = MaterialTheme.typography.bodySmall)
-        } }, confirmButton = { TextButton(enabled = "outgoing:${message.requestId}" !in model.receiptFlights,
-            onClick = { model.prepareOutgoing(message); reviewOutgoing = null }) { Text("Prepare again") }
+            if (canDismiss) Text(OUTGOING_WARNING_DISMISSAL_NOTICE, color = Muted, style = MaterialTheme.typography.bodySmall)
+            if (message.status == "failed") Text("Your current composition is kept in Saved drafts. Preparing again does not send the message.", color = Muted, style = MaterialTheme.typography.bodySmall)
+        } }, confirmButton = {
+            if (message.status == "failed") TextButton(enabled = "outgoing:${message.requestId}" !in model.receiptFlights && "dismiss:${message.requestId}" !in model.receiptFlights,
+                onClick = { model.prepareOutgoing(message); reviewOutgoing = null }) { Text("Prepare again") }
             TextButton(enabled = "outgoing:${message.requestId}" !in model.receiptFlights,
                 onClick = { model.checkOutgoing(message); reviewOutgoing = null }) { Text("Check receipt") }
+            if (canDismiss) TextButton(enabled = "dismiss:${message.requestId}" !in model.receiptFlights,
+                onClick = { model.dismissOutgoing(message); reviewOutgoing = null }) { Text("Dismiss warning") }
         }, dismissButton = { TextButton(onClick = { reviewOutgoing = null }) { Text("Cancel") } }) }
     discard?.let { draft -> ZerusAlertDialog(onDismissRequest = { discard = null }, title = { Text("Discard saved draft?") },
         text = { Text("This removes the private draft for ${draft.target.session} from this phone.") },
@@ -430,7 +443,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (badge.additionalUnread) {
-            val unread = DesktopSessionPalette.colors(if(SessionNotificationPreferences.muted(session)) DesktopBadgeKind.Neutral else DesktopBadgeKind.Unread,dark)
+            val unread = DesktopSessionPalette.colors(if(ChildSessions.silenced(session)) DesktopBadgeKind.Neutral else DesktopBadgeKind.Unread,dark)
             Surface(color = Color(unread.background), shape = RoundedCornerShape(5.dp)) {
                 Icon(Icons.Default.MarkEmailUnread, "New reply", Modifier.padding(4.dp).size(12.dp), tint = Color(unread.foreground))
             }
@@ -602,10 +615,11 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
     val query = model.sessionQuery
     val filter = model.sessionFilter
     val archiveRange = model.archive.range
-    val projectionGeneration = remember(sessions, machines, projects, drafts, selectedMachines, query, project?.key, filter, archiveRange) { Any() }
+    val teams = model.teamCollapse
+    val projectionGeneration = remember(sessions, machines, projects, drafts, selectedMachines, query, project?.key, filter, archiveRange, teams) { Any() }
     val preparedProjection by produceState<Pair<Any, SessionListPresentation>?>(null, projectionGeneration) {
         val prepared = withContext(Dispatchers.Default) {
-            SessionListPresentation.prepare(sessions, machines, projects, selectedMachines, query, project?.key, filter, drafts, archiveRange)
+            SessionListPresentation.prepare(sessions, machines, projects, selectedMachines, query, project?.key, filter, drafts, archiveRange, teams)
         }
         value = projectionGeneration to prepared
     }
@@ -691,22 +705,26 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                     Icon(if (collapsed) Icons.Default.ExpandMore else Icons.Default.ExpandLess, if (collapsed) "Expand project" else "Collapse project", tint = Muted)
                 }
             } }
-            if (!collapsed) items(group.sessions, key = { "session:${it.target.key}" }) { session ->
+            if (!collapsed) items(group.cards, key = { "session:${it.session.target.key}" }) { entry ->
+                val session = entry.session
                 val online = SessionFilters.online(session, model.machines)
                 val machine = model.machines.find { it.connectionId == session.target.connectionId && it.id == session.target.computerId }
                 val gitBadge = rememberGitBadge(model.gitStatus, GitStatusAccessPolicies.candidate(session),
                     "session:${session.target.key}" in gitViewport)
+                // A child session sits under its parent, indented with a tree connector (spec 3.3).
+                Box(Modifier.fillMaxWidth().childTree(entry, MaterialTheme.colorScheme.outline).padding(start = childIndent(entry.depth))) {
                 Card(Modifier.sessionCardGestures(RoundedCornerShape(14.dp), onOpen = { model.open(session, preserveProject = true) }, onActions = { sessionActions = session }),
                     colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(14.dp)) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             ProviderBadge(session.agent, Modifier.size(24.dp))
+                            SupervisedMark(session)
                             Text(SessionFilters.label(session), Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if(SessionNotificationPreferences.muted(session)) Icon(Icons.Default.NotificationsOff,"Notifications muted on all devices",tint=Muted,modifier=Modifier.size(18.dp))
                             // A reply read on another device needs no badge here.
                             (if (!SharedReadPolicies.canShowReplyBadge(session) || SessionFilters.replyInProgress(session, online)) null else UnreadPresentation.badge(model.unreadCount(session.target), model.loadedUnreadCount(session.target),
                                 SessionFilters.visibleUnreadReply(session, online)))?.let { unread ->
-                                val muted = SessionNotificationPreferences.muted(session)
+                                val muted = ChildSessions.silenced(session)
                                 Surface(color = if(muted) Color(0xFF2B343E) else Mint, shape = CircleShape, modifier = Modifier.semantics { contentDescription = unread.description }) {
                                     Text(unread.text, Modifier.padding(horizontal = 8.dp, vertical = 3.dp), color = if(muted) Muted else Background,
                                         style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
@@ -716,9 +734,14 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                         }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                             SessionBadge(session, online, if(online && SessionFilters.waitingIdle(session)) Modifier.weight(1.5f,fill=false) else Modifier)
-                            Box(Modifier.weight(1f)) { MachineLabel(machine?.name ?: session.target.computerId,colorHex = model.machineColor(MachineKey(session.target.connectionId,session.target.computerId))) }
-                            SessionSubagentCounter(model, session, online)
+                            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                MachineLabel(machine?.name ?: session.target.computerId,Modifier.weight(1f,fill=false),colorHex = model.machineColor(MachineKey(session.target.connectionId,session.target.computerId)))
+                                ChildSessions.accountMark(session, model.groupedAccounts)?.let { AccountMarkChip(it) }
+                            }
+                            SessionTeamCounter(model, entry, online)
                         }
+                        entry.fromParent?.let { parent -> FromParentLine(parent, entry.fromParentKey?.let { key ->
+                            model.sessions.find { it.target.key == key }?.let { listed -> { model.open(listed, preserveProject = true) } } }) }
                         SessionCheckoutLine(session, gitBadge)
                         SessionFilters.archiveDate(session).takeIf { it.isNotBlank() }?.let { archivedDate ->
                             Text("Archived $archivedDate", color = Muted, style = MaterialTheme.typography.labelSmall)
@@ -731,6 +754,7 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                         if (model.connections.size > 1) Text(model.connections.find { it.id == session.target.connectionId }?.displayName.orEmpty(), color = Muted, style = MaterialTheme.typography.labelSmall)
                         SessionSubagentRows(model, session, online)
                     }
+                }
                 }
             }
         }
@@ -779,39 +803,19 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         model.olderLoading, historyProgress, model.demo, resolved = model.activity != null, opening = opening)
 }
 
-@Composable private fun ConversationRefreshStatus(model: ZerusViewModel, status: ConversationLoadPresentation.Status?) {
-    val banner = ConversationLoadPresentation.banner(status, model.conversationEvents.isNotEmpty(),
-        model.activityVerified, model.historyComplete && model.readPositionReady, model.demo) ?: return
+@Composable private fun ConversationReadTiming(model: ZerusViewModel, status: ConversationLoadPresentation.Status?) {
     if (BuildConfig.READ_TIMING_ENABLED) {
         val stage = when {
-            banner.text == "Latest activity checked" -> RelayReadTiming.Stage.VisibleChecked
-            banner.spinner -> RelayReadTiming.Stage.VisibleChecking
+            status?.spinner == true -> RelayReadTiming.Stage.VisibleChecking
+            model.activityVerified -> RelayReadTiming.Stage.VisibleChecked
             else -> null
         }
-        LaunchedEffect(model.selected?.target, stage, banner.detail) {
+        val historyReady = model.historyComplete && model.readPositionReady
+        LaunchedEffect(model.selected?.target, stage, historyReady) {
             if (stage != null) withFrameNanos {
                 RelayReadTiming.point(stage)
-                if (stage == RelayReadTiming.Stage.VisibleChecked && banner.detail == "Message history loaded.")
+                if (stage == RelayReadTiming.Stage.VisibleChecked && historyReady)
                     RelayReadTiming.point(RelayReadTiming.Stage.VisibleHistory)
-            }
-        }
-    }
-    val compact = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    // Keep a stable slot across read phases. With the keyboard open, preserve
-    // space for the request disclosure; its delivery detail remains accessible.
-    Surface(color = Surface, modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(horizontal = 16.dp, vertical = if (compact) 3.dp else 6.dp)
-            .heightIn(min = if (compact) 24.dp else 40.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(18.dp), contentAlignment = Alignment.Center) {
-                if (banner.spinner) CircularProgressIndicator(Modifier.fillMaxSize(), color = Mint, strokeWidth = 2.dp)
-            }
-            Column(Modifier.weight(1f).semantics(mergeDescendants = true) {
-                liveRegion = LiveRegionMode.Polite
-                if (compact) stateDescription = banner.detail
-            }) {
-                Text(banner.text, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (!compact) Text(banner.detail, style = MaterialTheme.typography.labelSmall, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -852,9 +856,18 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
     val unreadBoundary = model.firstUnreadEventId.takeIf { id -> events.any { it.id == id } }.orEmpty()
     val savedViewport = model.conversationViewport(target)
     val readReady = model.readPositionReady || model.demo
-    val unread = UnreadPresentation.badge(model.unreadCount(target), model.loadedUnreadCount(target))
+    val unread = UnreadPresentation.conversationBadge(model.unreadCount(target), model.loadedUnreadCount(target))
     var unavailableSaved by remember(target.key) { mutableStateOf(false) }
     var latestPending by remember(target.key) { mutableStateOf(false) }
+    var ownCursor by remember(target.key) { mutableStateOf<String?>(null) }
+    var ownHighlight by remember(target.key) { mutableStateOf<String?>(null) }
+    var ownDirection by remember(target.key) { mutableStateOf<OwnMessageNavigation.Direction?>(null) }
+    var ownJob by remember(target.key) { mutableStateOf<Job?>(null) }
+    var ownGeneration by remember(target.key) { mutableIntStateOf(0) }
+    var ownEpoch by remember(target.key) { mutableStateOf(model.historyEpoch) }
+    var queuedOwn by remember(target.key) { mutableStateOf<OwnMessageNavigation.Direction?>(null) }
+    var navigationIdle by remember(target.key) { mutableStateOf(true) }
+    val ownAvailability = remember(target.key) { OwnMessageNavigation.Availability() }
     var searchNotice by remember(target.key) { mutableStateOf("") }
     val historyReason = if(model.demo) "" else model.historyReason(target)
     val boundedNotice = if(model.historyEpoch.isNotBlank()) {
@@ -862,18 +875,25 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
     } else if(model.conversationHistoryTruncated) "Showing recent activity. Older messages may be outside the available history." else ""
     val conversationLoading = loadStatus?.initial == true
     val context = LocalContext.current
-    val keys = buildList {
-        add("history:earlier")
-        add("history:status")
-        if (warning.isNotBlank()) add("history:warning")
-        if (boundedNotice.isNotBlank()) add("history:bounded")
-        add("history:missing-anchor")
-        events.forEach { if(it.id == unreadBoundary) add("history:unread"); add("event:" + it.id) }
-        if (events.isEmpty() && !conversationLoading) add("history:empty")
-        add("history:newer")
-        if (queueVisible) add("history:queue")
-        if (questions.isNotEmpty()) add("history:questions")
-        add("history:tail")
+    var previousRowKeys by remember(target.key) { mutableStateOf<ConversationRowKeys.State?>(null) }
+    val rowKeys = remember(target.key, events, model.conversationSupersededIds) {
+        ConversationRowKeys.reconcile(target.key, previousRowKeys, events, model.conversationSupersededIds)
+    }
+    SideEffect { previousRowKeys = rowKeys }
+    // The bounded-window notice is a status detail now (zerus-a4mub.10), not a list item.
+    val keys = ConversationViewport.keys(events, unreadBoundary, warning.isNotBlank(), hasBoundedNotice = false,
+        conversationLoading = conversationLoading, queueVisible = queueVisible, questionsVisible = questions.isNotEmpty(), eventKey = { rowKeys.key(it.id) })
+    val rowKeysHolder = remember(target.key) { mutableStateOf(rowKeys) }
+    val eventIdsHolder = remember(target.key) { mutableStateOf(events.mapTo(mutableSetOf()) { it.id }) }
+    SideEffect {
+        rowKeysHolder.value = rowKeys
+        eventIdsHolder.value = events.mapTo(mutableSetOf()) { it.id }
+    }
+    val currentRowKeys by rowKeysHolder
+    val currentEventIds by eventIdsHolder
+    fun displayedEventId(key: String): String? {
+        if (!key.startsWith("event:")) return null
+        return (currentRowKeys.eventIdByKey[key] ?: key.removePrefix("event:")).takeIf { it in currentEventIds }
     }
     val listState = rememberLazyListState()
     val cardVisible by remember(listState) { derivedStateOf {
@@ -896,6 +916,8 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
     }
     val scope = rememberCoroutineScope()
     val currentHistoryTarget by rememberUpdatedState(target.key)
+    val latestKeys by rememberUpdatedState(keys)
+    val latestEvents by rememberUpdatedState(events)
     val window = LocalWindowInfo.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var foreground by remember(lifecycle) { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
@@ -904,11 +926,13 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
-    suspend fun jump(index: Int, offset: Int = 0) {
+    suspend fun jump(index: Int, offset: Int = 0, key: String? = null, epoch: String? = null) {
         scrollMutex.withLock {
             if (target.key != currentHistoryTarget || model.selected?.target != target) return@withLock
+            if (epoch != null && epoch != model.historyEpoch) return@withLock
+            val position = if (key == null) index.coerceAtLeast(0) else latestKeys.indexOf(key).takeIf { it >= 0 } ?: return@withLock
             programmatic = true
-            try { listState.scrollToItem(index.coerceAtLeast(0), offset.coerceAtLeast(0)) }
+            try { listState.scrollToItem(position, offset.coerceAtLeast(0)) }
             finally { programmatic = false }
         }
     }
@@ -920,21 +944,87 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         val match = ConversationSearch.resolve(events,request.eventId)
         if(match == null) searchNotice = "That message is no longer in the loaded window. Search again or load its earlier page."
         else {
-            follow = follow.copy(opened = true,following = false,anchor = ConversationAnchor("event:" + match.id,0,false))
-            jump(keys.indexOf("event:" + match.id))
+            follow = follow.copy(opened = true,following = false,anchor = ConversationAnchor(rowKeys.key(match.id),0,false))
+            jump(keys.indexOf(rowKeys.key(match.id)))
         }
         onJumpConsumed()
     }
-    val latestKeys by rememberUpdatedState(keys)
     val renderedHistory by rememberUpdatedState(Triple(model.conversationEvents,model.hasOlder,model.hasNewer))
-    fun requestLatest() {
-        if(model.selected?.target != target || latestPending || model.hasNewer && model.olderLoading) return
-        val needsHistory = model.hasNewer
-        val reason = if(needsHistory) model.historyReason(target) else ""
-        if(reason.isNotBlank()) {
-            Toast.makeText(context,"Could not reach the latest messages. $reason",Toast.LENGTH_LONG).show()
+    fun cancelOwnNavigation(keepQueued: Boolean = false) {
+        ownGeneration++; ownJob?.cancel(); ownDirection = null; ownCursor = null; ownHighlight = null
+        if (!keepQueued) queuedOwn = null
+    }
+    DisposableEffect(target.key) { onDispose { ownJob?.cancel() } }
+    LaunchedEffect(target.key,model.historyEpoch) {
+        if (ownEpoch.isNotBlank() && ownEpoch != model.historyEpoch) cancelOwnNavigation()
+        ownEpoch = model.historyEpoch
+    }
+    LaunchedEffect(target.key,ownHighlight) {
+        if (ownHighlight != null) { delay(1600); ownHighlight = null }
+    }
+    fun ownSelection(): OwnMessageNavigation.Selection {
+        val viewport = listState.layoutInfo.visibleItemsInfo.firstNotNullOfOrNull { displayedEventId(it.key.toString()) }
+            ?: latestKeys.asSequence().drop(listState.firstVisibleItemIndex).mapNotNull(::displayedEventId).firstOrNull()
+        return OwnMessageNavigation.Selection(ownCursor,viewport,follow.following)
+    }
+    fun ownPage() = model.ownMessagePage(target,latestEvents)
+    fun requestOwn(direction: OwnMessageNavigation.Direction) {
+        val page = ownPage() ?: return
+        if (listState.isScrollInProgress || !navigationIdle) {
+            if (ownDirection == null && !latestPending && !obscured) queuedOwn = direction
             return
         }
+        val selection = ownSelection()
+        if (!OwnMessageNavigation.enabled(page,selection,direction,historyReason.isBlank() && !model.demo,
+                ownDirection != null || latestPending || model.olderLoading || listState.isScrollInProgress || !follow.opened || obscured)) return
+        val mine = ++ownGeneration
+        ownDirection = direction
+        follow = follow.copy(opened = true,following = false,anchor = null)
+        ownJob = scope.launch {
+            try {
+                val found = OwnMessageNavigation.find(target,selection,direction,::ownPage,read@{ requested ->
+                    if (currentHistoryTarget != target.key || model.selected?.target != target || model.historyReason(target).isNotBlank()) return@read false
+                    val read = (if (requested == OwnMessageNavigation.Direction.Previous) model.loadOlder(target) else model.loadNewer(target)) ?: return@read false
+                    read.join()
+                    // The page job prepares rows off-main. Wait for their existing
+                    // publication and composition before using named list keys.
+                    snapshotFlow { model.selected?.target != target || currentHistoryTarget != target.key || !model.olderLoading &&
+                        renderedHistory == Triple(model.conversationEvents,model.hasOlder,model.hasNewer) }.first { it }
+                    model.selected?.target == target && currentHistoryTarget == target.key && model.olderError.isBlank()
+                }) ?: return@launch
+                if (mine != ownGeneration || currentHistoryTarget != target.key || model.selected?.target != target) return@launch
+                val current = ownPage() ?: return@launch
+                val key = currentRowKeys.key(found.id)
+                val index = latestKeys.indexOf(key)
+                if (index < 0) return@launch
+                ownCursor = found.id; ownHighlight = found.id
+                follow = follow.copy(opened = true,following = false,anchor = ConversationAnchor(key,0,false))
+                jump(index,key = key,epoch = current.epoch)
+            } finally { if (mine == ownGeneration) ownDirection = null }
+        }
+    }
+    // A native fling owns availability until its end has reached a frame.
+    LaunchedEffect(target.key,listState.isScrollInProgress,model.olderLoading) {
+        if (listState.isScrollInProgress) { navigationIdle = false; return@LaunchedEffect }
+        withFrameNanos { }
+        if (!listState.isScrollInProgress) {
+            navigationIdle = true
+            if (!model.olderLoading) {
+                val direction = queuedOwn; queuedOwn = null
+                direction?.let(::requestOwn)
+            }
+        }
+    }
+    val ownGesture = remember(target.key) { object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            if (source == NestedScrollSource.UserInput) queuedOwn = null
+            return Offset.Zero
+        }
+    } }
+    fun requestLatest() {
+        if(model.selected?.target != target || latestPending) return
+        cancelOwnNavigation()
+        val needsHistory = model.hasNewer || model.olderLoading
         // Await this accepted navigation, rather than hoping a content effect sees
         // a loading transition. A cached/identical read can finish in one frame.
         latestPending = true
@@ -970,13 +1060,14 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         if (events.isEmpty() && questions.isEmpty() && raw == null && !model.demo) return@LaunchedEffect
         val own = ConversationViewport.own(events, ownSendId)
         // With no cards below the message, align its bottom to the composer.
-        val ownKey = if (own == null) null else if (questions.isEmpty() && !queueVisible) "history:tail" else "event:" + own.id
+        val ownKey = if (own == null) null else if (questions.isEmpty() && !queueVisible) "history:tail" else rowKeys.key(own.id)
         val explicitSend = ownSendId.isNotBlank() && ownSendId != follow.ownSendId && ownKey != null
+        if (explicitSend) cancelOwnNavigation()
         val firstOpen = !follow.opened
         // Ledger hydration must not cause a second jump after the reader deliberately scrolls.
         if (firstOpen && !explicitSend && !readReady) return@LaunchedEffect
         if (firstOpen && !explicitSend) {
-            val opening = UnreadPresentation.opening(initialAnchor, savedViewport, unreadBoundary, keys)
+            val opening = UnreadPresentation.opening(initialAnchor, savedViewport, unreadBoundary, keys, rowKeys::key)
             unavailableSaved = opening.unavailableSaved
             follow = follow.copy(anchor = opening.anchor, following = opening.anchor?.following ?: true)
         }
@@ -997,33 +1088,48 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         }.distinctUntilChanged().collect { (moving, atEnd, automatic) ->
             if (!automatic && moving) userMovement = true
             if (!automatic && userMovement) {
+                cancelOwnNavigation(keepQueued = true)
                 follow = ConversationViewport.userScrolled(follow, atEnd).copy(opened = true)
                 if (!moving) userMovement = false
             }
         }
     }
-    LaunchedEffect(viewportHeight) {
-        if (viewportHeight > 0 && follow.opened && follow.following && !listState.isScrollInProgress)
-            jump(latestKeys.lastIndex)
+    // Follow actual newly measured content, rather than every refresh or
+    // verification transition. A no-op poll leaves the reader's pixels alone.
+    LaunchedEffect(listState, target.key) {
+        snapshotFlow {
+            val layout = listState.layoutInfo
+            val tail = layout.visibleItemsInfo.lastOrNull()
+            follow.opened && follow.following && !programmatic && !listState.isScrollInProgress &&
+                layout.visibleItemsInfo.isNotEmpty() && layout.totalItemsCount == latestKeys.size &&
+                (tail?.key != "history:tail" || tail.offset + tail.size > layout.viewportEndOffset + 2)
+        }.distinctUntilChanged().collect { needsTail ->
+            if (needsTail) jump(latestKeys.lastIndex)
+        }
     }
     val settledAtTail by remember(listState) { derivedStateOf {
         val layout = listState.layoutInfo
         val tail = layout.visibleItemsInfo.lastOrNull()
         tail?.key == "history:tail" && tail.offset + tail.size <= layout.viewportEndOffset + 2
     } }
-    LaunchedEffect(settledAtTail,listState.isScrollInProgress,programmatic,follow.opened,follow.following,follow.anchor,model.hasNewer) {
-        if(!listState.isScrollInProgress && !programmatic) follow = ConversationViewport.settled(follow,settledAtTail,model.hasNewer)
+    LaunchedEffect(settledAtTail,listState.isScrollInProgress,programmatic,follow.opened,follow.following,follow.anchor,model.hasNewer,ownCursor,ownDirection) {
+        if(!listState.isScrollInProgress && !programmatic && ownCursor == null && ownDirection == null)
+            follow = ConversationViewport.settled(follow,settledAtTail,model.hasNewer)
     }
     val videoCapture = model.speech.recording && model.speech.videoRecorder != null
     var videoOverlayVisible by remember { mutableStateOf(false) }
     val readable = foreground && window.isWindowFocused && follow.opened && readReady &&
         !obscured && !videoCapture && !videoOverlayVisible
-    LaunchedEffect(target.key,listState,readable,model.hasOlder,model.olderLoading,model.olderError) {
-        if(!readable || !model.hasOlder || model.olderLoading || model.olderError.isNotBlank()) return@LaunchedEffect
+    LaunchedEffect(target.key,listState,readable,model.historyEpoch,model.hasOlder,model.olderLoading,model.olderError) {
+        // Entering canonical history is an explicit choice; scrolling a short recent
+        // inspection must never start indexing the entire conversation.
+        if(!readable || model.historyEpoch.isBlank() || !model.hasOlder || model.olderLoading || model.olderError.isNotBlank()) return@LaunchedEffect
         snapshotFlow { listState.isScrollInProgress && !programmatic && listState.firstVisibleItemIndex <= 3 }
             .distinctUntilChanged().collect { nearTop -> if(nearTop) model.loadOlder(target) }
     }
-    LaunchedEffect(target.key, listState, readable) {
+    // The shared readable-visibility rule (zerus-a4mub.31) in this screen's pixels.
+    val readableHeight = with(LocalDensity.current) { ConversationViewport.READABLE_HEIGHT_DP.dp.roundToPx() }
+    LaunchedEffect(target.key, listState, readable, readableHeight) {
         if (!readable) return@LaunchedEffect
         snapshotFlow {
             val layout = listState.layoutInfo
@@ -1031,37 +1137,63 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                 it.key.toString().startsWith("event:") && it.offset < layout.viewportEndOffset &&
                     it.offset + it.size > layout.viewportStartOffset
             }.let { rows ->
-                val ids=rows.map { it.key.toString().removePrefix("event:") }.toSet()
-                Triple(ids,rows.firstOrNull()?.let { it.key.toString().removePrefix("event:") to (-it.offset).coerceAtLeast(0) },
-                    model.visibleReadEvidence(target,ids))
+                val items=layout.visibleItemsInfo.map { ConversationViewport.Item(it.key.toString(),it.offset,it.size) }
+                val start=layout.viewportStartOffset;val end=layout.viewportEndOffset
+                val ids=ConversationViewport.visibleEventIds(items,start,end,readableHeight,::displayedEventId)
+                ReadViewport(ids,rows.firstOrNull()?.let { row -> displayedEventId(row.key.toString())?.let { it to (-row.offset).coerceAtLeast(0) } },
+                    model.visibleReadEvidence(target,ids),model.currentReadKey(target),
+                    ConversationViewport.currentFlags(items,start,end,readableHeight,model.newestDisplayedEventId(target),::displayedEventId))
             }
         }.distinctUntilChanged().collectLatest { viewport ->
             if (viewport == null) return@collectLatest
             // A transient row during initial positioning or a fling is not a deliberate read.
             delay(350)
             if (currentHistoryTarget == target.key && foreground && window.isWindowFocused && !programmatic) {
-                model.visibleMessages(target, viewport.first)
-                viewport.second?.let { (id, offset) -> model.saveConversationViewport(target,id,offset) }
+                model.visibleMessages(target, viewport.ids)
+                model.visibleCurrent(target,viewport.current,viewport.flags)
+                viewport.first?.let { (id, offset) -> model.saveConversationViewport(target,id,offset,follow.following && !model.hasNewer) }
             }
         }
     }
     DisposableEffect(target.key, listState) {
         onDispose {
             listState.layoutInfo.visibleItemsInfo.firstOrNull()?.let { item ->
-                positions[target.key] = ConversationAnchor(item.key.toString(), listState.firstVisibleItemScrollOffset, follow.following)
+                val dataKey = displayedEventId(item.key.toString())?.let { "event:$it" } ?: item.key.toString()
+                positions[target.key] = ConversationAnchor(dataKey, listState.firstVisibleItemScrollOffset, follow.following)
             }
         }
     }
+    // zerus-a4mub.10: one time-bound conversation status with details on demand. Presentation
+    // only: nothing below takes question, send or read authority from it.
+    val syncFacts = ConversationSyncStatus.Facts(now = 0L, demo = model.demo, archived = archived,
+        loaded = raw != null || events.isNotEmpty() || questions.isNotEmpty(),
+        verified = model.activityVerified, observedAt = model.conversationObservedAt,
+        refreshing = model.detailBusy, refreshVisible = model.detailBusy && model.detailProgress,
+        failure = model.conversationReadFailure(target),
+        offline = model.conversationReadOffline(target) || model.computerReportedOffline(target),
+        // Newer messages outside the loaded window; older ones are history, below.
+        tailPartial = model.hasNewer,
+        history = when {
+            model.olderLoading -> ConversationSyncStatus.History.Loading
+            model.olderError.isNotBlank() -> ConversationSyncStatus.History.Failed
+            model.historyIndexing -> ConversationSyncStatus.History.Indexing
+            model.hasOlder -> ConversationSyncStatus.History.MoreAvailable
+            model.historyEpoch.isBlank() && model.conversationHistoryTruncated -> ConversationSyncStatus.History.Truncated
+            model.historyEpoch.isNotBlank() && model.historyComplete -> ConversationSyncStatus.History.Complete
+            else -> ConversationSyncStatus.History.Unknown
+        }, historyMessage = model.olderError,
+        atLatest = follow.following && !model.hasNewer, unreadLabel = unread?.label.orEmpty(),
+        read = model.sharedReadStatus(target))
     Column(Modifier.fillMaxSize().imePadding()) {
-        if (unread != null || offeredQuestionCount > 0) {
-            Row(Modifier.fillMaxWidth().heightIn(min = 28.dp).padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(unread?.let { "${it.text} unread" }.orEmpty(), Modifier.weight(1f),
-                    color = if (unread != null && SessionNotificationPreferences.parse(raw ?: session.raw,target)?.muted != true) Mint else Muted, style = MaterialTheme.typography.bodySmall)
-                if (offeredQuestionCount > 0) TextButton(onClick = {
-                    if (!questionDisplay.expanded) questionQueue.selected?.let { question -> updateQuestionDisplay { it.open(question) } }
-                }) { Text("Questions ($offeredQuestionCount)") }
-            }
+        ConversationStatusStrip(syncFacts, refreshing = model.detailBusy && model.detailProgress,
+            onRefresh = { model.refreshActivity(explicit = true) }) {
+            // Compact here ("17 unread", "17+ unread"); the full wording is its description and the Position detail.
+            if (unread != null) Text("${unread.text} unread", Modifier.semantics { contentDescription = unread.description },
+                color = if (SessionNotificationPreferences.parse(raw ?: session.raw,target)?.muted != true) Mint else Muted,
+                style = MaterialTheme.typography.labelMedium, maxLines = 1)
+            if (offeredQuestionCount > 0) TextButton(onClick = {
+                if (!questionDisplay.expanded) questionQueue.selected?.let { question -> updateQuestionDisplay { it.open(question) } }
+            }) { Text("Questions ($offeredQuestionCount)") }
         }
         if(searchNotice.isNotBlank()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp),verticalAlignment = Alignment.CenterVertically) {
             Text(searchNotice,Modifier.weight(1f),color = Amber,style = MaterialTheme.typography.bodySmall)
@@ -1071,32 +1203,42 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
             .onGloballyPositioned { viewportBounds = it.boundsInWindow() }) {
             Box(Modifier.fillMaxSize().semantics { if (videoCapture || videoOverlayVisible) hideFromAccessibility() }) {
             ConversationTailRefresh(model, target.key, Modifier.fillMaxSize()) {
-            // The tail item already adds one item gap above the composer.
-            LazyColumn(Modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp),
+            // Keep the newest bubble above the floating navigation controls.
+            LazyColumn(Modifier.fillMaxSize().nestedScroll(ownGesture), state = listState, contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 72.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item(key = "history:earlier") { if (loadStatus?.initial != true) Column(Modifier.fillMaxWidth(),horizontalAlignment = Alignment.CenterHorizontally) {
                     if(model.olderError.isNotBlank()) {
                         Text(model.olderError,color = Amber,style = MaterialTheme.typography.bodySmall)
-                        TextButton(onClick = { model.retryHistory(target) },enabled = !model.olderLoading && historyReason.isBlank()) { Text("Retry history") }
+                        TextButton(onClick = { model.retryHistory(target) },enabled = !model.olderLoading &&
+                            (model.historyRetryIsLatest(target) || historyReason.isBlank())) { Text(model.historyRetryLabel(target)) }
                     } else if(model.hasOlder) TextButton(onClick = { model.loadOlder(target) },enabled = !model.olderLoading && historyReason.isBlank()) { Text("Load earlier messages") }
                     else if(model.historyEpoch.isNotBlank() && !model.historyIndexing) Text(if(model.historyComplete) "Beginning of conversation" else "No earlier page reported; history may be incomplete.",color = Muted,style = MaterialTheme.typography.labelSmall)
                     if(model.historyIndexing) Text("History is still indexing. Unread totals may be unavailable.",color = Muted,style = MaterialTheme.typography.labelSmall)
                     if(historyReason.isNotBlank() && events.isNotEmpty()) Text(historyReason,color = Muted,style = MaterialTheme.typography.labelSmall)
                 } }
-                item(key = "history:status") { if (loadStatus?.initial != true && events.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (raw == null && !model.demo) Tag("Checking…", Muted) else SessionDetailBadge(session,raw)
-                    Tag(if (model.demo) "Preview" else if (model.activityVerified) "Connected" else if (raw != null) "Last known" else "Checking…",
-                        if (online) Mint else Amber)
-                } }
+                // Freshness lives in the status strip; this row keeps only the session's own badge.
+                item(key = "history:status") { if (loadStatus?.initial != true && events.isNotEmpty() && (raw != null || model.demo))
+                    SessionDetailBadge(session,raw) }
                 if (warning.isNotBlank()) item(key = "history:warning") { Text(warning, color = Amber, style = MaterialTheme.typography.bodySmall) }
-                if (boundedNotice.isNotBlank()) item(key = "history:bounded") {
-                    Text(boundedNotice, color = Muted, style = MaterialTheme.typography.bodySmall)
-                }
                 item(key = "history:missing-anchor") {
                     if (unavailableSaved) Text("Your saved reading position is outside the loaded messages. Showing the earliest available messages.",
                         color = Muted, style = MaterialTheme.typography.bodySmall)
                 }
+                // A fork's inherited rows: each source under its label, then where the fork begins.
+                var inheritedSource = ""
                 events.forEach { event ->
+                    if (event.inheritedFrom != inheritedSource) {
+                        val label = if (event.inheritedFrom.isNotBlank()) "Inherited from ${event.inheritedFrom}: the history this fork began from"
+                            else "Forked here: this session's own activity continues below"
+                        item(key = ConversationViewport.inheritedKey(rowKeys.key(event.id))) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                HorizontalDivider(Modifier.weight(1f), color = Muted.copy(alpha = .4f))
+                                Text(label, Modifier.weight(3f, fill = false), color = Muted, style = MaterialTheme.typography.labelMedium)
+                                HorizontalDivider(Modifier.weight(1f), color = Muted.copy(alpha = .4f))
+                            }
+                        }
+                        inheritedSource = event.inheritedFrom
+                    }
                     if (event.id == unreadBoundary) item(key = "history:unread") {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             HorizontalDivider(Modifier.weight(1f), color = Mint.copy(alpha = .4f))
@@ -1104,10 +1246,10 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                             HorizontalDivider(Modifier.weight(1f), color = Mint.copy(alpha = .4f))
                         }
                     }
-                    item(key = "event:" + event.id) {
+                    item(key = rowKeys.key(event.id)) {
                     val provider = if (target.agentId.isNotBlank()) raw?.string("provider").orEmpty().ifBlank { session.agent } else session.agent
                     ConversationMessage(target, event, provider, outgoing.find { it.requestId == event.outgoingId },
-                        model, onReviewOutgoing)
+                        model, onReviewOutgoing,highlighted = ownHighlight?.let { it in HistoryInspection.identities(event) } == true)
                     }
                 }
                 if (events.isEmpty() && !conversationLoading) item(key = "history:empty") {
@@ -1117,7 +1259,7 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                 item(key = "history:newer") {
                     if(model.hasNewer) Row(Modifier.fillMaxWidth(),horizontalArrangement = Arrangement.Center) {
                         TextButton(onClick = { model.loadNewer(target) },enabled = !model.olderLoading && historyReason.isBlank()) { Text("Load newer messages") }
-                        TextButton(onClick = ::requestLatest,enabled = !latestPending && !model.olderLoading && historyReason.isBlank()) { Text("Latest") }
+                        TextButton(onClick = ::requestLatest,enabled = !latestPending) { Text("Latest") }
                     }
                 }
                 if (queueVisible) item(key = "history:queue") { NativeInputQueue(model,target) }
@@ -1132,19 +1274,41 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                 horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(loadStatus.text, Modifier.semantics { if (!obscured) liveRegion = LiveRegionMode.Polite }, color = Muted, style = MaterialTheme.typography.bodyMedium)
             }
-            if ((!follow.following || model.hasNewer || latestPending) && (events.isNotEmpty() || questions.isNotEmpty()) &&
-                !(questions.isNotEmpty() && cardVisible))
-                FilledTonalButton(onClick = ::requestLatest,enabled = !latestPending && !(model.hasNewer && model.olderLoading),
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).heightIn(min = 48.dp).semantics {
+            if ((events.isNotEmpty() || questions.isNotEmpty()) && !(questions.isNotEmpty() && cardVisible))
+                Row(Modifier.align(Alignment.BottomEnd).padding(16.dp),horizontalArrangement = Arrangement.spacedBy(8.dp),verticalAlignment = Alignment.CenterVertically) {
+                val page = ownPage()
+                val selection = ownSelection()
+                val busy = ownDirection != null || latestPending || model.olderLoading || listState.isScrollInProgress || !follow.opened || obscured
+                val directions = ownAvailability.project(page,selection,historyReason.isBlank() && !model.demo,busy,
+                    listState.isScrollInProgress || !navigationIdle)
+                SideEffect { ownAvailability.commit(directions) }
+                for (direction in OwnMessageNavigation.Direction.entries) {
+                    val previous = direction == OwnMessageNavigation.Direction.Previous
+                    val label = stringResource(if (previous) R.string.activity_previous_own else R.string.activity_next_own)
+                    val loading = stringResource(if (previous) R.string.activity_reading_previous_own else R.string.activity_reading_next_own)
+                    FilledTonalIconButton(onClick = { requestOwn(direction) },enabled = if (previous) directions.previous else directions.next,
+                        modifier = Modifier.size(48.dp).semantics {
+                            contentDescription = label
+                            if (ownDirection == direction) { stateDescription = loading; liveRegion = LiveRegionMode.Polite }
+                        },shape = RoundedCornerShape(16.dp),colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = Color(0xFF2D4142),contentColor = Mint,disabledContainerColor = Color(0xFF2D4142),disabledContentColor = Muted)) {
+                        if (ownDirection == direction) CircularProgressIndicator(Modifier.size(18.dp),color = Mint,strokeWidth = 2.dp)
+                        else Icon(if (previous) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,null)
+                    }
+                }
+                if (!follow.following || model.hasNewer || latestPending)
+                FilledTonalButton(onClick = ::requestLatest,enabled = !latestPending,
+                    modifier = Modifier.heightIn(min = 48.dp).semantics {
                         contentDescription = "Jump to latest messages"
-                        stateDescription = if(latestPending) "Loading latest messages" else unread?.description.orEmpty()
+                        stateDescription = UnreadPresentation.latest(latestPending).description
                     }, shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.filledTonalButtonColors(containerColor = Color(0xFF2D4142),contentColor = Mint,
                         disabledContainerColor = Color(0xFF2D4142),disabledContentColor = Muted)) {
                     if(latestPending) CircularProgressIndicator(Modifier.size(18.dp),color = Mint,strokeWidth = 2.dp)
                     else Icon(Icons.Default.KeyboardArrowDown, null)
-                    Text(if(latestPending) "Loading latest…" else unread?.let { "${it.text} unread" } ?: "Latest",
+                    Text(UnreadPresentation.latest(latestPending).text,
                         Modifier.padding(start = 4.dp),style = MaterialTheme.typography.labelMedium)
+                }
                 }
             }
             RoundVideoRecordingOverlay(model.speech, Modifier.matchParentSize()) { videoOverlayVisible = it }
@@ -1160,8 +1324,16 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         questionDisplay, ::updateQuestionDisplay, onReview)
 }
 
+/**
+ * One settled reading viewport: the visible event rows, the first row and its offset, the private read
+ * evidence, and for the shared current acknowledgement the open inspection's values ([ZerusViewModel.currentReadKey])
+ * and what the viewport showed of it ([ConversationViewport.currentFlags]).
+ */
+private data class ReadViewport(val ids:Set<String>,val first:Pair<String,Int>?,val evidence:List<Triple<String,String,Long?>>,
+    val current:String,val flags:ConversationViewport.CurrentFlags)
+
 @Composable internal fun ConversationMessage(target: Target, event: Event, agent: String, outgoing: OutgoingMessage?,
-    model: ZerusViewModel, onReview: (OutgoingMessage) -> Unit) {
+    model: ZerusViewModel, onReview: (OutgoingMessage) -> Unit, highlighted: Boolean = false) {
     if (event.role == ActivityNotices.ROLE) return ActivityNotice(target, event, model)
     val own = QuestionReplyPresentation.isOwnRole(event.role)
     val parsedReply by produceState<Pair<String, List<PresentedQuestionReply>?>>(event.text to null, event.text, own) {
@@ -1171,11 +1343,14 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
     val roundVideo = event.voice?.video != null
     val messageColor = if (roundVideo && own) MaterialTheme.colorScheme.primary.copy(alpha = .14f)
         .compositeOver(MaterialTheme.colorScheme.surface) else if (own) Color(0xFF203733) else Surface
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (own) Arrangement.End else Arrangement.Start) {
+    // A fork's inherited row is its source's history: dimmed, and never acting on this session.
+    val inherited = event.inheritedFrom.isNotBlank()
+    Row(Modifier.fillMaxWidth().alpha(if (inherited) .72f else 1f), horizontalArrangement = if (own) Arrangement.End else Arrangement.Start) {
         Surface(color = if (roundVideo) Color.Transparent else messageColor,
+            border = if (highlighted) BorderStroke(2.dp,Mint) else null,
             shape = if (roundVideo) RectangleShape else RoundedCornerShape(17.dp),
             modifier = Modifier.fillMaxWidth(if (own) .92f else 1f).semantics {
-                contentDescription = if (own) "You" else agent.ifBlank { "Agent" }
+                contentDescription = (if (inherited) "Inherited, " else "") + if (own) "You" else agent.ifBlank { "Agent" }
             }) {
             Column(Modifier.padding(horizontal = if (roundVideo) 0.dp else 12.dp,
                 vertical = if (roundVideo) 0.dp else 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1195,7 +1370,7 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                         }
                     } }
                 } else if (event.text.isNotBlank()) {
-                    if(own) SelectionContainer { Text(event.text, style = conversationTextStyle()) }
+                    if(own || event.source == QuestionRouteActivity.source) SelectionContainer { Text(event.text, style = conversationTextStyle()) }
                     else ProvideTextStyle(conversationTextStyle()) {
                         MarkdownText(event.text, fileScope = target.key) { reference ->
                             model.computerFiles.show(target, reference, model.machines.find {
@@ -1204,7 +1379,8 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                         }
                     }
                 }
-                if (event.voice == null) AttachmentRows(event.attachments, model.selected?.target, model)
+                if (inherited) event.attachments.forEach { Text("Attachment: ${it.name}", color = Muted, style = MaterialTheme.typography.labelSmall) }
+                else if (event.voice == null) AttachmentRows(event.attachments, model.selected?.target, model)
                 if(event.detailTruncated) Text("Message text shortened",color = Amber,style = MaterialTheme.typography.labelSmall)
                 if (event.voice == null && (event.delivery.isNotBlank() || event.at > 0)) Row(Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
@@ -1217,12 +1393,12 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
                     }
                 }
                 if (outgoing != null && outgoing.status in listOf("failed", "uncertain")) {
-                    if (outgoing.error.isNotBlank()) Text(outgoing.error, color = Amber, style = MaterialTheme.typography.bodySmall)
+                    if (!outgoing.deliveryDismissed && outgoing.error.isNotBlank()) Text(outgoing.error, color = Amber, style = MaterialTheme.typography.bodySmall)
                     Row {
                         if (outgoing.status == "uncertain") TextButton(onClick = { model.checkOutgoing(outgoing) },
                             enabled = "outgoing:" + outgoing.requestId !in model.receiptFlights) { Text("Check delivery") }
-                        TextButton(onClick = { onReview(outgoing) },
-                            enabled = "outgoing:" + outgoing.requestId !in model.receiptFlights) { Text("Review") }
+                        if (!outgoing.deliveryDismissed) TextButton(onClick = { onReview(outgoing) },
+                            enabled = "dismiss:" + outgoing.requestId !in model.receiptFlights) { Text("Review") }
                     }
                 }
             }
@@ -1312,7 +1488,7 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         else "Refresh to verify the session before sending."
     val canSend = (editor.text.isNotBlank() || draft.attachments.isNotEmpty()) && (draft.attachments.isEmpty() || model.attachmentReason(target).isBlank()) && !model.sendingBlocked(target) && !model.contextBlocked(target) &&
         draft.status == "editing" && !model.demo && online && target.run.isNotBlank() && model.storageReady && blockReason.isBlank()
-    val previous = model.outgoing.lastOrNull { it.belongsTo(target) && it.status in listOf("sending", "uncertain") }
+    val previous = model.outgoing.lastOrNull { it.belongsTo(target) && it.blocksSending }
     val sendReason = when {
         recording -> "Stop recording before sending a message. Your typed draft is kept."
         model.demo -> "Pair to send a message."
@@ -1361,7 +1537,8 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         PendingAttachmentSelection(model, target)
         if (previous?.status == "uncertain") OutgoingRecovery(previous,
             "outgoing:${previous.requestId}" in model.receiptFlights,
-            { model.checkOutgoing(previous) }, { onReviewOutgoing(previous) })
+            { model.checkOutgoing(previous) }, { onReviewOutgoing(previous) },
+            dismissing = "dismiss:${previous.requestId}" in model.receiptFlights)
         CompactMessageInput(state = editor, placeholder = if(cooperative) "Queue instruction" else "Message",
             modifier = if (retainedPreview) Modifier.weight(1f, fill = false) else Modifier,
             sharedPreviewSpace = retainedPreview,
@@ -1465,14 +1642,14 @@ private class MainListPullMotion(private val scope:CoroutineScope,private val ma
         items(unresolved.sortedByDescending { it.createdAt }, key = { "outgoing:${it.requestId}" }) { message ->
             Card(colors = CardDefaults.cardColors(containerColor = Surface)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(message.target.session, fontWeight = FontWeight.SemiBold)
-                Tag(deliveryLabel(message.status), if (message.blocksSending || message.status == "failed") Amber else Mint)
+                Tag(deliveryLabel(message.status), if (message.status in listOf("sending", "uncertain", "failed")) Amber else Mint)
                 if (message.text.isNotBlank()) SelectionContainer { Text(message.text, maxLines = 8, overflow = TextOverflow.Ellipsis) }
                 AttachmentRows(message.attachments.map(Attachment::displayed), message.target, model)
-                if (message.error.isNotBlank()) Text(message.error, color = Amber, style = MaterialTheme.typography.bodySmall)
+                if (!message.deliveryDismissed && message.error.isNotBlank()) Text(message.error, color = Amber, style = MaterialTheme.typography.bodySmall)
                 Row {
                     model.sessions.find { message.belongsTo(it.target) }?.let { session -> TextButton(onClick = { model.open(session) }) { Text("Open") } }
                     if (message.status == "uncertain") TextButton(onClick = { model.checkOutgoing(message) }, enabled = "outgoing:${message.requestId}" !in model.receiptFlights) { Text("Check delivery") }
-                    if (message.status in listOf("failed", "uncertain")) TextButton(onClick = { onReviewOutgoing(message) }, enabled = "outgoing:${message.requestId}" !in model.receiptFlights) { Text("Review") }
+                    if (!message.deliveryDismissed && message.status in listOf("failed", "uncertain")) TextButton(onClick = { onReviewOutgoing(message) }, enabled = "dismiss:${message.requestId}" !in model.receiptFlights) { Text("Review") }
                 }
             } }
         }

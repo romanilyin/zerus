@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 
+mod status;
+// Dormant original-claim resource support. Production freshness minting and
+// all producer/adapter wiring remain deliberately unavailable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+mod writer_claim;
+pub(super) use status::dispatch as status_dispatch;
+pub(crate) use status::machine as status_machine;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use status::observe_held;
+pub(crate) use status::observe_original;
+
+const INPUT_LIMIT: usize = 8192;
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -13,6 +27,8 @@ struct Request {
     action: String,
     expected_run_id: String,
     expected_conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_identity: Option<zerus_client_core::untracked_shell::Identity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,6 +61,7 @@ impl Scope {
     }
     pub(super) fn check(&self, record: &Value) -> Result<()> {
         self.check_base(record)?;
+        terminating::check_mutation(record)?;
         if record["archive_id"].as_str().filter(|s| !s.is_empty()) != self.archive.as_deref() {
             return Err("Archive identity changed; select the exact saved archive".into());
         }
@@ -56,7 +73,9 @@ impl Scope {
     pub(super) fn opencode_error(&self) {
         self.opencode_error.set(true);
     }
-    /// Only a supported native adapter may explicitly attest zero side effects.
+    /// Only a supported native adapter may explicitly attest zero side effects,
+    /// or a resume whose new terminal is gone with no record of its run
+    /// (zerus-5sl7r): it started nothing and left nothing.
     pub(super) fn unchanged(&self) {
         self.changed.set(false);
     }
@@ -99,63 +118,98 @@ impl Scope {
     }
 }
 
+/// Why an archive that ended before its first message cannot restore.
+pub(super) const NO_CONVERSATION: &str =
+    "This session ended before its first message, so it saved no conversation to restore";
+
 /// A presentation gate, never a substitute for the locked action checks.
 /// `resumed` is the summary's single verification of a pending resume.
-pub(super) fn summary(record: &Value, live_pane: bool, resumed: &Option<Result<()>>) -> Value {
+/// Ordinary listing supplies name availability from its bounded observation.
+pub(super) fn summary(
+    record: &Value,
+    live_pane: bool,
+    resumed: &Option<Result<()>>,
+    archive_name_taken: Option<bool>,
+) -> Value {
     let archived = !string(record, "archive_id").is_empty();
+    let terminating = terminating::pending(record);
     let changing = record.get("pausing").is_some() || record["resume_pending"] == true;
     let confirmed = !string(record, "conversation_id").is_empty();
-    let recipe = record["base"].is_array() && (Path::new(string(record, "launch_dir")).is_dir() || super::worktree_lifecycle::restorable(record));
-    let restore_pending = !string(record, "restore_archive_id").is_empty();
+    let native_archive = archived && record["backend"] == "dsh";
+    let recipe = if native_archive {
+        Path::new(string(record, "cwd")).is_dir() || super::worktree_lifecycle::restorable(record)
+    } else {
+        record["base"].is_array() && (Path::new(string(record, "launch_dir")).is_dir() || super::worktree_lifecycle::restorable(record))
+    };
+    let cleanup_pending = clear_context::cleanup_pending(record);
+    let restore_pending = !string(record, "restore_archive_id").is_empty() || cleanup_pending;
+    let name = string(record, "name");
+    let native_pending = native_archive && dsh::retirement::restore_source_held(record) == Ok(true);
+    let restorable = native_pending
+        || archived
+            && recipe
+            && !cleanup_pending
+            && if native_archive {
+                dsh::retirement::restore_name_busy(name) == Ok(false)
+            } else {
+                !archive_name_taken.unwrap_or_else(|| record_path(name).exists())
+            };
+    // The restore's own history check decides, through the shared code:
+    // one bounded metadata read, only for a Claude or Codex archive that
+    // may otherwise restore (zerus-63rru.70). Kimi, DeepSeek and OpenCode
+    // keep today's decision and are not read here.
+    let conversation = !restorable || recipes::conversation_persisted(record);
     let decisions = [
         (
             "pause",
-            !archived && live_pane && !changing && confirmed
+            !archived && live_pane && !changing && (confirmed || lifecycle::unconfirmed_fresh(record))
                 && lifecycle::pausable(record, || {
                     resume_input::idle_checked(record, resumed.as_ref().is_some_and(Result::is_ok))
                 }),
         ),
         (
             "resume",
-            !archived && !live_pane && !changing && confirmed && recipe,
+            !archived && !live_pane && !changing && confirmed && recipe && !cleanup_pending,
         ),
-        ("archive", !archived && !live_pane && !changing && confirmed),
-        ("rename", !changing),
+        ("archive", !archived && !live_pane && !changing && confirmed && !cleanup_pending),
+        ("rename", !changing && !native_pending),
         (
             "fork",
             !changing && fork::summary(record, live_pane)["fork_supported"] == true,
         ),
         ("terminate", !archived),
-        (
-            "restore",
-            archived && recipe && !record_path(string(record, "name")).exists(),
-        ),
-        ("forget", !changing && !restore_pending),
+        ("restore", restorable && conversation),
+        ("forget", !changing && !restore_pending && !native_pending),
     ];
     let mut allowed = Vec::new();
     let mut reasons = serde_json::Map::new();
     for (action, enabled) in decisions {
-        if enabled {
+        if enabled && !terminating {
             allowed.push(action);
         } else {
             reasons.insert(
                 action.into(),
-                json!(match action {
+                json!(if terminating { terminating::WAIT } else { match action {
                     "pause" => "Wait for a confirmed idle live session before pausing",
                     "resume" =>
                         "Resume requires a saved session and available native launch recipe",
                     "archive" => "Archive requires a stopped or paused confirmed session",
+                    "restore" if !conversation => NO_CONVERSATION,
                     "restore" => "Restore requires an archive recipe and an unused session name",
                     "terminate" => "An archive has no running session to terminate",
                     "fork" => "This session cannot fork its confirmed native context yet",
                     "forget" =>
                         "Wait for the active pause or restore before forgetting this session",
                     _ => "Wait for the active pause or restore before renaming",
-                }),
+                }}),
             );
         }
     }
-    json!({"allowed_actions":allowed,"action_reasons":reasons})
+    let mut result = json!({"allowed_actions":allowed,"action_reasons":reasons});
+    if native_pending {
+        result["restore_pending"] = json!(true);
+    }
+    result
 }
 
 fn validate(request: &Request, name: &str) -> Result<()> {
@@ -166,7 +220,11 @@ fn validate(request: &Request, name: &str) -> Result<()> {
     }
     for (value, maximum, nonempty) in [
         (name, 512, true),
-        (request.expected_run_id.as_str(), 128, true),
+        (
+            request.expected_run_id.as_str(),
+            128,
+            request.action != "terminate_shell",
+        ),
         (request.expected_conversation_id.as_str(), 256, false),
     ] {
         if value.len() > maximum
@@ -175,6 +233,25 @@ fn validate(request: &Request, name: &str) -> Result<()> {
         {
             return Err("Invalid session identity".into());
         }
+    }
+    if request.action == "terminate_shell" {
+        if !request.expected_run_id.is_empty()
+            || !request.expected_conversation_id.is_empty()
+            || !request
+                .terminal_identity
+                .as_ref()
+                .is_some_and(|identity| identity.valid())
+            || request.archive_id.is_some()
+            || request.new_name.is_some()
+            || request.tag.is_some()
+            || request.message_id.is_some()
+        {
+            return Err(zerus_client_core::untracked_shell::UNVERIFIED.into());
+        }
+        return Ok(());
+    }
+    if request.terminal_identity.is_some() {
+        return Err("Unexpected terminal identity".into());
     }
     let archived = matches!(
         request.action.as_str(),
@@ -229,6 +306,16 @@ fn validate(request: &Request, name: &str) -> Result<()> {
 }
 
 fn perform(request: &Request, name: &str, scope: &Scope) -> Result<()> {
+    if request.action == "terminate_shell" {
+        return untracked_shell::terminate(
+            name,
+            request
+                .terminal_identity
+                .as_ref()
+                .ok_or(zerus_client_core::untracked_shell::UNVERIFIED)?,
+            scope,
+        );
+    }
     if opencode::exists(name) {
         scope.opencode_error();
         return opencode::session_action(name, &request.action, request.new_name.as_deref(), request.message_id.as_deref(), scope);
@@ -236,7 +323,7 @@ fn perform(request: &Request, name: &str, scope: &Scope) -> Result<()> {
     if request.action == "remove_queued" {
         return Err("Only OpenCode sessions have removable queued messages".into());
     }
-    if dsh::exists(name) {
+    if request.archive_id.is_none() && dsh::exists(name) {
         if request.action == "fork" {
             return dsh::fork(name, request.tag.as_deref(), Some(&request.expected_run_id),
                 Some(&request.expected_conversation_id), false, Some(scope)).map(|_| ());
@@ -323,6 +410,13 @@ where
         }
         return Ok(old);
     }
+    // zerus-ucck P3c: the request's identities select among sessions that
+    // share the label, before anything is claimed.
+    if request.archive_id.is_some() && name.starts_with("dsh/") {
+        let _ = session_id::take_deferred(name);
+    } else {
+        expect(name, &request.expected_run_id, &request.expected_conversation_id)?;
+    }
     atomic(path, &receipt(request, name, hash, "claimed").to_string())?;
     let scope = Scope {
         name: name.into(),
@@ -355,6 +449,10 @@ where
         }
     }
     if outcome.is_ok() {
+        if let Some(identity) = &request.terminal_identity {
+            answer["terminal_identity"] = json!(identity);
+            answer["terminal_closed"] = json!(true);
+        }
         if let Some(target) = scope.target.into_inner() {
             answer["result_target"] = target;
         }
@@ -365,25 +463,65 @@ where
     Ok(answer)
 }
 
-pub(super) fn dispatch(args: &[String]) -> Result<i32> {
+fn input_bytes(args: &[String], command: &str) -> Result<Vec<u8>> {
     if args.len() != 2 || args[1] != "--json" {
-        return Err("usage: hgs session-action <session> --json".into());
+        return Err(format!("usage: hgs {command} <session> --json"));
     }
     let mut bytes = Vec::new();
     io::stdin()
-        .take(8193)
+        .take((INPUT_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() > 8192 {
+    if bytes.len() > INPUT_LIMIT {
         return Err("Action request is too large".into());
     }
-    let request: Request = serde_json::from_slice(crate::state::without_bom(&bytes)).map_err(|e| e.to_string())?;
-    let name = &args[0];
+    Ok(bytes)
+}
+
+fn decode_request(bytes: &[u8], name: &str) -> Result<Request> {
+    if bytes.len() > INPUT_LIMIT {
+        return Err("Action request is too large".into());
+    }
+    let request: Request = serde_json::from_slice(crate::state::without_bom(bytes)).map_err(|e| e.to_string())?;
     validate(&request, name)?;
-    let hash = format!(
+    Ok(request)
+}
+
+fn request_input(args: &[String], command: &str) -> Result<Request> {
+    let bytes = input_bytes(args, command)?;
+    decode_request(&bytes, &args[0])
+}
+
+/// The exact action receipt `hgs session-action` writes for the original
+/// stdin `original` of `name` with `status` (and, when completed, the
+/// resumed `run` as its result target), for other modules' fixtures.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn fixture_receipt(
+    name: &str,
+    original: &[u8],
+    status: &str,
+    run: Option<&str>,
+) -> Value {
+    let request = decode_request(original, name).unwrap();
+    let mut value = receipt(&request, name, &request_hash(&request, name), status);
+    if let Some(run) = run {
+        value["result_target"] = json!({"name":name,"run_id":run,
+            "conversation_id":request.expected_conversation_id});
+    }
+    value
+}
+
+fn request_hash(request: &Request, name: &str) -> String {
+    format!(
         "{:x}",
         Sha256::digest(json!([name, request]).to_string().as_bytes())
-    );
+    )
+}
+
+pub(super) fn dispatch(args: &[String]) -> Result<i32> {
+    let request = request_input(args, "session-action")?;
+    let name = &args[0];
+    let hash = request_hash(&request, name);
     let directory = absolute_root()?.join("action_receipts");
     let path = directory.join(format!("{}.json", request.request_id));
     let _receipt_guard = lock(Some(
@@ -514,5 +652,254 @@ mod tests {
         assert!(first.get("error").is_none());
         assert!(first.get("error_source").is_none());
         assert_eq!(attempt(&path, &request(), "session", "hash", |_| panic!("replayed")).unwrap(), first);
+    }
+
+    /// A Claude or Codex archive that exited before its first message wrote
+    /// no transcript: Restore is not offered, and says why (zerus-wyrqg).
+    #[test]
+    fn an_archive_without_a_saved_conversation_offers_no_restore() {
+        use std::fs;
+        let folder = tempfile::tempdir().unwrap();
+        let transcript = folder.path().join("conversation.jsonl");
+        let record = |agent: &str, launch_dir: &Path| {
+            json!({"name": format!("{agent}/example/archived-{}", uuid::Uuid::new_v4()),
+                "agent": agent, "archive_id": "archive-1", "conversation_id": "conversation-1",
+                "base": [agent], "launch_dir": launch_dir, "transcript": transcript})
+        };
+        let restore = |record: &Value| {
+            let summary = summary(record, false, &None, None);
+            let allowed = summary["allowed_actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("restore"));
+            (
+                allowed,
+                summary["action_reasons"]["restore"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        };
+        for agent in ["claude", "codex"] {
+            // Missing, a folder, then empty: nothing to restore.
+            let _ = fs::remove_file(&transcript);
+            assert_eq!(
+                restore(&record(agent, folder.path())),
+                (false, NO_CONVERSATION.to_owned()),
+                "{agent}"
+            );
+            fs::create_dir(&transcript).unwrap();
+            assert_eq!(
+                restore(&record(agent, folder.path())),
+                (false, NO_CONVERSATION.to_owned()),
+                "{agent}"
+            );
+            fs::remove_dir(&transcript).unwrap();
+            fs::write(&transcript, "").unwrap();
+            assert_eq!(
+                restore(&record(agent, folder.path())),
+                (false, NO_CONVERSATION.to_owned()),
+                "{agent}"
+            );
+            // The first message saved it.
+            fs::write(&transcript, "{}\n").unwrap();
+            assert_eq!(
+                restore(&record(agent, folder.path())),
+                (true, String::new()),
+                "{agent}"
+            );
+            // Without a recipe the usual reason stays.
+            let _ = fs::remove_file(&transcript);
+            let reason = restore(&record(agent, &folder.path().join("gone"))).1;
+            assert_eq!(
+                reason,
+                "Restore requires an archive recipe and an unused session name"
+            );
+        }
+        // Kimi keeps its own check in the restore itself.
+        assert!(restore(&record("kimi", folder.path())).0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn offered_restore(summary: &Value) -> bool {
+        summary["allowed_actions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("restore"))
+    }
+
+    /// Runs one ignored archive fixture alone in a child of this test binary
+    /// with a private state, configuration and tmux root: the archive writer
+    /// needs its own root, never the machine's, and never a real tmux server.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn isolated_archive_fixture(test: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--ignored", "--test-threads=1"])
+            .env("HGS_STATE_DIR", temp.path().join("state"))
+            .env("HGS_CONFIG_DIR", temp.path().join("config"))
+            .env("TMUX_TMPDIR", temp.path().join("tmux"))
+            .env_remove("HGS_SESSION")
+            .env_remove("HGS_SESSION_ID")
+            .env_remove("HGS_RUN_ID")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && text.contains("1 passed"),
+            "{text}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A Claude archive through the state's own archive writer, then the
+    /// state's own archive reader: every field the summary decides on is
+    /// product output.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn archived_record(name: &str, transcript: &Path) -> Value {
+        let unique = uuid::Uuid::new_v4().to_string();
+        let mut record = crate::state::listing_fixture::launched_record(
+            "claude",
+            name,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &unique,
+            "/",
+            "account-example",
+        );
+        crate::state::listing_fixture::confirmed(&mut record, &format!("conversation-{unique}"));
+        record["transcript"] = json!(transcript);
+        let id = crate::state::archive_for_test(&record).unwrap();
+        crate::state::archive::read_archive(name, &id).unwrap()
+    }
+
+    /// zerus-63rru.70: a Claude archive that exited before its first message
+    /// (a conversation ID but no transcript) offers no restore, with the
+    /// pinned reason; a saved one offers restore; the restore's own history
+    /// check still refuses the first.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_claude_archive_offers_restore_only_for_a_saved_conversation() {
+        isolated_archive_fixture(
+            "state::session_action::tests::a_claude_archive_never_saved_fixture",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its isolated wrapper"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_claude_archive_never_saved_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("saved.jsonl");
+        std::fs::write(&saved, "{\"type\":\"user\"}\n").unwrap();
+        // The conversation that was never saved: no transcript file.
+        let before_first =
+            archived_record("claude/example/never-saved", &dir.path().join("missing.jsonl"));
+        let offered = summary(&before_first, false, &None, None);
+        assert!(!offered_restore(&offered), "{offered}");
+        assert_eq!(offered["action_reasons"]["restore"], NO_CONVERSATION);
+        // The restore command's own check still refuses it, unchanged.
+        assert!(crate::state::recipes::verify_history(&before_first, true).is_err());
+        // The saved conversation offers restore and passes its own check.
+        let persisted = archived_record("claude/example/saved", &saved);
+        let offered = summary(&persisted, false, &None, None);
+        assert!(offered_restore(&offered), "{offered}");
+        assert!(crate::state::recipes::verify_history(&persisted, true).is_ok());
+    }
+
+    /// zerus-63rru.70: the real summary, over an archive the state's own
+    /// writer and reader produced, reads the transcript metadata exactly once.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn deciding_one_archives_actions_reads_the_transcript_at_most_once() {
+        isolated_archive_fixture(
+            "state::session_action::tests::deciding_one_archives_actions_reads_the_transcript_at_most_once_fixture",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its isolated wrapper"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn deciding_one_archives_actions_reads_the_transcript_at_most_once_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("saved.jsonl");
+        std::fs::write(&saved, "{\"type\":\"user\"}\n").unwrap();
+        let record = archived_record("claude/example/counted", &saved);
+        crate::state::journal::read_order::take();
+        let offered = summary(&record, false, &None, None);
+        let steps = crate::state::journal::read_order::take();
+        assert!(offered_restore(&offered), "{offered}");
+        assert_eq!(
+            steps.iter().filter(|step| **step == "transcript").count(),
+            1,
+            "{steps:?}"
+        );
+        // A missing conversation ID refuses before any transcript metadata I/O.
+        let mut unconfirmed = crate::state::listing_fixture::launched_record(
+            "claude",
+            "claude/example/unconfirmed",
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            "/",
+            "account-example",
+        );
+        crate::state::listing_fixture::confirmed(&mut unconfirmed, "conversation-unconfirmed");
+        unconfirmed["conversation_id"] = json!("");
+        unconfirmed["transcript"] = json!(saved);
+        let id = crate::state::archive_for_test(&unconfirmed).unwrap();
+        let unconfirmed =
+            crate::state::archive::read_archive("claude/example/unconfirmed", &id).unwrap();
+        crate::state::journal::read_order::take();
+        let offered = summary(&unconfirmed, false, &None, None);
+        let steps = crate::state::journal::read_order::take();
+        assert!(!offered_restore(&offered), "{offered}");
+        assert!(
+            steps.iter().all(|step| *step != "transcript"),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn other_agents_keep_todays_restore_decision_without_a_transcript_read() {
+        isolated_archive_fixture(
+            "state::session_action::tests::other_agents_keep_todays_restore_decision_without_a_transcript_read_fixture",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its isolated wrapper"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn other_agents_keep_todays_restore_decision_without_a_transcript_read_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let agent = "kimi";
+            let unique = uuid::Uuid::new_v4().to_string();
+            let name = format!("{agent}/example/member-{unique}");
+            let mut record = crate::state::listing_fixture::launched_record(
+                agent,
+                &name,
+                &uuid::Uuid::new_v4().to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+                &unique,
+                "/",
+                "account-example",
+            );
+            crate::state::listing_fixture::confirmed(&mut record, &format!("conversation-{unique}"));
+            record["transcript"] = json!(dir.path().join("missing.jsonl"));
+            let record = {
+                let id = crate::state::archive_for_test(&record).unwrap();
+                crate::state::archive::read_archive(&name, &id).unwrap()
+            };
+            crate::state::journal::read_order::take();
+            let offered = summary(&record, false, &None, None);
+            let steps = crate::state::journal::read_order::take();
+            assert!(offered_restore(&offered), "{agent}: {offered}");
+            assert!(
+                steps.iter().all(|step| *step != "transcript"),
+                "{agent}: {steps:?}"
+            );
+        }
     }
 }

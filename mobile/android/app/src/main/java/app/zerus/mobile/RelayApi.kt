@@ -1,8 +1,13 @@
 package app.zerus.mobile
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CancellationException
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Call
@@ -26,16 +31,25 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
     .connectTimeout(10, TimeUnit.SECONDS).readTimeout(35, TimeUnit.SECONDS)
     .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false).build(),
     internal val workspace: WorkspaceJournal? = null,
-    internal val catalogNowSeconds: () -> Long = { System.currentTimeMillis()/1000 }) {
+    internal val catalogNowSeconds: () -> Long = { System.currentTimeMillis()/1000 },
+    /** Test seam: a deterministic local seal failure before any mutation POST (zerus-a4mub.6). */
+    internal val sealEnvelope: (WorkspaceIdentity, WorkspaceDevice, WorkspaceHeader, ByteArray) -> WorkspaceEnvelope =
+        { identity, recipient, header, plaintext -> WorkspaceEnvelope.seal(identity, recipient, header, plaintext) }) {
     private val resultStream = RelayResultStream(client)
     internal fun closeResultStreams(connectionId: String? = null) = resultStream.close(connectionId)
-    suspend fun call(url: String, token: String, path: String, body: JSONObject? = null, delete: Boolean = false): JSONObject = RelayReadTiming.measure(RelayReadTiming.httpStage(path, body != null)) { withContext(Dispatchers.IO) {
+    suspend fun call(url: String, token: String, path: String, body: JSONObject? = null, delete: Boolean = false,
+        attempt: SendAttempt? = null): JSONObject = RelayReadTiming.measure(RelayReadTiming.httpStage(path, body != null)) { withContext(Dispatchers.IO) {
         val request = Request.Builder().url(ManagedRelay.transport(url) + path).header("Accept", "application/json")
         if (token.isNotBlank()) request.header("Authorization", "Bearer $token")
         if (delete) request.delete() else if (body != null) request.post(JsonRequestBody(body, when(path) { "/v1/requests" -> 30_408_704L; "/v2/requests" -> 41L*1024*1024; else -> 1_048_576L }))
         val call = client.newCall(request.build())
         suspendCancellableCoroutine { continuation ->
             continuation.invokeOnCancellation { call.cancel() }
+            // Already cancelled before the client saw it: nothing can leave.
+            if (!continuation.isActive) return@suspendCancellableCoroutine
+            // The mutation request is handed to the client here: from this point
+            // delivery may have begun, so settlement may only call it unknown.
+            attempt?.enqueued()
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, error: IOException) {
                     continuation.resumeWithException(error)
@@ -87,21 +101,26 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
     }
     suspend fun registerPush(connection:Connection,provider:String,token:String) = call(connection.url,connection.token,
         if(connection.protocolVersion==2) "/v2/push" else "/v1/push",JSONObject().put("provider",provider).put("token",token))
-    suspend fun post(connection:Connection,computerId:String,session:String="",operation:String,payload:JSONObject,id:String):JSONObject {
+    suspend fun post(connection:Connection,computerId:String,session:String="",operation:String,payload:JSONObject,id:String,
+        attempt: SendAttempt):JSONObject {
         val body=JSONObject().put("request_id",id).put("computer_id",computerId).put("session",session).put("operation",operation).put("payload",payload)
-        return (if(connection.protocolVersion==2) encryptedPost(connection,body) else call(connection.url,connection.token,"/v1/requests",body)).also {
+        return (if(connection.protocolVersion==2) encryptedPost(connection,body,attempt) else call(connection.url,connection.token,"/v1/requests",body,attempt = attempt)).also {
             check(it.string("request_id")==id) { "Gateway returned a mismatched receipt. Delivery remains unconfirmed." }
         }
     }
-    suspend fun submit(connection: Connection, target: Target, operation: String, payload: JSONObject, id: String): JSONObject {
-        require(target.agentId.isBlank() || operation in setOf("inspect", "history", "history_projection", "send", "attachment_read", "file_read")) { "This control belongs to the parent session." }
+    /** One mutation, with its transport evidence. The evidence is required by
+     *  type (no default): the outbox send cannot silently drop it and fall back
+     *  to "before the marker" (zerus-a4mub.21). */
+    suspend fun submit(connection: Connection, target: Target, operation: String, payload: JSONObject, id: String,
+        attempt: SendAttempt): JSONObject {
+        require(target.agentId.isBlank() || operation in setOf("inspect", "history", "history_projection", "send", "send_receipt", "attachment_read", "file_read")) { "This control belongs to the parent session." }
         require(target.archiveId.isBlank() && payload.string("archive_id").isBlank() || operation in setOf("inspect", "history", "history_projection", "process_output", "restore", "forget", "rename", "fork", "attachment_read", "file_read") && target.archiveId.isNotBlank() && payload.string("archive_id") == target.archiveId) { "Archived conversations are read-only." }
-        return post(connection,target.computerId,target.session,operation,payload,id)
+        return post(connection,target.computerId,target.session,operation,payload,id,attempt)
     }
     internal suspend fun speech(connection: Connection, host: MachineKey, operation: String, payload: JSONObject,
         id: String = UUID.randomUUID().toString()): JSONObject {
         require(host.connectionId == connection.id && operation in SpeechProtocol.operations + "speech_stats")
-        val initial = post(connection,host.computerId,"",operation,payload,id)
+        val initial = post(connection,host.computerId,"",operation,payload,id,SendAttempt())
         check(initial.string("request_id") == id) { "Gateway returned a different voice receipt." }
         val receipt = await(connection, initial)
         check(receipt.string("state") == "completed") {
@@ -113,7 +132,7 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
         require(connection.id == target.connectionId && operation in VoiceProtocol.operations && target.session.isNotBlank())
         require(payload.string("request_id") == id && payload.string("expected_run_id") == target.run &&
             payload.string("expected_conversation_id") == target.conversation)
-        val receipt = await(connection, submit(connection, target, operation, payload, id))
+        val receipt = await(connection, submit(connection, target, operation, payload, id, SendAttempt()))
         check(receipt.string("request_id") == id && receipt.string("state") == "completed") {
             receipt.string("error").ifBlank { "The computer has not confirmed this voice request. Check its status." }
         }
@@ -124,37 +143,92 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
         require(host.key.connectionId == connection.id && operation in SpeechConfigProtocol.operations)
         if (operation in SpeechConfigProtocol.mutations) require(payload.string("request_id") == id)
         if (operation != "speech_config") require(payload.string("expected_machine_id") == host.machineId)
-        val initial = post(connection,host.key.computerId,"",operation,payload,id)
+        val initial = post(connection,host.key.computerId,"",operation,payload,id,SendAttempt())
         check(initial.string("request_id") == id) { "The gateway returned a different configuration receipt." }
         val receipt = await(connection, initial)
         check(receipt.string("state") == "completed") { "The computer has not confirmed this configuration operation. Check its status." }
         return receipt.getJSONObject("result")
     }
+    /** Releases the exact sealed reservation of an outbox send proven never
+     *  enqueued. Call only while the same live SendAttempt is Local: a marked
+     *  request keeps its reservation as the unknown/no-replay evidence. */
+    internal suspend fun releaseReservedOutgoing(connection: Connection, id: String) = withContext(Dispatchers.IO) {
+        if (connection.protocolVersion == 2) workspace?.release(connection, id)
+    }
     suspend fun receipt(connection: Connection, id: String) = (if(connection.protocolVersion==2) encryptedReceipt(connection,id) else call(connection.url, connection.token, "/v1/requests/$id")).also {
         check(it.string("request_id") == id) { "Gateway returned a mismatched receipt. Delivery remains unconfirmed." }
     }
+    /** A fresh READ UUID observes the frozen original; it never submits that send again. */
+    suspend fun sendReceipt(connection:Connection,message:OutgoingMessage,intent:SendIntent):SendReceiptProof? {
+        require(connection.id==message.target.connectionId && SendReceiptRecovery.matches(message,intent))
+        val id=UUID.randomUUID().toString()
+        val receipt=await(connection,submit(connection,message.target,SendReceiptRecovery.operation,SendReceiptRecovery.request(id,intent),id,SendAttempt()),firstPollDelayMs=100)
+        if(receipt.string("request_id")!=id || receipt.string("state")!="completed") return null
+        return withContext(Dispatchers.Default) { receipt.optJSONObject("result")?.let { SendReceiptRecovery.proof(id,intent,it) } }
+    }
+    /** One unchanged campaign budget covers the original receipt and its exact native fallback. */
+    suspend fun checkDelivery(connection:Connection,message:OutgoingMessage,intent:SendIntent?,limitMs:Long=45_000,nativeOutcomeSupported:Boolean=false):SendReceiptCheck {
+        require(limitMs in 1..45_000)
+        val deadline=SendReceiptRecovery.nowMs()+limitMs
+        return withTimeout(limitMs) {
+            val original=try { await(connection,receipt(connection,message.requestId)) }
+                catch(e:CancellationException) { throw e } catch(_:Exception) { null }
+            if(message.nativeSendIntent!=null) {
+                val saved=message.nativeSendIntent
+                if(!saved.matches(message)) return@withTimeout SendReceiptCheck.Unconfirmed
+                original?.let { NativeSendOutcome.fromReceipt(message.requestId,saved,it) }?.let { return@withTimeout SendReceiptCheck.Outcome(it,deadline) }
+                if(!nativeOutcomeSupported || SendReceiptRecovery.nowMs()>=deadline) return@withTimeout SendReceiptCheck.Unconfirmed
+                val id=UUID.randomUUID().toString()
+                val initial=submit(connection,message.target,NativeSendOutcome.read,NativeSendOutcome.request(id,saved),id,SendAttempt())
+                val receipt=await(connection,initial,firstPollDelayMs=100)
+                val proof=NativeSendOutcome.fromReceipt(id,saved,receipt,lookup=true)
+                return@withTimeout if(proof==null || SendReceiptRecovery.nowMs()>=deadline) SendReceiptCheck.Unconfirmed else SendReceiptCheck.Outcome(proof,deadline)
+            }
+            if(original?.string("state")=="failed") return@withTimeout SendReceiptCheck.Original(original,deadline)
+            if(original?.string("state")=="completed" && original.optJSONObject("result")?.string("status") in listOf("submitted","queued")) {
+                if(!message.hasOriginalSendIdentity) return@withTimeout SendReceiptCheck.Original(original,deadline)
+                val proof=original.optJSONObject("result")?.let { message.originalSendIntent()?.let { saved -> SendReceiptRecovery.acknowledgement(saved,it) } }
+                if(proof!=null) return@withTimeout SendReceiptCheck.Native(message.originalSendIntent() ?: return@withTimeout SendReceiptCheck.Unconfirmed,proof,deadline)
+            }
+            if(intent==null || message.hasOriginalSendIdentity && message.originalSendIntent()!=intent || !SendReceiptRecovery.matches(message,intent)) return@withTimeout SendReceiptCheck.Unconfirmed
+            val proof=try { sendReceipt(connection,message,intent) }
+                catch(e:CancellationException) { throw e } catch(_:Exception) { null }
+            if(proof==null || SendReceiptRecovery.nowMs()>=deadline) SendReceiptCheck.Unconfirmed else SendReceiptCheck.Native(intent,proof,deadline)
+        }
+    }
     suspend fun await(connection: Connection, initial: JSONObject, maxPolls: Int = 35, pollDelayMs:Long = 800,
         firstPollDelayMs:Long = pollDelayMs): JSONObject {
-        var current = initial
-        var polls = maxPolls
-        if (connection.protocolVersion == 2 && resultStream.available(connection) && maxPolls > 0 && current.string("state") in listOf("queued", "claimed")) {
-            val id = current.getString("request_id")
+        if (connection.protocolVersion == 2 && resultStream.available(connection) && maxPolls > 0 && initial.string("state") in listOf("queued", "claimed")) {
+            val id = initial.getString("request_id")
             prepareReceiptWatch(connection, id)
-            val ordinary = pollDelayMs.coerceIn(50, 1000)
-            val started = System.nanoTime()
-            // A readiness hint never bypasses fresh membership, signature,
-            // request/route binding or journal settlement in receipt().
-            val signaled = RelayReadTiming.measure(RelayReadTiming.Stage.ResultSignalWait) {
-                resultStream.ready(connection, id, minOf(25_000L, maxPolls * ordinary))
+            return coroutineScope {
+                val ordinary = pollDelayMs.coerceIn(50, 1000)
+                // A hint may accelerate a receipt, but a connected silent socket
+                // must never postpone ordinary receipt recovery. One watcher is
+                // shared by this bounded polling campaign and consumed at most once.
+                val readiness = async {
+                    val signaled = RelayReadTiming.measure(RelayReadTiming.Stage.ResultSignalWait) {
+                        resultStream.ready(connection, id, minOf(25_000L, maxPolls * ordinary))
+                    }
+                    RelayReadTiming.point(if (signaled) RelayReadTiming.Stage.ResultSignalReady else RelayReadTiming.Stage.ResultSignalFallback)
+                    signaled
+                }
+                var consumed = false
+                try {
+                    ReceiptPolling.await(initial,maxPolls,pollDelayMs,firstPollDelayMs,
+                        pause = { pause -> RelayReadTiming.measure(RelayReadTiming.Stage.PollDelay) {
+                            if (consumed) delay(pause)
+                            else if (withTimeoutOrNull(pause) { readiness.await() } != null) consumed = true
+                        } },
+                        // The ordinary path still verifies fresh membership,
+                        // signature, original request/route and journal settlement.
+                        receipt = { receipt(connection,it) })
+                } finally {
+                    readiness.cancel()
+                }
             }
-            RelayReadTiming.point(if (signaled) RelayReadTiming.Stage.ResultSignalReady else RelayReadTiming.Stage.ResultSignalFallback)
-            // Also reconcile once after a dropped/unsupported/silent stream.
-            // The elapsed stream wait consumes the EXISTING wait budget rather
-            // than adding another complete polling campaign after a timeout.
-            polls = (maxPolls - 1 - (System.nanoTime() - started) / 1_000_000 / ordinary).coerceAtLeast(0).toInt()
-            current = receipt(connection, id)
         }
-        return ReceiptPolling.await(current,polls,pollDelayMs,firstPollDelayMs,
+        return ReceiptPolling.await(initial,maxPolls,pollDelayMs,firstPollDelayMs,
             pause={ RelayReadTiming.measure(RelayReadTiming.Stage.PollDelay) { delay(it) } },
             receipt={ receipt(connection,it) })
     }
@@ -163,7 +237,7 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
             if (target.archiveId.isNotBlank()) it.put("archive_id", target.archiveId)
             if (target.agentId.isNotBlank()) it.put("agent_id",target.agentId).put("expected_run_id",target.run).put("expected_conversation_id",target.parentConversation)
         }
-        val result = await(connection, submit(connection, target, "inspect", payload, UUID.randomUUID().toString()),firstPollDelayMs=100)
+        val result = await(connection, submit(connection, target, "inspect", payload, UUID.randomUUID().toString(), SendAttempt()),firstPollDelayMs=100)
         check(result.string("state") == "completed") { result.string("error").ifBlank { "Computer has not returned its activity yet. Refresh to check again." } }
         result.getJSONObject("result").also { activity ->
             if(target.agentId.isNotBlank()) check(activity.string("agent_id") == target.agentId && activity.string("parent_conversation_id") == target.parentConversation && activity.string("run_id") == target.run && activity.string("name") == target.session) { "Computer returned a different child conversation." }
@@ -178,7 +252,7 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
         require(direction in setOf("","before","after","around","unread") && (direction.isEmpty() == cursor.isEmpty()) && cursor.length<=8192)
         val id=UUID.randomUUID().toString()
         val payload=HistoryRequests.payload(target,id,direction,cursor,limit)
-        val receipt=await(connection,submit(connection,target,"history",payload,id),firstPollDelayMs=100)
+        val receipt=await(connection,submit(connection,target,"history",payload,id, SendAttempt()),firstPollDelayMs=100)
         check(receipt.string("state")=="completed") { receipt.string("error").ifBlank { "History is not available yet. Try again." } }
         withContext(Dispatchers.Default) { HistoryPage.parse(target,id,receipt.getJSONObject("result")) }
     }
@@ -186,7 +260,7 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
     suspend fun historyProjection(connection:Connection,target:Target,epoch:String,after:Long,until:Long):HistoryProjection.Page = RelayReadTiming.read(RelayReadTiming.Operation.Projection) {
         val id=UUID.randomUUID().toString()
         val payload=HistoryProjection.payload(target,id,epoch,after,until)
-        val receipt=await(connection,submit(connection,target,"history_projection",payload,id),firstPollDelayMs=100)
+        val receipt=await(connection,submit(connection,target,"history_projection",payload,id, SendAttempt()),firstPollDelayMs=100)
         check(receipt.string("state")=="completed") { receipt.string("error").ifBlank { "History changes are not available yet." } }
         withContext(Dispatchers.Default) { HistoryProjection.parse(target,id,epoch,after,until,receipt.getJSONObject("result")) }
     }
@@ -194,7 +268,7 @@ class RelayApi internal constructor(private val client: OkHttpClient = OkHttpCli
     suspend fun markRead(connection: Connection, target: Target, payload: JSONObject): JSONObject {
         require(target.archiveId.isBlank() && target.agentId.isBlank()) { "Read marks belong to the live parent conversation." }
         val id = UUID.randomUUID().toString()
-        return await(connection, submit(connection, target, "mark_read", payload, id))
+        return await(connection, submit(connection, target, "mark_read", payload, id, SendAttempt()))
     }
     suspend fun events(connection: Connection, after: Long, wait: Int = 25) = if(connection.protocolVersion==2) encryptedEvents(connection,after,wait)
         else call(connection.url, connection.token, "/v1/events?after=$after&wait=$wait")
@@ -231,11 +305,14 @@ object NativeParser {
         val occurrences = mutableMapOf<String, Int>()
         fun parse(value: JSONObject, streamArgument: String): Event? {
             val stream = value.string("history_stream").takeIf { it in listOf("journal", "provider", "attachment", "voice") } ?: streamArgument
-            val type = value.string("type")
+            // A fork's inherited row carries its original type; older apps drop the unknown type.
+            val inheritedFrom = if (value.string("type") == "Inherited") value.string("inherited_from") else ""
+            if (value.string("type") == "Inherited" && inheritedFrom.isBlank()) return null
+            val type = if (inheritedFrom.isNotEmpty()) value.string("inherited_type") else value.string("type")
             if (type !in listOf("UserPromptSubmit", "UserPromptQueued", "UserMessage", "TurnStarted", "QuestionAnswered", "AgentMessage", "Stop") ||
                 !inScope(value)) return null
             // A native prompt the person did not write is a notice, as on desktop.
-            val origin = value.string("origin").takeIf { it in ActivityNotices.origins && type in
+            val origin = value.string("origin").takeIf { inheritedFrom.isEmpty() && it in ActivityNotices.origins && type in
                 listOf("UserPromptSubmit", "UserPromptQueued", "UserMessage", "TurnStarted") }.orEmpty()
             val role = when (type) {
                 "QuestionAnswered" -> "You (answer)"
@@ -245,7 +322,9 @@ object NativeParser {
             // Identities keep the native role, so cached rows stay the same rows.
             val shown = if (origin.isNotEmpty()) ActivityNotices.ROLE else role
             val source = value.string("source").ifBlank { stream }
-            val voice = if (source == "hgs_voice") value.optJSONObject("voice")?.let {
+            // An inherited voice belongs to the source session: its text stays, but
+            // no voice card, playback or status acts on it through this fork.
+            val voice = if (source == "hgs_voice" && inheritedFrom.isEmpty()) value.optJSONObject("voice")?.let {
                 runCatching { VoiceProtocol.message(it) }.getOrNull()
             } else null
             val files = value.optJSONArray("attachments")?.objects().orEmpty().map {
@@ -274,7 +353,7 @@ object NativeParser {
             val originalId = value.string("original_id").ifBlank { "$stream:$source:$role:$fallback" }
             val historyId = value.string("history_id")
             val requestId = when {
-                shown != "You" -> ""
+                shown != "You" || inheritedFrom.isNotEmpty() -> ""
                 source in setOf("hgs_delivery", "hgs_voice") -> value.string("message_id")
                 // OpenCode dates a queued prompt by its delivery; hgs names the Zerus send
                 // that admitted it, so the phone can match its own message exactly.
@@ -284,13 +363,15 @@ object NativeParser {
             }
             return Event(if (historyId.isBlank()) originalId else "history:$historyId", shown,
                 text, value.string("at", "timestamp"), at, requestId, files, source,
-                delivery = if (shown == "You") MessageDeliveryPresentation.inboxState(value) else "",
+                delivery = if (shown == "You" && inheritedFrom.isEmpty()) MessageDeliveryPresentation.inboxState(value) else "",
                 nativeType = type, submittedText = if (source == "hgs_delivery") value.string("submitted_text") else "",
                 originalId = originalId, historyId = historyId, historyCursor = value.string("history_cursor"),
                 historyEpoch = raw.string("history_epoch"), incomingSeq = (value.opt("incoming_seq") as? Number)?.toLong()?.takeIf { it >= 0 },
                 originalIds = value.optJSONArray("original_ids")?.let { ids -> (0 until minOf(ids.length(),8)).mapNotNull { ids.opt(it) as? String } }.orEmpty(), detailTruncated = value.optBoolean("detail_truncated"), voice = voice,
                 origin = origin, sender = if (origin == "peer_message") value.string("sender") else "",
-                report = ActivityNotices.report(origin, value.string("report")))
+                report = ActivityNotices.report(origin, value.string("report")), inheritedFrom = inheritedFrom,
+                nativeMessageId = if(source in setOf("claude_native","codex_native","kimi_native","dsh_native","opencode_native")) value.string("message_id").takeIf {
+                    it.toByteArray(Charsets.UTF_8).size<=256 && it.none(Char::isISOControl) }.orEmpty() else "")
         }
         val rows = (journal.mapNotNull { item ->
             fun replaces(provider: JSONObject, hook: JSONObject) = provider.string("type") == "AgentMessage" && inScope(provider) && inScope(hook) &&
@@ -336,6 +417,7 @@ object NativeParser {
             val next = metadata.copy(originalIds = (metadata.originalIds + listOfNotNull(accepted?.id)).distinct().take(8))
             if (old < 0) rows += next else if (rows[old].voice!!.revision < voice.revision) rows[old] = next
         }
+        rows += QuestionRouteActivity.events(raw)
         return if (raw.string("history_epoch").isNotBlank()) rows.toList() else rows.sortedBy { it.at }
     }
     fun messageBlockReason(raw: JSONObject?): String {

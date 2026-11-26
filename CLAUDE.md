@@ -1,8 +1,12 @@
 # Agent instructions
 
 Zerus provides a desktop UI and the `hgs` CLI for persistent local and remote
-agent sessions. The CLI lives in `src/`; the Qt GUI lives in `tray/src/`;
-replicated documents (Loro) live in `crates/replica/`, the only code that
+agent sessions. The CLI lives in `src/`; the released GUI lives in `client/`. Zerus has
+no Qt code: the desktop installers, the guarded updater, the service units and
+the packaged icons live in `packaging/desktop/`. The Rust client reads no Qt
+data: an installation with unmigrated Qt data starts with Zerus's own defaults
+and leaves Qt's files untouched (`docs/reference.md`, First start without Qt
+data). Replicated documents (Loro) live in `crates/replica/`, the only code that
 imports Loro.
 The Rust mobile relay lives in `services/mobile/relay/` and the Rust outbound
 connector in `services/mobile/connector/`; the legacy Python connector remains in
@@ -18,10 +22,14 @@ only from trusted main; see `docs/ios-distribution.md`.
 `design/` contains prototypes and original artwork, not runtime dependencies.
 The Tauri desktop client lives in `client/`: the SolidJS frontend in
 `client/src`, a pure-Rust core in `client/core` and the Tauri app in
-`client/src-tauri`, each its own Cargo package and lock. It grows beside the
-Qt GUI; see `docs/superpowers/specs/2026-10-27-tauri-web-ui-design.md`. Its UI
+`client/src-tauri`, each its own Cargo package and lock. It is the Zerus Next GUI; see the
+[retirement acceptance checklist](docs/qt-release-acceptance.md) and
+`docs/superpowers/specs/2026-10-27-tauri-web-ui-design.md`. Its UI
 never separates values with dots; `scripts/check-ui-separators.py` enforces it
-in CI (the Qt GUI and mobile clients are out of that rule's scope).
+in CI (mobile clients are out of that rule's scope). Team app builds, dev servers
+and launches go through the `tauri-build`, `tauri-dev` and `tauri-launch`
+templates, which carry the development identity; only the release-candidate
+package step builds the switch identity.
 
 The repository language is English. Write documentation and other project-facing
 text in English; conversations may use the user's preferred language.
@@ -34,6 +42,15 @@ Zerus product tasks received through `hgs task` are separate from Beads engineer
 tracking. For a direct request already being worked on, agents use `hgs task add
 --start` or `hgs task start REF`; plain add queues work for later. Reports by the
 exact pinned agent move its unsent queued task to In review as well.
+Use exactly one acknowledgement command supplied by the original task prompt.
+After task-control activation, pinned `begin-attempt REF --attempt UUID` replaces
+plain `start` for managed work; plain start never binds a managed native turn.
+For managed work, use the report-attempt command pinned in the original task
+prompt or start acknowledgement, never a newer attempt ID from a lookup. An
+explicit legacy start prints the ordinary report command and creates no UUID.
+A history-only report succeeded as a history write but did not move the task;
+do not retry a duplicate or infer the latest attempt. Older managed prompts
+without the pinned command need the person's acceptance or a new resend.
 Use `bd remember --key <key> "<decision>"` for concise, shareable project memory.
 Do not create separate TODO or MEMORY files. Read current source before carrying
 forward a historical limitation.
@@ -50,6 +67,13 @@ Use only the returned project wing. Store short verified decisions there; never
 upload credentials, private personal data, transcripts or full prompts.
 Repository documentation owns specifications; Beads owns tasks and blockers.
 
+Search code and documentation through CodeLore (owner, 2026-11-10): `lore atlas
+search "what it does"` in a checkout finds code and Markdown by words, terms and
+symbols (the root `lore.toml` turns the map on; `hgs guide code`), and
+`hgs team lore find` searches the project's memory store, where the documentation
+is sliced into records citing `zerus:<path>#<heading>@<commit>`
+(`docs/lore-slicing.md`). Records go to that store, never into the repository.
+
 ## Compatibility and operation
 
 Treat pasted `zerus://session?...` URIs as references to another Zerus conversation.
@@ -63,13 +87,27 @@ When referring to another conversation, include its Zerus session name or copied
 reference. Beads IDs such as `zerus-ab12` identify tasks, not conversations; never
 present a task number as a session ID.
 
+Person requests. When the person asks you in your own conversation (their
+message from the Zerus composer or phone, not one relayed by another agent, a
+task, a team hand-out or a timer), do it, including actions reserved to the
+person: accepting a task, answering another session's trust, hook or permission
+prompt, stopping or archiving a session, turning automatic tool approvals on. A
+standing request given there ("from now on ...", "always ...") counts until the
+person withdraws it. A team's Confirm folder trust setting (`confirm_trust`) is
+the person's standing choice for its members' trust prompts. A child or team
+member acts for the person only when the person messaged it directly. Where a
+product check still refuses an agent (the tasks caller proof, Teams
+`person_gesture_required`, window-only settings), report the refusal to the
+person; never route around it. Sign-in, passwords, keys and payment stay with
+the person. See `docs/person-requests.md`.
+
 Keep the `hgs` CLI, `HGS_*` variables, state/config paths and existing application
 and service identifiers compatible. A repository rename must not reset accounts,
 project catalogs, native agent processes or saved conversations.
 
 Never restart or kill native agents, tmux servers or DeepSeek hosts as part of a
-GUI update. Update local installations only with `install.sh`, `tray/install.sh`
-and `mac-install.sh`; a running GUI is replaced through `tray/update-installed.py`,
+GUI update. Update local installations only with `install.sh`, `packaging/desktop/install.sh`
+and `mac-install.sh`; a running GUI is replaced through `packaging/desktop/update-installed.py`,
 which saves drafts and keeps one rollback copy. Never stage GUI copies in
 `~/Applications` or `~/.local/bin` by hand. Another session may be testing its own
 build: check the running GUI's `--build-info` and
@@ -104,22 +142,64 @@ Explicit desktop termination cleanup may remove verified generated caches only
 after its Remove worktree choice and exact successful termination. Keep branch
 and archive-restore identity. Bind cleanup to the checkout ownership recorded
 at session launch and bind removal fingerprints to that nonce. Missing or
-replaced ownership, unknown local data, source changes, other occupants and
-uncertain process use require fresh manual review. Background
-maintenance continues to preserve all ignored data. Never stop unrelated system
-services to make a worktree removable; uncertain removals are never replayed.
+replaced ownership, unknown local data, source changes, other session references
+and unconfirmed process use require fresh manual review, except for the explicit
+permission-denial rule below. Background maintenance continues to preserve all
+ignored data. Uncertain removals are never replayed.
+An explicit manual review may also remove a registered linked worktree that
+Zerus did not create, after a separate destructive confirmation showing its
+native-selected path, computer, kept branch and reviewed local data. Fresh
+session/process/file checks and matching discard consents still apply. Never
+remove the primary checkout or a plain folder, fabricate launch ownership, use
+this exception automatically or replay an unknown result. Preserve branches and
+archive identities; an unowned checkout may need manual recreation for Restore.
 Termination cleanup runs in the background after its original confirmation.
 Show removed, kept and unknown outcomes with explicit review actions. Only a
 verified refusal before deletion may be checked for a new removal; never replay
-an unknown outcome. Manual acceptance of unreadable process paths lasts five
-minutes for the exact checkout review and tolerates unrelated process churn.
-Fresh known-use, session, ownership and file protections still apply; automatic
-cleanup never uses that manual acceptance.
+an unknown outcome. Outside the explicit Terminate/Remove permission-denial
+exception, manual acceptance of unreadable process paths lasts five minutes for
+the exact checkout review and tolerates unrelated process churn. Fresh known-use,
+session, ownership and file protections still apply; automatic cleanup never
+uses that manual acceptance.
 On Linux and macOS, Terminate must confirm the exit of the selected agent's
 verified background process trees before worktree cleanup. Pin birth identities
 before terminal teardown loses ancestry; bound verification and restore temporary
-stops on refusal. Folder paths, executable names and shared process groups never
-authorize stopping other programs. Keep Pause and native Stop semantics unchanged.
+stops on refusal.
+
+Owner decisions of 2026-11-05 apply only to explicit Terminate with Remove
+working folder: Zerus may stop every program proven by its cwd or open files to
+use that session's verified generated worktree, including editors and terminals
+the person opened there. A complete bounded native manifest binds the original
+checkout object, ownership nonce, session/run/archive identity, selected CLI and
+configuration. Before confirmation, show a collapsed count and expandable list
+of other programs. A separate native presentation companion may omit only the
+exact record-bound agent and supervisor with verified native PID/birth and
+parent correlation; uncertainty leaves rows visible. Never filter the manifest,
+execution bindings, held sources or Stop/Force/cleanup inputs. Force shows its
+complete freshly checked survivor list expanded. Renderer PIDs or paths grant
+no authority. Before each signal, recheck the process
+birth/pin and actual membership in that same checkout; new or changed members
+require fresh review. Never signal the executing custodian or an ancestor or
+resource needed to verify and settle the action.
+
+For this explicit Remove choice, processes whose cwd/open-file membership cannot
+be inspected because of EACCES or EPERM are ignored for the removal decision:
+do not list or signal them, and they do not keep the folder. Apply this rule
+from the actual inspection result, never from executable names or an allowlist
+of system programs. Proven occupants remain in the full manifest and must be
+stopped first. This exception grants no signal authority and does not relax checkout ownership,
+process identity, confirmation, custody or unknown-removal protections.
+
+Normal stop is bounded and distinguishes confirmed exit, known surviving
+originals and unknown outcomes. Force is a separate native-confirmed action with
+a new request UUID, bound to the original stop result and freshly verified
+survivors, only after the prior writer/helper and pipes physically settle. Never
+escalate automatically or infer Force authority from a timeout. Stop-incomplete
+and removal-Unknown remain distinct; Force, restart, status and Retry never
+resume or replay an unknown removal or reconstruct consent. Keep branch and
+archive identity. Background cleanup, Pause and native Stop keep their existing
+scope; outside this explicit confirmed Remove choice, folder paths, executable
+names and shared process groups never authorize stopping other programs.
 
 A session is Working, Building, Waiting for you, Waiting for dependencies
 (always with its reason), Cooling, Cold or Stopped; Offline stays (owner
@@ -157,6 +237,8 @@ or peer idleness. Preserve exact waiter identity, native work/attention priority
 bounded previews and paged journals. Check the selected installed CLI's help
 marker before using `wait` on an older peer. See `docs/agent-coordination.md`.
 
+Retire idle sub-sessions you started and the owner does not use when their result is accepted or they have been idle 24 hours, provided they have no planned task. See `hgs guide stop`.
+
 Use non-interactive filesystem commands and `ssh/scp -o BatchMode=yes` in automation.
 On Windows, reach `ssh.exe` only through `hgs.exe`: Windows OpenSSH hangs after
 using a synchronous pipe, so scripts and tests must not pipe it directly.
@@ -188,7 +270,22 @@ Automatic tool approvals are a separate, dangerous desktop opt-in, off by
 default. Grant only a verified one-time native permission, reserve its private
 audit record durably before delivery, and retain exact run/conversation/question
 identity. Unknown delivery never authorizes replay. Ordinary questions, startup
-trust and broader persistent permission changes remain manual.
+trust and broader persistent permission changes remain manual: the person
+answers them, or an agent does at the person's request, a standing one included.
+An agent may turn this opt-in on at the person's request.
+
+A team's standing confirmations are a separate bounded exception with their
+own audit categories: the startup folder trust prompt of a member whose
+worktree Zerus created for that team, and the resume of a member whose agent
+exited by itself, at most three times an hour. Trust covers the team repository's
+main checkout and its subfolders on the member's account; its audit row names
+that scope. These confirmations never widen automatic tool approvals. Session
+and task command effects use this computer's own `hgs` as one original child,
+admitted at its spawn; a merge is admitted at its ref update. Closed-task key
+maintenance uses bounded replica writes without adding history. An unknown
+delivery is never replayed. Quitting
+a member's agent by hand stops neither the member nor the team. Zerus never
+stops a team's agents by itself.
 
 Dev publication is build-gated: successful distributables, package/source identity,
 signatures and installation checks admit Dev without waiting for the full regression
@@ -198,6 +295,12 @@ PRs need no additional manual trust approval for ordinary Dev integration.
 Main regressions cover shared Rust/protocol contracts, Linux CLI, Arch, macOS and
 Android. PRs add Windows/iOS for affected desktop, native or shared paths;
 unknown change inventories retain both. Nightly and Stable retain the full matrix.
+Shared candidate tests may run once in a same-SHA qualification job when final
+sealing requires its successful result. Do not start a second full matrix for a
+SHA already under full verification; check the resolved source and wait, or select
+missing platforms. A PR run does not replace the release's own required gate.
+Keep the iOS marketing version for ordinary Dev uploads; change it only when a new
+App Store/marketing version is actually needed, never just to publish another build.
 iOS TestFlight Dev uploads follow successful Nightly verification, using the exact
 source's main CI sequence. Manual checks remain available. Public
 standard GitHub runners are free; do not introduce paid larger runners or raise
@@ -271,9 +374,9 @@ for merges from WhiteWh's `whitewh/main`. The fork started from commit
 `f31086364f0964c4910a861c385baec904c39b0f`. `origin` is
 `romanilyin/zerus`; `whitewh` and `upstream` are read-only source remotes.
 Preserve upstream attribution, application identifiers and session identities.
-The fork scope includes PowerShell 7 Core preference with Windows PowerShell 5.1
-fallback when `HGS_PWSH` is unset, explicit canonical path identity and local
-Windows-to-WSL transport for an existing OpenCode 2 service.
+The fork requires PowerShell 7 Core for Windows shell operations; Windows
+PowerShell 5.1 is not supported. Its scope includes explicit canonical path
+identity and local Windows-to-WSL transport for an existing OpenCode 2 service.
 Use synthetic examples and keep deployment settings outside the public tree.
 
 Publication and account-specific permissions described above belong to the

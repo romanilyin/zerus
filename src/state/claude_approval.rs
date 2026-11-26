@@ -10,7 +10,6 @@
 //! the keys, so a panel taller than its pane can still be answered.
 use super::*;
 use sha2::{Digest,Sha256};
-use std::path::Path;
 pub(super) mod channel;
 mod children;
 pub(super) fn observe(record:&mut Value,event:&Value) {children::observe(record,event);channel::observe(record,event);}
@@ -53,10 +52,10 @@ fn gutter(row:&str)->&str {row.strip_prefix("│ ").unwrap_or(row)}
 
 // This advisory counts down, then disappears when the user starts navigating.
 // It is not the command's warning or a permission choice. Preserve display
-// text, but exclude only this exact native advisory from the decision identity.
+// text, but exclude only these exact native advisories from the decision identity.
 fn identity_body(panel:&Panel)->Vec<String> {
     static TIMER:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
-    let timer=TIMER.get_or_init(||regex::Regex::new(r"^⚠ Claude Code will automatically deny this request in [0-9]{1,3}:[0-9]{2}, to avoid blocking progress on an unattended session$").unwrap());
+    let timer=TIMER.get_or_init(||regex::Regex::new(r"^⚠ Claude Code will automatically (?:deny this request in [0-9]{1,3}:[0-9]{2}, to avoid blocking progress on an unattended session|block this request in [0-9]{1,3}:[0-9]{2}, to avoid holding up an unattended session)$").unwrap());
     let after_fence=panel.body.iter().rposition(|r|rule(r,'╌')||rule(r,'─'))
         .map_or(if panel.title=="Bash safety confirmation"{0}else{panel.body.len()},|i|i+1);
     let mut result=Vec::new();let mut index=0;
@@ -180,13 +179,39 @@ fn matches(request:&Value,panel:&Panel)->bool {
     let mut targets=Vec::new();
     for key in ["file_path","notebook_path","path"] {
         if let Some(path)=input[key].as_str().filter(|p|!p.is_empty()) {
-            targets.push(Path::new(path).file_name().and_then(|n|n.to_str()).unwrap_or(path).to_owned());
+            // Task #61 (team ede724c4): the file's name after either separator.
+            // A Windows agent's path keeps its backslashes on every host, and on
+            // Unix Path::file_name took the whole path, which the panel wraps.
+            targets.push(path.rsplit(['/','\\']).next().filter(|n|!n.is_empty()).unwrap_or(path).to_owned());
         }
     }
     if let Some(url)=input["url"].as_str().filter(|u|!u.is_empty()) {
         targets.push(url.split("://").nth(1).unwrap_or(url).split(['/','?','#']).next().unwrap_or(url).to_owned());
     }
     targets.iter().all(|target|text.contains(&compact(target)))
+}
+
+/// The native "Read outside the working directories" panel can appear without
+/// a PermissionRequest hook (auto mode), so no pending request names it. Its
+/// known title, question and four native options plus the Read(path) row are
+/// enough to form the request a tool-approval card answers; every answer is
+/// checked against this same panel again (`snapshot`).
+fn native_read_request(screen:&str)->Option<Value> {
+    let panel=parse(screen)?;
+    if panel.title.trim()!="Read outside the working directories"
+        ||panel.question.trim()!="Allow this read outside the working directories?" {return None;}
+    const EXPECTED:[&str;4]=["Yes, and keep allowing any reads outside the working directories",
+        "No, and block reads outside the working directories from now on",
+        "No, and ask again next time","Yes, but ask again next time"];
+    let labels:Vec<String>=panel.labels.iter().map(|text|label(text)).collect();
+    if labels.len()!=EXPECTED.len()||labels.iter().zip(EXPECTED).any(|(label,want)|label!=want) {return None;}
+    let body=panel.body.iter().filter(|row|!rule(row,'╌')).map(String::as_str).collect::<String>();
+    let start=body.find("Read(")?+5;
+    let end=body[start..].find(')')?+start;
+    let path=body[start..end].trim();
+    if path.is_empty() {return None;}
+    let request=json!({"tool_name":"Read","tool_input":{"file_path":path}});
+    matches(&request,&panel).then_some(request)
 }
 
 fn summary(request:&Value)->String {
@@ -265,8 +290,25 @@ fn build(record:&Value,screen:Option<&str>)->Option<(Value,Option<Panel>)> {
         card["answer_unavailable_reason"]=json!("This child tool request needs review in Terminal.");
         return Some((card,panel));
     }
-    if !eligible(record) {return None;}
-    build_request(record,screen,request(record)?,&record["pending_approval_at"],"")
+    if eligible(record) {
+        if let Some(request)=request(record) {
+            return build_request(record,screen,request,&record["pending_approval_at"],"");
+        }
+    }
+    // Auto mode can show a known native panel without the PermissionRequest
+    // hook; then no pending approval exists to name the request, and the panel
+    // itself does. A pending request of another kind is never read from the
+    // screen this way.
+    let screen=screen?;
+    if !["input","approval","working","tool"].contains(&string(record,"phase")) {return None;}
+    if record.get("pending_approval").is_some() {return None;}
+    let request=native_read_request(screen)?;
+    let at=record["attention_started"].as_f64().map_or(record["last_event_at"].clone(),|at|json!(at));
+    let (mut card,panel)=build_request_seen(record,Some(screen),&request,&at,"",false)?;
+    // No native request identity exists, so automatic approvals must never
+    // take this card; only the owner may answer the verified panel.
+    card["screen_only_request"]=json!(true);
+    Some((card,panel))
 }
 
 /// The exact shell command of a Bash or PowerShell request, for a team's safe
@@ -278,7 +320,11 @@ fn shell_input(card:&mut Value,request:&Value) {
 }
 
 fn build_request(record:&Value,screen:Option<&str>,request:&Value,at:&Value,child_request_id:&str)->Option<(Value,Option<Panel>)> {
-    if screen.is_some_and(|screen|!visible(screen)) {return None;}
+    build_request_seen(record,screen,request,at,child_request_id,true)
+}
+
+fn build_request_seen(record:&Value,screen:Option<&str>,request:&Value,at:&Value,child_request_id:&str,seen_required:bool)->Option<(Value,Option<Panel>)> {
+    if seen_required&&screen.is_some_and(|screen|!visible(screen)) {return None;}
     let tool=string(request,"tool_name");
     let panel=screen.and_then(parse);
     let problem=match &panel {
@@ -398,6 +444,14 @@ fn safety_warning(request:&Value,screen:&str,proven:bool,alone:bool)->Option<(Pa
 fn warning_text(panel:&Panel)->String {
     let start=panel.body.iter().rposition(|row|rule(row,'╌')).map_or(0,|fence|fence+1);
     panel.body[start..].join("\n").trim().to_owned()
+}
+
+/// The approval card this producer writes for `request` on a terminal it
+/// cannot read: the route the readers of these cards test with
+/// (zerus-63rru.73).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(super) fn produced_request(record: &Value, request: &Value) -> Option<Value> {
+    build_request(record, None, request, &json!(1793000002.0), "").map(|(card, _)| card)
 }
 
 /// The card for the pending main-agent request while Claude's permission hook
@@ -572,6 +626,15 @@ pub(super) fn terminal_card(record:&Value,cards:&[Value])->Option<Value> {
         .or_else(||if cards.is_empty() {terminal_choice(record,screen.as_deref()?)} else {None})
 }
 
+/// The hint under Claude's unnumbered choosers: "Enter to confirm · Esc to
+/// <what Esc does>", such as "cancel", or "keep browser tools off" under
+/// "Claude in Chrome extension detected" (task 2). Any other footer, or one
+/// with more keys, is not this chooser.
+pub(super) fn confirm_hint(row:&str)->bool {
+    row.trim().strip_prefix("Enter to confirm · Esc to ")
+        .is_some_and(|what|!what.trim().is_empty()&&!what.contains('·'))
+}
+
 /// A chooser whose options are not numbered and that Claude closes with Enter
 /// or Esc, such as "Review proposed auto-mode setup" (owner, 2026-10-28). The
 /// options are the rows right above the hint, exactly one marked `❯`; a bar
@@ -579,7 +642,7 @@ pub(super) fn terminal_card(record:&Value,cards:&[Value])->Option<Value> {
 fn hinted_choice(screen:&str)->Option<Chooser> {
     let rows:Vec<String>=screen.lines().map(|r|r.trim().trim_start_matches(['│','▌','▎','▍','┃']).trim().to_owned()).collect();
     let last=rows.iter().rposition(|r|!r.is_empty())?;
-    if rows[last]!="Enter to confirm · Esc to cancel" {return None;}
+    if !confirm_hint(&rows[last]) {return None;}
     let end=rows[..last].iter().rposition(|r|!r.is_empty())?;
     let start=rows[..=end].iter().rposition(|r|r.is_empty())?+1;
     let options=&rows[start..=end];
@@ -664,13 +727,70 @@ fn snapshot(record:&Value,screen:&str)->Option<(Value,usize)> {
 fn acknowledged(screen:&str)->bool {!screen.trim().is_empty()&&!visible(screen)}
 
 pub(super) fn current(record:&Value)->Option<Value> {current_with(record,false)}
+// A negative read-only screen parse grants no native identity or answer
+// authority. A positive/failed observation needs the original canonical path.
+pub(super) fn listing_needs_record(record: &Value) -> bool {
+    record["agent"] == "claude"
+        && kimi_tui_choice::capture(record)
+            .ok()
+            .is_none_or(|screen| !public_live_screen(&screen))
+}
+// Positive recognition of the complete ordinary composer, NOT a failed menu
+// parse. Blank, clipped, control-bearing and unfamiliar screens stay canonical.
+fn public_live_screen(screen: &str) -> bool {
+    if screen.len() > 512 * 1024
+        || screen
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r'))
+    {
+        return false;
+    }
+    let rows: Vec<_> = screen.trim_end().lines().map(str::trim).collect();
+    let Some(bottom) = rows.iter().rposition(|row| rule(row, '─')) else {
+        return false;
+    };
+    let Some(top) = rows[..bottom].iter().rposition(|row| rule(row, '─')) else {
+        return false;
+    };
+    let Some(prompt) = rows.get(top + 1).and_then(|row| row.strip_prefix('❯')) else {
+        return false;
+    };
+    let footers: Vec<_> = rows[bottom + 1..]
+        .iter()
+        .filter(|row| !row.is_empty())
+        .collect();
+    if footers.len() != 1 {
+        return false;
+    }
+    let footer = footers[0].to_lowercase();
+    bottom > top + 1
+        && prompt.chars().next().is_none_or(char::is_whitespace)
+        && !visible(screen)
+        && (footer.contains("? for shortcuts") || footer.contains("esc to interrupt"))
+}
 /// The card a question listing shows. Only a listing may first fit a clipped
 /// panel into its unviewed pane, and only for a recorded request; guards and
 /// answers read the screen as it is.
 pub(super) fn listed(record:&Value)->Option<Value> {current_with(record,true)}
-fn current_with(record:&Value,fit:bool)->Option<Value> {
-    if record["agent"]!="claude"||pause_active(record)||!string(record,"error").is_empty()
-        ||!active_phase(record) {return None;}
+// The `fit` the last approval read on this thread received (tests only):
+// questions' tests pin which reads are listings.
+#[cfg(test)]
+thread_local! {pub(super) static LAST_FIT:std::cell::Cell<Option<bool>>=const {std::cell::Cell::new(None)};}
+fn current_with(record: &Value, fit: bool) -> Option<Value> {
+    #[cfg(test)]
+    LAST_FIT.with(|last| last.set(Some(fit)));
+    if record["agent"] != "claude"
+        || pause_active(record)
+        || !string(record, "error").is_empty()
+        || !active_phase(record)
+    {
+        return None;
+    }
+    if storage::listing_scope::public(record) {
+        // Defence in depth: the public row must never request a native card.
+        storage::listing_scope::refuse();
+        return None;
+    }
     let live=kimi_tui_choice::identity(record).ok();
     let mut screen=live.as_ref().and_then(|live|kimi_tui_choice::capture(live).ok());
     // A waiting permission hook needs no taller pane; a decision it took or
@@ -834,13 +954,21 @@ pub(super) fn decide_group(record:&Value,question:&Value,answers:&Value) {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hand_over(record:&Value,question:&Value,calls:&[String],waiting:&[String],missing:&[String],
     verdict:&subagents_confirm::Verdict,carry_rule:bool,answered:bool)->Result<()> {
+    hand_over_within(record,question,calls,waiting,missing,verdict,carry_rule,answered,std::time::Duration::from_secs(3))
+}
+
+// Protocol tests can wait for their stand-in hooks without changing the
+// production acknowledgement deadline or the uncertain-delivery contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hand_over_within(record:&Value,question:&Value,calls:&[String],waiting:&[String],missing:&[String],
+    verdict:&subagents_confirm::Verdict,carry_rule:bool,answered:bool,within:std::time::Duration)->Result<()> {
     let carrier=waiting.first().map(String::as_str).filter(|_|carry_rule);
     subagents_confirm::decide(string(record,"conversation_id"),calls,verdict,carrier);
     // After the group's answer: a hook that saw the session allowance first
     // printed a bare allow, without the rule it carries (fork build 97).
     if verdict.remember {let _ = subagents_confirm::allow_session(record);}
     let ends_turn=!verdict.allow&&verdict.message.is_empty();
-    let delivered=answer_channel::batch_delivered(record,waiting,std::time::Duration::from_secs(3),ends_turn)?;
+    let delivered=answer_channel::batch_delivered(record,waiting,within,ends_turn)?;
     if delivered==0&&!answered {
         return Err("delivery uncertain: no subagent's permission hook reported handing the answer over; inspect Terminal before answering again".into());
     }
@@ -1031,6 +1159,31 @@ pub(super) fn reconcile(record:Value)->Value {
     const OUTSIDE:&str="────────────────────────────────────────\n Read outside the working directories\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Read(/home/user/.codex/generated_images/0000aaaa-1111-2222-3333-444455556666/exec-77778888-9999-aaaa-bbbb-cc\n ccddddeeee.png)\n╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n Auto mode and the sandbox read outside the working directories without asking. Yes or No answers for this read; the\n rest is for later reads. Block: the file tools refuse reads outside the working directories in every project.\n\n Allow this read outside the working directories?\n ❯ 1. Yes, and keep allowing any reads outside the working directories\n   2. No, and block reads outside the working directories from now on\n   3. No, and ask again next time\n   4. Yes, but ask again next time\n\n Esc to cancel · Tab to amend\n";
     const PATH:&str="/home/user/.codex/generated_images/0000aaaa-1111-2222-3333-444455556666/exec-77778888-9999-aaaa-bbbb-ccccddddeeee.png";
     const DENIED:&str="❯ Use the tool now.\n\n● Fetch(https://example.com)\n  ⎿  Interrupted · What should Claude do instead?\n\n────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  ⏸ manual mode on · ? for shortcuts\n";
+    #[test]
+    fn listing_negative_requires_a_complete_ordinary_composer() {
+        for screen in [
+            include_str!("../../tests/fixtures/claude-approval-running.txt"),
+            include_str!("../../tests/fixtures/claude-approval-denied.txt"),
+        ] {
+            assert!(public_live_screen(screen));
+        }
+        for screen in [
+            "",
+            "unknown native frame",
+            BASH,
+            WRITE,
+            FETCH,
+            OUTSIDE,
+            "────────────────────────\n❯ \n────────────────────────\nunknown footer",
+            "❯ incomplete\n? for shortcuts",
+            "────────────────────────\n❯ \n────────────────────────\n? for shortcuts\nUnknown menu",
+            "\x1b[0m? for shortcuts",
+        ] {
+            assert!(!public_live_screen(screen), "{screen:?}");
+        }
+        assert!(!public_live_screen(&"x".repeat(512 * 1024 + 1)));
+    }
+
     fn record(tool:&str,input:Value)->Value {
         json!({"agent":"claude","phase":"approval","run_id":"run","conversation_id":"conversation","pending_approval_at":10.0,
             "active_tools":{"toolu_one":{"name":tool}},"pending_approval":{"hook_event_name":"PermissionRequest","tool_name":tool,"tool_input":input}})
@@ -1134,6 +1287,12 @@ pub(super) fn reconcile(record:Value)->Value {
         assert_eq!(q["question_hash"],card(&r,&wrapped.replace("in 2:00,","in 1:59,"))["question_hash"]);
         assert_eq!(q["question_hash"],card(&r,&SAFETY.replace(advisory,""))["question_hash"]);
         assert_ne!(q["question_hash"],card(&r,&SAFETY.replace(advisory,&format!("{advisory} Changed warning")))["question_hash"]);
+        let current_advisory="⚠ Claude Code will automatically block this request in 2:00, to avoid holding up an unattended session";
+        let current=SAFETY.replace(advisory,current_advisory);
+        assert_eq!(q["question_hash"],card(&r,&current)["question_hash"]);
+        assert_eq!(q["question_hash"],card(&r,&current.replace("in 2:00,","in 1:59,"))["question_hash"]);
+        assert!(string(&card(&r,&current)["questions"][0],"body").contains(current_advisory));
+        assert_ne!(q["question_hash"],card(&r,&current.replace("holding up","blocking progress"))["question_hash"]);
         let mut command_panel=parse(SAFETY).unwrap();
         let fence=command_panel.body.iter().rposition(|row|rule(row,'╌')).unwrap();
         command_panel.body.insert(fence,advisory.into());
@@ -1306,9 +1465,75 @@ pub(super) fn reconcile(record:Value)->Value {
             let screen=card(&r,AGENT_PANEL);
             assert_eq!((screen["tool_call_id"].clone(),screen["subagent_confirmation"].clone()),(json!("toolu_one"),json!(true)));
             assert_eq!(screen["subagent_calls"],json!(["toolu_one","toolu_two"]));
+            // #511 N4: the screen card's hash covers the calls its answer
+            // decides: a call that joins the group is a new review, so an
+            // answer to the old card cannot start it unseen.
+            let mut joined=r.clone();
+            joined["active_tools"]["toolu_three"]=json!({"name":"Agent"});
+            subagents_confirm::group_add("conversation","toolu_three",&json!({"subagent_type":"test","description":"Run the suite"}));
+            let grown=card(&joined,AGENT_PANEL);
+            assert_eq!(grown["subagent_calls"],json!(["toolu_one","toolu_two","toolu_three"]));
+            assert_ne!(grown["question_hash"],screen["question_hash"]);
             // Two identical calls stay unbound: no group is decided for them.
             r["claude_tool_uses"]["toolu_two"]["input"]=r["claude_tool_uses"]["toolu_one"]["input"].clone();
             assert!(card(&r,AGENT_PANEL).get("subagent_confirmation").is_none());
+        });
+    }
+
+    /// Task #396 (owner, 2026-11-09): Claude's chooser for one call of a batch
+    /// of three Explore subagents, as its terminal draws it, and the same
+    /// chooser clipped by a short terminal (no top rule or title).
+    const ARENA_PANEL:&str=r"────────────────────────────────────────
+ Agent
+  Explore(Arena participants and spawn events)
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for Agent commands in D:\Work\Arena
+   3. No
+
+ Esc to cancel · Tab to amend
+";
+    const ARENA_CLIPPED:&str=r"  Explore(Arena participants and spawn events)
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for Agent commands in D:\Work\Arena
+   3. No
+
+ Esc to cancel · Tab to amend
+";
+
+    /// Task #396: a three-subagent request read from the screen is a subagent
+    /// card with Claude's own one-time Yes and No (the desktop's Allow all and
+    /// Deny press them); a clipped chooser offers no choices and says why.
+    #[test] fn a_three_subagent_chooser_on_the_screen_is_answerable_and_a_clipped_one_is_not() {
+        let dir=tempfile::tempdir().unwrap();
+        crate::state::with_test_state_root(dir.path(),||{
+            let calls=[("toolu_one","Arena participants and spawn events"),("toolu_two","HUD and Neo widget architecture"),
+                ("toolu_three","Boss presets table and boss BPs")];
+            let first=json!({"subagent_type":"Explore","description":calls[0].1});
+            let mut r=hooked("Agent",first.clone());
+            for (id,description) in calls {
+                let input=json!({"subagent_type":"Explore","description":description});
+                if id!="toolu_one" {
+                    r["active_tools"][id]=json!({"name":"Agent"});
+                    channel::observe(&mut r,&json!({"hook_event_name":"PreToolUse","tool_use_id":id,"tool_name":"Agent","tool_input":input}));
+                    r["claude_tool_uses"][id]["at"]=json!(5.0);
+                }
+                subagents_confirm::group_add("conversation",id,&input);
+            }
+            let screen=card(&r,ARENA_PANEL);
+            assert_eq!(screen["subagent_confirmation"],true);
+            assert_eq!(screen["subagent_calls"],json!(["toolu_one","toolu_two","toolu_three"]));
+            assert_eq!((screen["can_answer"].clone(),screen["approval_choices"].clone()),(json!(true),json!(true)));
+            let labels:Vec<_>=options(&screen).into_iter().map(|(label,scope)|format!("{label}|{scope}")).collect();
+            assert_eq!(labels,vec!["Yes|once".to_owned(),"Yes, and don't ask again for Agent commands in D:\\Work\\Arena|broader".to_owned(),"No|once".to_owned()]);
+            assert!(screen["questions"][0]["question"].as_str().unwrap().starts_with("Start 3 subagents"));
+            // A short terminal clips the panel: nothing to choose, Terminal answers it.
+            let clipped=card(&r,ARENA_CLIPPED);
+            assert_eq!((clipped["can_answer"].clone(),clipped["approval_choices"].clone()),(json!(false),json!(false)));
+            assert_eq!(clipped["questions"][0]["options"],json!([]));
+            assert_eq!(clipped["subagent_confirmation"],true);
+            assert!(string(&clipped,"answer_unavailable_reason").contains("Terminal"));
         });
     }
 
@@ -1603,6 +1828,50 @@ pub(super) fn reconcile(record:Value)->Value {
         assert_eq!(parse(&BASH.replace(" ❯ 1. Yes","   1. Yes").replace("   4. No"," ❯ 4. No")).unwrap().selected,3);
     }
 
+    #[test] fn windows_read_outside_without_a_hook_is_an_answerable_tool_approval() {
+        // The real Windows card at 2026-11-05 17:49:21 (attachment
+        // message-40hhyN/01-Screenshot_2.png) showed this path and these four
+        // options with no PermissionRequest; the fixture keeps that text in
+        // the Windows normal-screen layout.
+        let screen=include_str!("../../tests/fixtures/claude-read-outside-windows.txt");
+        let r=json!({"agent":"claude","phase":"input","run_id":"run","conversation_id":"conversation",
+            "pane":"%1","pid":1,"process_start":"1","attention_started":20.0,"last_event_at":21.0,"active_tools":{}});
+        let q=card(&r,screen);
+        assert_eq!((q["source"].clone(),q["can_answer"].clone(),q["answer_transport"].clone(),q["approval_choices"].clone()),
+            (json!("claude_tool_approval"),json!(true),json!("claude_tui"),json!(true)));
+        assert_eq!(q["questions"][0]["question"],"Allow this read outside the working directories?");
+        assert_eq!(options(&q),[("Yes, and keep allowing any reads outside the working directories","broader"),
+            ("No, and block reads outside the working directories from now on","broader"),
+            ("No, and ask again next time","once"),("Yes, but ask again next time","once")].map(|(l,s)|(l.to_owned(),s.to_owned())));
+        assert!(string(&q["questions"][0],"body").contains("01-Screenshot_2.png"));
+        assert!(string(&q["questions"][0],"body").contains("Read outside the working directories"));
+        assert_eq!(q["screen_only_request"],true);
+        assert!(snapshot(&r,screen).is_some());
+        // The same panel with the waiting hook keeps the existing answerable card.
+        let hooked=record("Read",json!({"file_path":r"C:\Users\example\.local\state\hgs\sessions\attachments\message-40hhyN\01-Screenshot_2.png"}));
+        let hooked=card(&hooked,screen);
+        assert_eq!((hooked["source"].clone(),hooked["can_answer"].clone()),(json!("claude_tool_approval"),json!(true)));
+        assert!(hooked.get("screen_only_request").is_none());
+        // A different question is not this known panel.
+        assert!(native_read_request(&screen.replace("Allow this read outside the working directories?","Do you want to proceed?")).is_none());
+    }
+
+    /// Real captured panels: the card's header carries the hook's tool name,
+    /// which names the automatic-approval category (zerus-sz42x).
+    #[test] fn automatic_approval_categories_read_the_hook_tool_name() {
+        use zerus_client_core::approvals::automatic::{categories,once,Category};
+        for (tool,input,screen,expected) in [
+            ("Bash",json!({"command":"printf hi > out.txt","description":"Write \"hi\" into out.txt without a trailing newline"}),BASH,Category::Shell),
+            ("Read",json!({"file_path":PATH}),OUTSIDE,Category::Read),
+            ("WebFetch",json!({"url":"https://example.com","prompt":"title?"}),FETCH,Category::Web),
+            ("Write",json!({"file_path":"/work/project/new.txt","content":"x"}),WRITE,Category::Edit),
+        ] {
+            let card=card(&record(tool,input),screen);
+            assert!(once("claude",&card).is_some(),"{tool}");
+            assert_eq!(categories::tool("claude",&card).category,expected,"{tool}");
+        }
+    }
+
     #[test] fn mismatched_or_unreadable_panels_stay_visible_for_terminal() {
         let other=card(&record("Read",json!({"file_path":"/home/user/other.png"})),OUTSIDE);
         assert_eq!(other["can_answer"],false);assert!(options(&other).is_empty());
@@ -1877,5 +2146,34 @@ mod hinted_choice_tests {
         assert!(hinted_choice(&SETUP.replace("Enter to confirm · Esc to cancel", "Esc to cancel")).is_none());
         assert!(hinted_choice(&SETUP.replace("   Discard and exit", " ❯ Discard and exit")).is_none());
         assert!(hinted_choice(&SETUP.replace("   Discard and exit\n", "")).is_none());
+    }
+    // Task 2: Claude Code 2.1.318's "Claude in Chrome extension detected"
+    // panel, whose Esc keeps browser tools off.
+    const CHROME: &str = include_str!("../../tests/fixtures/claude-chrome-detected.txt");
+    #[test]
+    fn a_chooser_whose_esc_does_something_else_has_its_options() {
+        let (title, body, options) = hinted_choice(CHROME).unwrap();
+        assert_eq!(title, "Claude in Chrome extension detected");
+        assert!(body.starts_with("Claude will use your Chrome browser by default") && body.ends_with("with /chrome"), "{body}");
+        assert!(!body.contains("use my browser"), "{body}");
+        assert_eq!(options.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["Yes, use my browser", "No, keep browser tools off"]);
+        // After the first turn it is a read-only Terminal card with both options.
+        let record = json!({"agent":"claude","run_id":"run","conversation_id":"conversation","last_event_at":20,"phase":"idle"});
+        let card = choice_card(&record, CHROME, hinted_choice(CHROME).unwrap()).unwrap();
+        assert_eq!((card["source"].clone(), card["can_answer"].clone()), (json!("claude_terminal_choice"), json!(false)));
+        let labels: Vec<_> = card["questions"][0]["options"].as_array().unwrap().iter().map(|option| option["label"].clone()).collect();
+        assert_eq!(labels, [json!("Yes, use my browser"), json!("No, keep browser tools off")]);
+        assert_eq!(card["questions"][0]["question"], "Claude in Chrome extension detected");
+    }
+    #[test]
+    fn only_the_enter_to_confirm_esc_to_hint_marks_this_chooser() {
+        assert!(confirm_hint("Enter to confirm · Esc to cancel") && confirm_hint(" Enter to confirm · Esc to keep browser tools off "));
+        for footer in ["Esc to keep browser tools off", "Enter to confirm · Esc to", "Enter to confirm · Esc to  ",
+            "Enter to select · Esc to cancel", "Enter to confirm · Esc to cancel · Tab to amend",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel", "Press Enter to confirm · Esc to cancel", "Ordinary output"] {
+            assert!(!confirm_hint(footer), "{footer}");
+            let screen = CHROME.replace("Enter to confirm · Esc to keep browser tools off", footer);
+            assert!(hinted_choice(&screen).is_none(), "{footer}");
+        }
     }
 }

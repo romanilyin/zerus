@@ -4,9 +4,10 @@
 //! requests a [`Coalescer`] folds every [`Change`] so that a burst of thousands
 //! of deltas costs one batch with the latest row per key, and its memory stays
 //! bounded by the number of distinct keys.
+use crate::swarm::grouping::{GroupOut, GroupingOut};
 use crate::{
     ActivityUpdate, Change, ComputerId, ComputerStatus, MachineMeta, OrganizationUpdate,
-    ProcessesUpdate, TasksUpdate, ViewRow,
+    ProcessesUpdate, TasksUpdate, TeamsUpdate, ViewRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,11 +49,64 @@ pub struct ComputerOut {
     pub attempt: u32,
 }
 
+/// A computer's restart schedule (see [`crate::Retry`]): `phase` is `idle`,
+/// `waiting` (with `delay_ms` and `remaining_ms`, measured from the
+/// supervisor's own monotonic deadline when this batch was taken) or
+/// `attempting`. `serial` names the wait: a view anchors one countdown per
+/// serial on its own monotonic clock and never restarts it for a resent one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetryOut {
+    pub computer: ComputerId,
+    pub phase: String,
+    #[serde(default)]
+    pub serial: u64,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms: Option<u64>,
+}
+
+impl RetryOut {
+    /// `now` is when the view receives it, for the remaining time.
+    pub fn new(computer: ComputerId, retry: crate::Retry, now: std::time::Instant) -> Self {
+        let mut out = Self {
+            computer,
+            phase: retry.phase().to_owned(),
+            ..Self::default()
+        };
+        match retry {
+            crate::Retry::Idle => {}
+            crate::Retry::Waiting(next) => {
+                out.serial = next.serial;
+                out.attempt = next.attempt;
+                out.delay_ms = Some(next.delay_ms);
+                out.remaining_ms = Some(next.remaining_ms(now));
+            }
+            crate::Retry::Attempting { serial, attempt } => {
+                out.serial = serial;
+                out.attempt = attempt;
+            }
+        }
+        out
+    }
+}
+
 /// One Activity update of a followed session. `kind` and `payload`:
 /// `events` and `replace` carry `{events, cursor}`, `event` `{id, rev, event}`,
 /// `state` `{value, rev}` and `ended` null.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActivityOut {
+    pub computer: ComputerId,
+    pub key: String,
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// One bounded Git folder update. A failure replaces any preceding state.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitOut {
     pub computer: ComputerId,
     pub key: String,
     pub kind: String,
@@ -89,6 +143,19 @@ pub struct TasksOut {
 /// `payload`: `state` carries `{value, digest}` (`value` is `swarm get`'s
 /// object without `versions` and `written`), `failed` `{code, message}` (the
 /// last state stays) and `ended` null.
+/// The latest change of one Teams view of this computer, keyed as
+/// [`crate::teams::model`] says (`list`, `waiting`, `team:<id>`). `kind` and
+/// `payload`: the view's name and its view model, `failed` `{code, message}`
+/// (the view keeps what it showed) or `ended` null (no longer followed). The
+/// payload is the projected view: the webview parses no `hgs` reply.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamsOut {
+    pub computer: ComputerId,
+    pub key: String,
+    pub kind: String,
+    pub payload: Value,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrganizationOut {
     pub computer: ComputerId,
@@ -104,8 +171,10 @@ pub struct MachineOut {
 }
 
 /// Everything that changed since the previous batch. The view applies, in
-/// order: `computers`, `machines`, `replaces`, `removes`, `upserts`,
-/// `activity`, `processes`, `tasks`, then `organizations`. `machines` holds
+/// order: `computers`, `retries`, `machines`, `replaces`, `removes`, `upserts`,
+/// `activity`, `processes`, `tasks`, `organizations`, `teams`, then `groups` and `grouping`. A `replaces`
+/// entry keeps the groups of the keys it keeps: grouping does not resend
+/// unchanged rows after a Replace, so the view must not clear them. `machines` holds
 /// at most one entry per computer and none for a computer whose status became
 /// `ended`; `organizations` holds at most one per computer. Row changes of a computer with a replacement are
 /// already part of it; otherwise a key is in at most one of `removes` and
@@ -113,10 +182,15 @@ pub struct MachineOut {
 /// left out when empty.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git: Vec<GitOut>,
     pub upserts: Vec<RowOut>,
     pub removes: Vec<KeyOut>,
     pub replaces: Vec<ReplaceOut>,
     pub computers: Vec<ComputerOut>,
+    /// Restart schedules, after `computers`; at most one per computer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retries: Vec<RetryOut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub machines: Vec<MachineOut>,
     pub activity: Vec<ActivityOut>,
@@ -126,19 +200,45 @@ pub struct Batch {
     pub tasks: Vec<TasksOut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub organizations: Vec<OrganizationOut>,
+    /// The Teams views that changed, at most one entry per key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<TeamsOut>,
+    /// Each row's project and rank in the Sessions list, for the rows whose
+    /// grouping changed. The Coalescer leaves it empty; the Tauri pump fills
+    /// it from `swarm::grouping` (zerus-5wmh.31).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupOut>,
+    /// The ordered project headers and whether edits can run, when they changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<GroupingOut>,
+    /// Present only for the default-off desktop-service frontend mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_service: Option<crate::desktop::service::Snapshot>,
+    /// Task 235: computers whose rows came from the last session list on
+    /// disk (when it was saved), or `None` once their live listing replaced
+    /// them. The Tauri pump fills it; the Coalescer leaves it empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stale: std::collections::BTreeMap<String, Option<f64>>,
 }
 
 impl Batch {
     pub fn is_empty(&self) -> bool {
         self.upserts.is_empty()
+            && self.git.is_empty()
             && self.removes.is_empty()
             && self.replaces.is_empty()
             && self.computers.is_empty()
+            && self.retries.is_empty()
             && self.machines.is_empty()
             && self.activity.is_empty()
             && self.processes.is_empty()
             && self.tasks.is_empty()
             && self.organizations.is_empty()
+            && self.teams.is_empty()
+            && self.groups.is_empty()
+            && self.grouping.is_none()
+            && self.desktop_service.is_none()
+            && self.stale.is_empty()
     }
 }
 
@@ -172,7 +272,10 @@ type SessionKey = (ComputerId, String);
 /// [`PENDING_EVENTS`] per followed session.
 #[derive(Debug, Default)]
 pub struct Coalescer {
+    git: BTreeMap<SessionKey, crate::GitUpdate>,
+    posters: crate::video_posters::Posters,
     computers: BTreeMap<ComputerId, ComputerStatus>,
+    retries: BTreeMap<ComputerId, crate::Retry>,
     machines: BTreeMap<ComputerId, MachineMeta>,
     replaces: BTreeMap<ComputerId, BTreeMap<String, ViewRow>>,
     rows: BTreeMap<SessionKey, RowChange>,
@@ -182,15 +285,50 @@ pub struct Coalescer {
     processes: BTreeMap<SessionKey, ProcessesUpdate>,
     tasks: BTreeMap<SessionKey, TasksUpdate>,
     organizations: BTreeMap<ComputerId, OrganizationUpdate>,
+    teams: BTreeMap<SessionKey, (TeamsUpdate, std::sync::Arc<Value>)>,
 }
 
 impl Coalescer {
+    /// A retained JPEG only; no hgs call, file read or JSON encoding.
+    pub fn poster(
+        &self,
+        computer: &ComputerId,
+        key: &str,
+        message: &str,
+    ) -> Option<std::sync::Arc<[u8]>> {
+        self.posters.get(computer, key, message)
+    }
+
+    pub fn strip_posters(&mut self, computer: &ComputerId, key: &str, value: &mut Value) {
+        self.posters.strip(computer, key, value);
+    }
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn push(&mut self, change: Change) {
         match change {
+            Change::Git {
+                computer,
+                key,
+                update,
+            } => {
+                if self.git.len() >= crate::git::FOLDERS * 2
+                    && !self.git.contains_key(&(computer.clone(), key.clone()))
+                {
+                    self.git.clear();
+                    // One fixed display invalidation, ordered before named
+                    // folders; rapid viewport churn cannot retain old clean
+                    // states or grow the pending batch indefinitely.
+                    self.git.insert(
+                        (ComputerId::local(), String::new()),
+                        crate::GitUpdate::Unavailable {
+                            code: "git_batch_overflow".into(),
+                        },
+                    );
+                }
+                self.git.insert((computer, key), update);
+            }
             Change::Upsert { computer, key, row } => match self.replaces.get_mut(&computer) {
                 Some(rows) => {
                     rows.insert(key, row);
@@ -226,8 +364,13 @@ impl Coalescer {
             Change::Computer { computer, status } => {
                 if status == ComputerStatus::Ended {
                     self.machines.remove(&computer);
+                    self.retries.remove(&computer);
+                    self.posters.forget(&computer, None);
                 }
                 self.computers.insert(computer, status);
+            }
+            Change::Retry { computer, retry } => {
+                self.retries.insert(computer, retry);
             }
             Change::Machine { computer, machine } => {
                 self.machines.insert(computer, machine);
@@ -281,17 +424,57 @@ impl Coalescer {
                     self.tasks.insert(id, update);
                 }
             }
+            // Task 8: the stream's team heads go to the Teams pollers, never the webview.
+            Change::TeamHeads { .. } => {}
+            // Task #16 (P2.5): the stream's team views go to the pollers too.
+            Change::TeamViews { .. } => {}
+            Change::Teams {
+                computer,
+                key,
+                update,
+                payload,
+            } => {
+                // The latest view of a key wins; a failure never replaces a
+                // pending view.
+                let id = (computer, key);
+                let keep = matches!(update, TeamsUpdate::Failed { .. })
+                    && self
+                        .teams
+                        .get(&id)
+                        .is_some_and(|(shown, _)| shown.is_view());
+                if !keep {
+                    self.teams.insert(id, (update, payload));
+                }
+            }
         }
     }
 
     pub fn take(&mut self) -> Batch {
         let mut batch = Batch::default();
+        for ((computer, key), update) in std::mem::take(&mut self.git) {
+            let (kind, payload) = match update {
+                crate::GitUpdate::State { value, rev } => {
+                    ("state", json!({"value":value,"rev":rev}))
+                }
+                crate::GitUpdate::Unavailable { code } => ("unavailable", json!({"code":code})),
+            };
+            batch.git.push(GitOut {
+                computer,
+                key,
+                kind: kind.into(),
+                payload,
+            });
+        }
         for (computer, status) in std::mem::take(&mut self.computers) {
             batch.computers.push(ComputerOut {
                 computer,
                 status: status.name().to_owned(),
                 attempt: status.attempt(),
             });
+        }
+        let now = std::time::Instant::now();
+        for (computer, retry) in std::mem::take(&mut self.retries) {
+            batch.retries.push(RetryOut::new(computer, retry, now));
         }
         for (computer, machine) in std::mem::take(&mut self.machines) {
             batch.machines.push(MachineOut { computer, machine });
@@ -322,7 +505,20 @@ impl Coalescer {
             let Some(updates) = activity.remove(&id) else {
                 continue;
             };
-            for update in updates {
+            for mut update in updates {
+                match &mut update {
+                    ActivityUpdate::Events { events, .. }
+                    | ActivityUpdate::Older { events, .. }
+                    | ActivityUpdate::Replace { events, .. } => {
+                        for event in events {
+                            self.posters.strip(&id.0, &id.1, event);
+                        }
+                    }
+                    ActivityUpdate::Event { event, .. } => self.posters.strip(&id.0, &id.1, event),
+                    ActivityUpdate::State { value, .. } => self.posters.strip(&id.0, &id.1, value),
+                    ActivityUpdate::Ended => self.posters.forget(&id.0, Some(&id.1)),
+                    ActivityUpdate::Connection { .. } => (),
+                }
                 let (kind, payload) = out(update);
                 batch.activity.push(ActivityOut {
                     computer: id.0.clone(),
@@ -357,11 +553,16 @@ impl Coalescer {
                     damaged,
                     digest,
                     truncated,
-                } => (
-                    "list",
-                    json!({"tasks": tasks, "project": project, "damaged": damaged,
-                           "digest": digest, "truncated": truncated}),
-                ),
+                    window,
+                } => {
+                    let mut payload = json!({"tasks": tasks, "project": project,
+                        "damaged": damaged, "digest": digest, "truncated": truncated});
+                    // Only a windowed list names its window; a whole list keeps its shape.
+                    if !window.is_null() {
+                        payload["window"] = window;
+                    }
+                    ("list", payload)
+                }
                 TasksUpdate::Failed { code, message } => {
                     ("failed", json!({"code": code, "message": message}))
                 }
@@ -390,6 +591,18 @@ impl Coalescer {
                 payload,
             });
         }
+        for ((computer, key), (update, payload)) in std::mem::take(&mut self.teams) {
+            // The model's payload, computed once for its digest (task #9);
+            // shared only when the change was cloned.
+            let payload =
+                std::sync::Arc::try_unwrap(payload).unwrap_or_else(|shared| (*shared).clone());
+            batch.teams.push(TeamsOut {
+                computer,
+                key,
+                kind: update.kind().to_owned(),
+                payload,
+            });
+        }
         batch
     }
 
@@ -404,11 +617,14 @@ impl Coalescer {
                 .flatten()
                 .map(|update| match update {
                     ActivityUpdate::Events { events, .. }
+                    | ActivityUpdate::Older { events, .. }
                     | ActivityUpdate::Replace { events, .. } => events.len().max(1),
                     _ => 1,
                 })
                 .sum();
         self.computers.len()
+            + self.retries.len()
+            + self.git.len()
             + self.machines.len()
             + replaced
             + self.rows.len()
@@ -416,10 +632,13 @@ impl Coalescer {
             + self.processes.len()
             + self.tasks.len()
             + self.organizations.len()
+            + self.teams.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.computers.is_empty()
+            && self.retries.is_empty()
+            && self.git.is_empty()
             && self.machines.is_empty()
             && self.replaces.is_empty()
             && self.rows.is_empty()
@@ -427,20 +646,30 @@ impl Coalescer {
             && self.processes.is_empty()
             && self.tasks.is_empty()
             && self.organizations.is_empty()
+            && self.teams.is_empty()
     }
 }
 
 fn fold(list: &mut Vec<ActivityUpdate>, update: ActivityUpdate) {
-    // Updates before an end belong to the ended subscription.
+    // Transport replacement can restart native revisions. Never fold a new
+    // state backwards across that boundary into an earlier route's position.
     let start = list
         .iter()
-        .rposition(|old| matches!(old, ActivityUpdate::Ended))
+        .rposition(|old| {
+            matches!(
+                old,
+                ActivityUpdate::Ended | ActivityUpdate::Connection { .. }
+            )
+        })
         .map_or(0, |index| index + 1);
     match update {
         ActivityUpdate::Ended => {
             list.clear();
             list.push(ActivityUpdate::Ended);
         }
+        // A page answers one read; it neither merges nor is dropped by the
+        // live window's folding, and keeps its place among the entries.
+        ActivityUpdate::Older { .. } => list.push(update),
         ActivityUpdate::Replace { .. } => {
             let mut index = start;
             while index < list.len() {
@@ -477,6 +706,15 @@ fn fold(list: &mut Vec<ActivityUpdate>, update: ActivityUpdate) {
                 }),
             }
             bound(list);
+        }
+        ActivityUpdate::Connection { .. } => {
+            // Keep transport transitions ordered with the native payloads.
+            // Repeated statuses without data need only their newest value.
+            if matches!(list.last(), Some(ActivityUpdate::Connection { .. })) {
+                *list.last_mut().unwrap() = update;
+            } else {
+                list.push(update);
+            }
         }
         ActivityUpdate::State { .. } => {
             match list[start..]
@@ -532,10 +770,27 @@ fn out(update: ActivityUpdate) -> (&'static str, Value) {
         ActivityUpdate::Replace { events, cursor } => {
             ("replace", json!({"events": events, "cursor": cursor}))
         }
+        ActivityUpdate::Older {
+            events,
+            cursor,
+            last,
+            more,
+        } => (
+            "older",
+            json!({"events": events, "cursor": cursor, "last": last, "more": more}),
+        ),
         ActivityUpdate::Event { id, rev, event } => {
             ("event", json!({"id": id, "rev": rev, "event": event}))
         }
         ActivityUpdate::State { value, rev } => ("state", json!({"value": value, "rev": rev})),
+        ActivityUpdate::Connection {
+            ready,
+            pending,
+            code,
+        } => (
+            "connection",
+            json!({"ready":ready,"pending":pending,"code":code}),
+        ),
         ActivityUpdate::Ended => ("ended", Value::Null),
     }
 }
@@ -760,6 +1015,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_latest_teams_view_wins_and_a_failure_keeps_it() {
+        use crate::teams::view::TeamList;
+        use std::sync::Arc;
+
+        let first = TeamsUpdate::List(Arc::new(TeamList::default()));
+        let second = TeamsUpdate::List(Arc::new(TeamList {
+            truncated: true,
+            ..TeamList::default()
+        }));
+        let failed = TeamsUpdate::Failed {
+            code: "teams_inactive".into(),
+            message: "Teams are off.".into(),
+        };
+        let teams =
+            |key: &str, update: TeamsUpdate| crate::Change::teams(local(), key.to_owned(), update);
+        let mut coalescer = Coalescer::new();
+        coalescer.push(teams("list", first));
+        coalescer.push(teams("list", second));
+        // A failure does not replace a pending view: the tab keeps what it had.
+        coalescer.push(teams("list", failed.clone()));
+        coalescer.push(teams("waiting", failed));
+        assert_eq!(coalescer.pending(), 2);
+        let batch = coalescer.take();
+        let kinds: Vec<_> = batch
+            .teams
+            .iter()
+            .map(|out| (out.key.as_str(), out.kind.as_str()))
+            .collect();
+        assert_eq!(kinds, vec![("list", "list"), ("waiting", "failed")]);
+        assert_eq!(batch.teams[0].payload["truncated"], true);
+        let value = serde_json::to_value(&batch).unwrap();
+        assert_eq!(value["teams"][1]["payload"]["code"], "teams_inactive");
+        assert!(serde_json::to_value(Batch::default())
+            .unwrap()
+            .get("teams")
+            .is_none());
+        // An end of a followed view is the latest word.
+        coalescer.push(crate::Change::teams(
+            local(),
+            "list".to_owned(),
+            TeamsUpdate::Ended,
+        ));
+        let batch = coalescer.take();
+        assert_eq!(batch.teams[0].kind, "ended");
+        assert_eq!(batch.teams[0].payload, Value::Null);
+    }
+
+    #[test]
+    fn the_latest_retry_wins_reports_time_left_and_an_end_drops_it() {
+        let peer = ComputerId::from("studio");
+        let now = std::time::Instant::now();
+        let waiting = |serial: u64| {
+            crate::Retry::Waiting(crate::NextAttempt {
+                serial,
+                attempt: 2,
+                delay_ms: 2000,
+                deadline: now + std::time::Duration::from_secs(2),
+            })
+        };
+        let mut coalescer = Coalescer::new();
+        coalescer.push(Change::Retry {
+            computer: peer.clone(),
+            retry: waiting(1),
+        });
+        coalescer.push(Change::Retry {
+            computer: peer.clone(),
+            retry: waiting(2),
+        });
+        coalescer.push(Change::Retry {
+            computer: local(),
+            retry: crate::Retry::Attempting {
+                serial: 4,
+                attempt: 3,
+            },
+        });
+        assert_eq!(coalescer.pending(), 2);
+        let batch = coalescer.take();
+        assert_eq!(batch.retries.len(), 2);
+        assert_eq!(
+            batch.retries[0],
+            RetryOut {
+                computer: local(),
+                phase: "attempting".into(),
+                serial: 4,
+                attempt: 3,
+                delay_ms: None,
+                remaining_ms: None,
+            }
+        );
+        let wait = &batch.retries[1];
+        assert_eq!((wait.phase.as_str(), wait.serial), ("waiting", 2));
+        assert_eq!(wait.delay_ms, Some(2000));
+        // Measured from the deadline at take time: never more than the delay.
+        assert!(wait
+            .remaining_ms
+            .is_some_and(|left| left <= 2000 && left > 0));
+        let value = serde_json::to_value(&batch).unwrap();
+        assert_eq!(value["retries"][1]["phase"], "waiting");
+        assert!(value["retries"][0].get("remaining_ms").is_none());
+
+        // A computer that ended keeps no schedule behind it.
+        coalescer.push(Change::Retry {
+            computer: peer.clone(),
+            retry: waiting(3),
+        });
+        coalescer.push(Change::Computer {
+            computer: peer,
+            status: ComputerStatus::Ended,
+        });
+        assert!(coalescer.take().retries.is_empty());
+        assert!(serde_json::to_value(Batch::default())
+            .unwrap()
+            .get("retries")
+            .is_none());
+    }
+
     fn kinds(batch: &Batch) -> Vec<(&str, &str)> {
         batch
             .activity
@@ -825,6 +1197,31 @@ mod tests {
             batch.activity[0].payload,
             json!({"events": [{"seq": 10}, {"seq": 11}], "cursor": 11})
         );
+    }
+
+    #[test]
+    fn older_pages_are_never_merged_and_keep_their_order() {
+        let page = |seq: i64, last: bool| ActivityUpdate::Older {
+            events: vec![json!({"seq": seq})],
+            cursor: seq,
+            last,
+            more: last,
+        };
+        let mut coalescer = Coalescer::new();
+        coalescer.push(activity("run:a", page(5, false)));
+        coalescer.push(activity("run:a", events(20..22)));
+        coalescer.push(activity("run:a", page(2, true)));
+        coalescer.push(activity("run:a", events(22..23)));
+        let batch = coalescer.take();
+        assert_eq!(
+            kinds(&batch),
+            vec![("run:a", "older"), ("run:a", "events"), ("run:a", "older")]
+        );
+        assert_eq!(
+            batch.activity[2].payload,
+            json!({"events": [{"seq": 2}], "cursor": 2, "last": true, "more": true})
+        );
+        assert_eq!(batch.activity[1].payload["events"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -972,6 +1369,7 @@ mod tests {
             damaged: json!([]),
             digest: digest.into(),
             truncated: false,
+            window: Value::Null,
         };
         let failed = TasksUpdate::Failed {
             code: "tasks_failed".into(),
@@ -1007,6 +1405,20 @@ mod tests {
         );
         let value = serde_json::to_value(&batch).unwrap();
         assert_eq!(value["tasks"][1]["payload"]["code"], "tasks_failed");
+        let window = json!({"counts": {"todo": 120}, "damaged_total": 0, "revision": "r1",
+            "window": {"schema": 1, "limit": 50, "stages": {}}});
+        coalescer.push(tasks(
+            "p1",
+            TasksUpdate::List {
+                tasks: vec![json!({"text": "d4"})],
+                project: json!({"id": "p1"}),
+                damaged: json!([]),
+                digest: "d4".into(),
+                truncated: false,
+                window: window.clone(),
+            },
+        ));
+        assert_eq!(coalescer.take().tasks[0].payload["window"], window);
         assert!(value.get("processes").is_none());
         assert!(serde_json::to_value(Batch::default())
             .unwrap()
@@ -1128,5 +1540,53 @@ mod tests {
         );
         let back: Batch = serde_json::from_value(value).unwrap();
         assert_eq!(back.computers[0].attempt, 3);
+    }
+
+    #[test]
+    fn groups_and_grouping_are_left_out_when_empty() {
+        let value = serde_json::to_value(Batch::default()).unwrap();
+        assert!(value.get("groups").is_none() && value.get("grouping").is_none());
+        assert!(Batch::default().is_empty());
+        let batch = Batch {
+            groups: vec![crate::GroupOut::default()],
+            ..Batch::default()
+        };
+        assert!(!batch.is_empty());
+    }
+    #[test]
+    fn a_new_transport_state_stays_after_its_revision_reset() {
+        let mut out = Coalescer::new();
+        out.push(activity(
+            "run:a",
+            ActivityUpdate::State {
+                value: json!({"old":true}),
+                rev: 90,
+            },
+        ));
+        out.push(activity(
+            "run:a",
+            ActivityUpdate::Connection {
+                ready: true,
+                pending: false,
+                code: "subscribed".into(),
+            },
+        ));
+        out.push(activity(
+            "run:a",
+            ActivityUpdate::State {
+                value: json!({"new":true}),
+                rev: 1,
+            },
+        ));
+        let batch = out.take();
+        assert_eq!(
+            batch
+                .activity
+                .iter()
+                .map(|a| a.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["state", "connection", "state"]
+        );
+        assert_eq!(batch.activity[2].payload["rev"], 1);
     }
 }

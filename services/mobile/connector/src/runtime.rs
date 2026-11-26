@@ -62,8 +62,14 @@ const LIST_TOO_LARGE: &str = "relay request list exceeds size limit";
 /// closed stderr loses the line; it never stops the connector.
 pub fn log(level: &str, message: &str) {
     use std::io::Write;
+    #[cfg(feature = "test-hooks")]
+    if crate::hooks::write_captured_stderr(level, message) {
+        return;
+    }
     let _ = writeln!(std::io::stderr(), "{level}: {message}");
 }
+
+pub const TASK_EXCHANGE_UNAVAILABLE: &str = "Configured hgs lacks mobile task exchange and digests; phone task sync is unavailable. Point connector.json hgs_path at the maintained hgs, or update the pinned CLI.";
 
 /// A one-shot flag that tasks can wait for.
 #[derive(Default)]
@@ -103,6 +109,8 @@ pub struct State {
     pub attention: HashMap<(String, String, String), Value>,
     pub attention_cursor: usize,
     pub project_cache: Option<Value>,
+    /// Bounded native-only exact ID presence, never a relay schema extension.
+    pub project_memberships: projects::PrimaryMemberships,
     pub project_next_poll: f64,
     pub capabilities_next_poll: f64,
     /// The latest listing's `desktop_presence`, sent beside the snapshot.
@@ -121,6 +129,9 @@ pub struct State {
     pub archive_preview_next: f64,
     /// Archive pairs admitted by a page, read or lookup, with when.
     pub paged_archives: HashMap<(String, String), f64>,
+    /// The listed session ID of each live run in the latest listing
+    /// (`session_selector::index`).
+    pub session_ids: HashMap<String, String>,
 }
 
 impl State {
@@ -151,7 +162,11 @@ pub struct Connector<N: Native> {
     /// One journal for this computer and every peer context.
     pub journal: Rc<Journal>,
     pub settings: Settings,
-    pub flags: Cell<Flags>,
+    pub flags: Rc<Cell<Flags>>,
+    /// A peer context's gateway capabilities: its calls pass the gateway's
+    /// own mobile peer entry point first.
+    gateway_flags: Option<Rc<Cell<Flags>>>,
+    task_exchange_warning_logged: Cell<bool>,
     pub state: RefCell<State>,
     pub snapshot_ready: Event,
     /// The first capability probe has finished (`fleet.probe_complete`).
@@ -168,6 +183,9 @@ pub struct Connector<N: Native> {
 }
 
 tokio::task_local! {
+    /// One immutable current-session route for one claimed request. It never
+    /// propagates into another task or supplies native execution authority.
+    pub(crate) static SESSION_LABEL_SELECTION: Option<crate::session_selector::Selection>;
     /// `LOCAL_MACHINE_GUARD`: while a request routed to this computer runs,
     /// its native calls go through the guarded local entry point.
     static LOCAL_MACHINE: String;
@@ -202,7 +220,9 @@ impl<N: Native + 'static> Connector<N> {
             native,
             journal: Rc::new(journal),
             settings,
-            flags: Cell::new(Flags::default().for_native_platform()),
+            flags: Rc::new(Cell::new(Flags::default().for_native_platform())),
+            gateway_flags: None,
+            task_exchange_warning_logged: Cell::new(false),
             state: RefCell::new(State::fresh()),
             snapshot_ready: Event::default(),
             probed: Event::default(),
@@ -225,7 +245,9 @@ impl<N: Native + 'static> Connector<N> {
                 binding: machine_id.to_owned(),
                 ..self.settings.clone()
             },
-            flags: Cell::new(Flags::default()),
+            flags: Rc::new(Cell::new(Flags::default())),
+            gateway_flags: Some(Rc::clone(&self.flags)),
+            task_exchange_warning_logged: Cell::new(false),
             state: RefCell::new(State::fresh()),
             snapshot_ready: Event::default(),
             probed: Event::default(),
@@ -280,6 +302,27 @@ impl<N: Native + 'static> Connector<N> {
         if self.stopping.is_set() {
             return Err(NativeError::Stopping);
         }
+        if call
+            .argv
+            .get(..2)
+            .is_some_and(|v| v == ["__state", "delivery"])
+        {
+            // This read checks its physical machine inside the closed entry,
+            // using the read-only catalog path. Do not wrap an older executable
+            // in --expect-machine: its old guard could initialize that catalog.
+            let machine = LOCAL_MACHINE
+                .try_with(Clone::clone)
+                .ok()
+                .or_else(|| ENCRYPTED_LOCAL_MACHINE.try_with(Clone::clone).ok());
+            if machine.is_some_and(|m| {
+                call.payload
+                    .as_ref()
+                    .is_none_or(|p| p["expected_machine_id"] != m)
+            }) {
+                return Err(NativeError::Failed(crate::fleet::LOCAL_CHANGED));
+            }
+            return self.native.call(call).await;
+        }
         // WhiteWh fork: a Windows gateway names folders as `/D:/...` to the
         // phone and as `D:\...` to hgs (windows_paths.rs).
         if self.flags.get().windows_gateway && !self.peer {
@@ -307,6 +350,16 @@ impl<N: Native + 'static> Connector<N> {
     }
 
     async fn native_call(&self, mut call: Call) -> NativeResult {
+        if let Some(selected) = SESSION_LABEL_SELECTION
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+        {
+            if let Some(argv) = crate::session_selector::auxiliary_argv(&call.argv, &selected) {
+                call.argv = argv;
+                call = call.selecting(selected);
+            }
+        }
         if self.peer {
             return self.native.call(call).await;
         }
@@ -325,6 +378,100 @@ impl<N: Native + 'static> Connector<N> {
                 .splice(0..0, ["--expect-machine".to_owned(), machine]);
         }
         self.native.call(call).await
+    }
+
+    /// A fresh request can route its auxiliary reads only through the same
+    /// native path that advertises complete label support. No renderer ID or
+    /// label lookup supplies this hint; a missing/ambiguous run stays absent.
+    pub(crate) fn labels_selection(
+        &self,
+        session: &str,
+        payload: Option<&Value>,
+    ) -> Option<crate::session_selector::Selection> {
+        let payload = payload?;
+        if payload.get("archive_id").is_some() || session.is_empty() {
+            return None;
+        }
+        let flags = self.flags.get();
+        let through_peer = self.peer || LOCAL_MACHINE.try_with(|_| ()).is_ok();
+        if !flags.session_labels
+            || !flags.session_selector
+            || (through_peer && !flags.peer_session_id)
+            || self.gateway_flags.as_ref().is_some_and(|f| {
+                let f = f.get();
+                !f.session_labels || !f.peer_session_id
+            })
+        {
+            return None;
+        }
+        let run = payload
+            .get("expected_run_id")
+            .or_else(|| payload.get("run_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?;
+        if payload
+            .get("expected_run_id")
+            .zip(payload.get("run_id"))
+            .is_some_and(|(a, b)| a != b)
+        {
+            return None;
+        }
+        let id = self.state.borrow().session_ids.get(run)?.clone();
+        Some(crate::session_selector::Selection {
+            name: session.into(),
+            id,
+        })
+    }
+
+    /// The session a phone mutation also selects by ID (zerus-ucck P1c-2b):
+    /// the listed session ID of the request's exact run, once every CLI on the
+    /// call's path lists the markers. A call through a mobile peer entry point,
+    /// from a peer context or a request routed to this computer, also needs
+    /// that CLI's [`crate::session_selector::PEER_MARKER`], and a peer's call
+    /// the gateway's as well. Anything else keeps the name form.
+    pub(crate) fn send_outcome_supported(&self) -> bool {
+        self.flags.get().send_outcome
+            && self
+                .gateway_flags
+                .as_ref()
+                .is_none_or(|flags| flags.get().send_outcome)
+    }
+
+    pub(crate) fn send_outcome_encoding(&self) -> &'static str {
+        if self.peer || LOCAL_MACHINE.try_with(|_| ()).is_ok() {
+            "compact"
+        } else {
+            "python_default"
+        }
+    }
+
+    pub fn selection(
+        &self,
+        operation: &str,
+        session: &str,
+        payload: &Value,
+    ) -> Option<crate::session_selector::Selection> {
+        if !crate::session_selector::selects(operation, payload) {
+            return None;
+        }
+        let flags = self.flags.get();
+        let through_peer_entry = self.peer || LOCAL_MACHINE.try_with(|_| ()).is_ok();
+        let gateway = self.gateway_flags.as_ref().map(|gateway| gateway.get());
+        if !flags.session_selector
+            || (through_peer_entry && !flags.peer_session_id)
+            || gateway.is_some_and(|gateway| !gateway.peer_session_id)
+        {
+            return None;
+        }
+        let run = payload
+            .get("expected_run_id")
+            .and_then(Value::as_str)
+            .filter(|run| !run.is_empty())?;
+        let id = self.state.borrow().session_ids.get(run)?.clone();
+        Some(crate::session_selector::Selection {
+            name: session.to_owned(),
+            id,
+        })
     }
 
     /// Runs `future` with this computer's guarded native entry point.
@@ -367,13 +514,21 @@ impl<N: Native + 'static> Connector<N> {
         }
         let mut flags = self.flags.get();
         flags.history_projection = false;
+        flags.send_receipt = false;
+        flags.session_labels = false;
         self.flags.set(flags);
         if let Ok(Output::Text(help)) = self
             .native(Call::new(["--help"]).timeout(PROBE_TIMEOUT).text())
             .await
         {
-            self.flags
-                .set(Flags::from_help(&help).for_native_platform());
+            let flags = Flags::from_help(&help).for_native_platform();
+            if !self.peer
+                && !flags.task_exchange
+                && !self.task_exchange_warning_logged.replace(true)
+            {
+                log("WARNING", TASK_EXCHANGE_UNAVAILABLE);
+            }
+            self.flags.set(flags);
         }
         self.probed.set();
     }
@@ -465,6 +620,8 @@ impl<N: Native + 'static> Connector<N> {
                 .filter_map(|row| row.get("name").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect();
+            state.session_ids =
+                crate::session_selector::index(sessions.iter().filter_map(Value::as_object));
             state.archives = sessions
                 .iter()
                 .filter_map(Value::as_object)
@@ -487,7 +644,10 @@ impl<N: Native + 'static> Connector<N> {
         }
         let mut projects =
             projects.unwrap_or_else(|| projects::unavailable(&self.settings.binding));
-        projects::apply_memberships(&mut sessions, &projects);
+        self.state
+            .borrow()
+            .project_memberships
+            .apply(&mut sessions, &projects);
         if paged {
             // Archive membership is applied to explicit pages; thousands of
             // IDs do not belong in every live-session heartbeat.
@@ -507,6 +667,14 @@ impl<N: Native + 'static> Connector<N> {
             .flags
             .get()
             .advertised_for(self.fleet.is_some(), self.gateway_available());
+        let mut capabilities = capabilities;
+        if !self.send_outcome_supported() {
+            if let Some(operations) = capabilities["operations"].as_array_mut() {
+                operations.retain(|op| {
+                    !matches!(op.as_str(), Some("send_outcome" | "send_outcome_receipt"))
+                });
+            }
+        }
         snapshot.insert("mobile_capabilities".into(), capabilities);
         Ok(Value::Object(snapshot))
     }
@@ -606,8 +774,12 @@ impl<N: Native + 'static> Connector<N> {
         };
         let timeout = self.settings.default_timeout.min(1.0);
         let inspections = selected.iter().map(|key| async move {
-            let detail = self
-                .native(Call::new(["inspect", key.0.as_str()]).timeout(timeout))
+            let selection = self.labels_selection(&key.0, Some(&json!({"expected_run_id":key.1})));
+            let detail = SESSION_LABEL_SELECTION
+                .scope(
+                    selection,
+                    self.native(Call::new(["inspect", key.0.as_str()]).timeout(timeout)),
+                )
                 .await;
             (key, detail)
         });
@@ -634,7 +806,8 @@ impl<N: Native + 'static> Connector<N> {
                 continue;
             };
             if let (Some(cards), Some(row)) = (state.attention.get(&key), row.as_object_mut()) {
-                row.insert("mobile_attention".into(), cards.clone());
+                let merged = merge_attention(row.get("mobile_attention"), cards);
+                row.insert("mobile_attention".into(), merged);
             }
         }
     }
@@ -657,8 +830,23 @@ impl<N: Native + 'static> Connector<N> {
                 .await
                 .ok()
                 .and_then(|native| {
-                    projects::normalize(&native.json(), &snapshot, &self.settings.binding).ok()
+                    let raw = native.json();
+                    if self.flags.get().session_labels
+                        && raw.get("session_id_memberships").is_none()
+                    {
+                        return None;
+                    }
+                    let primary = projects::PrimaryMemberships::read(&raw).ok()?;
+                    let mut catalog = if primary.available() {
+                        projects::normalize(&raw, &snapshot, &self.settings.binding).ok()?
+                    } else {
+                        projects::unavailable(&self.settings.binding)
+                    };
+                    primary.project(&mut catalog);
+                    Some((catalog, primary))
                 });
+            let primary = fresh.as_ref().map(|(_, primary)| primary.clone());
+            let mut fresh = fresh.take().map(|(catalog, _)| catalog);
             // Each project's phone-view digest; a failed read leaves them out.
             let digests = |catalog: &&mut Value| {
                 self.flags.get().task_exchange && catalog["available"] == json!(true)
@@ -670,6 +858,11 @@ impl<N: Native + 'static> Connector<N> {
                 }
             }
             let mut state = self.state.borrow_mut();
+            if let Some(primary) = primary {
+                state.project_memberships = primary;
+            } else if self.flags.get().session_labels {
+                state.project_memberships = projects::PrimaryMemberships::Unavailable;
+            }
             let cache = match fresh {
                 Some(fresh) => fresh,
                 None => {
@@ -1169,6 +1362,7 @@ fn native_text(error: NativeError) -> String {
         NativeError::Failed(text) => text.into(),
         NativeError::Unicode => crate::execute::GENERIC.into(),
         NativeError::Stopping => crate::journal::RESTART_ERROR.into(),
+        NativeError::SessionChanged => crate::session_selector::CHANGED.into(),
     }
 }
 
@@ -1229,6 +1423,67 @@ fn attention_cards(detail: &Value, key: &(String, String, String)) -> Option<Val
             })
             .collect(),
     ))
+}
+
+/// The connector's question cards, after the row's own Zerus alerts (task 95:
+/// a stalled lead's `team_lead_stall` item on the lead's row; task 97: an
+/// `owner_deferred` request of the owner queue; task 113: a member's raised
+/// `team_terminal_prompt`). Only those alerts are kept:
+/// every other row item is the cards' to replace.
+fn merge_attention(row: Option<&Value>, cards: &Value) -> Value {
+    let mut merged: Vec<Value> = row
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item.get("kind").and_then(Value::as_str),
+                Some("team_lead_stall" | "owner_deferred" | "team_terminal_prompt")
+            )
+        })
+        .cloned()
+        .collect();
+    merged.extend(cards.as_array().into_iter().flatten().cloned());
+    Value::Array(merged)
+}
+
+#[cfg(test)]
+mod attention_merge_tests {
+    use super::*;
+
+    #[test]
+    fn a_team_alert_on_the_row_survives_the_question_cards() {
+        let alert = json!({"question_id":"team-lead-stall:t:2","question_hash":"h","kind":"team_lead_stall"});
+        let stale = json!({"question_id":"old","question_hash":"o"});
+        let cards = json!([{"question_id":"q1","question_hash":"h1"}]);
+        let merged = merge_attention(Some(&json!([alert.clone(), stale])), &cards);
+        assert_eq!(
+            merged,
+            json!([alert, {"question_id":"q1","question_hash":"h1"}])
+        );
+        // Task 97: a deferred request of the owner queue is kept as well.
+        let deferred =
+            json!({"question_id":"owner-deferred:ab","question_hash":"d","kind":"owner_deferred"});
+        assert_eq!(
+            merge_attention(Some(&json!([deferred.clone()])), &cards),
+            json!([deferred, {"question_id":"q1","question_hash":"h1"}])
+        );
+        // Task 113: a member's Terminal-only prompt raised on the lead's row.
+        let prompt = json!({"question_id":"team-terminal-prompt:t:m:q","question_hash":"p","kind":"team_terminal_prompt"});
+        assert_eq!(
+            merge_attention(Some(&json!([prompt.clone()])), &cards),
+            json!([prompt, {"question_id":"q1","question_hash":"h1"}])
+        );
+        // Without a team alert the cards replace the row's items, as before.
+        assert_eq!(
+            merge_attention(
+                Some(&json!([{"question_id":"old","question_hash":"o"}])),
+                &cards
+            ),
+            cards
+        );
+        assert_eq!(merge_attention(None, &cards), cards);
+    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1572,84 @@ mod encrypted_machine_tests {
             })
             .await
             .expect("The one queued account refresh must finish");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn label_reads_need_every_cli_marker_and_one_unambiguous_original_run() {
+        use crate::session_selector::{LABELS_MARKER, PEER_MARKER, SELECTOR_MARKER};
+        let f = Fixture::new();
+        let name = "codex/example/labels";
+        let id = "11111111-1111-4111-8111-111111111111";
+        f.connector
+            .state
+            .borrow_mut()
+            .session_ids
+            .insert("run".into(), id.into());
+        let payload = json!({"expected_run_id":"run"});
+        let flags = |markers: &[&str]| crate::capabilities::Flags::from_help(&markers.join("\n"));
+        let all = [LABELS_MARKER, SELECTOR_MARKER, PEER_MARKER];
+        for (markers, expected) in [(&all[..], true), (&all[..2], false), (&all[1..], false)] {
+            f.connector.flags.set(flags(markers));
+            let selection = Connector::<NativeFixture>::guarded(MACHINE.into(), async {
+                f.connector.labels_selection(name, Some(&payload))
+            })
+            .await;
+            assert_eq!(selection.is_some(), expected, "{markers:?}");
+        }
+        f.connector.flags.set(flags(&all[..2]));
+        assert_eq!(
+            f.connector
+                .labels_selection(name, Some(&payload))
+                .unwrap()
+                .id,
+            id
+        );
+        assert!(f
+            .connector
+            .labels_selection(
+                name,
+                Some(&json!({"expected_run_id":"run","run_id":"other"}))
+            )
+            .is_none());
+        assert!(f
+            .connector
+            .labels_selection(
+                name,
+                Some(&json!({"expected_run_id":"run","archive_id":"old"}))
+            )
+            .is_none());
+        assert!(f
+            .connector
+            .labels_selection(name, Some(&json!({"expected_run_id":"unlisted"})))
+            .is_none());
+        let fleet = f.connector.fleet.as_ref().unwrap();
+        let peer = f.connector.peer_context(
+            MACHINE,
+            crate::fleet::PeerNative {
+                gateway: fleet.gateway.clone(),
+                routes: fleet.routes.clone(),
+                slots: fleet.slots.clone(),
+                identity: "peer".into(),
+                machine: MACHINE.into(),
+                default_timeout: 1.0,
+            },
+        );
+        peer.state
+            .borrow_mut()
+            .session_ids
+            .insert("run".into(), id.into());
+        for (gateway, own, expected) in [
+            (&all[..], &all[..], true),
+            (&all[1..], &all[..], false),
+            (&all[..], &all[..2], false),
+        ] {
+            f.connector.flags.set(flags(gateway));
+            peer.flags.set(flags(own));
+            assert_eq!(
+                peer.labels_selection(name, Some(&payload)).is_some(),
+                expected
+            );
         }
     }
 

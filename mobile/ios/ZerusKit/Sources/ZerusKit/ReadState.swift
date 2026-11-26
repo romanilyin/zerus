@@ -5,11 +5,24 @@ public struct SavedConversationViewport: Codable, Hashable, Sendable {
     public var offset: Int
     public var cursor: String
     public var epoch: String
-    public init(eventId: String, offset: Int, cursor: String = "", epoch: String = "") {
+    public var following: Bool
+    public init(eventId: String, offset: Int, cursor: String = "", epoch: String = "", following: Bool = false) {
         self.eventId = eventId
         self.offset = offset
         self.cursor = cursor
         self.epoch = epoch
+        self.following = following
+    }
+
+    private enum CodingKeys: String, CodingKey { case eventId, offset, cursor, epoch, following }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        eventId = try values.decode(String.self, forKey: .eventId)
+        offset = try values.decode(Int.self, forKey: .offset)
+        cursor = try values.decode(String.self, forKey: .cursor)
+        epoch = try values.decode(String.self, forKey: .epoch)
+        // Existing saved positions represented deliberate reading locations.
+        following = try values.decodeIfPresent(Bool.self, forKey: .following) ?? false
     }
 }
 
@@ -114,15 +127,15 @@ public struct ConversationReadState: Codable, Hashable, Sendable {
         guard let old = record(target) else { return self }
         var next = viewed(target, Set(aliases.filter { old.seen.contains($0.key) }.values))
         if let anchor = old.viewport, let alias = aliases[anchor.eventId] {
-            next = next.viewport(target, eventId: alias, offset: anchor.offset, cursor: anchor.cursor, epoch: anchor.epoch)
+            next = next.viewport(target, eventId: alias, offset: anchor.offset, cursor: anchor.cursor, epoch: anchor.epoch, following: anchor.following)
         }
         return next
     }
 
-    public func viewport(_ target: Target, eventId: String, offset: Int, cursor: String = "", epoch: String = "") -> ConversationReadState {
+    public func viewport(_ target: Target, eventId: String, offset: Int, cursor: String = "", epoch: String = "", following: Bool = false) -> ConversationReadState {
         if eventId.isEmpty || eventId.count > 2048 || offset < 0 || cursor.count > 8192 || epoch.count > 512 { return self }
         var previous = record(target) ?? ConversationReadRecord(target: target)
-        previous.viewport = SavedConversationViewport(eventId: eventId, offset: offset, cursor: cursor, epoch: epoch)
+        previous.viewport = SavedConversationViewport(eventId: eventId, offset: offset, cursor: cursor, epoch: epoch, following: following)
         previous.established = true
         return put(previous)
     }
@@ -176,8 +189,10 @@ public enum ConversationReadPolicies {
         JSON([target.connectionId, target.computerId, target.session, target.conversation, target.archiveId, target.agentId, target.parentConversation]).compact
     }
 
+    /// A fork's inherited reply is its source's: never incoming, so never unread here.
     public static func incoming(_ event: Event) -> Bool {
-        ["AgentMessage", "Stop"].contains(event.nativeType) && event.role != "You" && event.role != "You (answer)" && event.outgoingId.isEmpty
+        ["AgentMessage", "Stop"].contains(event.nativeType) && event.role != "You" && event.role != "You (answer)" && event.outgoingId.isEmpty &&
+            (event.inheritedFrom ?? "").isEmpty
     }
 
     /// Canonical order proves the incoming prefix before a visible message position, including an own row.
@@ -186,7 +201,7 @@ public enum ConversationReadPolicies {
         if epoch.isEmpty { return incomingVisible }
         func canonical(_ row: Event) -> Bool { row.historyEpoch == epoch && !row.historyId.isEmpty && !row.historyCursor.isEmpty }
         func position(_ row: Event) -> Bool {
-            incoming(row) || ["You", "You (answer)"].contains(row.role) &&
+            incoming(row) || (row.inheritedFrom ?? "").isEmpty && ["You", "You (answer)"].contains(row.role) &&
                 ["UserPromptSubmit", "UserPromptQueued", "UserMessage", "TurnStarted", "QuestionAnswered"].contains(row.nativeType)
         }
         let positions = visible.filter { canonical($0) && position($0) }.compactMap { shown -> Int? in
@@ -446,7 +461,139 @@ public final class HistoryHeadScheduler {
 
 /// Read marks shared through the session's computer (`mark_read`). The computer applies a
 /// field only while it is current, so marks never hide newer work.
+/// An open conversation's `current_read` (`hgs inspect --current-read`): the reply and attention its computer would
+/// accept now, from the same inspection this phone displays (zerus-a4mub.9).
+public struct CurrentRead: Equatable, Sendable {
+    public let reply: String?
+    public let attention: String?
+    public let attentionComplete: Bool
+    public init(reply: String?, attention: String?, attentionComplete: Bool) {
+        self.reply = reply
+        self.attention = attention
+        self.attentionComplete = attentionComplete
+    }
+}
+
+/// What one settled viewport showed for the shared current acknowledgement (zerus-a4mub.9): the tail sentinel, the
+/// newest displayed event row and the questions item.
+public struct CurrentReadFlags: Equatable, Sendable {
+    public let tail: Bool
+    public let newest: Bool
+    public let questions: Bool
+    public init(tail: Bool = false, newest: Bool = false, questions: Bool = false) {
+        self.tail = tail
+        self.newest = newest
+        self.questions = questions
+    }
+}
+
+/// The conversation list's visible item ids mapped to reading inputs.
+public enum ConversationReadViewport {
+    /// One listed item of a settled viewport: its key, top offset and height in the viewport's coordinates (points).
+    public struct Item: Equatable, Sendable {
+        public let key: String
+        public let offset: Double
+        public let size: Double
+        public init(key: String, offset: Double, size: Double) {
+            self.key = key
+            self.offset = offset
+            self.size = size
+        }
+    }
+
+    /// The readable part of an item (points; dp on Android): about one line of body text with its padding.
+    public static let readableHeight: Double = 48
+    /// Layout rounding every comparison tolerates.
+    private static let rounding = 0.5
+
+    /// Whether `item` counts as shown in the viewport from `start` to `end`, after the settled dwell, for both the
+    /// canonical read and the current flags (zerus-a4mub.31). Android applies the same rule to the same shared layouts
+    /// (mobile/fixtures/current-read.json): the part inside the viewport is at least min(its height, `readable`, the
+    /// viewport height). A short item must be wholly visible; a taller one, however tall, needs its readable part.
+    /// The 1-point tail sentinel counts when it starts inside the viewport and ends at most 2 points past it.
+    public static func shows(_ item: Item, start: Double, end: Double, readable: Double = readableHeight) -> Bool {
+        if item.key == "history:tail" {
+            return item.offset + rounding >= start && item.offset + item.size <= end + 2 + rounding
+        }
+        let visible = min(item.offset + item.size, end) - max(item.offset, start)
+        return visible > 0 && visible + rounding >= min(item.size, readable, end - start)
+    }
+
+    /// The keys of the items `shows` counts, top to bottom.
+    public static func visible(_ items: [Item], start: Double, end: Double, readable: Double = readableHeight) -> [String] {
+        items.filter { shows($0, start: start, end: end, readable: readable) }.sorted { $0.offset < $1.offset }.map(\.key)
+    }
+
+    /// The event ids among the visible item ids (`event:` keys).
+    public static func eventIds(_ visible: [String]) -> Set<String> {
+        Set(visible.filter { $0.hasPrefix("event:") }.map { String($0.dropFirst(6)) })
+    }
+
+    /// The current acknowledgement flags of one settled viewport: the tail sentinel, the newest displayed event row
+    /// (`newestId`, empty when the latest messages are not shown) and the questions item among the visible ids.
+    public static func flags(visible: [String], newestId: String) -> CurrentReadFlags {
+        CurrentReadFlags(tail: visible.contains("history:tail"), newest: !newestId.isEmpty && eventIds(visible).contains(newestId),
+                         questions: visible.contains("history:questions"))
+    }
+}
+
 public enum SharedReadPolicies {
+    private static let currentKeys: Set<String> = ["schema", "run_id", "conversation_id", "reply_id", "attention_signature", "attention_complete"]
+
+    private static func signature(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
+    }
+
+    /// The verified open inspection's `current_read` when it names exactly `target`: schema 1, exactly the native
+    /// fields, and the target's and the inspection's own run and conversation. Nil for archives, subagents, cached
+    /// frames, older computers or anything malformed; nothing is repaired.
+    public static func current(_ raw: JSONObject?, target: Target, verified: Bool) -> CurrentRead? {
+        guard verified, let raw, target.archiveId.isEmpty, target.agentId.isEmpty, !target.run.isEmpty, !target.conversation.isEmpty,
+              raw["run_id"] == .string(target.run), raw["conversation_id"] == .string(target.conversation),
+              let value = raw.object("current_read"), Set(value.keys) == currentKeys, value["schema"] == .int(1),
+              value["run_id"] == .string(target.run), value["conversation_id"] == .string(target.conversation),
+              case .bool(let complete)? = value["attention_complete"] else { return nil }
+        let reply: String?
+        switch value["reply_id"] {
+        case .null?: reply = nil
+        case .string(let text)? where !text.isEmpty && text.utf16.count <= 256 && !text.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }):
+            reply = text
+        default: return nil
+        }
+        let attention: String?
+        switch value["attention_signature"] {
+        case .null?: attention = nil
+        case .string(let text)? where signature(text): attention = text
+        default: return nil
+        }
+        return CurrentRead(reply: reply, attention: attention, attentionComplete: complete)
+    }
+
+    /// What one settled viewport of the open conversation showed of its current inspection: the reply when it shows
+    /// the latest messages and the tail or the newest displayed row was visible; the attention when the listed
+    /// questions were visible or, without questions, when the reply was shown.
+    public static func currentShown(latest: Bool, questionsListed: Bool, flags: CurrentReadFlags) -> (reply: Bool, attention: Bool) {
+        let reply = latest && (flags.tail || flags.newest)
+        return (reply, latest && (questionsListed ? flags.questions : reply))
+    }
+
+    /// The `mark_read` the open conversation may send for `current`: its reply once the conversation's tail or newest
+    /// row stayed visible, its attention once complete and its presentation stayed visible. Values the computer already
+    /// has are left out; nil when nothing is new. This never moves the phone's private read position, which only
+    /// canonical history can advance.
+    public static func currentPayload(_ row: Session?, target: Target, current: CurrentRead, replyShown: Bool,
+                                      attentionShown: Bool) -> JSONObject? {
+        if let row, SessionFilters.archived(row) { return nil }
+        let read = row.flatMap(mark)
+        let reply = current.reply.flatMap { replyShown && read?.string("reply_id") != $0 ? $0 : nil }
+        let attention = current.attention.flatMap {
+            attentionShown && current.attentionComplete && read?.string("attention_signature") != $0 ? $0 : nil
+        }
+        if reply == nil && attention == nil { return nil }
+        return ["run_id": .string(target.run), "conversation_id": .string(target.conversation),
+                "reply_id": reply.map(JSON.string) ?? .null, "attention_signature": attention.map(JSON.string) ?? .null]
+    }
+
     public static func mark(_ row: Session) -> JSONObject? {
         guard let read = row.raw.object("read"), !row.target.conversation.isEmpty, read.string("conversation_id") == row.target.conversation else { return nil }
         return read
@@ -543,7 +690,7 @@ public enum UnreadPresentation {
     /// The first reading position: remembered or saved place, else the unread divider, else the newest message.
     /// A missing saved position never silently drops the reader at the newest message.
     public static func opening(memory: ConversationAnchor?, saved: SavedConversationViewport?, boundary: String, keys: [String]) -> Opening {
-        let remembered = memory.flatMap { $0.following ? nil : $0 } ?? saved.map { ConversationAnchor(itemKey: "event:" + $0.eventId, offset: $0.offset, following: false) }
+        let remembered = memory.flatMap { $0.following ? nil : $0 } ?? saved.flatMap { $0.following ? nil : ConversationAnchor(itemKey: "event:" + $0.eventId, offset: $0.offset, following: false) }
         if let remembered, keys.contains(remembered.itemKey) { return Opening(anchor: remembered, unavailableSaved: false) }
         if !boundary.isEmpty && keys.contains("history:unread") {
             return Opening(anchor: ConversationAnchor(itemKey: "history:unread", offset: 0, following: false), unavailableSaved: remembered != nil)

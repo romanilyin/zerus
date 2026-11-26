@@ -27,6 +27,168 @@ const TASK: &str = "0b9d6c55-2f5e-4c39-9a51-0d6f3c2a7e11";
 const EXCHANGE: [&str; 3] = ["task", "exchange", "--json"];
 const DIGESTS: [&str; 3] = ["task", "digests", "--json"];
 
+fn cli_image(path: &std::path::Path, tasks: bool, digest: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let help = if tasks { MARKER } else { "Usage: hgs\n" }.replace('\'', "'\\''");
+    let commands = if tasks {
+        format!(
+            "'task digests --json') echo '{{\"schema\":1,\"projects\":{{\"project-1\":{{\"digest\":\"{digest}\"}}}}}}';;\n\
+             'task exchange --json') cat >/dev/null; echo '{{\"schema\":1,\"imported\":0,\"refused\":[],\"updates\":[],\"more\":false,\"digest\":\"{digest}\"}}';;"
+        )
+    } else {
+        String::new()
+    };
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\ncase \"$*\" in\n--help) printf '%s' '{help}';;\n{commands}\n*) exit 2;;\nesac\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn configured_native(scratch: &Scratch, path: &std::path::Path) -> native::Process {
+    let (value, _) = zerus_mobile_connector::workspace_cli::read_config(path).unwrap();
+    let parsed = zerus_mobile_connector::config::parse(&value.to_string()).unwrap();
+    let config = zerus_mobile_connector::config::validate(
+        &parsed,
+        false,
+        &zerus_mobile_connector::config::Environment {
+            home: Some(scratch.path("home")),
+            cwd: scratch.root.clone(),
+        },
+    )
+    .unwrap();
+    native::Process::new(config.hgs_path, native::DEFAULT_TIMEOUT)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn maintained_cli_upgrades_keep_task_exchange_without_overriding_custom_pins() {
+    let scratch = Scratch::new("configured-cli");
+    let pinned = scratch.path("home/.local/share/zerus-mobile/bin/hgs");
+    let maintained = scratch.path("home/.local/bin/hgs");
+    cli_image(&pinned, false, "");
+    cli_image(&maintained, true, &"ab".repeat(32));
+    let original_pinned = std::fs::read(&pinned).unwrap();
+    let path = scratch.path("connector.json");
+    let original = json!({"server_url":"https://relay.example.test","node_token":"synthetic-node-token",
+        "hgs_path":pinned,"state_dir":scratch.path("receipts"),"extension":{"keep":true}});
+    let revision =
+        zerus_mobile_connector::workspace_cli::replace_config(&path, "", &original).unwrap();
+    let pinned_process = configured_native(&scratch, &path);
+    let help = pinned_process
+        .call(Call::new(["--help"]).text())
+        .await
+        .unwrap();
+    assert!(!Flags::from_help(help.json().as_str().unwrap()).task_exchange);
+    assert!(pinned_process.call(Call::new(DIGESTS)).await.is_err());
+
+    // The documented explicit repair changes only the executable selection.
+    // Runtime selection itself must never replace an intentionally pinned CLI.
+    let mut repaired = original.clone();
+    repaired["hgs_path"] = json!(maintained);
+    zerus_mobile_connector::workspace_cli::replace_config(&path, &revision, &repaired).unwrap();
+    let saved_bytes = std::fs::read(&path).unwrap();
+    let process = configured_native(&scratch, &path);
+    for (next_image, digest) in [(false, "ab".repeat(32)), (true, "cd".repeat(32))] {
+        if next_image {
+            let staged = maintained.with_extension("new");
+            cli_image(&staged, true, &digest);
+            std::fs::rename(staged, &maintained).unwrap();
+        }
+        let help = process.call(Call::new(["--help"]).text()).await.unwrap();
+        assert!(Flags::from_help(help.json().as_str().unwrap()).task_exchange);
+        assert_eq!(
+            process.call(Call::new(DIGESTS)).await.unwrap().json()["projects"]["project-1"]
+                ["digest"],
+            digest
+        );
+        assert_eq!(
+            process
+                .call(Call::new(EXCHANGE).payload(
+                    json!({"schema":1,"project":"project-1","inventory":{"project":{},"tasks":{}}})
+                ))
+                .await
+                .unwrap()
+                .json()["digest"],
+            digest
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+        assert_eq!(std::fs::read(&pinned).unwrap(), original_pinned);
+        assert!(pinned_process.call(Call::new(DIGESTS)).await.is_err());
+    }
+    assert_eq!(
+        zerus_mobile_connector::workspace_cli::read_config(&path)
+            .unwrap()
+            .0,
+        repaired
+    );
+    assert!(
+        !scratch.path("receipts").exists(),
+        "selection must not open or reset the journal"
+    );
+}
+
+#[test]
+fn a_missing_task_exchange_warns_once_but_failed_or_supported_probes_do_not() {
+    const CHILD: &str = "ZERUS_TEST_CONFIGURED_CLI_WARNING";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let scratch = Scratch::new("configured-cli-warning");
+        let cli = scratch.path("hgs");
+        cli_image(&cli, mode == "supported", &"ab".repeat(32));
+        if mode == "failed" {
+            std::fs::write(&cli, "#!/bin/sh\nexit 2\n").unwrap();
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let journal = Journal::open(&scratch.path("state"), "fixture-binding", EPOCH).unwrap();
+            let connector = Connector::new(
+                native::Process::new(cli.to_string_lossy().into_owned(), native::DEFAULT_TIMEOUT),
+                journal,
+                Settings {
+                    interval: 5.0,
+                    binding: "fixture-binding".into(),
+                    default_timeout: native::DEFAULT_TIMEOUT,
+                    clock_scale: 1.0,
+                },
+                Box::new(|| EPOCH),
+            );
+            for _ in 0..3 {
+                connector.state.borrow_mut().capabilities_next_poll = 0.0;
+                connector.probe_capabilities().await;
+                assert_eq!(connector.flags.get().task_exchange, mode == "supported");
+            }
+        });
+        return;
+    }
+    for (mode, warnings) in [("missing", 1), ("supported", 0), ("failed", 0)] {
+        let output = captured(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "a_missing_task_exchange_warns_once_but_failed_or_supported_probes_do_not",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .matches(zerus_mobile_connector::runtime::TASK_EXCHANGE_UNAVAILABLE)
+                .count(),
+            warnings,
+            "{mode}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct Scripted {
     answers: RefCell<HashMap<Vec<String>, Value>>,
@@ -193,6 +355,29 @@ async fn task_exchange_runs_hgs_with_its_payload() {
     );
     assert_eq!(harness.calls(&EXCHANGE), [Some(request())]);
     assert_eq!(harness.journal(), [json!([id, "completed"])]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_done_fetch_uses_the_existing_empty_version_and_keeps_validation_strict() {
+    let harness = Harness::new("task-done-fetch", true);
+    harness.answer(&EXCHANGE, answer());
+    let mut fetch = request();
+    fetch["inventory"]["tasks"][TASK] = json!({});
+    assert_eq!(
+        harness
+            .exchange("7d2c4e8a-1b3f-4a5c-9d6e-0f1a2b3c4d60", "", fetch.clone())
+            .await["state"],
+        "completed"
+    );
+    assert_eq!(harness.calls(&EXCHANGE), [Some(fetch.clone())]);
+    fetch["shallow"] = json!(true);
+    assert_eq!(
+        harness
+            .exchange("7d2c4e8a-1b3f-4a5c-9d6e-0f1a2b3c4d61", "", fetch)
+            .await["state"],
+        "failed"
+    );
+    assert_eq!(harness.calls(&EXCHANGE).len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -379,6 +564,101 @@ fn actions() -> Harness {
     Harness::with_help("task-actions", help() + MARKER + ACTIONS)
 }
 
+const IDENTITY: &str = "Mobile task identity ABI: task-session-identity-v2";
+
+#[test]
+fn task_identity_is_advertised_only_by_the_exact_native_marker_and_task_operations() {
+    let supports = |help: String, windows: bool| {
+        let flags = Flags::from_help(&help);
+        let flags = if windows {
+            flags.windows_local()
+        } else {
+            flags
+        };
+        flags.advertised(true)["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("task_session_identity_v2"))
+    };
+    assert!(supports(format!("{ACTIONS}\n{IDENTITY}\n"), false));
+    for help in [
+        ACTIONS.to_owned(),
+        IDENTITY.to_owned(),
+        format!("{ACTIONS}\n{IDENTITY}-extra\n"),
+        format!("{ACTIONS}\nnot {IDENTITY}\n"),
+    ] {
+        assert!(!supports(help, false));
+    }
+    assert!(!supports(format!("{ACTIONS}\n{IDENTITY}\n"), true));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task_identity_is_forwarded_once_without_a_legacy_retry() {
+    let harness = Harness::with_help(
+        "task-identity",
+        format!("{}{MARKER}{ACTIONS}\n{IDENTITY}\n", help()),
+    );
+    let payload = json!({"schema":2,"project":"project-1","task":TASK,
+        "session":"codex/stale-label","session_id":"launch_id:original"});
+    let id = "7d2c4e8a-1b3f-4a5c-9d6e-0f1a2b3c8d01";
+    // A known native refusal must stay a refusal. No rewritten schema-1 send.
+    harness.answer(
+        &SEND,
+        json!({"schema":1,"ok":false,"error":"selected session is gone"}),
+    );
+    assert_eq!(
+        harness.finished("task_send", id, payload.clone()).await["state"],
+        "failed"
+    );
+    assert_eq!(harness.calls(&SEND), [Some(payload.clone())]);
+    assert_eq!(
+        harness.execute("task_send", id, "", payload.clone()).await,
+        Outcome::Replayed
+    );
+    assert_eq!(harness.calls(&SEND).len(), 1);
+    // With no native answer the result is unknown, and that identity still runs once.
+    let unknown = Harness::with_help(
+        "task-identity-unknown",
+        format!("{}{ACTIONS}\n{IDENTITY}\n", help()),
+    );
+    assert_eq!(
+        unknown.finished("task_send", id, payload.clone()).await["state"],
+        "uncertain"
+    );
+    assert_eq!(
+        unknown.execute("task_send", id, "", payload.clone()).await,
+        Outcome::Replayed
+    );
+    assert_eq!(unknown.calls(&SEND), [Some(payload.clone())]);
+    // An older native host is refused before spawning a task action.
+    let old = actions();
+    let refused = old.finished("task_send", id, payload).await;
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(
+        refused["error"],
+        "native task session identity ABI is unavailable"
+    );
+    assert!(old.calls(&SEND).is_empty());
+    // The read path preserves the same exact filter, including a stale label.
+    let filter = json!({"schema":2,"project":"project-1","limit":50,
+        "session":{"machine":"node-1","session":"codex/stale-label","session_id":"launch_id:original"}});
+    harness.answer(
+        &DONE,
+        json!({"schema":1,"tasks":[],"next":null,"total":0,"recent":0}),
+    );
+    assert_eq!(
+        harness
+            .finished(
+                "task_done",
+                "7d2c4e8a-1b3f-4a5c-9d6e-0f1a2b3c8d02",
+                filter.clone()
+            )
+            .await["state"],
+        "completed"
+    );
+    assert_eq!(harness.calls(&DONE), [Some(filter)]);
+}
+
 #[test]
 fn the_task_actions_are_advertised_only_with_their_marker() {
     let ops = |help: String| -> Vec<String> {
@@ -526,4 +806,51 @@ async fn a_done_page_is_a_short_read() {
     assert!(journal
         .claim("d", "task_done", Some("hash"), EPOCH + 121.0)
         .unwrap());
+}
+
+#[test]
+fn task_media_uploads_need_the_exact_native_marker_and_an_offered_exchange() {
+    const UPLOAD: &str = "Mobile task media ABI: task-media-upload-v1";
+    let supports = |help: String, windows: bool| {
+        let flags = Flags::from_help(&help);
+        let flags = if windows {
+            flags.windows_local()
+        } else {
+            flags
+        };
+        flags.advertised(true)["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("task_media_upload_v1"))
+    };
+    assert!(supports(format!("{MARKER}{UPLOAD}\n"), false));
+    for help in [
+        MARKER.to_owned(),
+        UPLOAD.to_owned(),
+        format!("{MARKER}{UPLOAD}-extra\n"),
+        format!("{MARKER}not {UPLOAD}\n"),
+    ] {
+        assert!(!supports(help, false));
+    }
+    assert!(!supports(format!("{MARKER}{UPLOAD}\n"), true));
+}
+
+#[test]
+fn admitted_edit_marker_needs_exchange_and_never_grants_plain_or_windows_advertisement() {
+    const EDIT: &str = "Mobile task edit ABI: task-admitted-edit-v1";
+    let flags = Flags::from_help(&format!("{MARKER}{EDIT}\n"));
+    assert!(flags.task_admitted_edit);
+    assert!(!flags.advertised(true)["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("task_admitted_edit_v1")));
+    for help in [
+        MARKER.to_owned(),
+        EDIT.to_owned(),
+        format!("{MARKER}{EDIT}-extra\n"),
+        format!("{MARKER}not {EDIT}\n"),
+    ] {
+        assert!(!Flags::from_help(&help).task_admitted_edit);
+    }
+    assert!(!flags.windows_local().task_admitted_edit);
 }

@@ -67,9 +67,12 @@ object SessionDetailsPresentation {
         else -> effort.replaceFirstChar { it.uppercase() }
     }
 
-    fun parse(raw: JSONObject?, target: Target, verified: Boolean): SessionDetailsView {
+    fun parse(raw: JSONObject?, target: Target, verified: Boolean, now: Double = System.currentTimeMillis() / 1000.0): SessionDetailsView {
         val record = raw ?: JSONObject()
         val recorded = !verified || target.archiveId.isNotBlank()
+        val recordedAgents = recorded || record.string("state").ifBlank { "running" } != "running" ||
+            record.string("process_state") == "exited" || record.string("activity") == "unknown" ||
+            record.string("conversation_state") == "ended" && record.string("activity") != "idle"
         val fields = buildList {
             add(ContextDetail("Session", target.session))
             SessionReference.identifiers(target).forEach { identifier ->
@@ -81,6 +84,7 @@ object SessionDetailsPresentation {
             }
             add(ContextDetail("Process", record.string("process_state").ifBlank { "Not reported" }))
             add(ContextDetail("Activity", record.string("activity").ifBlank { "Not reported" }))
+            if (target.archiveId.isBlank()) addAll(KeepWarmPresentation.fields(record, now))
             record.string("error").takeIf { it.isNotBlank() }?.let { add(ContextDetail("Native error", it)) }
         }
         val goalRaw = record.optJSONObject("goal")
@@ -115,7 +119,7 @@ object SessionDetailsPresentation {
             if (groups) emptyList() else record.optJSONArray("subagent_previews")?.objects().orEmpty().mapNotNull { child -> child.string("id","agent_id").takeIf { it.isNotBlank() }?.let { it to child } }
         }
         val agents = rows.map { (id,child) -> DetailAgent(id,child.string("label","name","profile").ifBlank { id }, child.string("display_state","state").ifBlank { "unknown" },
-            child.string("task","description"),child.string("preview","last_message"),groups,recorded || child.string("run_id").let { it.isNotBlank() && it != target.run },
+            child.string("task","description"),child.string("preview","last_message"),groups,recordedAgents || child.string("run_id").let { it.isNotBlank() && it != target.run },
             numeric(child,"active_count"),numeric(child,"total_count")) }
         val processesRaw = record.optJSONObject("processes") ?: JSONObject()
         val processes = processesRaw.optJSONArray("items")?.objects().orEmpty().map { process ->
@@ -129,9 +133,10 @@ object SessionDetailsPresentation {
             processes,strings(processesRaw.optJSONArray("notes")),processesRaw.optBoolean("complete"),processesRaw.string("generation").ifBlank { record.string("generation") },recorded)
     }
     fun taskStatus(status: String) = when(status) { "completed" -> "Done"; "in_progress" -> "In progress"; "pending" -> "Planned"; else -> status.ifBlank { "Unknown" } }
-    fun agentStatus(status: String) = when(status) {
+    fun agentActive(agent: DetailAgent, current: Boolean): Long? = if (agent.recorded || !current) 0L else agent.active
+    fun agentStatus(status: String, recorded: Boolean = false) = if (recorded) "Recorded" else when(status) {
         "finished","ready","idle" -> "Ready"; "working","running","busy" -> "Working"; "approval" -> "Needs approval"; "input" -> "Needs input"
-        "attention" -> "Needs attention"; "error","failed" -> "Error"; "completed" -> "Finished"; "stopped" -> "Stopped"; "paused" -> "Paused"; else -> status.ifBlank { "Unknown" }
+        "attention" -> "Needs attention"; "error","failed" -> "Error"; "completed" -> "Finished"; "stopped" -> "Stopped"; "paused" -> "Paused"; "ended" -> "Ended"; "unknown" -> "Unknown"; else -> status.ifBlank { "Unknown" }
     }
     fun goalStatus(goal: JSONObject) = when(goal.string("status")) {
         "active" -> if(goal.string("activation") == "disarmed") "Goal waiting to resume" else "Pursuing goal"

@@ -5,8 +5,9 @@
 //! may start the server runs in a scope of its own when hgs runs in a user unit
 //! (`scope`); it still spawns that same `tmux` command.
 use super::{
-    ClientExit, ClientRow, DryRun, InputClaim, InputState, Key, LaunchSpec, Listing, PaneField,
-    PaneInfo, PanePath, PaneRow, Paste, SessionRow, StageErrors, Target, TerminalBackend,
+    ClientExit, ClientRow, DryRun, InputClaim, InputState, Key, LaunchSpec, Launched, Listing,
+    PaneField, PaneInfo, PanePath, PaneRow, Paste, SessionRow, StageErrors, Target,
+    TerminalBackend, TerminalState,
 };
 use crate::cli::{Error, Result as CliResult};
 use crate::platform;
@@ -26,7 +27,36 @@ pub(crate) struct Tmux;
 /// `tmux ARGS` with captured output. With `check`, a failure becomes tmux's own
 /// message, or "tmux command failed" when it printed none.
 fn tmux(args: &[String], check: bool) -> Result<Output> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::state::effort::picker_entered() {
+        return crate::state::effort::picker_refuse(
+            "Unowned tmux call refused in original Effort keeper".into(),
+        );
+    }
     checked(Command::new("tmux").args(args).output(), check)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn picker(call: crate::state::effort::PickerRead, args: &[String], check: bool) -> Result<Output> {
+    if let Some(output) = crate::state::effort::picker_helper_read(call, args) {
+        return output
+            .and_then(|output| checked(Ok(output), check))
+            .or_else(crate::state::effort::picker_refuse);
+    }
+    tmux(args, check)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn picker_ps(args: &[String]) -> Result<Output> {
+    if let Some(output) =
+        crate::state::effort::picker_helper_read(crate::state::effort::PickerRead::ProcessTty, args)
+    {
+        return output;
+    }
+    Command::new("ps")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())
 }
 
 /// Run tmux `args`, a command that may start the server, with `run`. Where that
@@ -40,14 +70,30 @@ fn starting<T>(
 ) -> T {
     #[cfg(target_os = "linux")]
     if let Some(scope) = scope::Scope::new(|| Tmux.server_running()) {
-        let result = run(&mut scope.command(args));
+        let result = run(without_session_context(&mut scope.command(args)));
         if scope.started() || !rerun(&result) {
             return result;
         }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = rerun;
-    run(Command::new("tmux").args(args))
+    run(without_session_context(Command::new("tmux").args(args)))
+}
+
+/// A server keeps the environment of the client that started it as the
+/// global environment of every pane, so a command that may start one leaves
+/// out the session and agent it runs in (zerus-01sz8): a launch sets again
+/// what its own session needs. `TMUX` stays, as it selects the server. A
+/// running server takes none of these from a `new-session` client.
+fn without_session_context(command: &mut Command) -> &mut Command {
+    for name in super::host::SESSION_CONTEXT
+        .iter()
+        .chain(super::AGENT_COMMAND_CONTEXT)
+        .filter(|name| **name != "TMUX")
+    {
+        command.env_remove(name);
+    }
+    command
 }
 
 fn checked(output: io::Result<Output>, check: bool) -> Result<Output> {
@@ -65,6 +111,19 @@ fn checked(output: io::Result<Output>, check: bool) -> Result<Output> {
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_owned()).collect()
+}
+
+/// Multiple arguments use tmux's direct exec path, even for one program. Its
+/// command parser still consumes a final semicolon unless escaped once here.
+fn direct_command(mut arguments: Vec<String>, command: &[String]) -> Vec<String> {
+    arguments.extend(owned(&["--", "/usr/bin/env", "--"]));
+    arguments.extend(command.iter().cloned());
+    for argument in &mut arguments {
+        if argument.ends_with(';') {
+            argument.insert(argument.len() - 1, '\\');
+        }
+    }
+    arguments
 }
 
 /// The `-t` operand of a session command.
@@ -87,6 +146,12 @@ fn field_format(field: PaneField) -> &'static str {
     match field {
         PaneField::SessionId => "#{session_id}",
         PaneField::SessionName => "#{session_name}",
+        PaneField::SocketPath => "#{socket_path}",
+        PaneField::SessionCreated => "#{session_created}",
+        PaneField::SessionWindows => "#{session_windows}",
+        PaneField::SessionGrouped => "#{session_grouped}",
+        PaneField::WindowPanes => "#{window_panes}",
+        PaneField::WindowLinked => "#{window_linked}",
         PaneField::PaneId => "#{pane_id}",
         PaneField::ServerPid => "#{pid}",
         PaneField::PanePid => "#{pane_pid}",
@@ -112,7 +177,103 @@ fn format(fields: &[PaneField]) -> String {
         .join("\t")
 }
 
-fn pane_info_args(target: Target, fields: &[PaneField]) -> Vec<String> {
+/// What `new-session -P` prints of the terminal it created: the server's pid
+/// and start time, the pane, and the pane's process (zerus-5sl7r). The
+/// fields are separated by a colon, which none of them holds: a client whose
+/// locale is not UTF-8 gets a tab as `_`.
+const LAUNCHED: &str = "#{pid}:#{start_time}:#{pane_id}:#{pane_pid}";
+/// What one observation reads of a pane `-t %N` names: the answering server's
+/// pid and start time, the pane it resolved (empty when it has none: tmux
+/// then still answers, with no pane), whether its command ended, and its
+/// process (empty once it ended).
+const OBSERVED: &str = "#{pid}:#{start_time}:#{pane_id}:#{pane_dead}:#{pane_pid}";
+
+/// The terminal `new-session -P -F LAUNCHED` reports, when it reports one;
+/// the launched process's birth is read separately ([`child_birth`]).
+fn launched(stdout: &[u8]) -> Option<Launched> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut fields = text.trim_end_matches(['\n', '\r']).split(':');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some(pid), Some(start), Some(pane), Some(process), None)
+            if !pid.is_empty() && !start.is_empty() && pane.starts_with('%') =>
+        {
+            Some(Launched {
+                server: format!("{pid}:{start}"),
+                pane: pane.into(),
+                process: process.parse().ok().filter(|&process| process > 0)?,
+                birth: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The kernel birth of `process` when it is a child of the tmux server
+/// `server` (a pane's process is the server's child), else None.
+fn child_birth(process: u32, server: &str) -> Option<String> {
+    let server: u32 = server.split(':').next()?.parse().ok()?;
+    platform::process_identity(process)
+        .filter(|identity| identity.parent == server)
+        .map(|identity| identity.birth)
+}
+
+/// What tmux's answer to `display-message -p -t %N OBSERVED` proves of the
+/// terminal `launched` names (zerus-5sl7r); `birth` reads a process's kernel
+/// birth now. Only the server that created the pane (same pid and start time)
+/// says anything: a server at that socket path with another identity (one
+/// started there while the original runs on), a refused or missing socket, a
+/// failed program or a signal proves nothing. That server answers a pane it
+/// has no longer with an empty pane, and never gives its id to another pane
+/// while it runs. A live pane is the launch only while it runs the launched
+/// process (same pid and kernel birth); another process there (`respawn-pane`)
+/// is [`TerminalState::Replaced`], and one whose birth cannot be read proves
+/// nothing.
+fn observed_state(
+    launched: &Launched,
+    status: Option<i32>,
+    stdout: &[u8],
+    birth: impl Fn(u32) -> Option<String>,
+) -> TerminalState {
+    if status != Some(0) {
+        return TerminalState::Unknown;
+    }
+    let text = String::from_utf8_lossy(stdout);
+    let mut fields = text.trim_end_matches(['\n', '\r']).split(':');
+    let (Some(pid), Some(start), Some(pane), Some(dead), Some(process), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return TerminalState::Unknown;
+    };
+    if pid.is_empty() || format!("{pid}:{start}") != launched.server {
+        return TerminalState::Unknown;
+    }
+    if pane != launched.pane {
+        return TerminalState::Absent;
+    }
+    match dead {
+        "1" => TerminalState::DeadPane,
+        "0" if process != launched.process.to_string() => TerminalState::Replaced,
+        "0" => match (birth(launched.process), &launched.birth) {
+            (Some(now), Some(then)) if &now == then => TerminalState::Alive,
+            (Some(_), Some(_)) => TerminalState::Replaced,
+            _ => TerminalState::Unknown,
+        },
+        _ => TerminalState::Unknown,
+    }
+}
+
+pub(in crate::state) fn pane_info_args(target: Target, fields: &[PaneField]) -> Vec<String> {
     vec![
         "display-message".into(),
         "-p".into(),
@@ -172,7 +333,13 @@ fn start_args(spec: &LaunchSpec) -> Vec<String> {
     for value in &spec.env {
         arguments.extend(["-e".into(), value.clone()]);
     }
-    arguments.push(crate::state::join_command(&spec.command));
+    direct_command(arguments, &spec.command)
+}
+
+/// [`start_args`] that also print the terminal created ([`LAUNCHED`]).
+fn start_observed_args(spec: &LaunchSpec) -> Vec<String> {
+    let mut arguments = start_args(spec);
+    arguments.splice(2..2, owned(&["-P", "-F", LAUNCHED]));
     arguments
 }
 
@@ -190,9 +357,8 @@ fn launch_args(spec: &LaunchSpec) -> Vec<String> {
         spec.name.clone(),
         "-c".into(),
         spec.cwd.clone(),
-        platform::join(&spec.command),
     ]);
-    arguments
+    direct_command(arguments, &spec.command)
 }
 
 /// Foreground programs that mean a shell, not the agent, reads the pane's input.
@@ -212,6 +378,81 @@ impl Tmux {
             false
         }
     }
+}
+
+/// The unchanged native input check with explicit fixed read callbacks.
+/// A scoped owner can retain its exact helper Children without changing the
+/// process-wide backend or installing a persistent routing flag.
+pub(in crate::state) fn input_state_using(
+    claim: &InputClaim,
+    pane_info: impl FnOnce(&[PaneField]) -> Result<PaneInfo>,
+    process: impl FnOnce(&[String]) -> Result<Output>,
+) -> Result<InputState> {
+    let info = pane_info(
+        &[
+            PaneField::Tty,
+            PaneField::CursorX,
+            PaneField::CursorY,
+            PaneField::InMode,
+            PaneField::CurrentCommand,
+            PaneField::Dead,
+            PaneField::RunMarker,
+            PaneField::SessionName,
+            PaneField::BracketedPaste,
+        ],
+    )?;
+    let fields = info.fields();
+    if fields.len() != 9
+        || fields[3] != "0"
+        || fields[5] != "0"
+        || fields[6] != claim.run_id
+        || fields[7] != claim.name
+        || fields[8] != "1"
+    {
+        return Err("terminal is not in the expected agent input mode; open Terminal".into());
+    }
+    let tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(fields[0])
+        .map_err(|e| e.to_string())?;
+    let pid = claim.pid.ok_or("missing agent process")? as i32;
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut attributes) } != 0
+        || attributes.c_lflag & (libc::ICANON | libc::ECHO) != 0
+    {
+        return Err("agent does not own an interactive input terminal; open Terminal".into());
+    }
+    // Ensure the pinned process is attached to this tty, not just a PID sharing a group.
+    let tty_output = process(&owned(&[
+        "-p",
+        &pid.to_string(),
+        "-o",
+        "tty=,pgid=,tpgid=,comm=",
+    ]))?;
+    let tty_text = String::from_utf8_lossy(&tty_output.stdout);
+    let process_fields: Vec<_> = tty_text.split_whitespace().collect();
+    if process_fields.len() < 4
+        || process_fields[0] != fields[0].trim_start_matches("/dev/")
+        || process_fields[1] != process_fields[2]
+        || !process_fields[2].parse::<i32>().is_ok_and(|id| id > 0)
+    {
+        return Err("tracked agent is not attached to the selected terminal".into());
+    }
+    if SHELLS.contains(&fields[4])
+        && !(claim.agent == "kimi"
+            && Path::new(process_fields[3])
+                .file_name()
+                .is_some_and(|name| name == "kimi"))
+    {
+        return Err("terminal is not in the expected agent input mode; open Terminal".into());
+    }
+    Ok(InputState {
+        cursor_x: fields[1].into(),
+        cursor_y: fields[2].into(),
+    })
+
 }
 
 impl TerminalBackend for Tmux {
@@ -271,6 +512,23 @@ impl TerminalBackend for Tmux {
         // tmux reports a failed listing as no sessions, as hgs always has.
         Ok(Listing { clients, sessions })
     }
+    fn last_client_input(&self, name: &str) -> Option<Option<f64>> {
+        let target = format!("={name}");
+        let output = tmux(
+            &owned(&["list-clients", "-t", &target, "-F", "#{client_activity}"]),
+            false,
+        )
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut latest = None;
+        for row in String::from_utf8_lossy(&output.stdout).lines() {
+            let at = row.trim().parse::<f64>().ok()?;
+            latest = Some(latest.map_or(at, |seen: f64| seen.max(at)));
+        }
+        Some(latest)
+    }
     fn attached_counts(&self) -> Result<Option<Vec<(String, String)>>> {
         let Some(rows) = platform::capture(
             "tmux",
@@ -287,7 +545,8 @@ impl TerminalBackend for Tmux {
         ))
     }
     fn panes(&self) -> Result<Vec<PaneRow>> {
-        let output = tmux(
+        let output = picker(
+            crate::state::effort::PickerRead::Panes,
             &owned(&[
                 "list-panes",
                 "-a",
@@ -338,8 +597,28 @@ impl TerminalBackend for Tmux {
     fn session_exists(&self, name: &str) -> bool {
         platform::silent("tmux", &["has-session", "-t", &format!("={name}")])
     }
+    /// One `display-message` of the launched pane, bounded by `wait` and read
+    /// in the C locale; a late observation is killed and unknown
+    /// ([`observed_state`]).
+    fn terminal_state(&self, launched: &Launched, wait: std::time::Duration) -> TerminalState {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if crate::state::effort::picker_entered() {
+            return TerminalState::Unknown;
+        }
+        let arguments = owned(&["display-message", "-p", "-t", &launched.pane, OBSERVED]);
+        match platform::output_until(
+            Command::new("tmux").args(&arguments).env("LC_ALL", "C"),
+            wait,
+        ) {
+            Ok(answer) => observed_state(launched, answer.status.code(), &answer.stdout, |pid| {
+                platform::process_identity(pid).map(|identity| identity.birth)
+            }),
+            Err(_) => TerminalState::Unknown,
+        }
+    }
     fn session_name(&self, id: &str) -> Result<Option<String>> {
-        let output = tmux(
+        let output = picker(
+            crate::state::effort::PickerRead::SessionName,
             &owned(&["display-message", "-p", "-t", id, "#{session_name}"]),
             false,
         )?;
@@ -349,19 +628,52 @@ impl TerminalBackend for Tmux {
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
     }
     fn pane_info(&self, target: Target, fields: &[PaneField]) -> Result<PaneInfo> {
-        let output = tmux(&pane_info_args(target, fields), true)?;
+        let output = picker(
+            crate::state::effort::PickerRead::PaneInfo,
+            &pane_info_args(target, fields),
+            true,
+        )?;
         Ok(PaneInfo::new(
             String::from_utf8_lossy(&output.stdout).into_owned(),
         ))
     }
     fn probe(&self, target: Target, fields: &[PaneField]) -> Option<PaneInfo> {
         let arguments = pane_info_args(target, fields);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if crate::state::effort::picker_entered() {
+            let output = picker(crate::state::effort::PickerRead::Probe, &arguments, false).ok()?;
+            return output
+                .status
+                .success()
+                .then(|| PaneInfo::new(String::from_utf8_lossy(&output.stdout).trim().into()));
+        }
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         platform::capture("tmux", &arguments).map(PaneInfo::new)
     }
     fn start(&self, spec: &LaunchSpec) -> Result<()> {
+        if spec.command.is_empty() {
+            return Err("Session launch needs a program".into());
+        }
+        // Fork and relaunch submit a runner recipe naming this image; a unit
+        // test image must not hand itself to tmux with production arguments.
+        crate::self_exec::ensure().map_err(|e| e.to_string())?;
         let output = starting(&start_args(spec), Command::output, |_| true);
         checked(output, true).map(drop)
+    }
+    fn start_observed(&self, spec: &LaunchSpec) -> Result<Option<Launched>> {
+        if spec.command.is_empty() {
+            return Err("Session launch needs a program".into());
+        }
+        crate::self_exec::ensure().map_err(|e| e.to_string())?;
+        let output = starting(&start_observed_args(spec), Command::output, |_| true);
+        // The launched process's birth, read now: a process that already
+        // ended, or is no child of that server, leaves it unknown.
+        checked(output, true).map(|output| {
+            launched(&output.stdout).map(|mut launched| {
+                launched.birth = child_birth(launched.process, &launched.server);
+                launched
+            })
+        })
     }
     fn set_run_marker(&self, name: &str, run_id: &str) -> Result<()> {
         tmux(
@@ -385,75 +697,10 @@ impl TerminalBackend for Tmux {
     }
 
     fn input_state(&self, claim: &InputClaim) -> Result<InputState> {
-        let info = self.pane_info(
-            Target::Pane(claim.pane),
-            &[
-                PaneField::Tty,
-                PaneField::CursorX,
-                PaneField::CursorY,
-                PaneField::InMode,
-                PaneField::CurrentCommand,
-                PaneField::Dead,
-                PaneField::RunMarker,
-                PaneField::SessionName,
-                PaneField::BracketedPaste,
-            ],
-        )?;
-        let fields = info.fields();
-        if fields.len() != 9
-            || fields[3] != "0"
-            || fields[5] != "0"
-            || fields[6] != claim.run_id
-            || fields[7] != claim.name
-            || fields[8] != "1"
-        {
-            return Err("terminal is not in the expected agent input mode; open Terminal".into());
-        }
-        let tty = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(fields[0])
-            .map_err(|e| e.to_string())?;
-        let pid = claim.pid.ok_or("missing agent process")? as i32;
-        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut attributes) } != 0
-            || attributes.c_lflag & (libc::ICANON | libc::ECHO) != 0
-        {
-            return Err("agent does not own an interactive input terminal; open Terminal".into());
-        }
-        // Ensure the pinned process is attached to this tty, not just a PID sharing a group.
-        let tty_output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "tty=,pgid=,tpgid=,comm="])
-            .output()
-            .map_err(|e| e.to_string())?;
-        let tty_text = String::from_utf8_lossy(&tty_output.stdout);
-        let process_fields: Vec<_> = tty_text.split_whitespace().collect();
-        if process_fields.len() < 4
-            || process_fields[0] != fields[0].trim_start_matches("/dev/")
-            || process_fields[1] != process_fields[2]
-            || !process_fields[2].parse::<i32>().is_ok_and(|id| id > 0)
-        {
-            return Err("tracked agent is not attached to the selected terminal".into());
-        }
-        if SHELLS.contains(&fields[4])
-            && !(claim.agent == "kimi"
-                && Path::new(process_fields[3])
-                    .file_name()
-                    .is_some_and(|name| name == "kimi"))
-        {
-            return Err("terminal is not in the expected agent input mode; open Terminal".into());
-        }
-        Ok(InputState {
-            cursor_x: fields[1].into(),
-            cursor_y: fields[2].into(),
-        })
+        input_state_using(claim, |fields| self.pane_info(Target::Pane(claim.pane), fields), picker_ps)
     }
     fn on_terminal(&self, pid: &str, tty: &str) -> Result<bool> {
-        let output = Command::new("ps")
-            .args(["-p", pid, "-o", "tty="])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let output = picker_ps(&owned(&["-p", pid, "-o", "tty="]))?;
         Ok(output.status.success()
             && !tty.is_empty()
             && String::from_utf8_lossy(&output.stdout).trim() == tty.trim_start_matches("/dev/"))
@@ -463,7 +710,15 @@ impl TerminalBackend for Tmux {
             super::Capture::Plain => owned(&["capture-pane", "-p", "-t", pane]),
             super::Capture::Styled => owned(&["capture-pane", "-p", "-e", "-t", pane]),
         };
-        Ok(tmux(&arguments, true)?.stdout)
+        Ok(picker(
+            match mode {
+                super::Capture::Plain => crate::state::effort::PickerRead::CapturePlain,
+                super::Capture::Styled => crate::state::effort::PickerRead::CaptureStyled,
+            },
+            &arguments,
+            true,
+        )?
+        .stdout)
     }
     fn grow_unviewed(&self, pane: &str, rows: u16) -> Result<bool> {
         let size = tmux(
@@ -501,21 +756,26 @@ impl TerminalBackend for Tmux {
         resized.map(|_| true)
     }
     fn send(&self, pane: &str, keys: &[Key]) -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if crate::state::effort::picker_entered() && keys.len() != 1 {
+            return crate::state::effort::picker_refuse(
+                "Effort key batch is not a single trusted choice".into(),
+            );
+        }
         for arguments in send_args(pane, keys) {
-            tmux(&arguments, true)?;
+            picker(crate::state::effort::PickerRead::Keys, &arguments, true)?;
         }
         Ok(())
     }
     fn stage(&self, buffer: &str, text: &[u8], errors: StageErrors) -> Result<bool> {
-        let mut loader = Command::new("tmux")
+        let mut loader = zerus_client_core::child_environment::spawn(Command::new("tmux")
             .args(["load-buffer", "-b", buffer, "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(match errors {
                 StageErrors::Read => Stdio::piped(),
                 StageErrors::Discard => Stdio::null(),
-            })
-            .spawn()
+            }))
             .map_err(|e| e.to_string())?;
         let written = match loader.stdin.take() {
             Some(mut stdin) => stdin.write_all(text),
@@ -535,6 +795,10 @@ impl TerminalBackend for Tmux {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> CliResult<ClientExit> {
+        if spec.command.is_empty() {
+            return Err(Error::new(1, "Session launch needs a program"));
+        }
+        crate::self_exec::ensure().map_err(|e| Error::new(1, e.to_string()))?;
         let arguments = launch_args(spec);
         if spec.detached {
             let code = platform::code(starting(&arguments, Command::status, |_| true)?);
@@ -641,6 +905,20 @@ impl TerminalBackend for Tmux {
         let line = environment.trim_end_matches('\n');
         line.strip_prefix("HGS_CLIENT=").unwrap_or(line).to_owned()
     }
+    fn session_variable(&self, name: &str, key: &str) -> Result<Option<String>> {
+        // The session's whole environment: a listing that succeeds and lacks
+        // the key proves it unset, which a failed lookup of the key alone
+        // could not tell from an unreadable terminal.
+        let listing =
+            platform::capture("tmux", &["show-environment", "-t", &format!("={name}")])
+                .ok_or_else(|| format!("{name}: the terminal's environment cannot be read"))?;
+        let prefix = format!("{key}=");
+        Ok(listing
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
     fn notify(&self, client: &str, text: &str) {
         platform::silent(
             "tmux",
@@ -656,8 +934,11 @@ impl TerminalBackend for Tmux {
         match operation {
             DryRun::ListJson => "tmux list-clients -F \"#{client_session}\\t#{client_tty}\"\ntmux list-sessions -F \"#{session_name}\\t#{session_attached}\\t#{session_created}\\t#{session_id}\\t#{HGS_LAUNCH_ID}\"".into(),
             DryRun::List => "tmux list-sessions".into(),
+            // Every word as the shell reads it: a session name is free text (zerus-sa9qn.38).
             DryRun::Attach { session, client } => format!(
-                "tmux set-environment -t ={session} HGS_CLIENT {client}\ntmux -u attach-session -t ={session}"
+                "tmux set-environment -t {target} HGS_CLIENT {client}\ntmux -u attach-session -t {target}",
+                target = platform::quote(&format!("={session}")),
+                client = platform::quote(client)
             ),
             DryRun::AttachExisting { session, run_id } => format!(
                 "tmux attach existing session {}{}",
@@ -666,23 +947,27 @@ impl TerminalBackend for Tmux {
                     .map(|id| format!(" (run {})", platform::quote(id)))
                     .unwrap_or_default()
             ),
-            DryRun::Kill { session } => format!("tmux kill-session -t ={session}"),
+            DryRun::Kill { session } => format!(
+                "tmux kill-session -t {}",
+                platform::quote(&format!("={session}"))
+            ),
             DryRun::Launch(spec) => format!(
                 "tmux -u new-session {}{} -s {} -c {} -- {}",
                 if spec.detached { "-d " } else { "" },
                 spec.env
                     .iter()
-                    .map(|v| format!("-e {v}"))
+                    .map(|v| format!("-e {}", platform::quote(&super::masked(v))))
                     .collect::<Vec<_>>()
                     .join(" "),
-                spec.name,
-                spec.cwd,
+                platform::quote(&spec.name),
+                platform::quote(&spec.cwd),
                 platform::join(&spec.command)
             ),
+            // `quote`'s words, which fish also reads exactly (zerus-sa9qn.43).
             DryRun::Start(spec) => {
-                let mut display = vec!["tmux".into()];
+                let mut display = vec!["tmux".to_owned()];
                 display.extend(start_args(spec));
-                crate::state::join_command(&display)
+                platform::join(&display)
             }
         }
     }
@@ -692,6 +977,257 @@ impl TerminalBackend for Tmux {
 mod tests {
     use super::super::PaneField::*;
     use super::*;
+
+    /// zerus-5sl7r: only the server that created the pane, by its pid and
+    /// start time, says anything of it, and a live pane is the launch only
+    /// while it runs the launched process (pid and kernel birth). Another
+    /// server at the same socket path, a missing or refused socket and every
+    /// other failure are unknown; a pane respawned with another process is
+    /// replaced. The answers are tmux 3.8's own, read from private servers
+    /// (the review's respawn included).
+    #[test]
+    fn only_the_creating_server_says_its_pane_is_gone() {
+        use TerminalState::{Absent, Alive, DeadPane, Replaced, Unknown};
+        let mut pane = launched(b"517721:1795037025:%1:517731\n").unwrap();
+        assert_eq!(
+            pane,
+            Launched {
+                server: "517721:1795037025".into(),
+                pane: "%1".into(),
+                process: 517731,
+                birth: None
+            }
+        );
+        pane.birth = Some("7000".into());
+        let births = |pid: u32| match pid {
+            517731 => Some("7000".to_owned()),
+            517918 => Some("7100".to_owned()),
+            _ => None,
+        };
+        for (status, stdout, state) in [
+            (Some(0), "517721:1795037025:%1:0:517731\n", Alive),
+            // Its command ended and the pane is kept: tmux clears its pid.
+            (Some(0), "517721:1795037025:%1:1:\n", DeadPane),
+            // `respawn-pane` after it ended: another process in the same pane.
+            (Some(0), "517721:1795037025:%1:0:517918\n", Replaced),
+            // The creating server, with or without other sessions, has no
+            // such pane any more.
+            (Some(0), "517721:1795037025:::\n", Absent),
+            // A sessionless server started at the same path.
+            (Some(0), "517929:1795037025:::\n", Unknown),
+            (Some(0), "517929:1795037025:%1:0:517731\n", Unknown),
+            // The same pid with another start: another server.
+            (Some(0), "517721:1795037999:::\n", Unknown),
+            (Some(0), "::::\n", Unknown),
+            (Some(0), "", Unknown),
+            (Some(0), "517721:1795037025:%1:0\n", Unknown),
+            (Some(0), "517721:1795037025:%1:0:517731:extra\n", Unknown),
+            (Some(0), "517721:1795037025:%1::517731\n", Unknown),
+            // As a client without a UTF-8 locale reads tabs.
+            (Some(0), "517721_1795037025_%1_0_517731\n", Unknown),
+            // A missing or refused socket, a replacement's `no current
+            // target`, a failed program or a signal.
+            (Some(1), "", Unknown),
+            (Some(127), "517721:1795037025:::\n", Unknown),
+            (None, "517721:1795037025:::\n", Unknown),
+        ] {
+            assert_eq!(
+                observed_state(&pane, status, stdout.as_bytes(), births),
+                state,
+                "{status:?} {stdout:?}"
+            );
+        }
+        // The launched pid with another birth (reused), or one that cannot
+        // be read now or at the launch, is not the launched process alive.
+        let live = b"517721:1795037025:%1:0:517731\n";
+        assert_eq!(
+            observed_state(&pane, Some(0), live, |_| Some("7999".into())),
+            Replaced
+        );
+        assert_eq!(observed_state(&pane, Some(0), live, |_| None), Unknown);
+        let unborn = Launched {
+            birth: None,
+            ..pane.clone()
+        };
+        assert_eq!(observed_state(&unborn, Some(0), live, births), Unknown);
+        for unnamed in [
+            "",
+            "\n",
+            "517721:1795037025\n",
+            "517721:1795037025:%1\n",
+            "517721:1795037025:%1:\n",
+            "517721:1795037025:%1:0\n",
+            ":1795037025:%1:517731\n",
+            "517721::%1:517731\n",
+            "517721:1795037025:1:517731\n",
+            "517721:1795037025:%1:517731:x\n",
+            "517721:1795037025:%1:x\n",
+            // As a client without a UTF-8 locale, or an older format, reads.
+            "517721_1795037025_%1_517731\n",
+            "517721\t1795037025\t%1\t517731\n",
+        ] {
+            assert_eq!(launched(unnamed.as_bytes()), None, "{unnamed:?}");
+        }
+        // A pane's process is the server's child; nothing else is its birth.
+        let own = std::process::id();
+        assert_eq!(child_birth(own, "4294967294:1795037025"), None);
+        assert_eq!(child_birth(own, "x"), None);
+        let parent = platform::process_identity(own).unwrap().parent;
+        assert_eq!(
+            child_birth(own, &format!("{parent}:1795037025")),
+            Some(platform::process_identity(own).unwrap().birth)
+        );
+        let spec = LaunchSpec {
+            name: "claude/p/t".into(),
+            cwd: "/tmp".into(),
+            env: vec!["A=1".into()],
+            command: vec!["/x/hgs".into()],
+            detached: true,
+        };
+        let observed = start_observed_args(&spec);
+        assert_eq!(&observed[..5], ["new-session", "-d", "-P", "-F", LAUNCHED]);
+        assert_eq!(observed[5..], start_args(&spec)[2..]);
+    }
+
+    /// zerus-sa9qn.38: `--dry-run` prints commands a person may paste; each
+    /// line passes a hostile session name, folder and variable to tmux as the
+    /// same single words and runs nothing else.
+    #[test]
+    fn dry_runs_print_hostile_names_as_single_words() {
+        let names = [
+            "claude/p/x;touch pwned;#",
+            "claude/$(touch pwned)/t",
+            "claude/p/`touch pwned`",
+            "claude/p/it's \"q\" | touch pwned",
+            "claude/p/x\ntouch pwned",
+            // zerus-sa9qn.43: fish reads \' inside single quotes.
+            "claude/p/x\\'; touch pwned; #",
+            "claude/p/a\\b",
+        ];
+        for name in names {
+            let spec = LaunchSpec {
+                name: name.into(),
+                cwd: format!("/work/{name}"),
+                env: vec![format!("HGS_SESSION={name}")],
+                command: vec!["/x/hgs".into(), "0".into()],
+                detached: true,
+            };
+            let launch = Tmux.describe(&DryRun::Launch(&spec));
+            let start = Tmux.describe(&DryRun::Start(&spec));
+            for (line, args) in [
+                (start, vec![start_args(&spec)]),
+                (
+                    Tmux.describe(&DryRun::Attach {
+                        session: name,
+                        client: "local",
+                    }),
+                    vec![
+                        vec![
+                            "set-environment".to_owned(),
+                            "-t".into(),
+                            format!("={name}"),
+                            "HGS_CLIENT".into(),
+                            "local".into(),
+                        ],
+                        vec![
+                            "-u".into(),
+                            "attach-session".into(),
+                            "-t".into(),
+                            format!("={name}"),
+                        ],
+                    ],
+                ),
+                (
+                    Tmux.describe(&DryRun::Kill { session: name }),
+                    vec![vec!["kill-session".into(), "-t".into(), format!("={name}")]],
+                ),
+                (
+                    launch,
+                    vec![["-u", "new-session", "-d", "-e"]
+                        .map(String::from)
+                        .into_iter()
+                        .chain([
+                            format!("HGS_SESSION={name}"),
+                            "-s".into(),
+                            name.into(),
+                            "-c".into(),
+                            format!("/work/{name}"),
+                            "--".into(),
+                            "/x/hgs".into(),
+                            "0".into(),
+                        ])
+                        .collect()],
+                ),
+            ] {
+                let folder = tempfile::tempdir().unwrap();
+                let script = format!("tmux() {{ printf '%s\\0' \"$@\"; printf '\\n'; }}\n{line}");
+                let out = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(script)
+                    .current_dir(folder.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .output()
+                    .unwrap();
+                assert!(
+                    !folder.path().join("pwned").exists(),
+                    "{line:?} ran a payload"
+                );
+                let calls: Vec<Vec<String>> = String::from_utf8(out.stdout)
+                    .unwrap()
+                    .split_terminator("\0\n")
+                    .map(|call| call.split('\0').map(str::to_owned).collect())
+                    .collect();
+                assert_eq!(calls, args, "{line}");
+                // fish (modelled) reads each line as the same tmux call.
+                let tmux: Vec<_> = args
+                    .iter()
+                    .map(|call| [vec!["tmux".to_owned()], call.clone()].concat())
+                    .collect();
+                assert_eq!(crate::platform::fish_commands(&line), Ok(tmux), "{line}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_test_image_never_hands_its_runner_recipe_to_tmux() {
+        crate::self_exec::private_probe("state::backend::tmux::tests::runner_submission_probe");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by a_test_image_never_hands_its_runner_recipe_to_tmux"]
+    fn runner_submission_probe() {
+        crate::self_exec::probe_child("state::backend::tmux::tests::runner_submission_probe");
+        // The real recipe still renders; only its submission is refused.
+        let runner = crate::state::storage::runner_executable().unwrap();
+        let spec = |detached| LaunchSpec {
+            name: "probe".into(),
+            cwd: "/".into(),
+            env: vec![],
+            command: [
+                "/bin/sh",
+                "-lic",
+                "exec \"$0\" --run \"$@\"",
+                &runner,
+                "0",
+                "/bin/true",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            detached,
+        };
+        // No fake is installed: this is the real tmux backend fork,
+        // relaunch and launch use.
+        let backend = super::super::current();
+        assert_eq!(
+            backend.start(&spec(true)).unwrap_err(),
+            crate::self_exec::TEST_IMAGE
+        );
+        for detached in [true, false] {
+            let error = backend.launch(&spec(detached)).err().unwrap();
+            assert_eq!(error.message, crate::self_exec::TEST_IMAGE);
+        }
+    }
 
     #[test]
     fn pane_queries_keep_their_formats_and_targets() {
@@ -790,12 +1326,20 @@ mod tests {
                 "A=1",
                 "-e",
                 "B=two words",
-                "/bin/bash -lic 'exec \"$0\" --run \"$@\"' /x/hgs 0 claude",
+                "--",
+                "/usr/bin/env",
+                "--",
+                "/bin/bash",
+                "-lic",
+                "exec \"$0\" --run \"$@\"",
+                "/x/hgs",
+                "0",
+                "claude",
             ]
         );
         assert_eq!(
             Tmux.describe(&DryRun::Start(&spec)),
-            "tmux new-session -d -s claude/p/t -c '/tmp/a b' -e 'A=1' -e 'B=two words' '/bin/bash -lic '\\''exec \"$0\" --run \"$@\"'\\'' /x/hgs 0 claude'"
+            "tmux new-session -d -s claude/p/t -c '/tmp/a b' -e A=1 -e 'B=two words' -- /usr/bin/env -- /bin/bash -lic 'exec \"$0\" --run \"$@\"' /x/hgs 0 claude"
         );
         assert_eq!(
             launch_args(&spec),
@@ -810,18 +1354,80 @@ mod tests {
                 "claude/p/t",
                 "-c",
                 "/tmp/a b",
-                "/bin/bash -lic 'exec \"$0\" --run \"$@\"' /x/hgs 0 claude",
+                "--",
+                "/usr/bin/env",
+                "--",
+                "/bin/bash",
+                "-lic",
+                "exec \"$0\" --run \"$@\"",
+                "/x/hgs",
+                "0",
+                "claude",
             ]
         );
         assert_eq!(
             Tmux.describe(&DryRun::Launch(&spec)),
-            "tmux -u new-session -e A=1 -e B=two words -s claude/p/t -c /tmp/a b -- /bin/bash -lic 'exec \"$0\" --run \"$@\"' /x/hgs 0 claude"
+            "tmux -u new-session -e A=1 -e 'B=two words' -s claude/p/t -c '/tmp/a b' -- /bin/bash -lic 'exec \"$0\" --run \"$@\"' /x/hgs 0 claude"
         );
         spec.detached = true;
         spec.env.clear();
         assert_eq!(launch_args(&spec)[..3], ["-u", "new-session", "-d"]);
         assert!(Tmux
             .describe(&DryRun::Launch(&spec))
-            .starts_with("tmux -u new-session -d  -s claude/p/t -c /tmp/a b -- "));
+            .starts_with("tmux -u new-session -d  -s claude/p/t -c '/tmp/a b' -- "));
+    }
+
+    #[test]
+    fn a_dry_run_masks_a_secret_in_the_launch_environment() {
+        let spec = LaunchSpec {
+            name: "claude/p/t".into(),
+            cwd: "/work".into(),
+            env: vec![
+                "ANTHROPIC_AUTH_TOKEN=sk-secret".into(),
+                "ANTHROPIC_BASE_URL=http://192.0.2.10:8080".into(),
+            ],
+            command: vec!["claude".into()],
+            detached: false,
+        };
+        let line = Tmux.describe(&DryRun::Launch(&spec));
+        assert!(line.contains("ANTHROPIC_AUTH_TOKEN=***"), "{line}");
+        assert!(!line.contains("sk-secret"), "the secret never reaches a dry-run: {line}");
+        assert!(line.contains("ANTHROPIC_BASE_URL=http://192.0.2.10:8080"), "{line}");
+    }
+
+    #[test]
+    fn direct_argv_has_no_default_shell_and_keeps_literal_final_semicolons() {
+        let arguments = direct_command(
+            owned(&["new-session", "-c", "/private/dir;", "-e", "A=x;"]),
+            &owned(&[
+                "/private/program",
+                ";",
+                "\\;",
+                "words with space",
+                "quote'",
+                "$(not-a-command)",
+                "",
+            ]),
+        );
+        assert_eq!(
+            arguments,
+            owned(&[
+                "new-session",
+                "-c",
+                "/private/dir\\;",
+                "-e",
+                "A=x\\;",
+                "--",
+                "/usr/bin/env",
+                "--",
+                "/private/program",
+                "\\;",
+                "\\\\;",
+                "words with space",
+                "quote'",
+                "$(not-a-command)",
+                ""
+            ])
+        );
     }
 }

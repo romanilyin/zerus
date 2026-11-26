@@ -9,6 +9,7 @@
       "page": "#ebe5da",
       "pane": "#f6f1e8",
       "surface": "#fcf9f3",
+      "members-surface": "#f1ede4",
       "raised": "#fffdf8",
       "card": "#fffdf8",
       "card-border": "#e3dccf",
@@ -46,7 +47,8 @@
       "row-hover": "#f1ebdf",
       "row-selected": "#ece2cb",
       "row-selected-border": "#b9a272",
-      "status-attention": "#d9a43a"
+      "status-attention": "#d9a43a",
+      "members-surface": "#f1ede4"
     },
     "font": {
       "ui": [

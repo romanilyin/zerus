@@ -3154,6 +3154,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerus-file-lock"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+]
+
+[[package]]
 name = "zerus-mobile-connector"
 version = "0.1.0"
 dependencies = [
@@ -3174,7 +3181,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "zerus-file-lock",
  "zerus-mobile-crypto",
+ "zerus-mobile-endpoint",
  "zerus-relay",
  "zerus-watch-protocol",
  "zerus-windows-private",
@@ -3192,6 +3201,21 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "zerus-mobile-endpoint"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "uuid",
+ "zerus-file-lock",
+ "zerus-mobile-crypto",
+ "zerus-windows-private",
 ]
 
 [[package]]

@@ -3,6 +3,8 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import re
+import shlex
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,8 @@ import macos_release
 import nightly_common as nightly
 import release_common as common
 import windows_portable
+import windows_installer_release
+from windows_installer_fixture import installer_files
 
 
 def load(name, filename):
@@ -78,13 +82,14 @@ class NightlyTests(unittest.TestCase):
         recipe = directory / "aur" / nightly.PACKAGE
         recipe.mkdir(parents=True)
         digest = common.sha256(binary)
-        (recipe / "PKGBUILD").write_text(nightly.render_recipe(self.info, digest))
+        rendered = nightly.render_recipe(self.info, digest)
+        (recipe / "PKGBUILD").write_text(rendered)
+        dependencies = shlex.split(re.search(r"^depends=\((.*?)\)$", rendered, re.MULTILINE | re.DOTALL).group(1))
         (recipe / ".SRCINFO").write_text(
             f"pkgbase = {nightly.PACKAGE}\n\tpkgver = {version}\n\tpkgrel = 1\n\tarch = x86_64\n"
             f"\tsource = https://github.com/ufna/zerus/releases/download/nightly-123/{binary.name}\n"
             f"\tsha256sums = {digest}\n" +
-            "".join(f"\tdepends = {name}>=1.2.3\n" for name in self.info["binary_dependencies"]) +
-            "".join(f"\tdepends = {name}\n" for name in ("tmux>=3.7", "openssh", "python", "curl", "procps-ng", "hicolor-icon-theme", "bash", "tar")) +
+            "".join(f"\tdepends = {name}\n" for name in dependencies) +
             "".join(f"\tconflicts = {name}\n" for name in ("zerus", "zerus-git", "zerus-ade-bin")) +
             f"\tprovides = zerus={version}\n\tprovides = hgs\n\tprovides = hgs-tray\npkgname = {nightly.PACKAGE}\n")
         common.finish_candidate(directory, nightly.PACKAGES)
@@ -109,12 +114,12 @@ class NightlyTests(unittest.TestCase):
         self.assertTrue(text.startswith('cask "zerus@nightly" do\n'))
         self.assertIn(f'version "{version}"', text)
         self.assertIn("releases/download/nightly-123/zerus-#{version}-macos-arm64.zip", text)
-        self.assertIn('conflicts_with cask: "zerus"\n', text)
+        self.assertIn('conflicts_with cask: ["zerus", "zerus@dev"]\n', text)
         self.assertEqual(macos_release.cask_fields(text), {"version": version, "sha256": "c" * 64})
-        self.assertNotIn("@", text.replace("#{", "").replace("zerus@nightly", ""), "template markers must all be replaced")
-        for stanza in ("preflight", "postflight", "uninstall", "uninstall_preflight", "auto_updates"):
+        self.assertNotRegex(text, r"@[A-Z_]+@", "template markers must all be replaced")
+        for stanza in ("preflight", "postflight", "zap", "uninstall", "uninstall_preflight", "launchctl", "quit", "auto_updates"):
             self.assertNotRegex(text, rf"(?m)^  {stanza}\b", "upgrades must not quit the GUI or unload agents")
-        for line in ("  depends_on arch: :arm64", '  app "Zerus.app"', "  zap launchctl: ["):
+        for line in ("  depends_on arch: :arm64", '  app "Zerus.app"'):
             self.assertIn(line, text, "stable and nightly install the same application")
         with self.assertRaisesRegex(ValueError, "version"):
             macos_release.render_cask("0.37.0", "c" * 64, "nightly", TAG)
@@ -157,6 +162,31 @@ class NightlyTests(unittest.TestCase):
             macos_release.render_cask(self.info["version"], "c" * 64, "nightly", TAG))
         with self.assertRaisesRegex(ValueError, "Unsealed"):
             nightly.validate_nightly(directory)
+
+    def test_sealed_previous_cask_validates_unchanged_but_new_casks_use_the_current_template(self):
+        directory = self.candidate(macos=True, dmg=True)
+        version = self.info["version"]
+        cask = directory / "homebrew/zerus@nightly.rb"
+        digest = common.sha256(directory / self.info["macos"]["asset"])
+        previous = (ROOT / "packaging/homebrew/previous/zerus@nightly.rb.in").read_text().replace(
+            "@VERSION@", version).replace("@SHA256@", digest).replace("@RELEASE_TAG@", TAG)
+        cask.write_text(previous)
+        before = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        nightly.validate_nightly(directory)
+        self.assertEqual(before, {path.relative_to(directory): path.read_bytes()
+                                  for path in directory.rglob("*") if path.is_file()})
+        with self.assertRaisesRegex(ValueError, "template"):
+            macos_release.require_template_cask(previous, version, digest, "nightly", TAG)
+        self.assertNotIn("  zap ", macos_release.render_cask(version, digest, "nightly", TAG))
+        for edited in (previous + "# edited\n", previous.replace(digest, "d" * 64),
+                       previous.replace(TAG, "nightly-124"), previous.replace(version, "0.37.0.r60.gaaaaaaa.n8"),
+                       previous.replace("com.hgdev.hgs-recovery", "com.example.foreign"),
+                       previous.replace('conflicts_with cask: "zerus"',
+                                        'conflicts_with cask: ["zerus", "zerus@dev"]')):
+            with self.subTest(edited=edited):
+                cask.write_text(edited)
+                with self.assertRaisesRegex(ValueError, "template"):
+                    nightly.validate_nightly(directory)
 
     def test_nightly_disk_image_is_sealed_beside_the_cask_zip(self):
         directory = self.candidate(macos=True, dmg=True)
@@ -277,18 +307,57 @@ class NightlyTests(unittest.TestCase):
         self.assertNotIn(common.OPTIONAL_WEBENGINE, recipe)
         nightly.validate_nightly(directory, COMMIT, 123, 7)
 
-    def test_current_nightly_lists_qt_webengine_only_as_optional(self):
+    def test_next_nightly_has_no_qt_and_previous_optional_recipe_is_retryable(self):
+        recipe = nightly.render_recipe(self.info, "0" * 64)
+        self.assertNotIn("qt6-", recipe)
+        self.assertIn("'webkit2gtk-4.1>=", recipe)
+        nightly.validate_nightly(self.candidate(), COMMIT, 123, 7)
+        self.info["binary_dependencies"] = {name: "1.2.3" for name in common.QT_BINARY_LIBRARIES}
         recipe = nightly.render_recipe(self.info, "0" * 64)
         self.assertIn(common.OPTIONAL_WEBENGINE, recipe)
-        self.assertNotIn("'qt6-webengine>=", recipe)
-        nightly.validate_nightly(self.candidate(), COMMIT, 123, 7)
+        self.assertNotIn("gst-plugins-good", recipe)
+        nightly.validate_nightly(self.candidate(name="previous-qt"), COMMIT, 123, 7)
+
+    def test_rendered_next_dependencies_validate_and_remain_exact(self):
+        directory = self.candidate()
+        path = directory / "aur" / nightly.PACKAGE / ".SRCINFO"
+        original = path.read_text()
+        codecs = {"gst-plugins-base", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly", "gst-libav"}
+        expected = {f"{name}>=1.2.3" for name in common.BINARY_LIBRARIES} | codecs | {
+            "tmux>=3.7", "openssh", "python", "curl", "procps-ng", "hicolor-icon-theme", "bash", "tar"}
+        self.assertEqual(set(common.metadata(original)["depends"]), expected)
+        nightly.validate_nightly(directory, COMMIT, 123, 7)
+        changes = [original.replace(f"\tdepends = {name}\n", "") for name in sorted(codecs)]
+        changes.append(original + "\tdepends = unreviewed-codec\n")
+        for changed in changes:
+            with self.subTest(srcinfo=changed):
+                path.write_text(changed)
+                common.finish_candidate(directory, nightly.PACKAGES)
+                with self.assertRaisesRegex(ValueError, "Nightly dependencies"):
+                    nightly.validate_nightly(directory)
+
+    def test_rendered_qt_fallback_dependencies_validate_without_next_codecs(self):
+        for index, libraries in enumerate((common.QT_BINARY_LIBRARIES, common.LEGACY_BINARY_LIBRARIES)):
+            with self.subTest(libraries=libraries):
+                self.info["binary_dependencies"] = {name: "1.2.3" for name in libraries}
+                directory = self.candidate(name=f"qt-fallback-{index}")
+                path = directory / "aur" / nightly.PACKAGE / ".SRCINFO"
+                original = path.read_text()
+                expected = {f"{name}>=1.2.3" for name in libraries} | {
+                    "tmux>=3.7", "openssh", "python", "curl", "procps-ng", "hicolor-icon-theme", "bash", "tar"}
+                self.assertEqual(set(common.metadata(original)["depends"]), expected)
+                nightly.validate_nightly(directory, COMMIT, 123, 7)
+                path.write_text(original + "\tdepends = gst-libav\n")
+                common.finish_candidate(directory, nightly.PACKAGES)
+                with self.assertRaisesRegex(ValueError, "Nightly dependencies"):
+                    nightly.validate_nightly(directory)
 
     def test_moving_url_missing_floors_and_extra_files_are_rejected(self):
         directory = self.candidate()
         path = directory / "aur" / nightly.PACKAGE / ".SRCINFO"
         original = path.read_text()
         for replacement in (original.replace("nightly-123", "nightly"),
-                            original.replace("depends = qt6-base>=1.2.3", "depends = qt6-base")):
+                            original.replace("depends = webkit2gtk-4.1>=1.2.3", "depends = webkit2gtk-4.1")):
             path.write_text(replacement)
             common.finish_candidate(directory, nightly.PACKAGES)
             with self.assertRaises(ValueError):
@@ -310,8 +379,11 @@ class NightlyTests(unittest.TestCase):
                 {key: value for key, value in self.info.items() if key not in {"version", "product_version"}}))
         def check_output(command, **kwargs):
             return {"rev-parse": COMMIT + "\n", "rev-list": "60\n"}[command[1]]
+        installer, build = installer_files(self.directory, portable,
+            nightly.nightly_version(product, 60, COMMIT, 7), product, COMMIT)
         arguments = ["prepare-nightly.py", "--package", "arch.pkg.tar.zst", "--windows-zip", str(portable),
                      "--output", str(output), "--run-id", "123", "--run-number", "7"]
+        arguments += ["--windows-installer", str(installer), "--windows-installer-info", str(build)]
         with patch.object(prepare.subprocess, "run", side_effect=run), \
                 patch.object(prepare.subprocess, "check_output", side_effect=check_output), \
                 patch.object(sys, "argv", arguments):
@@ -325,6 +397,9 @@ class NightlyTests(unittest.TestCase):
         info = json.loads((output / "release-info.json").read_text())
         self.assertEqual(info["windows_portable"], f"zerus-{info['version']}-windows-x86_64.zip")
         self.assertEqual((output / info["windows_portable"]).read_bytes(), portable.read_bytes())
+        setup = output / info["windows_installer"]["asset"]
+        self.assertTrue(setup.is_file())
+        self.assertEqual(info["windows_installer"]["portable_sha256"], common.sha256(portable))
         for name, options in (("commit", {"commit": "b" * 40}), ("version", {"version": "0.0.1"}),
                               ("layout", {"version": product, "entries": [("outside", "x")]})):
             with self.subTest(mismatch=name), self.assertRaises(ValueError):

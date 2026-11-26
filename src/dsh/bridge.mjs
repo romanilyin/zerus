@@ -1,16 +1,256 @@
-// HGS adapter for the official @deepseek-ai/dsh 0.2.1-rc.2 host.
+// HGS adapter for reviewed official @deepseek-ai/dsh 0.2.1 rc.2/rc.5 and
+// 0.2.2-rc.1 hosts. Its ping version identifies the adapter, not the harness.
 // Loaded through its supported Cordis --patch extension mechanism. No fork of
 // the engine, credential copying, HTTP authentication bypass or PTY injection.
+// One method wrapper adds explicit environment entries, the subprocess
+// service's documented caller entries, to processes a tool call starts.
 import net from 'node:net';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { checkCommand } from './command-guard.mjs';
-import { randomUUID } from 'node:crypto';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { isDeepStrictEqual } from 'node:util';
 
 export const name = 'hgs-native-dsh';
+
+// zerus-ppd26. One host serves every DeepSeek session of its agent home, so
+// its own environment names no session: hgs starts it without the markers of
+// whichever session launched it. Every tool call's processes instead carry
+// HGS_AGENT=dsh and exactly the calling session's own markers, or none of
+// them; an explicit undefined entry is the subprocess service's tombstone
+// that removes an inherited value. Never a partial or inherited set.
+const SESSION_MARKERS = Object.freeze(['HGS_SESSION', 'HGS_RUN_ID', 'HGS_SESSION_ID', 'HGS_ACCOUNT_ID']);
+const IDENTITY_BYTES = 4096;
+const RESUME_REQUEST = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const RESUME_RECEIPTS = 4096;
+const NATIVE_SESSION = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Only an ordinary forever-waiting request of this exact owned root may
+// grant parent routing. Timed waits and typed approval/plan intents stay manual.
+export function blockingQuestion(request, agent) {
+  const wait = request.wait;
+  const forever = wait === undefined || (wait !== null && typeof wait === 'object' && !Array.isArray(wait)
+    && typeof wait.callId === 'string' && wait.callId.length > 0
+    && (wait.timed === undefined || wait.timed === false));
+  return Boolean(agent && request.agent === agent && forever
+    && Array.isArray(request.questions) && request.questions.length > 0
+    && request.questions.every(item => item !== null && typeof item === 'object' && !Array.isArray(item)
+      && typeof item.id === 'string' && item.id.length > 0
+      && typeof item.question === 'string' && item.question.length > 0 && item.intent === undefined));
+}
+
+export function callEnvironment(identity) {
+  const env = { HGS_AGENT: 'dsh' };
+  for (const key of SESSION_MARKERS) env[key] = undefined;
+  if (identity) Object.assign(env, { HGS_SESSION: identity.session, HGS_RUN_ID: identity.run,
+    HGS_SESSION_ID: identity.session_id, HGS_ACCOUNT_ID: identity.account });
+  return Object.freeze(env);
+}
+
+const plainMarker = value => typeof value === 'string' && value.length > 0 && value.length <= 2048
+  && [...value].every(c => { const n = c.codePointAt(0); return n > 0x1f && (n < 0x7f || n > 0x9f); });
+
+// The file hgs writes for one native conversation (state/dsh/shell_identity.rs).
+export function parseIdentity(text, sessionId) {
+  let value;
+  try { value = JSON.parse(text); } catch { return undefined; }
+  if (value?.version !== 1 || value.conversation !== sessionId) return undefined;
+  const { session, run, session_id, account } = value;
+  return [session, run, session_id, account].every(plainMarker) ? { session, run, session_id, account } : undefined;
+}
+
+// A child agent's processes carry its top-level session's markers, as an
+// in-process subagent of another agent shares that agent's environment.
+export function identitySession(agent) {
+  const header = agent?.session?.header;
+  const id = header?.origin === 'subagent' ? header.parentSession : (agent?.session?.id ?? header?.id);
+  return typeof id === 'string' && NATIVE_SESSION.test(id) ? id : undefined;
+}
+
+export function readIdentity(dir, sessionId) {
+  if (typeof dir !== 'string' || !dir || !sessionId) return undefined;
+  let fd;
+  try {
+    fd = openSync(join(dir, sessionId + '.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const meta = fstatSync(fd);
+    if (!meta.isFile() || meta.size > IDENTITY_BYTES) return undefined;
+    const buffer = Buffer.alloc(IDENTITY_BYTES + 1);
+    const read = readSync(fd, buffer, 0, buffer.length, 0);
+    return read > IDENTITY_BYTES ? undefined : parseIdentity(buffer.subarray(0, read).toString('utf8'), sessionId);
+  } catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+// zerus-ppd26 Part B. Process ancestry cannot tell hosted agents apart, so
+// each tool call's processes also carry a fresh random token of 256 bits. The
+// host keeps token -> the calling top-level conversation while the call runs
+// and, for its background or promoted jobs, until each job settles; hgs asks
+// the host for it over the private socket to prove which conversation's call
+// started a command. The table is bounded; an evicted token is unknown.
+export const CALL_TOKEN = 'HGS_DSH_CALL_TOKEN';
+const CALL_TOKENS = 4096;
+// A conversation's calls and jobs make room only from its own oldest tokens:
+// another conversation's live token is never evicted (zerus-ppd26.5, .13).
+const CONVERSATION_TOKENS = 512;
+// What the host's socket serves in place of a live token (zerus-ppd26.5).
+export const HIDDEN_TOKEN = '[hidden call token]';
+export function callTokens(limit = CALL_TOKENS, share = CONVERSATION_TOKENS) {
+  const live = new Map(), jobs = new Map(), held = new Map();
+  const drop = token => {
+    const entry = live.get(token);
+    if (!entry) return;
+    live.delete(token);
+    for (const id of entry.jobs) jobs.delete(id);
+    const mine = held.get(entry.conversation);
+    mine?.delete(token);
+    if (mine?.size === 0) held.delete(entry.conversation);
+  };
+  const release = token => { const entry = live.get(token); if (entry && !entry.open && entry.jobs.size === 0) drop(token); };
+  return {
+    // A full table holding only other conversations' live tokens issues none:
+    // that call stays unproven rather than taking another conversation's.
+    open(conversation) {
+      const mine = held.get(conversation) ?? new Set();
+      while (mine.size > 0 && (mine.size >= share || live.size >= limit)) drop(mine.values().next().value);
+      if (live.size >= limit) return undefined;
+      const token = randomBytes(32).toString('hex');
+      live.set(token, { conversation, open: true, jobs: new Set() });
+      held.set(conversation, mine.add(token));
+      return token;
+    },
+    close(token) { const entry = live.get(token); if (entry) { entry.open = false; release(token); } },
+    job(token, id) { const entry = live.get(token); if (entry) { entry.jobs.add(id); jobs.set(id, token); } },
+    settled(id) {
+      const token = jobs.get(id);
+      jobs.delete(id);
+      if (token === undefined) return;
+      live.get(token)?.jobs.delete(id);
+      release(token);
+    },
+    conversation(token) {
+      return typeof token === 'string' && /^[0-9a-f]{64}$/.test(token) ? live.get(token)?.conversation : undefined;
+    },
+    // A live token printed whole never leaves the host in what its socket
+    // serves. Every 64-character window of each hex run is tested, so a token
+    // after another hex digit or a JSON-escaped control character is
+    // hidden too, and every copy of it (zerus-ppd26.13).
+    redact(text) {
+      if (live.size === 0) return text;
+      // A cheap prefix test before the 64-character lookup; a live token's
+      // first 8 hex characters are not a hex run of their own (zerus-ppd26.14).
+      const prefixes = new Set();
+      for (const token of live.keys()) prefixes.add(token.slice(0, 8));
+      // {64}[0-9a-f]* never asks the regex engine for an unbounded run: a
+      // 4-8 MiB hex run threw RangeError with {64,} (zerus-ppd26.14).
+      return text.replace(/[0-9a-f]{64}[0-9a-f]*/g, run => {
+        let out = '', at = 0, from = 0;
+        while (at + 64 <= run.length) {
+          if (prefixes.has(run.slice(at, at + 8)) && live.has(run.slice(at, at + 64))) {
+            out += run.slice(from, at) + HIDDEN_TOKEN;
+            at += 64;
+            from = at;
+          } else {
+            at += 1;
+          }
+        }
+        return out + run.slice(from);
+      });
+    },
+    get size() { return live.size; },
+  };
+}
+
+// Cordis traces each service and method read with a new proxy. Install on
+// the underlying service while letting Cordis still bind the caller's `this`.
+const CORDIS_ORIGINAL = Symbol.for('cordis.original');
+const SPAWN_ORIGINAL = Symbol.for('hgs.dsh.spawn.original');
+const spawnInstallations = new WeakMap();
+
+function originalSpawn(method) {
+  const seen = new Set();
+  while (typeof method[SPAWN_ORIGINAL] === 'function') {
+    if (seen.has(method)) throw new Error('Cyclic HGS subprocess wrapper chain');
+    seen.add(method);
+    method = method[SPAWN_ORIGINAL];
+  }
+  return method;
+}
+
+// Adds only the current tool call's entries to the native invocation.
+export function wrapSpawns(service, current) {
+  const target = service?.[CORDIS_ORIGINAL] ?? service;
+  const previous = spawnInstallations.get(target);
+  if (previous && previous.current === current && previous.installation.current()) return previous.installation;
+  previous?.installation.restore();
+  const methods = [];
+  for (const method of ['spawn', 'spawnTerminal']) {
+    const observed = target?.[method];
+    if (typeof observed !== 'function') {
+      methods.push({ method, expected: observed });
+      continue;
+    }
+    const original = originalSpawn(observed);
+    let descriptor = Object.getOwnPropertyDescriptor(target, method);
+    // Restore the native method. Deleting the wrapper reveals an inherited
+    // native implementation again.
+    if (observed !== original) {
+      descriptor = Object.getPrototypeOf(target)?.[method] === original
+        ? undefined : { ...descriptor, value: original };
+    }
+    const wrapper = function (spec, ...rest) {
+      const env = current();
+      return original.call(this, env && spec && typeof spec === 'object' ? { ...spec, env: { ...spec.env, ...env } } : spec, ...rest);
+    };
+    Object.defineProperty(wrapper, SPAWN_ORIGINAL, { value: original });
+    target[method] = wrapper;
+    methods.push({ method, expected: wrapper, restore() {
+      if (target[method] !== wrapper) return;
+      if (descriptor) Object.defineProperty(target, method, descriptor);
+      else delete target[method];
+    } });
+  }
+  const installation = {
+    target,
+    installed: methods.some(binding => binding.method === 'spawn' && binding.restore),
+    current: () => methods.every(({ method, expected }) => target?.[method] === expected),
+    restore() { for (const binding of methods) binding.restore?.(); },
+  };
+  if (target) spawnInstallations.set(target, { current, installation });
+  return installation;
+}
 export const inject = ['sessionController', 'agents', 'goals', 'llm', 'agentDefaultModel', 'sessionQuery', 'userQuestions', 'workspaceRegistry', 'subagents', 'permissionPresets', 'approval', 'commands', 'sessions'];
+
+// Task 209: the `/compact` slash command is a human-command adapter plugin; a
+// headless host composition may not register it while the native compaction
+// seam (`@deepseek-ai/dsh-compaction`) is there. Support is either one, never a
+// member's momentary phase: being busy means "not now", not "never".
+const COMPACT_DEFINITION = '@deepseek-ai/dsh-command-compact';
+export function compactCommand(command) {
+  return command?.definitionId === COMPACT_DEFINITION ? command : undefined;
+}
+export function compactAvailable(command, compaction) {
+  return Boolean(compactCommand(command) || typeof compaction?.compactNow === 'function');
+}
+
+// Whether a create/resume call may finish an explicit permission preset on an
+// already-live agent. Ordinary ensures and retries never switch a live
+// session; only a pending initial-setup recovery may, and only while idle.
+// An implicit account default leaves a live native choice untouched. Exported
+// for the synthetic compatibility test.
+export function presetGate({ preset, live, recovery, running, explicit, current }) {
+  if (preset === undefined) return { apply: false, applied: false, refuse: false };
+  if (!live) return { apply: true, applied: true, refuse: false };
+  if (current === preset) return { apply: false, applied: true, refuse: false };
+  if (recovery === true) {
+    if (running === true) return { apply: false, applied: false, refuse: true };
+    return { apply: true, applied: true, refuse: false };
+  }
+  if (explicit === true) return { apply: false, applied: false, refuse: false };
+  return { apply: false, applied: true, refuse: false };
+}
 
 // A session folder is a full path on this platform: on Windows with a drive
 // or a UNC share, since a rooted `\x` there still depends on the current drive.
@@ -18,35 +258,221 @@ function absoluteFolder(folder) {
   return path.isAbsolute(folder) && (process.platform !== 'win32' || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(folder));
 }
 
+export const AGENT_HINT_SECTION = 'hgs:agent-hint';
+export function registerAgentHint(ctx, hint, owned) {
+  if (!(owned instanceof Map) || typeof hint !== 'string' || !hint) return false;
+  try {
+    const prompts = ctx.get('systemPrompt');
+    if (typeof prompts?.section !== 'function') return false;
+    ctx.effect(() => prompts.section({
+      name: AGENT_HINT_SECTION, order: 10300, interpolate: false,
+      text: context => owned.has(context.agent?.session?.id) ? hint : '',
+    }));
+    return true;
+  } catch (error) {
+    console.warn('hgs: optional agent hint registration failed: ' + String(error?.message ?? error));
+    return false;
+  }
+}
+
+// 0.2.2 moved selection from the controller's WeakMap to the Agent's native
+// model object. Both reads are side-effect-free; never use selectionFor or
+// public selectModel (which also saves the profile default) as a fallback.
+export function modelSelectionAdapter(control) {
+  const incompatible = () => new Error('HGS: incompatible official dsh session controller');
+  if (typeof control?.composeAgent !== 'function' || typeof control?.presetForObservation !== 'function'
+      || typeof control?.serializeImageAdmission !== 'function') throw incompatible();
+  const legacy = control.selections instanceof WeakMap && typeof control.selectForNextRequest === 'function';
+  // A partial old interface is not the reviewed new interface.
+  if (!legacy && (control.selections !== undefined || control.selectForNextRequest !== undefined)) throw incompatible();
+  const modelOf = agent => {
+    const model = agent?.model;
+    if (typeof model?.current !== 'function' || typeof model?.select !== 'function') throw incompatible();
+    return model;
+  };
+  return {
+    legacy,
+    async compose(preset) {
+      const composition = await control.composeAgent(preset);
+      if (legacy) return composition;
+      if (typeof composition?.setup !== 'function') throw incompatible();
+      // The native factory runs setup before publishing/starting the Agent.
+      return { ...composition, setup(agentCtx, agent) {
+        modelOf(agent);
+        return composition.setup(agentCtx, agent);
+      } };
+    },
+    has(agent) { return legacy ? control.selections.has(agent) : Boolean(modelOf(agent)); },
+    current(agent, projections) {
+      if (!legacy) {
+        const current = modelOf(agent).current();
+        return current === undefined ? null : { ...current };
+      }
+      const installed = control.selections.get(agent);
+      if (installed) return { ...installed.current };
+      const stored = projections?.modelSelection?.next;
+      if (stored) return stored;
+      const { provider, model, reasoningEffort } = agent.options ?? {};
+      return provider && model ? { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } : null;
+    },
+    // Called only inside the SAME native serializeImageAdmission chain used
+    // by image prompts. No private queue, global default write or option edit.
+    select(agent, selection) {
+      if (legacy) control.selectForNextRequest(agent, selection);
+      else modelOf(agent).select(selection);
+    },
+  };
+}
+
+function prefixHash(events, count) {
+  if (!Array.isArray(events) || !Number.isSafeInteger(count) || count < 1 || count > events.length) return null;
+  const hash = createHash('sha256');
+  for (let i = 0; i < count; i++) {
+    if (events[i]?.seq !== i) return null;
+    hash.update(JSON.stringify(events[i])); hash.update('\n');
+  }
+  return hash.digest('hex');
+}
+
+// 0.2.2 intentionally omits parentSession on ordinary forks. Pin an exact
+// completed source cut BEFORE the call, then verify its immutable inherited
+// bytes and native seed boundary. Missing parent metadata alone proves nothing.
+export function completedForkCut(source) {
+  const atSeq = source.events.findLastIndex(event => event.type === 'turn/end');
+  const sha256 = prefixHash(source.events, atSeq + 1);
+  if (sha256 === null) throw new Error('Wait for a completed reply before forking');
+  return { atSeq, sha256 };
+}
+
+export function matchesForkCut(created, cut) {
+  const count = cut.atSeq + 1, marker = created.events[count];
+  return created.header.isSeeded === true && created.header.parentSession === undefined
+    && created.inheritedEventCount === count && marker?.seq === count
+    && marker.type === 'session/end-seed' && marker.data?.inherited === true
+    && prefixHash(created.events, count) === cut.sha256;
+}
+
+// A 0.2.2 task belongs to the Host; only its actual destination binds it to
+// this session. Being a creator/editor in involvedSessionIds is insufficient.
+export function scheduleSession(entry) {
+  if (Object.hasOwn(entry, 'target'))
+    return entry.target?.kind === 'session' ? entry.target.sessionId : undefined;
+  return entry.sessionId;
+}
+
+function scheduleRecord(entry) {
+  const record = { ...entry };
+  for (const key of ['sessionId', 'status', 'lastDelivery']) delete record[key];
+  return record;
+}
+
+// Preserve the session-scoped wire contract over the reviewed Host-wide v2
+// service. Its version compare happens INSIDE the native edit queue, so a
+// retarget after our read refuses instead of mutating another session's task.
+export async function manageSchedule(schedule, p) {
+  const exact = { sessionId: p.sessionId, id: p.id };
+  const history = { id: p.id, limit: p.limit, ...(p.before === undefined ? {} : { before: p.before }) };
+  if (typeof schedule.update === 'function' && typeof schedule.delete === 'function') {
+    if (p.action === 'history') return schedule.history({ ...exact, ...history });
+    if (p.action === 'delete') return schedule.delete(exact);
+    return schedule.update({ ...exact, expected: p.expected,
+      ...Object.fromEntries(['title', 'prompt', 'change'].filter(key => p[key] !== undefined).map(key => [key, p[key]])) });
+  }
+  if (schedule.update !== undefined || schedule.delete !== undefined
+      || typeof schedule.view !== 'function' || typeof schedule.edit !== 'function')
+    throw new Error('HGS: incompatible official dsh schedule service');
+  const current = await schedule.view({ id: p.id });
+  if (scheduleSession(current) !== p.sessionId)
+    return { id: p.id, code: 'schedule_not_found', ...(p.action === 'delete' ? { deleted: false } : p.action === 'update' ? { updated: false } : {}) };
+  if (p.action === 'history') {
+    const result = await schedule.history(history);
+    const after = await schedule.view({ id: p.id });
+    if (scheduleSession(after) !== p.sessionId || after.updatedAt !== current.updatedAt)
+      return { id: p.id, code: 'schedule_not_found' };
+    // A Host task can have been retargeted earlier too. Its opaque native
+    // cursor is preserved, but another destination's deliveries stay private.
+    return Array.isArray(result.records) ? { ...result, records: result.records.filter(row => row.targetSessionId === p.sessionId) } : result;
+  }
+  if (p.action === 'update' && !isDeepStrictEqual(p.expected, scheduleRecord(current)))
+    return { id: p.id, updated: false, code: 'schedule_conflict' };
+  const request = { id: p.id, action: p.action, expectedUpdatedAt: current.updatedAt ?? null };
+  if (p.action === 'update') {
+    request.patch = Object.fromEntries(['title', 'prompt'].filter(key => p[key] !== undefined).map(key => [key, p[key]]));
+    if (p.change !== undefined) {
+      if (!['after', 'at', 'every', 'daily', 'weekly', 'cron', 'rrule'].includes(p.change?.kind))
+        throw new Error('Unsupported native schedule timing');
+      request.patch.timing = p.change;
+    }
+  }
+  const result = await schedule.edit(request);
+  if (p.action === 'delete') return result;
+  return result.code ? { ...result, updated: false } : { id: p.id, updated: true, record: scheduleRecord(result) };
+}
+
 export function apply(ctx, config) {
   const api = ctx.sessionController;
-  // These extension seams are deliberately pinned to the tested release.
-  // In particular the public selectModel also changes the profile default, and
-  // only the private selection map tells whether an Agent has a selection.
   const control = api.agents;
-  if (typeof control?.composeAgent !== 'function' || typeof control?.serializeImageAdmission !== 'function'
-      || typeof control?.selectForNextRequest !== 'function' || !(control.selections instanceof WeakMap))
-    throw new Error('HGS: incompatible official dsh session controller');
+  const models = modelSelectionAdapter(control);
   const owned = new Map(), opening = new Map(), questions = new Map();
+  const scopedResumes = new Map();
+  registerAgentHint(ctx, config?.agentHint, owned);
   const generation = randomUUID();
+  // An end is the host's own lifecycle event, never a failed list/inspect
+  // or a turn that finished while its Agent remains alive. Keep bounded
+  // evidence only; a pruned or pre-bridge session has an unknown end.
+  const endedAgents = new Map();
+  ctx.on('agent/disposed', ({ agent }) => {
+    const sessionId = agent.session.id;
+    endedAgents.delete(sessionId);
+    endedAgents.set(sessionId, { at: Date.now(), source: 'agent/disposed' });
+    while (endedAgents.size > 4096) endedAgents.delete(endedAgents.keys().next().value);
+  });
   const shellContext = new AsyncLocalStorage(), shellCalls = new Map(), jobCalls = new Map();
   // Windows composes the official pwsh tools instead of bash; both run shell jobs.
   const shellTools = new Set(['bash', 'pwsh']);
+  const callContext = new AsyncLocalStorage(), tokens = callTokens();
+  const identities = typeof config.shellIdentities === 'string' && config.shellIdentities ? config.shellIdentities : null;
+  let spawns;
+  const currentEnvironment = () => callContext.getStore();
+  // A changed service or a stale wrapper can be repaired before the next
+  // tool call, without disposing any resident agent.
+  function callEnvironmentInstalled() {
+    const next = wrapSpawns(ctx.get('subprocess'), currentEnvironment);
+    if (spawns?.target !== next.target) spawns?.restore();
+    spawns = next;
+    return next.installed;
+  }
+  callEnvironmentInstalled();
+  ctx.effect(() => () => spawns?.restore());
   const jobRegistry = ctx.get('jobs');
   if (jobRegistry) ctx.on('dispose',jobRegistry.events.subscribe({owners:'scope'},event => {
+    // A job a tool call registers keeps that call's token until it settles.
+    const token = callContext.getStore()?.[CALL_TOKEN];
+    if (event.type === 'registered' && token) tokens.job(token, event.job.id);
+    if (event.type === 'settled' || event.type === 'removed') tokens.settled(event.job.id);
     const call = shellContext.getStore();
     if (event.type === 'registered' && shellTools.has(event.job.kind) && call?.owner === event.job.owner) {
       call.jobId=event.job.id;jobCalls.set(event.job.id,call);
     }
     if (event.type === 'removed') jobCalls.delete(event.job.id);
   }));
-  ctx.on('tools/execute',async (exec,next) => {
+  // Every tool call, whatever the tool or agent: its processes carry
+  // HGS_AGENT=dsh and the calling top-level session's markers or none.
+  ctx.on('tools/execute', async (exec, next) => {
+    callEnvironmentInstalled();
+    const session = identitySession(exec.agent);
+    const token = session === undefined ? undefined : tokens.open(session);
+    const env = Object.freeze({ ...callEnvironment(readIdentity(identities, session)), [CALL_TOKEN]: token });
+    try { return await callContext.run(env, () => observeShell(exec, next)); }
+    finally { if (token) tokens.close(token); }
+  });
+  function observeShell(exec, next) {
     if (!shellTools.has(exec.name)) return next();
     const refused = checkCommand(exec.arguments?.command, os.homedir());
     if (refused) {
       const { message } = refused;
-      return {content: [{type: 'text', text: 'Error: ' + message}], isError: true,
-        error: {message, info: {name: 'CommandGuardError', code: 'HGS_COMMAND_GUARD'}}};
+      return Promise.resolve({content: [{type: 'text', text: 'Error: ' + message}], isError: true,
+        error: {message, info: {name: 'CommandGuardError', code: 'HGS_COMMAND_GUARD'}}});
     }
     if (!exec.agent?.session?.id) return next();
     const full=String(exec.arguments?.command ?? '');
@@ -63,26 +489,27 @@ export function apply(ctx, config) {
         return result;
       } catch(error){call.status='failed';call.finishedAt=Date.now();throw error;}
     });
-  });
+  }
   const recovery = new Map(), recoveryReceipts = new Map();
   const compactions = new Map(), compactReceipts = new Set();
   const forkReceipts = new Map(), forking = new Map();
   // Optional official Schedule bundle. Absent means unknown, never "no tasks".
   const scheduleService = () => ctx.get('schedule');
-  const recurringKinds = new Set(['every', 'daily', 'weekly', 'cron']);
+  const recurringKinds = new Set(['every', 'daily', 'weekly', 'cron', 'rrule']);
   async function scheduleSummaries() {
     const schedule = scheduleService();
     if (typeof schedule?.catalog !== 'function') return null;
     try {
       const summaries = new Map();
       for (const entry of await schedule.catalog()) {
-        if (entry.status !== 'active') continue;
-        const summary = summaries.get(entry.sessionId) ?? { count: 0, recurring: 0, nextAt: null };
+        const sessionId = scheduleSession(entry);
+        if (entry.status !== 'active' || typeof sessionId !== 'string' || !sessionId) continue;
+        const summary = summaries.get(sessionId) ?? { count: 0, recurring: 0, nextAt: null };
         const at = Date.parse(entry.scheduledAt) / 1000;
         summary.count += 1;
         if (recurringKinds.has(entry.kind)) summary.recurring += 1;
         if (Number.isFinite(at) && (summary.nextAt === null || at < summary.nextAt)) summary.nextAt = at;
-        summaries.set(entry.sessionId, summary);
+        summaries.set(sessionId, summary);
       }
       return summaries;
     } catch { return null; }
@@ -135,15 +562,44 @@ export function apply(ctx, config) {
       return { workspaceId: workspace.id, path: workspace.path, sessionIds: [...workspace.sessionIds] };
     } finally { observation[Symbol.dispose](); }
   }
+  // Configured presets only: Auto is current-session-only and can never be a
+  // launch/account default. The resident host keeps one fixed preset table.
+  const presetOptions = () => {
+    try { return ctx.permissionPresets.catalog().defaultOptions ?? []; } catch { return []; }
+  };
+  function checkPreset(name) {
+    if (name === undefined || name === null) return;
+    if (typeof name !== 'string' || !name || Buffer.byteLength(name, 'utf8') > 128
+        || name.trim() !== name || /[\u0000-\u001f\u007f]/.test(name))
+      throw new Error('Invalid native permission preset');
+    if (!presetOptions().some(option => option.value === name))
+      throw new Error('The selected permission preset is not offered by the running DeepSeek host');
+  }
+  function applyPreset(agent, name) {
+    if (name === undefined || name === null) return;
+    checkPreset(name);
+    ctx.permissionPresets.apply(agent.session, name,
+      policy => ctx.approval.setPolicy(agent, policy));
+  }
   function applyPermissions(agent, mode) {
     if (mode === 'bypass') ctx.permissionPresets.apply(agent.session, 'danger-full-access',
       policy => ctx.approval.setPolicy(agent, policy));
   }
   function checkPermissions(mode) {
     if (mode !== undefined && !['provider', 'bypass'].includes(mode)) throw new Error('Unknown account permission mode');
+    if (mode === 'bypass' && !presetOptions().some(option => option.value === 'danger-full-access'))
+      throw new Error('The running DeepSeek host does not offer the danger-full-access preset');
   }
-  async function resume(sessionId, permissionMode) {
+  // The native default route, effort included, as the official session
+  // controller's agentOptions(). A selection the session already recorded
+  // still wins on resume; this is only the route of a session without one.
+  function defaultAgentOptions() {
+    const { provider, model, reasoningEffort } = ctx.agentDefaultModel.currentSelection();
+    return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) };
+  }
+  async function resume(sessionId, permissionMode, permissionPreset) {
     checkPermissions(permissionMode);
+    checkPreset(permissionPreset);
     const live = ctx.agents.get(sessionId);
     if (live) return live;
     if (opening.has(sessionId)) return opening.get(sessionId);
@@ -151,10 +607,10 @@ export function apply(ctx, config) {
       const observation = await ctx.sessionQuery.observeSession(sessionId);
       try {
         if (observation.header.origin === 'subagent') throw new Error('Use the parent to manage a subagent');
-        const composition = await control.composeAgent(control.presetForObservation(observation));
-        const { provider, model } = ctx.agentDefaultModel.currentSelection();
-        const handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: { provider, model }, setup: composition.setup });
+        const composition = await models.compose(control.presetForObservation(observation));
+        const handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: defaultAgentOptions(), setup: composition.setup });
         applyPermissions(handle.agent, permissionMode);
+        applyPreset(handle.agent, permissionPreset);
         owned.set(sessionId, handle);
         await publishWorkspace(sessionId);
         return handle.agent;
@@ -163,20 +619,13 @@ export function apply(ctx, config) {
     opening.set(sessionId, work);
     return work;
   }
-  // Upstream installs a model selection while composing a top-level Agent or
+  // The 0.2.1 controller installs a selection while composing a top-level Agent or
   // changing its model. selectionFor would also install one on a read of any
   // other Agent, such as a child: prompt listeners that take over its request
   // route (the profile default before its first request), and an effect Cordis
   // rejects on an unloading scope. Reads never install one; an Agent without
   // one reports its stored selection, or before its first request its own route.
-  const selectionOf = (agent, projections) => {
-    const installed = control.selections.get(agent);
-    if (installed) return { ...installed.current };
-    const stored = projections?.modelSelection?.next;
-    if (stored) return stored;
-    const { provider, model, reasoningEffort } = agent.options ?? {};
-    return provider && model ? { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } : null;
-  };
+  const selectionOf = (agent, projections) => models.current(agent, projections);
   // A child lives in its parent's Agent scope and belongs to subagent routing:
   // upstream neither prompts nor reconfigures one directly, offers it no
   // commands and interrupts it only through its parent's address. HGS messages
@@ -188,8 +637,8 @@ export function apply(ctx, config) {
     return agent;
   };
   const publicQuestions = sessionId => [...questions.values()].filter(q => q.sessionId === sessionId)
-    .map(({ id, items, approval, tool, command }) => ({ id, questions: items, approval: Boolean(approval),
-      ...(tool ? { tool } : {}), ...(command === undefined ? {} : { command }) }));
+    .map(({ id, items, approval, tool, command, blocking }) => ({ id, questions: items, approval: Boolean(approval),
+      blocking: blocking === true, ...(tool ? { tool } : {}), ...(command === undefined ? {} : { command }) }));
   // A live request is the only authority for answering. Disconnecting HGS does
   // not answer, dismiss, or approve it. Native cancellation releases the wait.
   ctx.on('user-questions/request', (request, next) => {
@@ -200,7 +649,8 @@ export function apply(ctx, config) {
       const abort = () => { questions.delete(id); reject(request.signal.reason ?? new Error('Question cancelled')); };
       if (request.signal?.aborted) { abort(); return; }
       const settle = answer => { questions.delete(id); request.signal?.removeEventListener('abort', abort); resolve(answer); };
-      questions.set(id, { id, sessionId, items: request.questions, settle });
+      questions.set(id, { id, sessionId, items: request.questions, settle,
+        blocking: blockingQuestion(request, owned.get(sessionId)?.agent) });
       request.signal?.addEventListener('abort', abort, { once: true });
       // Timed questions must claim the native wait, not invent a separate timer.
       if (request.wait?.timed) {
@@ -330,7 +780,7 @@ export function apply(ctx, config) {
       childMode: child?.mode, childSendSupported: !unstarted && child?.mode === 'continuable' && Boolean(parentLive), goal,
       pendingQuestions: publicQuestions(sessionId), selection, accountStatus: status, authRequired: needsSignIn(selection, status),
       live: Boolean(live), owned: owned.has(sessionId), nativeRecovery: recoveryPublic(sessionId), interruptSupported: typeof api.cancel === 'function',
-      compactSupported: Boolean(live && ctx.commands.find(live,'compact')?.definitionId === '@deepseek-ai/dsh-command-compact'), compactRequest: agentId ? null : compactionPublic(sessionId),
+      compactSupported: Boolean(live && compactAvailable(ctx.commands.find(live,'compact'), ctx.get('compaction'))), compactRequest: agentId ? null : compactionPublic(sessionId),
       // Native fork copies the latest completed-turn prefix. An older page
       // can hold it; the native operation remains the authoritative check.
       forkSupported: !agentId && typeof api.fork === 'function',
@@ -350,16 +800,18 @@ export function apply(ctx, config) {
     if (typeof api.fork !== 'function') throw new Error('Native fork is unavailable');
     const work = (async () => {
       const source = await ctx.sessionQuery.observeSession(p.sessionId, { projectionMode: 'none' });
-      let cwd;
+      let cwd, cut;
       try {
         if (source.header.origin === 'subagent') throw new Error('Fork the parent session; a child belongs to its parent');
         if (typeof p.cwd !== 'string' || source.header.cwd !== p.cwd) throw new Error('Native session belongs to another folder');
         cwd = source.header.cwd;
+        if (!models.legacy) cut = completedForkCut(source);
       } finally { source[Symbol.dispose](); }
-      const { sessionId } = await api.fork({ sessionId: p.sessionId });
+      const { sessionId } = await api.fork({ sessionId: p.sessionId, ...(cut ? { atSeq: cut.atSeq } : {}) });
       const created = await ctx.sessionQuery.observeSession(sessionId, { projectionMode: 'none' });
       try {
-        if (sessionId === p.sessionId || created.header.parentSession !== p.sessionId || created.header.cwd !== cwd
+        if (sessionId === p.sessionId || created.header.id !== sessionId
+            || (cut ? !matchesForkCut(created, cut) : created.header.parentSession !== p.sessionId) || created.header.cwd !== cwd
             || created.header.origin === 'subagent')
           throw new Error(`Native fork ${sessionId} does not match its source; inspect Native UI`);
       } finally { created[Symbol.dispose](); }
@@ -431,36 +883,185 @@ export function apply(ctx, config) {
     if (typeof p.sessionId !== 'string' || !p.sessionId) throw new Error('Choose a native session');
     if (!schedule) return { available: false, generation };
     if (p.action === 'list') {
-      const items = (await schedule.catalog()).filter(entry => entry.sessionId === p.sessionId);
+      const items = (await schedule.catalog()).filter(entry => scheduleSession(entry) === p.sessionId);
       return { available: true, generation, items };
     }
     if (p.generation !== generation) throw new Error('DeepSeek host changed; refresh schedules');
     if (typeof p.id !== 'string' || !p.id) throw new Error('Choose a scheduled task');
-    const exact = { sessionId: p.sessionId, id: p.id };
-    switch (p.action) {
-      case 'history': return { available: true, generation, result: await schedule.history({ ...exact, limit: p.limit,
-        ...(p.before === undefined ? {} : { before: p.before }) }) };
-      case 'delete': return { available: true, generation, result: await schedule.delete(exact) };
-      case 'update': {
-        if (!p.expected || typeof p.expected !== 'object') throw new Error('Expected task record is required');
-        const request = { ...exact, expected: p.expected };
-        for (const key of ['title', 'prompt', 'change']) if (p[key] !== undefined) request[key] = p[key];
-        return { available: true, generation, result: await schedule.update(request) };
-      }
-      default: throw new Error('Unsupported schedule action');
+    if (!['history', 'delete', 'update'].includes(p.action)) throw new Error('Unsupported schedule action');
+    if (p.action === 'update' && (!p.expected || typeof p.expected !== 'object')) throw new Error('Expected task record is required');
+    return { available: true, generation, result: await manageSchedule(schedule, p) };
+  }
+  // zerus-hfw2s: input witness (docs/reference.md). A send with a requestId
+  // is bound to the FIRST message the harness inserted for it on that session
+  // ({session, messageId, spliceSeq}); a later insert with the same rpcId but
+  // another message id never rebinds it. input-witness flushes that session
+  // and returns bounded facts from its in-memory log forward from spliceSeq;
+  // HGS classifies them. The bridge records its own disposals so a canceled
+  // removal they cause can be told from any other.
+  const WITNESS_LIMIT = 256, WITNESS_SCAN = 4096, WITNESS_WAIT = 25000;
+  const witnesses = new Map(), expecting = new Map(), disposals = new WeakMap();
+  const witnessDigest = content => {
+    const hash = createHash('sha256');
+    for (const block of Array.isArray(content) ? content : [])
+      hash.update(`${block?.type ?? ''}\0${block?.type === 'text' ? block.text ?? '' : ''}\0`);
+    return hash.digest('hex');
+  };
+  const rememberWitness = (requestId, record) => {
+    witnesses.delete(requestId); witnesses.set(requestId, record);
+    while (witnesses.size > WITNESS_LIMIT) witnesses.delete(witnesses.keys().next().value);
+  };
+  const rpcIdOf = message => (message?.source?.kind === 'user' && typeof message.source.rpcId === 'string' ? message.source.rpcId : null);
+  ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+    const rpcId = rpcIdOf(message), session = agent?.session;
+    if (!rpcId || !session || expecting.get(rpcId) !== session.id || witnesses.get(rpcId)?.messageId) return;
+    rememberWitness(rpcId, { sessionId: session.id, session, messageId: message.id, spliceSeq: session.seq - 1 });
+  });
+  // A duplicate request inserts nothing: bind the message an earlier send of
+  // the same request inserted, if the bounded tail of the log still holds it.
+  function bindEarlierInsert(requestId, sessionId) {
+    const session = ctx.agents.get(sessionId)?.session;
+    if (!session || witnesses.get(requestId)?.messageId) return;
+    const from = Math.max(0, session.seq - WITNESS_SCAN);
+    const events = session.snapshotEvents(from, session.seq);
+    for (const event of events) {
+      const message = event.type === 'agent/inbox/spliced' ? event.data.inserted.find(m => rpcIdOf(m) === requestId) : undefined;
+      if (message) return rememberWitness(requestId, { sessionId, session, messageId: message.id, spliceSeq: event.seq });
     }
+  }
+  async function witnessedSend(p, send) {
+    const requestId = typeof p.requestId === 'string' && p.requestId ? p.requestId : null;
+    if (!requestId) return send();
+    expecting.set(requestId, p.sessionId);
+    try {
+      const sent = await send();
+      bindEarlierInsert(requestId, p.sessionId);
+      return sent;
+    } catch (error) {
+      // Refused only when the harness inserted nothing for this request.
+      if (!witnesses.get(requestId)?.messageId) rememberWitness(requestId, { sessionId: p.sessionId, refused: String(error?.message ?? error) });
+      throw error;
+    } finally { expecting.delete(requestId); }
+  }
+  async function disposeOwned(sessionId, handle) {
+    const session = handle?.agent?.session ?? ctx.agents.get(sessionId)?.session;
+    const from = session?.seq;
+    try { await handle.dispose(); } finally {
+      if (session && from !== undefined) {
+        const windows = disposals.get(session) ?? [];
+        windows.push([from, session.seq]);
+        while (windows.length > 16) windows.shift();
+        disposals.set(session, windows);
+        await freezeWitnesses(session);
+      }
+    }
+  }
+  // A disposed session's log no longer changes: keep each of its records with
+  // its final facts and drop the session, so records never retain the logs of
+  // disposed sessions. A record whose facts exceed one page keeps the session.
+  async function freezeWitnesses(session) {
+    const records = [...witnesses.values()].filter(record => record.session === session);
+    if (!records.length) return;
+    let durable = false;
+    try { durable = Boolean(await ctx.get('sessions')?.flush(session)); } catch {}
+    for (const record of records) {
+      const facts = witnessFacts(record, session.seq);
+      if (!facts.complete) continue;
+      record.frozen = { ...facts, durable, frozen: true };
+      delete record.session;
+    }
+  }
+  // One page of facts from `from` (at least spliceSeq), at most WITNESS_SCAN
+  // events; `complete` says it reached the log's end at `through`. HGS pages
+  // forward from the returned `through`.
+  function witnessFacts(record, through, from = record.spliceSeq) {
+    const { session, messageId, spliceSeq } = record;
+    const start = Math.min(Math.max(Number.isSafeInteger(from) ? from : spliceSeq, spliceSeq), through);
+    const end = Math.min(through, start + WITNESS_SCAN);
+    const events = [];
+    for (const event of session.snapshotEvents(start, end)) {
+      const d = event.data;
+      if (event.type === 'agent/inbox/spliced') events.push({ seq: event.seq, type: event.type, target: d.target, start: d.start,
+        removedCount: d.removedCount ?? 0, outcome: d.outcome ?? null, inserted: d.inserted.map(m => ({ id: m.id, rpcId: rpcIdOf(m) })) });
+      else if (event.type === 'user/message') events.push({ seq: event.seq, type: event.type, id: d.id, rpcId: rpcIdOf(d), digest: witnessDigest(d.content) });
+      else if (event.type === 'turn/end') events.push({ seq: event.seq, type: event.type, turn: d.turn, reason: d.reason?.kind ?? null });
+    }
+    const live = ctx.agents.get(record.sessionId);
+    const pending = Boolean(live && [...live.inbox.nextStep, ...live.inbox.nextTurn].some(m => m.id === messageId));
+    return { messageId, spliceSeq, from: start, through: end, complete: end === through, live: Boolean(live), pending,
+      idle: !live || live.status === 'idle', events,
+      disposals: (disposals.get(session) ?? []).filter(([first, last]) => last > spliceSeq && first < end) };
+  }
+  // {sessionId, requestId, generation, waitMs, fromSeq?}: see witnessFacts.
+  async function inputWitness(p) {
+    if (p.generation !== generation) return { generation, state: 'host_gone' };
+    const record = witnesses.get(p.requestId);
+    if (!record || record.sessionId !== p.sessionId) return { generation, state: 'unseen' };
+    if (record.refused !== undefined) return { generation, state: 'refused', reason: record.refused };
+    if (record.frozen) {
+      const from = Math.max(Number.isSafeInteger(p.fromSeq) ? p.fromSeq : record.frozen.from, record.frozen.from);
+      return { generation, state: 'tracked', ...record.frozen, from, events: record.frozen.events.filter(event => event.seq >= from) };
+    }
+    // Wait, bounded, until the message is delivered or can no longer be.
+    const deadline = Date.now() + Math.min(Math.max(Number(p.waitMs) || 0, 0), WITNESS_WAIT);
+    for (;;) {
+      const facts = witnessFacts(record, record.session.seq);
+      const delivered = facts.events.some(e => e.type === 'user/message' && e.id === record.messageId);
+      if (delivered || (!facts.pending && facts.idle) || Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    // Only what was appended before the flush is reported, and only a
+    // successful flush makes it durable.
+    const through = record.session.seq;
+    let durable = false;
+    try { durable = Boolean(await ctx.get('sessions')?.flush(record.session)); } catch {}
+    return { generation, state: 'tracked', durable, ...witnessFacts(record, through, p.fromSeq) };
+  }
+  // zerus-yj7ef: every list row carries `listJobs`, a bounded summary of the
+  // session's running bash jobs, its own and its listed subagents', read from
+  // the same job registry as inspect. Contract (docs/reference.md):
+  //   {complete: true, count: N, jobs: [N jobs]} when N <= LIST_JOB_LIMIT;
+  //   {complete: false, count: null, jobs: []} without a registry or over it.
+  // ping advertises listJobs: true. A host without both is unknown, never idle.
+  // Kept apart from the rest of the list builder.
+  const LIST_JOB_LIMIT = 32;
+  const runningJob = job => job.kind === 'bash' && ['starting', 'running', 'stopping'].includes(job.status);
+  function listJobs(items) {
+    const registry = ctx.get('jobs');
+    const owners = new Map(items.map(row => [row.sessionId, [row.sessionId]]));
+    for (const row of items) {
+      if (row.origin === 'subagent' && row.parentSessionId !== row.sessionId) owners.get(row.parentSessionId)?.push(row.sessionId);
+    }
+    const summaries = new Map();
+    for (const [sessionId, ids] of owners) {
+      const jobs = typeof registry?.list === 'function'
+        ? ids.flatMap(owner => registry.list(owner).filter(job => job.owner === owner && runningJob(job))) : null;
+      summaries.set(sessionId, !jobs || jobs.length > LIST_JOB_LIMIT ? { complete: false, count: null, jobs: [] }
+        : { complete: true, count: jobs.length, jobs: jobs.map(job => ({ id: job.id, kind: job.kind, owner: job.owner,
+          status: job.status, startedAt: job.startedAt, label: String(job.label ?? '').slice(0, 240), callId: jobCalls.get(job.id)?.callId ?? null })) });
+    }
+    return summaries;
   }
   async function execute(request) {
     if (closing) throw new Error('Native host is stopping');
     const p = request.params ?? {};
     switch (request.method) {
-      case 'ping': return { protocol: 1, version: '0.2.1-rc.2', generation, accountPermissions: true, sessionActions: true, sessionRows: true, fileAttachments: true,
-        nativeOperations: ['fork', 'history-search', 'schedules'], schedule: Boolean(scheduleService()) };
+      // Task 234: loadedSessions lets a listing reuse a stopped session's row
+      // (building one replays its stored history) until this host loads it.
+      case 'ping': {
+        const environment = callEnvironmentInstalled();
+        return { protocol: 1, version: '0.2.1-rc.2', generation, accountPermissions: true, sessionActions: true, sessionRows: true, fileAttachments: true,
+          inputWitness: true, listJobs: true, teamLifecycle: true,
+          shellIdentity: environment, callTokens: environment,
+          loadedSessions: typeof ctx.sessions?.keys === 'function' ? [...ctx.sessions.keys()].slice(0, 5000) : undefined,
+          nativeOperations: ['fork', 'history-search', 'schedules', 'permission-preset', 'permissions'], schedule: Boolean(scheduleService()) };
+      }
       case 'list': {
         const list = await api.list({}, new AbortController().signal);
         const status = await accountStatus();
         const scheduled = await scheduleSummaries();
-        return { ...list, generation, items: list.items.map(row => listRow(row, status, scheduled)) };
+        const jobSummaries = listJobs(list.items);
+        return { ...list, generation, items: list.items.map(row => ({ ...listRow(row, status, scheduled), listJobs: jobSummaries.get(row.sessionId) })) };
       }
       // WhiteWh fork: the list rows of these Sessions and their subagents only.
       case 'rows': {
@@ -468,21 +1069,30 @@ export function apply(ctx, config) {
           throw new Error('Invalid session rows request');
         const status = await accountStatus();
         const scheduled = await scheduleSummaries();
-        const items = [], seen = new Set();
+        const rows = [], seen = new Set();
         const add = async sessionId => {
           if (seen.has(sessionId)) return null;
           seen.add(sessionId);
           const row = await summaryOf(sessionId);
-          if (row) items.push(listRow(row, status, scheduled));
+          if (row) rows.push(row);
           return row;
         };
         for (const sessionId of p.sessionIds) {
           const row = await add(sessionId);
           for (const child of row?.projections?.values?.subagentCatalog ?? []) if (typeof child?.id === 'string') await add(child.id);
         }
-        return { generation, items };
+        const jobSummaries = listJobs(rows);
+        return { generation, items: rows.map(row => ({ ...listRow(row, status, scheduled), listJobs: jobSummaries.get(row.sessionId) })) };
       }
       case 'inspect': return inspect(p);
+      case 'input-witness': return inputWitness(p);
+      case 'session-lifecycle': {
+        if (typeof p.sessionId !== 'string' || !p.sessionId || p.sessionId.length > 2048) throw new Error('Invalid session identity');
+        const live = ctx.agents.get(p.sessionId);
+        const end = endedAgents.get(p.sessionId);
+        return { generation, sessionId: p.sessionId, state: live ? 'live' : end ? 'ended' : 'unknown',
+          ...(live || !end ? {} : { end }) };
+      }
       case 'fork': return fork(p);
       case 'search-history': return searchHistory(p);
       case 'schedules': return schedules(p);
@@ -506,17 +1116,28 @@ export function apply(ctx, config) {
       case 'compact': {
         if (p.generation !== generation) throw new Error('DeepSeek host changed');
         const agent = topLevel(ctx.agents.get(p.sessionId));
-        if (!agent || ctx.commands.find(agent,'compact')?.definitionId !== '@deepseek-ai/dsh-command-compact') throw new Error('Native compaction is unavailable');
+        const command = agent ? ctx.commands.find(agent,'compact') : undefined;
+        const compaction = ctx.get('compaction');
+        if (!agent || !compactAvailable(command, compaction)) throw new Error('Native compaction is unavailable');
         if (compactReceipts.has(p.requestId) || compactionPublic(p.sessionId)?.status === 'compacting') throw new Error('Compaction was already requested');
         const abort = new AbortController();
-        const operation = ctx.commands.execute(agent, '/compact', [], abort.signal);
+        // The slash command's own receipt when it is registered; else the seam it
+        // runs, so a headless composition compacts all the same.
+        const operation = compactCommand(command)
+          ? ctx.commands.execute(agent, '/compact', [], abort.signal)
+          : compaction.compactNow(agent, abort.signal);
         const state = { public: { request_id: p.requestId, status: 'compacting', at: Date.now() / 1000 }, abort };
         compactions.set(p.sessionId, state); compactReceipts.add(p.requestId);
         operation.then(async result => {
           if (state.public.status !== 'compacting') return;
           state.revision = (await api.projections({sessionId:p.sessionId}, new AbortController().signal)).asOfSeq;
-          state.public.status = result?.result.kind !== 'success' ? 'failed' : result.result.sourceEventSeq !== undefined ? 'completed' : 'unchanged';
-          state.public.error = result?.result.kind === 'error' ? result.result.text : undefined;
+          if (result?.result) {
+            state.public.status = result.result.kind !== 'success' ? 'failed' : result.result.sourceEventSeq !== undefined ? 'completed' : 'unchanged';
+            state.public.error = result.result.kind === 'error' ? result.result.text : undefined;
+          } else {
+            // The seam: null means there was no compactable history yet.
+            state.public.status = result === null ? 'unchanged' : 'completed';
+          }
           state.public.completed_at = Date.now() / 1000;
         }).catch(error => { state.public.status = 'failed'; state.public.error = String(error?.message ?? error); });
         return { status: 'submitted' };
@@ -560,8 +1181,16 @@ export function apply(ctx, config) {
       }
       case 'workspace': return publishWorkspace(p.sessionId);
       case 'catalog': return api.modelCatalog();
+      case 'permissions': {
+        // Read-only sanitized snapshot of the configured preset table; Auto is
+        // intentionally excluded because it cannot be an account/launch default.
+        return { generation, options: presetOptions().map(option => ({
+          value: option.value, label: option.name ?? option.value,
+          ...(option.description ? { description: option.description } : {}) })) };
+      }
       case 'create': {
         checkPermissions(p.permissionMode);
+        checkPreset(p.permissionPreset);
         // WhiteWh fork: a full folder on this platform (on Windows, a drive or UNC share).
         if (typeof p.cwd !== 'string' || !absoluteFolder(p.cwd) || !(await fs.stat(p.cwd)).isDirectory()) throw new Error('Choose an existing absolute folder');
         const sessionId = p.sessionId;
@@ -571,30 +1200,88 @@ export function apply(ctx, config) {
           try {if (observation.header.cwd !== p.cwd) throw new Error('Native session belongs to another folder');}
           finally {observation[Symbol.dispose]();}
           await publishWorkspace(sessionId);
-          return {sessionId,generation};
+          // An ordinary ensure or retry never switches a live agent's preset:
+          // that is deferred live-session work. Only an explicit pending
+          // initial-setup recovery may finish the exact requested preset, and
+          // only while the native turn is idle.
+          let presetApplied;
+          if (p.permissionPreset !== undefined) {
+            const live = ctx.agents.get(sessionId);
+            let current = null;
+            try { current = ctx.permissionPresets.current(live.session); } catch {}
+            const recovery = p.permissionRecovery === true;
+            const row = recovery ? await summaryOf(sessionId) : null;
+            if (recovery && !row) throw new Error('Wait for the native turn before finishing permission setup');
+            const gate = presetGate({
+              preset: p.permissionPreset, live: true, recovery,
+              running: row?.running === true, explicit: p.permissionExplicit === true, current,
+            });
+            if (gate.refuse) throw new Error('Wait for the native turn before finishing permission setup');
+            if (gate.apply) applyPreset(live, p.permissionPreset);
+            presetApplied = gate.applied;
+          }
+          return {sessionId,generation,...(presetApplied === undefined ? {} : {presetApplied})};
         }
         try {
           const observation = await ctx.sessionQuery.observeSession(sessionId);
           try {
             if (observation.header.cwd !== p.cwd) throw new Error('Native session belongs to another folder');
           } finally { observation[Symbol.dispose](); }
-          await resume(sessionId, p.permissionMode); return { sessionId, generation };
+          await resume(sessionId, p.permissionMode, p.permissionPreset);
+          return { sessionId, generation, ...(p.permissionPreset === undefined ? {} : {presetApplied:true}) };
         } catch (error) {
           if (error?.code !== 'SESSION_QUERY_SESSION_NOT_FOUND') throw error;
         }
-        const composition = await control.composeAgent('standard');
-        const { provider, model } = ctx.agentDefaultModel.currentSelection();
-        const handle = await ctx.agents.create({ sessionId, agentOptions: { provider, model },
+        const composition = await models.compose('standard');
+        const handle = await ctx.agents.create({ sessionId, agentOptions: defaultAgentOptions(),
           meta: { cwd: p.cwd, agentPreset: composition.agentPreset }, setup: composition.setup });
         applyPermissions(handle.agent, p.permissionMode);
+        applyPreset(handle.agent, p.permissionPreset);
         owned.set(sessionId, handle);
         await publishWorkspace(sessionId);
         if (p.title) await api.rename({ sessionId, title: p.title });
-        return { sessionId, generation };
+        return { sessionId, generation, ...(p.permissionPreset === undefined ? {} : {presetApplied:true}) };
+      }
+      case 'session-resume-status': {
+        let status = 'unknown';
+        if (p.generation === generation && plainMarker(p.sessionId)
+          && typeof p.requestId === 'string' && RESUME_REQUEST.test(p.requestId)) {
+          const prior = scopedResumes.get(p.requestId);
+          if (prior) {
+            if (prior.sessionId === p.sessionId) status = prior.status;
+          } else {
+            // The status read and the native admission run on this same
+            // event loop. Fence the original before reporting non-delivery.
+            status = 'failed';
+            if (scopedResumes.size < RESUME_RECEIPTS) {
+              scopedResumes.set(p.requestId, { sessionId: p.sessionId, action: 'resume', generation,
+                status, error: 'The original DeepSeek resume was fenced before it started' });
+            }
+          }
+        }
+        return { generation, requestId: p.requestId, sessionId: p.sessionId, status };
       }
       case 'session-action': {
         let changed = false;
-        const answer = (status, error) => ({ sessionId:p.sessionId, action:p.action, generation, status, ...(error ? {error} : {}) });
+        const requestId = p.action === 'resume' && p.generation === generation
+          && typeof p.requestId === 'string' && RESUME_REQUEST.test(p.requestId)
+          ? p.requestId : null;
+        const result = (status, error) => ({ sessionId:p.sessionId, action:p.action, generation, status, ...(error ? {error} : {}) });
+        if (requestId) {
+          const prior = scopedResumes.get(requestId);
+          if (prior) return prior.sessionId === p.sessionId ? prior : result('failed', 'Native resume request identity changed');
+          // A fence must last for this generation, including after an
+          // arbitrarily delayed original. At capacity every unknown ID is
+          // refused; the person can restart the host when it is idle.
+          if (scopedResumes.size >= RESUME_RECEIPTS)
+            return result('failed', 'DeepSeek restore receipt capacity is full. Restart the host when it is idle');
+          scopedResumes.set(requestId, result('pending'));
+        }
+        const answer = (status, error) => {
+          const value = result(status, error);
+          if (requestId && scopedResumes.has(requestId)) scopedResumes.set(requestId, value);
+          return value;
+        };
         try {
           const listed = p.action === 'pause' ? await summaryOf(p.sessionId) : null;
           if (p.generation !== generation) throw new Error('DeepSeek host changed; refresh before this action');
@@ -606,20 +1293,21 @@ export function apply(ctx, config) {
           if (p.action === 'resume') {
             if (live || opening.has(p.sessionId)) throw new Error('This session is already running or opening');
             checkPermissions(p.permissionMode);
+            checkPreset(p.permissionPreset);
             changed = true;
-            await resume(p.sessionId,p.permissionMode);
+            await resume(p.sessionId,p.permissionMode,p.permissionPreset);
           } else if (p.action === 'rename') {
             if (typeof p.title !== 'string' || !p.title || p.title.length > 512) throw new Error('Invalid scoped title');
             changed = true; await api.rename({sessionId:p.sessionId,title:p.title});
           } else if (live) {
             changed = true; ctx.goals.disarm(live);
-            await handle.dispose();
+            await disposeOwned(p.sessionId, handle);
             if (owned.get(p.sessionId) === handle) owned.delete(p.sessionId);
           }
           return answer('completed');
         } catch (error) { return answer(changed ? 'uncertain' : 'failed',String(error?.message ?? error)); }
       }
-      case 'resume': await resume(p.sessionId, p.permissionMode); return { generation };
+      case 'resume': await resume(p.sessionId, p.permissionMode, p.permissionPreset); return { generation };
       case 'pause': {
         // Closing the owned handle drains exactly this agent and its children;
         // other sessions and the shared native host remain alive.
@@ -628,7 +1316,7 @@ export function apply(ctx, config) {
         const handle = owned.get(p.sessionId);
         if (!handle) throw new Error('This agent is owned by the native UI; stop it there');
         ctx.goals.disarm(live);
-        await handle.dispose(); owned.delete(p.sessionId);
+        await disposeOwned(p.sessionId, handle); owned.delete(p.sessionId);
         return { stopped: true };
       }
       case 'rename': return api.rename(p);
@@ -637,7 +1325,7 @@ export function apply(ctx, config) {
         if (!parent) throw new Error('Resume the parent session before messaging this agent');
         return ctx.subagents.prompt(p, new AbortController().signal);
       }
-      case 'send': {
+      case 'send': return witnessedSend(p, async () => {
         topLevel(ctx.agents.get(p.sessionId));
         const compact = compactionPublic(p.sessionId);
         if (p.expectedCompactionId && (compact?.request_id !== p.expectedCompactionId || compact.status !== 'completed'))
@@ -651,7 +1339,7 @@ export function apply(ctx, config) {
         if (!agent) throw new Error('Resume this session before sending a message');
         // Read as list and inspect do. A top-level Agent upstream composed has an
         // installed selection; another one, such as a webhook root, gets none here.
-        const selection = selectionOf(agent, control.selections.has(agent) ? undefined
+        const selection = selectionOf(agent, models.has(agent) ? undefined
           : (await api.projections({ sessionId: p.sessionId }, new AbortController().signal))?.values);
         if (needsSignIn(selection, await accountStatus()))
           throw new Error('Sign in to DeepSeek in the native UI before sending a message');
@@ -667,9 +1355,14 @@ export function apply(ctx, config) {
           content.push({ type: 'file', receiptId });
         }
         return api.prompt({ ...p, content }, new AbortController().signal);
-      }
+      });
       case 'settings': {
-        const agent = topLevel(await resume(p.sessionId));
+        // A launch applying account defaults binds the exact host generation
+        // that created the session. A paused session resumes under the
+        // account permission mode HGS passes, as a scoped resume does.
+        if (p.generation !== undefined && p.generation !== generation) throw new Error('DeepSeek host changed; refresh before changing settings');
+        checkPermissions(p.permissionMode);
+        const agent = topLevel(await resume(p.sessionId, p.permissionMode));
         const catalog = await api.modelCatalog();
         const model = catalog.groups.find(g => g.id === p.provider)?.models.find(m => m.id === p.model);
         if (!model) throw new Error('This model is unavailable for the native account');
@@ -679,11 +1372,17 @@ export function apply(ctx, config) {
             ...(p.reasoningEffort === undefined ? {} : { reasoningEffort: p.reasoningEffort }) });
           const selection = { provider: resolved.provider, model: resolved.model,
             ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }) };
-          control.selectForNextRequest(agent, selection);
+          models.select(agent, selection);
           return { selected: selection, scope: 'session' };
         });
       }
       case 'answer': {
+        // Optional correlation for durable CLI receipts. Older CLIs omit it;
+        // older resident bridges ignore it and keep their original response.
+        const requestId = p.requestId;
+        if (requestId !== undefined && (typeof requestId !== 'string'
+            || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(requestId)))
+          throw new Error('Invalid answer request ID');
         const q = questions.get(p.id);
         if (p.generation !== generation || !q || q.sessionId !== p.sessionId) throw new Error('This question is no longer pending');
         if (!Array.isArray(p.answers) || p.answers.length !== q.items.length) throw new Error('Answer every question');
@@ -698,7 +1397,13 @@ export function apply(ctx, config) {
               || (answer.custom !== undefined && typeof answer.custom !== 'string')) throw new Error('Invalid question answer');
           seen.add(answer.id);
         }
-        q.settle({ answers: p.answers }); return { accepted: true };
+        q.settle({ answers: p.answers });
+        return { accepted: true, ...(requestId === undefined ? {} : { requestId }) };
+      }
+      // Which conversation's live tool call holds this token; nothing else.
+      case 'call-token': {
+        const conversation = tokens.conversation(p.token);
+        return conversation === undefined ? { known: false } : { known: true, conversation };
       }
       default: throw new Error('Unsupported HGS native request');
     }
@@ -722,9 +1427,9 @@ export function apply(ctx, config) {
       (async () => {
         try {
           const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          socket.end(JSON.stringify({ ok: true, value: await execute(request) }) + '\n');
+          socket.end(tokens.redact(JSON.stringify({ ok: true, value: await execute(request) })) + '\n');
         } catch (error) {
-          socket.end(JSON.stringify({ ok: false, error: String(error?.message ?? error), code: error?.code }) + '\n');
+          socket.end(tokens.redact(JSON.stringify({ ok: false, error: String(error?.message ?? error), code: error?.code })) + '\n');
         }
       })();
     });

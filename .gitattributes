@@ -5,15 +5,33 @@
 
 # Reviewed official manifests are hash-pinned raw upstream bytes on every host.
 scripts/ci/kimi-native-manifests/*.json -text
+# A reviewed third-party license is hash-pinned too (collect-licenses.py):
+# a Windows checkout must not turn its line endings into CRLF (task 169).
+docs/licenses/canonicalpath-LICENSE.txt -text
+
+# The Next Russian catalogs merge as data, not as text: the reviewed supplement
+# as a key union and the generated catalog by regeneration
+# (scripts/i18n-merge.py, driver `i18n`; Zerus passes it on its merge paths,
+# contributors enable it with one git config line, see CONTRIBUTING.md).
+client/src/i18n.next-ru.json merge=i18n
+client/src/i18n.ru.json merge=i18n
 
 # Captured terminal screens intentionally preserve whitespace and blank lines.
 # They and the recorded screen data are embedded with include_str!, so checkouts
 # keep their bytes exactly (no CRLF conversion on Windows).
 tests/fixtures/*.txt -text -whitespace
+# Reviewed reverse-projection patches pin raw bytes, including context whitespace.
+tests/fixtures/*.patch -text -whitespace
+# SessionStart serialization has a byte-exact UTF-8/LF contract on every host.
+tests/fixtures/session-start-context.json -text
+# Task #20: compared byte for byte by details_contract; a Windows checkout kept CRLF.
+client/core/tests/fixtures/inspect-details.json text eol=lf
+# Template digests pin the canonical UTF-8/LF encoding on every host.
+crates/team-plan/fixtures/template-create-canonical.json -text
 src/state/data/*.txt -text -whitespace
 
 # Keep vendored libvterm byte-for-byte identical to the documented upstream.
-tray/vendor/libvterm/** -whitespace
+client/core/tests/fixtures/qt-fork-helper/*.ps1 -text -whitespace
 
 # Design prototypes and artwork are documentation, not application source.
 design/** linguist-documentation

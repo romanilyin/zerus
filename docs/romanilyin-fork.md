@@ -17,11 +17,26 @@ and verified.
 Engineering tracking remains in this fork's existing Dolt database; the source
 merge does not import another fork's task database or replace local deployments.
 
+## November 27 integration
+
+The current integration follows WhiteWh's `whitewh/main` through
+`12dacdd2b4a2a405d8a9c36652e3a363244169e3`. The desktop is now Tauri; retired
+Qt sources are not restored when resolving historical fork conflicts. Roman
+source builds keep their explicit candidate identity and refuse both automatic
+and manual replacement by another distribution's update feed. Official WhiteWh
+portable releases are a separate, explicitly selected deployment option; their
+published source SHA can lag the development branch.
+
+The merge preserves the existing fork database and Windows/WSL contracts. It
+also repairs an incoming Unix bounded-process stdin forwarding error while
+preserving the no-input behavior of callers that reserve a spawn turn first.
+Deployment records must distinguish an official Windows artifact from a Linux
+receiver built with a separately identified source correction.
+
 ## Scope
 
-- Prefer PowerShell 7 Core for native Windows shell operations, with Windows
-  PowerShell 5.1 fallback when `HGS_PWSH` is unset; an explicit override remains
-  authoritative.
+- Require PowerShell 7 Core for native Windows shell operations. Windows
+  PowerShell 5.1 is unsupported, including when `HGS_PWSH` is unset.
 - Represent lexical path identity separately from physical filesystem access.
 - Pin CanonicalPath release `2026.10.24-1` to source commit
   `50b390675a146874b1555f361e491d1efeb393a7` and the Cargo lockfile.

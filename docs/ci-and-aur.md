@@ -28,22 +28,61 @@ conservative change selection, including both sides of renames.
 | --- | --- | --- |
 | Resolve commit | Always | Exact test commit and suite selection for every other job |
 | Quick checks | Always | Privacy, Gitleaks 8.30.1 on the tree and every fetched branch and tag, Python/Bash syntax, version consistency, actionlint, stable/nightly publication contracts, locked Rust 1.99 unit tests, the replica crate (format, clippy, tests, golden vectors), Rust license notices |
+| Desktop client core | Always | The unchanged `client-core.sh` format, strict Clippy and test sequence on Ubuntu, in parallel with Quick and bound to the same resolved commit; required by Suite results |
 | Rust relay | Always | Rust 1.99 format, clippy, and every storage contract (cross-worker ones included) on its own PostgreSQL database; every `services/mobile/tests` module, with the Rust relay fixtures on per-test PostgreSQL databases and no skips; the speech suites against the Python reference relay; the deployment image and its 256 MiB envelope |
 | Rust mobile connector | Always | Rust 1.99 format, clippy, vector, binary and journal handoff tests; the black-box suites against the Python and Rust connectors concurrently with differential traces compared against the reviewed allowlist, and a 300 s soak of the Rust build (`services/mobile/tests/BLACKBOX.md`) |
 | Rust mobile connector on macOS | Always | Cold Rust 1.99 build, unit, vector and binary tests, and the black-box modules that need no real `hgs`, journal handoffs with the Python connector included |
 | iOS core tests and simulator build | Affected PR; full nightly/stable | The project task replica built with Rust 1.99.1 for the iPhone, the simulator and macOS (`mobile/ios/scripts/build-replica.sh`, without the release profile's LTO in this check), then `swift test` for the ZerusKit core and an unsigned Release build of the app for the iOS simulator, with the newest installed Xcode 26 or later and no signing identity |
 | Android unit tests and lint | Always | `testDebugUnitTest` and `lintRelease` of the Firebase variant that Dev ships, with a synthetic `google-services.json` and no credentials |
 | Linux CLI | Always | Stable Rust unit tests, terminal smoke tests, Python integration modules, release build |
-| Arch desktop | Always | Qt build and all CTest suites |
+| Native desktop client | Linux with the CLI; macOS/Windows with their desktop jobs | Linux `client/media` audio/video tests, including synthetic GStreamer recordings, and `client/src-tauri` tests under headless Xvfb plus clippy with video; native macOS `client/core` tests, `client/media` video checks and `client/src-tauri` clippy (its test suite runs on the local Mac gate until `zerus-5wmh.78` is fixed); native Windows `client/core` tests, `client/media` video checks and `client/src-tauri` clippy (its test suite stays pending `zerus-5wmh.52`), all on standard runners with Rust 1.99.1 |
 | Arch package | Always | Production package with the recipe's `check()`, namcap, staged and installed bundle checks; the only producer of the `arch-x86_64-<commit>` candidate artifact |
-| macOS CLI and desktop | Always | Native CLI integration and all Qt CTest suites on two standard macOS jobs |
-| Windows client and desktop | Affected PR; full nightly/stable | Rust tests, Rust 1.99 clippy for the Windows target, Windows client and session host integration tests, MSVC Qt build with all offscreen CTest suites, and the portable zip checked from an isolated extraction |
+| macOS CLI | Always | Native CLI integration and the maintained Next core/Tauri checks |
+| macOS CLI Clippy | Always | Rust 1.99.1 Clippy of the root `hgs` for macOS with all targets (`--all-targets -D warnings`), check only on a standard runner; it restores the CLI cache and never saves (zerus-3ldf4, zerus-8evem) |
+| Windows client and desktop | Affected PR; full nightly/stable | Rust tests, Rust 1.99 clippy for the Windows target, Windows client and session host integration tests, Tauri build with video and frontend notices, and the portable zip checked from an isolated extraction |
 | Windows real agents | Affected PR; full nightly/stable | One latest `win32-x64` Claude Code and Codex release in isolated session hosts of the release build, each against a local fake API; skipped or empty suites fail |
 | CI gate | Always | Requires every selected suite to succeed; fails on unexpected skips, cancellation and errors |
 
-Quick checks and the full suites start together once the commit is resolved, so
-a quick-check failure no longer holds back the other suites. New PR/manual runs cancel
-obsolete runs for the same branch/PR and workflow. Trusted public Dev main pushes
+Manual checks may pin a source older than the client-core job split. If that
+source's disk helper does not support the job, client-core omits only its disk
+preparation/diagnostics and cache restore, building cold to avoid extracting
+Quick's full target cache onto an unprepared runner. Format, strict Clippy,
+tests and the required suite result still run against the exact pinned source.
+
+PR #430's first native-client run at `b3716dd8` (run `40898847326`) measured an
+11-minute-19-second green Linux check run, a 65-minute macOS check-run span that
+ended in cancellation at the 60-minute job timeout, and a 1-minute-51-second
+Windows run that stopped at the first core-test failure. To bound cold builds
+with registry-only caches, macOS and Windows disable dev/test debug info and use
+`client/src-tauri` clippy with all targets instead of a redundant cargo check
+with all targets. The separate media/video check remains because the app's
+default features do not include media.
+
+Native macOS checks are split into two parallel standard-runner jobs with
+90-minute timeouts: `client-native-macos-core` runs core tests and the
+media/video check, while `client-native-macos-tauri` runs clippy with a
+25-minute step timeout. Hosted src-tauri tests are disabled until
+`zerus-5wmh.78` is fixed; the local Mac gate continues to run them. Every cargo
+command has its own named workflow step and calls
+`scripts/ci/client-native.sh macos` with its stage. Only the Tauri job saves the
+shared registry cache, so the two jobs cannot race to save one key. Linux keeps
+45 minutes and Windows 60.
+
+Quick, the client-core job and the full suites start together once the commit is
+resolved. Client-core restores the compiler/month Rust cache read-only and adds
+no cache writer or cache family. Suite results requires client-core success for
+every platform selection, so its failure, cancellation or skip reaches the
+calling CI, regression, Nightly and stable-candidate gates. A Quick failure does
+not hold back the other suites. New PR/manual runs cancel
+obsolete runs for the same branch/PR and workflow. Every `pull_request` workflow has
+such a per-PR group: a new head cancels that PR's older run, and the other workflows'
+manual runs keep their earlier concurrency. Closing or merging a PR cancels its
+remaining queued and running runs, and force-cancels those still active a minute
+later, since queued runs can ignore an ordinary cancel (`pr-closed.yml`: one inline
+`gh api` script with only `actions: write`, no checkout, action or secret). A fork
+PR's runs stay until they finish, since its token is read-only.
+`tests/test_ci_security.py` keeps every `pull_request` workflow on a per-PR
+cancelling group. Trusted public Dev main pushes
 use separate bounded qualification and signing/sealing queues; each keeps its active
 phase and coalesces pending revisions to the newest one. PR/manual checks and main
 before Dev rollout keep their existing whole-run concurrency. PR jobs have read-only
@@ -180,12 +219,28 @@ save them.
 
 | Family | Job | Key after the prefix | Saved when | Bound |
 | --- | --- | --- | --- | --- |
-| `msrv-`, `cli-`, `windows-cli-` | Quick checks, CLI, Windows | OS/arch, hash of `rustc -Vv`, month, `Cargo.lock` hash | Exact key missed; Rust build passed | Monthly restart; about 200–250 MB each; the quick checks' `target/replica` (the replica crate's own lockfile) rides under the same key |
+| `msrv-v2-` | Quick checks | OS/arch, hash of `rustc -Vv`, month, `Cargo.lock` hash | Exact key missed; Rust checks passed | Shared Cargo target, incremental state and debug symbols disabled; monthly restart |
+| `cli-`, `windows-cli-` | CLI, Windows (macOS CLI Clippy restores `cli-` only) | OS/arch, hash of `rustc -Vv`, month, `Cargo.lock` hash | Exact key missed; Rust build passed | Monthly restart |
 | `connector-` | Rust mobile connector | OS/arch, hash of `rustc +1.99.1 -Vv`, month, `services/mobile/connector/Cargo.lock` hash | Exact key missed; connector tests passed | Monthly restart; about 400 MB before compression, without incremental state |
+| `client-native-` | Native desktop client | OS/arch, hash of `rustc +1.99.1 -Vv`, month, hashes of the three client lockfiles | Exact key missed; native checks passed | Monthly restart; Cargo registry and Git checkouts only, so multi-GB native target directories are never cached |
 | `arch-cargo-v1-` | Arch package | Month, hash of `Cargo.lock` and the connector's lock | Exact key missed; package built | Cargo registry only |
 | `android-gradle-v1-` | Android | Month, hash of the Gradle wrapper properties and `*.gradle.kts` | Exact key missed; tests and lint passed | Monthly restart; about 700 MB (`~/.gradle/caches` and `wrapper`) |
-| `windows-qt-6.10.3-` | Windows | Hash of the Qt pin and installer | Exact key missed; desktop build passed | The pinned Qt archives, no WebEngine |
-| `arch-ccache-v1-`, `arch-package-ccache-v1-`, `mac-desktop-ccache-v1-`, `windows-ccache-v1-` | Arch desktop, Arch package, macOS, Windows | Architecture (macOS, Windows), Qt release (Windows), run ID | Build passed with ccache misses | `CCACHE_MAXSIZE` 150, 100, 100 and 500 MB |
+| `arch-package-ccache-v1-` | Arch package | Run ID | Build passed with ccache misses | `CCACHE_MAXSIZE` 100 MB |
+
+Quick, relay and Linux native-client checks reclaim only unused Android, .NET, Haskell and CodeQL installations on disposable hosted Ubuntu runners. Disk checkpoints record free bytes and build-directory sizes. Quick shares one Cargo target across its crates; the new cache family avoids restoring the former duplicated debug and incremental trees. Relay removes its completed host Cargo targets before Docker compiles the deployment image; the remaining memory-envelope checks run that image. PostgreSQL containers and volumes, Cargo registries and the Python test environment stay available. Runner classes and the repository cache limit are unchanged.
+
+The hosted Linux native-client job reports disk use after checkout, dependency
+installation and cache restore, between its existing build phases, and after
+checks even when they fail. Reports include sizes for `target/client-native` and
+the Cargo registry/Git caches. After its fixed unused-tool cleanup, this job
+requires a fresh measurement of at least 24 GiB free before installing dependencies
+or compiling. A healthy run used 17.7 GiB from checkout to the end of its checks,
+8.7 GiB of it in the core test links, and the cleanup reclaimed 18.1 GiB; the
+remainder covers parallel link temporaries and growth. A refusal fails the job
+before any build with a run annotation naming the required and actual free bytes,
+instead of a linker crash on a full disk. Quick and relay do not use this minimum.
+Host build-target retirement remains relay-only. Local native-check script runs
+skip the hosted checkpoints and preparation.
 
 The Windows real-agent job restores the `windows-cli-` family of the Windows
 desktop job for its release build and never saves it, so two jobs cannot race to
@@ -218,16 +273,6 @@ the image's default `BUILDENV` differs only in `ccache`. The published recipes a
 their `check()` are unchanged. The package build uses different compiler flags
 from the desktop build, so it has its own cache family.
 
-Windows installs the official ccache 4.14.1 x86_64 release. The job pins its
-SHA-256, which matches the archive signed with the ccache minisign key
-`RWQX7yXbBedVfI4PNx6FLdFXu9GHUFsr28s4BVGxm4BeybtnX3P06saF`. ccache officially
-supports MSVC since 4.13. Release builds have no `/Zi`, which ccache cannot
-cache; a build with debug information would need `/Z7` instead. Depend mode
-(`CCACHE_DEPEND`) takes the includes from Ninja's `/showIncludes` instead of
-running the preprocessor again. The job sets no `CCACHE_BASEDIR`: rewriting
-paths to relative ones would also change `__FILE__`, from which suites locate
-their fixtures, and the runner's workspace path is the same on every run.
-
 ### Manual checks
 
 ```sh
@@ -243,6 +288,37 @@ An explicit test `ref` changes the checked-out commit, not GitHub's workflow run
 metadata. Use the exact tested SHA recorded in the job summary when reviewing
 such a manual run. Automatic PR and push runs produce CI gate without a dispatch.
 Review and merging remain deliberate; successful CI does not auto-merge PRs.
+
+The existing CI workflow accepts `windows_flake_rounds` from 0 to 40 for opt-in
+native Windows qualification. Zero keeps ordinary runs unchanged. A selected
+run samples four independent sustained transports per round and serial mode
+round trips, each under two local hash workers. Successful changed-mode replies
+carry bounded Stop step timings; a no-op or missing timing cannot qualify a
+Stop sample. A fresh round explicitly Rearms after the prior passive rollback. Mode sampling stops at the first
+refused or unknown choice, retaining the original fixture custody; it never
+retries that choice. Per-invocation readiness, lease, Stop and cleanup bounds
+stay unchanged. Additional dispatch-only steps have their own aggregate CI
+allowance for the extra rounds; ordinary suite commands and limits are
+unchanged. Mode sampling requires that exact Windows shell/native step to
+succeed, while earlier independent failures stay visible. Use the PR's
+reviewed workflow and exact source pin;
+do not start a second full matrix while that SHA is already under verification.
+
+The sustained transport fixture gives startup and an exact framed-input marker
+one eight-second deadline, then gives the 20-chunk render its own 25 seconds.
+The marker must appear in the fake's complete input record before rendering
+starts; no renewal is queued between those events. This binds the 19-second
+render to the decoder's actual clock, which starts after `Add-Type`. The product
+lease remains 15 seconds. Native no-renewal controls must observe the original
+helper exit with code 127 before rendering completes, while stdin stays open.
+The 4 KiB paste marker fills the existing redirected-input buffer before EOF;
+the fixture's 8 KiB incoming pipe fits its data and framing before the decoder
+reads, so marker publication cannot block the startup deadline checks. See the
+[redirected stdin construction](https://github.com/microsoft/referencesource/blob/main/System/services/monitoring/system/diagnosticts/Process.cs)
+and [buffered writes](https://github.com/microsoft/referencesource/blob/main/mscorlib/system/io/filestream.cs#L1638)
+in the .NET Framework reference source.
+Readiness/marker and render diagnostics identify their separate stage and bound;
+cleanup keeps its existing 18-second wait, five-second fallback and reader joins.
 
 Arch is the Linux GUI build environment because the application uses Qt 6 and KDE
 Frameworks 6. Ubuntu remains useful for portable CLI and minimum-Rust checks.
@@ -328,7 +404,6 @@ and [Dependabot options](https://docs.github.com/en/code-security/reference/supp
 ```sh
 python3 scripts/ci/check-source.py
 bash scripts/ci/cli.sh
-bash scripts/ci/gui.sh
 cargo +1.99.1 test --locked
 # Arch only, as an ordinary user with the documented build dependencies:
 bash scripts/ci/arch.sh
@@ -354,13 +429,8 @@ Native agent CLIs are not included in the product package.
 
 The CI CLI jobs set `ZERUS_PYTHON_JOBS` to twice the runner vCPUs (8 on Ubuntu,
 6 on macOS): the Python test classes mostly wait on terminals and subprocesses.
-The desktop jobs keep per-function QtTest JUnit results in `qt-functions/` of
-their test-results artifacts. The `test_sessionswindow` shards are balanced by
-`tray/tests/qt-shard-durations.txt`, the largest duration of each function, or
-data row of its slowest functions, across the measured runs. After tests are
-added or become slower, download the Arch, macOS and Windows desktop artifacts
-of one main run and rebuild that file with `scripts/ci/qt-shard-seed.py`; its
-usage lists the commands. A test the file does not list still runs exactly once.
+Task #28 removed the Qt desktop with its QtTest suites, their shards and
+`scripts/ci/qt-shard-seed.py`.
 
 `tests/test_claude_input_native.py` checks exact message acceptance by the real
 Claude TUI with a private home/socket and a localhost fake API; it never reads a
@@ -375,6 +445,18 @@ model and effort in a fresh session, accepts Claude's own cache
 notice in a resumed conversation, and requires the session-only transcript
 receipt while `settings.json` stays unchanged. A session-only change made in
 Terminal must reach hgs through `PostModelSwitch` with the exact model ID.
+The served-catalog cases use a private TLS proxy that never forwards traffic,
+fixture credentials and a temporary process-local CA. They cover a hidden model
+under **More models**, full-name picker rows, ordinary and effort-only changes,
+failure cleanup and existing-ID cancellation without replay. Every settings or
+effort request checks that the complete account `settings.json` is unchanged.
+`tests/test_existing_id_send.py` exercises the actual public pending-before-message
+controller on private scripted PTYs, using the exact-source ID seed image. It
+pins early outer receipts, the late input marker, GUI auto-apply slot fallback,
+Background routing, large/symlink receipt-cache parity, uncertainty and exact
+buffer cleanup. These controls are separate from official-agent acceptance:
+the Claude, Codex and Kimi native contracts must prove pending Settings followed
+by one unchanged message and exactly one model call with account defaults kept.
 `tests/test_claude_statusline_native.py` starts the real TUI through a tracked
 `hgs claude` launch, with the private home, state folder and socket and the
 loopback API of `tests/model_api_fixture.py`. Claude 2.1.296 and 2.1.308 coverage requires the
@@ -562,105 +644,66 @@ gives each step a synchronous anonymous pipe as stdin, and Windows OpenSSH never
 exits after using one (the fake client refuses it), so steps that start `hgs.exe`,
 `ssh` or the desktop app read stdin from `/dev/null`.
 
-Qt 6.10.3 for MSVC 2022 x64 with Qt Multimedia comes from the official archives
-pinned in `packaging/windows/qt.json`, which `scripts/install-qt-windows.py`
-installs with the shared standard-library installer `scripts/qt_archives.py`
-(also used for [macOS](macos-distribution.md#pinned-qt)). No PyPI package is
-installed for it. The pin lists what aqtinstall 3.3.0 installed for this build
-before: every archive of `qt.qt6.6103.win64_msvc2022_64` (`qtbase`, `qtsvg`,
-`qtdeclarative`, `qttools` with `windeployqt`, `qttranslations`,
-`d3dcompiler_47` and `opengl32sw`) and `qtmultimedia`, each with its URL path in
-the repository, its size, its SHA-256 and the directory its `Extract` operation
-in `Updates.xml` names. The installer downloads every archive (download.qt.io may
-redirect to a mirror), stops reading at the pinned size, checks the SHA-256 and
-lists the members with the runner image's 7-Zip before it extracts any archive.
-A member with an absolute, drive, parent, device or alternate-stream name, or a
-link, stops the installation; so does a link left in the extracted tree that
-resolves outside it. A failed download is retried twice, each failure logged;
-nothing unverified is kept. The result is aqtinstall's layout,
-`RUNNER_TEMP/Qt/6.10.3/msvc2022_64`. Of aqtinstall's fixups only `bin/qt.conf`
-(`Prefix=..`) is repeated: the official Qt is relocatable, the `qmake.exe`, `.prl`
-and `qconfig.pri` patches find nothing to change in 6.10.3, and `qtenv2.bat` is
-for interactive shells. Compared with an aqtinstall 3.3.0 installation of the
-same release (on Linux, 2026-10-15), all other 11807 entries matched, except
-for the line endings of `qconfig.pri`, which aqtinstall rewrites in text mode. On
-Windows that rewrite keeps the archive's CRLF in `qconfig.pri` but gave the LF
-`lib/*.prl` files CRLF, which only qmake reads; they now stay LF. The
-installer also writes `zerus-qt.json`, the archive list it installed, and the
-`Use Qt` step checks it with `--check`, so a restored cache must match the pin
-too.
+The Windows desktop is Zerus Next, built from the locked frontend and Tauri
+Rust package with `tauri.windows.switch.conf.json` and the `video` feature. The output
+is `target/windows-next/release/hgs-tray.exe`, with the installed identity
+`com.hgdev.hgs-tray`. This job does not install Qt, run `windeployqt` or cache a
+Qt/C++ desktop build. Native Windows shell contracts also run in the dedicated
+client-native job.
 
-To update Qt, change the version, `prefix`, package names and directories in
-`qt.json`, then run `python scripts/install-qt-windows.py --lock`: it reads the
-archives and their `Extract` directories from the official `Updates.xml`,
-downloads each archive and records its size and digest once it matches the
-published `.sha256`. From Qt 6.11 each Windows architecture has a repository
-directory of its own (`desktop/qt6_6112/qt6_6112_msvc2022_64` rather than
-aqtinstall's expected `desktop/qt6_6112/qt6_6112`), which a package's `directory`
-names; the 6.11 base package adds `qtdoc`. Review the locked pin like the other
-pins and check `--output` locally (7-Zip on Linux works as well) before
-committing. The Qt directory is cached with `actions/cache` under a key that
-covers the Qt release, the pin and the installer. Like every cache, only trusted
-main checks save it; PR, manual and nightly runs restore it (see
-[build caches](#build-caches)). Such a run downloads Qt when no cache entry exists
-yet. Qt WebEngine is not installed: the embedded DeepSeek Native UI is an
-optional Linux plugin. The desktop build compiles through ccache.
+WebView2 Evergreen is a shared prerequisite. The app installer checks the
+Microsoft-documented user and machine registration and stops before changing
+Zerus files when it is missing. Winget declares `Microsoft.EdgeWebView2Runtime`
+as a dependency; portable users install it separately. Only the disposable
+Windows CI runner uses `scripts/ci/ensure-webview2.py`: it first checks for an
+existing runtime, otherwise downloads the official HTTPS bootstrapper within a
+4 MiB/time bound, verifies a valid Microsoft Authenticode signature, runs it
+with a fixed timeout and checks the registration again. It refuses owner and
+non-Windows environments and never removes the shared runtime. See Microsoft's
+[WebView2 distribution guidance](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution).
 
-`scripts/ci/gui.sh` re-enters itself through `scripts/ci/msvc-env.py`, which
-locates Visual Studio with `vswhere` and applies `vcvars64.bat` (with its CMake
-and Ninja first on `PATH`) to that build only, then builds with Ninja and `cl` and
-runs every CTest suite offscreen.
+`scripts/package-windows.py` copies the exact tested `hgs.exe`, Tauri
+`hgs-tray.exe` and `zerus-mobile-connector.exe` into
+`zerus-windows-x86_64.zip`, preserving the top-level
+`zerus-windows-x86_64/hgs-tray.exe` path winget uses. It adds the app-local MSVC
+runtime from Visual Studio's default redistributable directory and the pinned
+ConPTY pair next to `hgs.exe`. No Qt runtime or plugins are deployed.
 
-`scripts/package-windows.py` bundles the exact tested `hgs.exe`, `hgs-tray.exe`
-and `zerus-mobile-connector.exe`
-into `zerus-windows-x86_64.zip` with one top-level `zerus-windows-x86_64/` folder:
+The zip carries the project, Codex and ConPTY notices, the host-target Rust
+notices for the CLI/connector and Tauri desktop (including its selected video
+feature), and the exact installed production frontend packages' license texts.
+Frontend collection uses the shared `client/scripts/collect-notices.py` and npm
+lockfile, excludes development tools except Vite's emitted preload runtime, and
+refuses missing notices or mismatched installed versions. `build-info.json`
+records `desktop:tauri`, `webview2_runtime:evergreen`, versions and exact source.
+The portable inspector still accepts immutable published Qt archives with their
+original layout and notices, so retries never rebuild or alter older releases.
 
-- `windeployqt` adds Qt, its plugins (including the SVG image and icon plugins
-  loaded at run time) and translations. It runs with `--no-opengl-sw`: the Mesa
-  software OpenGL fallback would need notices the zip does not carry. `--no-system-d3d-compiler` and `--no-system-dxc-compiler` keep
-  Microsoft's shader compilers out: Windows includes `D3DCompiler_47.dll`, and
-  the notices do not cover the Windows SDK's `dxcompiler.dll` and `dxil.dll`.
-  The ICU DLLs it copies from the build machine's System32 (a forwarder
-  to `icu.dll` on current Windows) are removed; `Qt6Core.dll` uses the system ICU.
-  The minimum is Windows 10 1903, which the desktop app's UTF-8 code page also
-  needs.
-- The app-local Visual C++ runtime DLLs come from the default redistributable
-  folder of the Visual Studio found by `vswhere`, never a hard-coded version.
-- `conpty.dll` and `OpenConsole.exe`, the pinned [ConPTY pair](#the-bundled-conpty-pair),
-  sit next to `hgs.exe`, so `hgs session-host install` from the extracted folder
-  stages them into the host image. `--conpty` names a folder from
-  `scripts/fetch-conpty.py`, whose files must match the pin; without it the
-  script fetches the pair itself.
-- `licenses/` holds the libvterm, md4c, Codex and ConPTY texts (the ConPTY license
-  and Windows Terminal's notices), the host-target Rust
-  dependency notices from `scripts/collect-licenses.py`, the per-module SPDX
-  documents shipped with Qt and, in `licenses/qt`, the texts from
-  `packaging/windows/licenses` (sources in its `README.md`). Packaging parses the
-  documents and fails when one names a standard license or exception without its
-  text there, or a `LicenseRef-` without extracted text in the documents.
-- `LICENSE`, `THIRD_PARTY_NOTICES.md`, a `README.txt` for Windows users and
-  `build-info.json` with the source commit, product, CLI and Qt versions.
+`scripts/check-windows-portable.py` checks safe regular-file names, the pinned
+ConPTY hashes, notices, manifest identity and the existing 512 MiB compressed /
+500 MB unpacked bounds. `--run --selftest` on Windows uses private temporary
+configuration and a minimal environment to check CLI/connector startup and the
+exact clean desktop `--build-info` identity. It stages the bundled ConPTY pair
+through `hgs.exe session-host install` without starting a host. New Tauri builds
+do not use Qt's old `--selftest` option.
 
-`scripts/check-windows-portable.py` then checks every entry (no absolute, parent,
-device, case-duplicate or symlink names, no ICU, software OpenGL or Direct3D
-shader compiler DLLs and no Qt WebEngine files), the required runtime and license texts, the manifest
-provenance and the limits: at most 512 MiB compressed, the release mirror's
-asset limit, and 500 MB unpacked, the bound applied to whole nightly candidates.
-`conpty.dll` and `OpenConsole.exe` must be the pinned builds, by size and SHA-256
-read in memory, and no file of either name may sit anywhere but next to
-`hgs.exe`; stable and nightly assembly and publication repeat these checks.
-With `--run --selftest` on Windows it extracts the zip and starts both
-executables with a minimal environment, without Qt or the bundle on `PATH`:
-`--version` of each, `hgs.exe ls --json --local` must report the control-only
-local computer, and `hgs-tray.exe --selftest` must find the `hgs.exe` next to
-it. Last, `hgs.exe session-host install` enables local sessions in the
-disposable profile and must stage the pinned pair into the host image; it starts
-no host. The job uploads the zip and logs as `windows-x86_64-<commit>` without
-recompressing them and keeps them for seven days (three for schedules). Qt
-WebEngine, which made earlier zips about 140 MB (345 MB unpacked), is not part of
-it. Only stable and nightly assembly use that zip. On main pushes the [Dev channel](public-distribution.md#verified-main-dev-channel)
-waits for this job like every other suite, so a Windows failure also holds back
-Dev, but Dev candidates carry no Windows build.
+CI builds the per-user Inno Setup installer from the tested zip without changing
+payload bytes. Installer survival tests install, upgrade and uninstall in their
+isolated fixture while preserving staged hosts and sessions. Login start is an
+unchecked installer choice and invokes the desktop's guarded login-item command;
+uninstall asks that command to remove only its own registration. Obsolete Qt
+files are removed only by the existing owned-app-folder upgrade sweep.
+Windows service registration/removal is reserved for the maintained G1 command
+from the Windows service lane. Explicit installer hooks currently log that it is
+pending; they create no ad-hoc scheduled task or claim active background duties.
+`hgs desktop registration --json` previews the shared definition/readiness interface.
+
+The job uploads the zip, installer and logs in `windows-x86_64-<commit>` for seven
+days (three for schedules). Stable/nightly assembly includes the tested zip
+unchanged and its paired per-user installer; both are present in the published
+0.48.0 release. The installer stays on GitHub, outside the v1 feed and mirror
+downloads, and winget keeps the portable zip layout. Windows Dev builds remain
+absent.
 
 #### The bundled ConPTY pair
 
@@ -833,6 +876,43 @@ selected agent, then resolves its exact platform package and SHA-512 integrity.
 All selected packages must resolve before any native execution. The report saves
 their exact versions, URLs and digests before the first test; a missing release,
 platform package or valid digest fails without falling back to historical pins.
+
+Kimi's standalone image selection reads three official current-release pointers
+once: the standalone `code.kimi.com/kimi-code/latest`, npm's
+`@moonshot-ai/kimi-code` latest metadata and the published stable release at
+`MoonshotAI/kimi-code` on GitHub. The highest stable numeric version must be named
+by at least two sources. An unavailable or invalid source, three-way disagreement,
+or an uncorroborated higher version fails before execution; an older agreeing pair
+never supplies a fallback. This handles a lagging standalone pointer without
+qualifying an older native agent. The exact selected version's official manifest
+and image HEAD bind the platform filename, manifest digest, image size and SHA-256;
+the download must match them. Selection provenance retains all three observations
+and agreeing sources. Every case in the run keeps that one selected image.
+
+Discovery retries only the same official metadata URL and method, through the
+shared `scripts/ci/native_discovery.py` reader used by Kimi, Claude Code, Codex,
+OpenCode and DeepSeek. Each request has at most three attempts, each in a private
+child with a 30-second wall timeout, normally with 2- and 4-second backoff: a 96-second
+request budget, further clamped by any original caller deadline. Kimi resolves
+five metadata requests (the three current pointers, that exact manifest and the
+image HEAD), so its metadata phase has at most 480 seconds; image download keeps
+its separate bound.
+Each attempt logs URL, stage, attempt and outcome as `ZERUS_DISCOVERY` JSON.
+Transient network errors and HTTP 408/429/5xx may retry; invalid metadata,
+redirects rejected by the existing caller policy, permanent HTTP errors and
+certificate verification failures fail closed. Exhaustion raises a distinct
+`discovery unavailable` error and fails the job before native execution. A retry never selects a historical release, relaxes
+integrity checks or turns unavailable discovery into a skipped-suite success.
+
+The GitHub current-release read uses the workflow's existing read-only
+`GITHUB_TOKEN` when present, only for HTTPS `api.github.com` requests that refuse
+redirects. The token is absent from native child environments and provenance.
+GitHub HTTP 403/429 may retry only with unambiguous `Retry-After` or exhausted
+quota/reset headers. The reader waits past the reset, within the same original
+96-second budget; a reset outside that budget fails without another request.
+Other GitHub HTTP failures stay closed, and all three source reads and the
+highest-version agreement rule still apply.
+
 Every terminal case uses that same selected image. Historical package records in
 `scripts/ci/agent-compatibility.json` remain evidence for separately selected old
 fixtures; ordinary CI and the daily upstream report do not execute those versions.
@@ -840,6 +920,27 @@ Targets are `linux-x64`, `linux-x64-baseline`, `darwin-arm64` and `win32-x64`.
 From 2.1.304 Claude also
 records each API request as an `api-request-blob` transcript row and can defer
 WebFetch behind ToolSearch (its approval fixture sets `ENABLE_TOOL_SEARCH=false`).
+Reviewed 2.1.314 against 2.1.312: its unattended approval countdown says
+"automatically block" and "avoid holding up" instead of "automatically deny"
+and "avoid blocking progress". Either exact advisory is outside question identity
+because it counts down and disappears on navigation; the command, warning and
+choices remain bound, and altered wording still refuses delivery.
+Claude 2.1.317 adds a Bash reliability check after approval: macOS's system
+Bash 3.2 refuses some compound commands with exit code 126. The native safety
+fixtures retain the variable-path rm warning and exact directory fence using
+`T=$PWD; test . -ef <fixture-work>`; the former `$(pwd)` and quoted-variable
+comparison form was refused. Timeout diagnostics retain bounded native tool
+results beside the screen so execution errors remain visible when Claude
+collapses a completed tool call.
+Claude 2.1.322 attaches a pasted line that is only an image path asynchronously
+and swallows an Enter while it shows `Pasting…` (zerus-iitw8). The busy input
+contracts send a message whose lines name two 6000x4000 screenshots, with two
+attachments, idle and during a running tool: Claude must settle, enter once and
+prove the submission in its transcript (`NativeHookedImagesClaude` also runs
+hgs's own UserPromptSubmit hook, which takes the state lock); Codex queues and
+delivers it once; Kimi delivers it once after a turn the fixture model holds.
+`NativeBusyClaude` also sends a prompt identical to one already in Claude's
+queue: only the send's own new `enqueue` may prove it, and both arrive.
 Claude offers a one-time default permission mode change; fixtures set
 `hasSeenAutoDefaultNudge` except the suite that answers that offer. OpenCode has
 a supported minimum of 2.0.32; CI tests its latest release on Linux and macOS.
@@ -862,6 +963,29 @@ Windows the runner's own version, help and schema probes also get a private
 `USERPROFILE`, `APPDATA` and `LOCALAPPDATA`, while the suites keep the real
 profile: each case gives its hosts and agents a profile of its own, and Codex
 prints folders relative to the real one, which the suites place projects by.
+
+Default Unix Claude/Codex runs also require an exact-source Effort seed receipt.
+`scripts/ci/native-effort-seed.py` builds the production CLI and one Rust test
+image with the same toolchain and existing Cargo target directory. It locates
+the test image through Cargo's artifact output, lists the exact ignored seed
+method without executing it, then seals a private copy. The bounded receipt
+binds the clean commit/tree, Rust identity and both executable hashes. Runners
+check those bindings before and after native execution; `--effort-seed-receipt`
+selects a nondefault receipt. Only the maintained fixture invokes the seed,
+against its own original saved record, to perform a real LegacyMoved transfer
+without changing the native process, run or conversation. Actual Effort requests
+use the production CLI, check raw request identity and replay behavior, observe
+the native chooser and preserve account defaults. Kimi uses the same seed in its
+separate hosted-only runner, including a later native turn to check hooks after
+the transfer. These fixtures do not establish Fresh native publication or finish
+the global ID rollout. The keeper refuses Codex Effort when its internal child
+catalog needs reconciliation: SQLite's ordinary read-only open can still write
+native WAL/SHM files, and omitting reconciliation could hide current child work.
+Ordinary status reads retain their native reconciliation. Reading that catalog
+without source-side writes remains separate rollout work. Windows, OpenCode-only and historical agent-hint contracts
+retain their separate setup. The macOS debug handoff carries the private
+`hgs-effort-seed` beside its existing test executables under the same verified
+artifact/source manifest; it is never an installation or release asset.
 
 On Linux and macOS, Claude Code runs every `tests/test_claude_*_native.py` suite
 plus the Claude clear and compaction fixtures: exact input, questions, approvals,
@@ -924,7 +1048,18 @@ identity transition, stale usage suppression, a single durable clear boundary,
 preserved process/run identity, unsent native drafts and foreign-directory
 rejection. A resumed conversation whose `SessionStart` is still deferred must
 pause, and clear from the GUI and from Terminal, where the next message's hook
-names the new conversation. A new session in a folder outside the fixture home,
+names the new conversation. A separate ordering fixture inserts a modeled main
+`SessionEnd`, unless the native agent already emitted it, immediately before
+forwarding the real clear `SessionStart` unchanged. The end ordering is controlled;
+the successor hook and native process/file ownership are real. It verifies an unrequested
+Terminal clear through the original supervised process, its held old rollout and
+the held successor's bounded native header, without inventing a clear request or
+replaying input. Process fixtures also require the complete owned reset before
+reopening the composer after that end; the end alone grants no input permission.
+They also refuse a nested interactive Codex even when the supervised process
+holds the successor, and an actually held successor outside the selected account's
+`sessions/` directory. The nearest native hook caller must be the supervised PID.
+A new session in a folder outside the fixture home,
 which Codex prints in full in its header, answers a first message from the localhost
 provider; idle polls must not treat that header above the history as a reset,
 and a later clear must still be confirmed. A separate fixture caches a newer
@@ -980,24 +1115,45 @@ versions only. Its separate native and approval workflows qualify one latest
 Kimi release for affected PRs or manual runs. DeepSeek's latest-release keyless
 contract fixture runs in full Linux CLI CI.
 
+The Kimi approval gate covers CreateGoal in both regular and fullscreen mode.
+The fullscreen panel shows only the selected choice's description; inspection
+checks that visible text without navigating. An explicit answer verifies every
+choice's description through guarded navigation before submitting the requested
+option. Changed or clipped descriptions, a changed request or a layout transition
+refuse further input. Both modes retain native decision, permission-mode and
+single goal-creation checks.
+
 The Kimi native inventory includes launching with an initial message, waiting
 at folder trust without sending it, then delivering it exactly once through
 guarded input and preserving the conversation across pause/resume without
-replaying that message. The former send-after-start-only coverage missed the
-unsupported positional launch prompt. Help snapshots from native 2.1.1, 2.2.0
-and 2.3.3 cover argument construction without running historical releases in CI.
+replaying that message. Fork coverage independently checks the native utility's
+live-instance refusal, the disabled live offer and CLI refusal, then real paused
+and archived forks with distinct CIDs. The paused fork also verifies inherited
+model context. The former send-after-start-only coverage missed the unsupported
+positional launch prompt.
+Help snapshots from native 2.1.1, 2.2.0 and 2.3.3 cover argument construction
+without running historical releases in CI.
 Declining trust also verifies cancellation without delivery and bounds the
 retained inspection preview independently of the full initial message size.
 
-To test the latest releases or inspect current upstream changes locally:
+To test the latest releases or inspect current upstream changes locally on Unix,
+start from the exact clean, committed source. The builder uses the existing Cargo
+target directory; these paths show its default location:
 
 ```sh
-cargo build --locked
+RUSTUP_TOOLCHAIN=1.99.1 python3 scripts/ci/native-effort-seed.py build \
+  --source-sha "$(git rev-parse HEAD)" --hgs target/debug/hgs \
+  --image target/debug/hgs-effort-seed --receipt target/debug/hgs-effort-seed.json
 python3 scripts/ci/agent-compatibility.py
 python3 scripts/ci/agent-compatibility.py --agent claude
 python3 scripts/ci/agent-compatibility.py --agent opencode
 python3 scripts/ci/agent-compatibility.py --latest
 ```
+
+For another existing target directory, set `CARGO_TARGET_DIR` for the builder
+and pass its CLI/image paths. Pass both `--hgs` for that CLI and
+`--effort-seed-receipt` for its receipt to the runner. An OpenCode-only run
+requires the production CLI but no Effort seed.
 
 The unshipped static coordination hint has a separately selected source candidate:
 `--contract agent-hint`. This historical, separately granted fixture consumes its
@@ -1288,6 +1444,217 @@ Logs are under ignored
 `artifacts/test-results/`; packaging outputs are under ignored `artifacts/` and
 `dist/`.
 
+### Agent Teams real agents
+
+`tests/test_teams_native.py` checks the Agent Teams milestone 1 against the real
+agents. It is selected separately: `scripts/ci/agent-compatibility.py --contract teams`
+runs it for Claude Code and Codex, and `scripts/ci/kimi-native.py --teams` runs its
+Kimi class. Both run in the **Agent Teams real agents** workflow (`teams-native.yml`)
+on pull requests and main pushes that change a component the contract can catch
+drifting (`src/**`, `crates/**`, `client/core/**`, the Cargo files) or a script, test
+or fixture it runs, and on demand, on the public repository only. The workflow is not
+part of the Dev gate or of Nightly: a red run is visible and holds nothing back.
+
+- **Selection.** Each agent gets the same one latest official release as ordinary
+  CI, with the same checked fetch. There is no Effort seed and no
+  terminal-geometry matrix, and no other job's timing changes.
+- **Static tests.** Run the suite's static parts from the repository root with the
+  tests folder on the path, as `scripts/ci/python-tests.py` does:
+  `PYTHONPATH=tests python3 -m unittest test_ci_security test_kimi_native_ci
+  test_agent_compatibility test_teams_native`. The native classes skip without a pinned
+  agent.
+- **Setup.** Each class creates one private root (`hgs-tn-*` in `TMPDIR`)
+  with:
+  - `HOME`, every XDG folder and a 0700 `XDG_RUNTIME_DIR`;
+  - `HGS_STATE_DIR` and `HGS_CONFIG_DIR`;
+  - the agents' account homes;
+  - an existing 0700 `TMUX_TMPDIR`;
+  - a D-Bus address naming a missing socket;
+  - `PATH` limited to the root's wrappers and the system folders.
+
+  It then starts a private `hgs desktop serve --background` with the Teams preview
+  turned on by the person, and creates one team: a lead and one member of the agent
+  under test. The service launches both.
+- **Model.** A keyless loopback fixture (`tests/model_api_fixture.py`) answers text,
+  or a scripted shell step for a delivered task prompt or a typed `ZT-RUN <step>`.
+  No account and no model quota are used, and only fixture keys exist in the root.
+
+It runs these steps in order:
+
+1. **Launch and identity.** The launch binds by launch ID, and the session record
+   carries the store's ownership nonce and worktree. The native process is the
+   pinned image under the production supervisor. The role's model and effort reach
+   its argv. The service writes the member's parent link once the lead has a
+   conversation. Codex starts its conversation at the first message, so for Codex the
+   person's first message to each session comes before this check.
+2. **Delivery and the member's shell.** `team-deliver` puts the prompt into the
+   member exactly once. The prompt pins `report-attempt` exactly once and
+   `begin-attempt` at most once (only while the product's task controls are on; off
+   today), and the case records which form it met. The member's own tool shell runs
+   every pinned command: it acknowledges with `begin-attempt` when one is pinned,
+   passes the caller proof (`hgs team current` names the member), is refused the
+   lead's inbox, and reports with `report-attempt`.
+3. **The lead's doorbell.** The lead gets one message naming the inbox, with none
+   of the item's text, and its own shell reads the inbox as the lead.
+4. **The cancel notice.** The lead cancels a delivered task from its shell, and the
+   member gets the existing notice once.
+5. **Stop and Terminate.** Unless a task is still unfinished, the step adds one, so
+   the stop has an unfinished node. The person's team stop ends no agent, while the service cancels the stopped
+   team's nodes. Terminate ends the member's process and
+   archives its run.
+
+The person answers each startup card the way the product offers it:
+
+- Claude's and Kimi's folder trust, and Codex's Folder access, through `hgs answer`;
+- Codex's hooks review through `hgs answer`. It shows once per account: after "Trust
+  all and continue", a second session on the same account does not show it.
+
+Further classes repeat the same bring-up with one of the team's delegations on:
+
+- **Codex folder trust by the standing confirmation** (`NativeTeamsTrustCodex`,
+  `confirm_trust`, selected). Every member worktree is a linked worktree, so Codex's
+  Folder access panel carries its Git-root note and asks "Trust this Git
+  repository?". The standing confirmation answers that startup card, as owner
+  decision D9 permits, with one audited grant per member naming the exact main
+  checkout scope, category and original run. The person supplies no folder answer;
+  the native account records only the main checkout as trusted. The ordinary Codex
+  startup case, where the person answers, retains which panel the pane showed (a folder of up to 76
+  columns fills one row): a hosted runner, whose root in `/tmp` is short, must show
+  the one-row panel and a local run the wrapped one.
+- **Resume of an exited member** (`NativeTeamsResumeClaude` and
+  `NativeTeamsResumeCodex`, `resume_exited`, selected; the person answers folder
+  trust). The member works once
+  (the person's message and its answer), so its conversation is persisted. The existing
+  turn wait requires both Stop and the product Terminal reader's empty composer before
+  sending quit keys; Stop can precede native input readiness. When its
+  agent then exits by itself (`/exit`; Codex `/quit`), the service resumes it in a new run of the same
+  launch and conversation, it gets its brief once, and the audit records `team_resume`. A member
+  the person terminates is refused with a card and no audit row, and no run of its
+  launch is live.
+- **A Claude Code member that exits before any message**
+  (`NativeTeamsResumeUnworkedClaude`, `resume_exited`, selected). It has no persisted
+  conversation, so the service's restore is refused before launch. Nothing of its
+  launch starts, and the person's card carries the exact refusal reason from the
+  archive's own inspection. The separate explicit Restore must fail too; its receipt
+  is recorded beside the inspection, and no member run starts afterward.
+
+Written and waiting: `WAITING` in the module lists these, and the contract does not
+select them until their fixes land.
+
+| Case | Waits for |
+|---|---|
+| Claude Code folder trust by the standing confirmation (`NativeTeamsTrustClaude`, two members pinned to one account): the service answers each member's startup folder trust with one audit grant. What Claude Code 2.1.322 records is pinned as observed: the account holds exactly the main checkout as trusted and no worktree key, and the later worktree on the same account still shows its card. The owner's decision (zerus-63rru.66) keeps the automatic answer for Claude and Codex and states the real scope in the setting, the docs and the audit row, which names the repository's main checkout next to the card's folder. Then each member asks an ordinary question: it stays pending for the person, with no card and no grant, and its member is not free while it is open | `zerus-63rru.66` and `zerus-63rru.73` (an ordinary question is taken as a trust candidate today) |
+| An ordinary question after no startup card (`NativeTeamsQuestionAfterTrustClaude`): the person has trusted the main checkout on both Claude accounts first; the question plans nothing, no card and no grant | `zerus-63rru.73` (today it opens one notice card) |
+| A member whose agent runs its shell in a private PID namespace (`waiting_6_a_member_shell_in_a_private_pid_namespace`, written down, not built): its report and team commands are refused with the refusal that names the separate process namespace and its remedy, no report is recorded, and the lead is told | `zerus-63rru.76` (the caller proof cannot see the agent's recorded process; the named refusal comes with the other stream's next sync to main) |
+
+#### Isolation
+
+Each class checks its own isolation and fails rather than skipping:
+
+- **tmux.** A `tmux` wrapper first on `PATH` logs every call and refuses any call
+  that names no server inside the root. It resolves symbolic links before judging:
+  an existing socket path must resolve inside the root, and a path that does not
+  exist yet is judged by its nearest existing ancestor. A link from the private
+  folder to another server therefore never reaches tmux.
+- **Account name.** The suite's children never see the runner's account name:
+  `USER` and `LOGNAME` are the fixture value `teams-fixture`, and the preflight fails
+  if the real name is the value of any variable.
+- **Shims.** `ssh`, `scp`, `systemd-run` and `hgs` are refusing shims: nothing
+  reaches another computer, the user manager or an installed hgs. The build under
+  test runs only by its absolute path.
+- **Preflight.** Before anything starts, a preflight checks every path, the absent
+  session and display variables and the wrappers' resolution.
+- **Account homes.** Every account home that the launch inspects is configured,
+  including the always-listed native ones (`HOME/.claude`, `HOME/.codex`,
+  `HOME/.kimi-code`): auto-update off, plugins off and the provider's base URL on
+  loopback where the agent allows it.
+- **Teardown.** It terminates the team's sessions as the person, stops the service
+  (exit 0 on SIGTERM) and ends the private tmux server. It then requires that no
+  process refers to the root by its working folder, executable or environment.
+  Otherwise the root is kept and the class fails.
+- **A killed run.** A run killed after a session started (the row's bound, a
+  cancelled job) runs no teardown. What remains is the evidence written as it goes:
+  the calls, waits, census, model requests, account inspection, preflight, and the
+  tmux and shim logs, which the wrappers write straight into the uploaded evidence
+  folder. There is no archive of the private root. The hosted Kimi runner records the
+  root in its custody file as soon as it exists, but its retention refuses the
+  sockets a killed session leaves behind, which is that campaign's reviewed rule. The
+  Claude Code and Codex job uploads only the evidence folder. A runner killed directly
+  (SIGKILL) also leaves the private desktop service and its tmux server running, since
+  the suite has no handler for it: locally the transient user unit's cgroup ends them
+  when the unit stops, and on a hosted runner the runner's end does.
+- **Network census.** Once a second, a census lists the TCP and UDP peers of the
+  class's own processes: the descendants of the test process and of the private
+  tmux server. Any peer that is neither loopback nor an address of an allow-listed
+  host fails the class. The census is sampled: a connection opened and closed
+  between two samples is not seen.
+
+| Agent | Allowed host | Contacted with these switches set |
+|---|---|---|
+| Claude Code | `downloads.claude.ai` | `DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in its environment and settings, `autoUpdates: false`; once per session start |
+| Codex | `raw.githubusercontent.com`, `ab.chatgpt.com` | `check_for_update_on_startup=false`, `[features] plugins=false`, `chatgpt_base_url` on loopback |
+| Kimi Code | none | `KIMI_CODE_NO_AUTO_UPDATE=1`, `KIMI_DISABLE_TELEMETRY=1`, `tui.toml` `auto_install=false`, platform URL on loopback, private `fd` stand-in for file references |
+
+#### Kimi account inspection
+
+Kimi signs an account in only through `api.kimi.com`. The Kimi class therefore puts
+an expiring fixture token in the account home and a logged `node` stand-in on `PATH`
+for the one call `hgs account inspect` makes to refresh it. The stand-in prints a
+value its producer, `src/accounts/kimi-read.mjs`, writes: a signed-in profile with no
+usage windows, built from the producer's starting object by changing named keys
+only. `TeamsFixtureProducers` compares it with that file, so a key the producer does
+not write fails. Kimi's account choice is
+not evidence here (a loopback inspection seam is a follow-up for the accounts owner); everything after it
+is the real Kimi image. `kimi-native.py --teams` runs only on a disposable
+GitHub-hosted runner. It runs the class in a child of its own under a 2400-second
+bound and sets the `ZERUS_TEAMS_KIMI_HOSTED` marker, without which the class skips.
+A skip is reported as no evidence.
+Kimi Code's steps 2 to 4 (delivery and the member's shell, the doorbell, the cancel
+notice) are selected but not yet proven: no hosted run has carried them yet, and their
+first proof is the first hosted run. Until then they count as no evidence.
+
+#### Bounds
+
+Every wait names what it waits for and has its own bound, about three times the
+duration measured on a loaded development host; the upstream canary has no Teams
+step yet. Measured on 2026-11-12 with Claude Code 2.1.322 and Codex 0.167.2, over
+seven passing runs:
+
+| Wait | Measured | Bound |
+|---|---|---|
+| Lead and member bound by launch ID | 129–141 s | 420 s |
+| Ready after the person's startup answers | 3.5–11 s | 360 s |
+| A Codex conversation started by its first message | 0.8–3 s | 180 s |
+| Parent link written by the service | 26–53 s | 200 s |
+| The service's cancel and key clear after a stop | 2 s | 180 s |
+| One whole run | 215–230 s | 2400 s (the row) |
+ Each wait logs its measured duration as a `ZERUS_TEAMS_WAIT=` line and in
+`waits.jsonl`, so a bound can be tightened from evidence. The row's bound is 2400
+seconds. Locally, run the contract outside any agent session, for example in a
+`systemd-run --user` unit with `env -i` and `USER=teams-fixture LOGNAME=teams-fixture`:
+the Teams caller proof refuses a person command below a live agent.
+
+#### Not covered in milestone 1
+
+- **DeepSeek and OpenCode members:** a resident host serves those sessions, so the
+  caller proof cannot bind their commands to them. Team creation refuses them until
+  the per-call token lands.
+- **macOS:** not run in this milestone. The Mac is not used for packages, Codex has
+  no darwin package in the runner, and the marked path with the hardened release
+  `hgs` is unobserved on a Mac.
+- **Windows:** the caller proof refuses every caller there, so the preview cannot be
+  turned on.
+- **Uncertain outcomes** (unknown delivery, answer or launch): a real agent cannot
+  produce them honestly. They are not agent behaviour and stay with the package
+  fakes.
+- **Timers past their first firing:** they are agent-independent and stay with the
+  package fakes.
+- **The waiting cases:** Claude Code folder trust by the standing confirmation, for
+  the owner's decision `zerus-63rru.66` and for `zerus-63rru.73`, and an ordinary
+  question after no startup card, for `zerus-63rru.73`. The cases exist and are not
+  selected. A member shell in a private PID namespace (`zerus-63rru.76`) is written
+  down as a waiting case and not yet built.
+
 ## Automatic nightly publication
 
 `nightly.yml` runs daily at 00:17 UTC (03:17 Europe/Moscow) and supports manual
@@ -1405,24 +1772,25 @@ Generate `.SRCINFO` with `makepkg --printsrcinfo`; never edit it manually.
 
 | Class | Packages | Reason |
 | --- | --- | --- |
-| Desktop runtime | `qt6-base`, `qt6-multimedia`, `qt6-svg`, `kstatusnotifieritem`, `kwindowsystem`, `kidletime`, `hicolor-icon-theme` | Widgets, voice recording, SVG plugin, tray/window integration, idle detection and icons |
+| Desktop runtime | `webkit2gtk-4.1`, `gtk3`, `gdk-pixbuf2`, `glib2`, `cairo`, `libsoup3`, `libappindicator`, `dbus`, `hicolor-icon-theme` | Zerus Next webview, GTK integration, tray and icons |
+| Media runtime | `alsa-lib`, `gstreamer`, `gst-plugins-base-libs`, `gst-plugins-base`, `gst-plugins-good`, `gst-plugins-bad`, `gst-plugins-ugly`, `gst-libav` | Voice capture, camera/round video, H.264/AAC and playback |
 | CLI/runtime tools | `tmux>=3.7`, `openssh`, `python`, `curl`, `procps-ng`, `bash`, `tar` | Persistent sessions, remote access, compatibility helper, account HTTP, process inspection, installers and remote source transfer |
 | Native library runtime | `glibc`, `libgcc`, `libstdc++` | Dynamically linked CLI/desktop binaries |
-| Source build only | `rust`, `cmake`, `ninja`, `qt6-webengine`; additionally `git` for `zerus-git` | Locked Rust and production Qt builds, the native UI plugin; Git source/version discovery |
+| Source build only | `rust`, `nodejs`, `npm`; additionally `git` for `zerus-git` | Locked Rust client/CLI/connector and frontend builds; Git source/version discovery |
 | Standard build environment | `base-devel` | Required by Arch's makepkg/AUR build convention; its tools are not repeated in makedepends |
-| Optional features | `nodejs`, `npm`, `git`, `konsole`, `wl-clipboard`, `xclip`, `systemd`, `qt6-webengine` | Native agent installation/runtime, worktrees, external terminals, clipboard, user services/scopes and the embedded DeepSeek Native UI |
+| Optional features | `nodejs`, `npm`, `git`, `konsole`, `wl-clipboard`, `xclip`, `systemd` | Native agent installation/runtime, worktrees, external terminals, clipboard and user services/scopes |
 
-The binary package has no Rust/CMake/Ninja build dependencies. Its Qt/KDE, C/C++
-runtime and glibc dependency floors are generated from the **verified builder's
-`.BUILDINFO`**, not the publication runner. `release-info.json` records these
-versions. This prevents installing that binary against older libraries that may
-lack symbols; Arch users should keep a fully updated system. A fresh binary/ABI
-rebuild gets a new product version and immutable assets.
+Both source recipes build `client/` with
+`tauri build --no-bundle --config tauri.switch.linux.conf.json --features video`.
+The output remains `hgs-tray`. Binary packages need no Rust, Node.js/npm or Qt
+build toolchain. GTK/WebKit, media and C/C++ library floors come from the
+**verified builder's `.BUILDINFO`**, never the publication runner;
+`release-info.json` records them. Arch users should keep a fully updated system.
+A fresh binary/ABI rebuild gets a new product version and immutable assets.
 
-Node.js and npm are separate optional dependencies. Native agents are installed
-separately through Accounts or their upstream installers; agent executables,
-credentials and user configuration are never bundled. Systemd integration is
-optional and detected at runtime. Packaging never enables services.
+Node.js/npm are runtime options for separately installed agents. Credentials,
+agent executables and user configuration are never bundled. Systemd integration
+is detected at runtime; packaging never enables services.
 
 ### Package contents and compatibility
 
@@ -1431,10 +1799,9 @@ Each flavor installs the same ADE bundle:
 - `/usr/bin/hgs`, `/usr/bin/hgs-tray`, the `hgs_state.py` compatibility shim and
   the explicit `zerus-setup` migration helper, whose `--mobile-connector
   {protect,migrate,rollback}` runs `/usr/lib/zerus/install-mobile-connector-service.py`.
-- `/usr/lib/hgs-tray/plugins/libhgs-tray-native-ui.so`, the embedded DeepSeek
-  Native UI. It alone links Qt WebEngine and loads only when `qt6-webengine` is
-  installed; otherwise Native UI opens in the browser. `check-package.py`
-  requires it and rejects an `hgs-tray` that links Qt WebEngine itself.
+- Zerus Next's `hgs-tray`, with embedded frontend assets. `check-package.py`
+  requires the Next build identity and GTK/WebKit linkage, rejects Qt/KDE
+  linkage and rejects a packaged Qt native UI plugin.
 - `/usr/bin/zerus-mobile-connector`, the Rust mobile connector, and its user
   unit `zerus-mobile-connector.service` (`KillMode=process`, configuration
   `%E/hgs/mobile/connector.json`, skipped while that file is missing). The
@@ -1447,18 +1814,14 @@ Each flavor installs the same ADE bundle:
 - A desktop entry, existing application icons and system-provided **user** unit
   definitions for `hgs-tray`, `hgs-swarm` and `hgs-recovery`.
 - Documentation and a sample tmux configuration under `/usr/share/doc/zerus`.
-- Zerus MIT, vendored libvterm MIT and the exact host-target Cargo dependency
-  license texts of `hgs` and the mobile connector (both locks) under
-  `/usr/share/licenses/<package-name>`.
+- Zerus MIT, the Codex data notice, and the host-target Cargo dependency
+  notices for `hgs`, the mobile connector and the client with its shipped
+  media/video features under `/usr/share/licenses/<package-name>`.
 
-Qt and KDE libraries are dynamically linked system dependencies. Qt WebEngine is
-needed only by the native UI plugin. Upgrades keep an installed `qt6-webengine`:
-an optional dependency is not an orphan for `pacman -Qdt`. Candidates sealed
-before Qt WebEngine became optional still validate for publication retries.
-`qt6-svg` supplies the dynamically loaded SVG image plugin used by menu and
-combo-box arrows; a Qt test renders the actual bundled resources so a missing
-plugin fails CI. The current Arch Qt base package supplies its Wayland display
-plugin. [Arch Qt SVG package](https://archlinux.org/packages/extra/x86_64/qt6-svg/).
+The Arch desktop dynamically links system GTK3/WebKitGTK and GStreamer; packages
+ship no Qt/KDE runtime or native UI plugin. Existing sealed Qt candidates remain
+valid for publication retries without changing their original bytes. Qt
+source builds and Qt installer selections are retired on Linux/macOS.
 The runtime also declares curl for native account HTTP requests and procps-ng
 for process inspection. Optional Node.js/npm enable agent installation from
 Accounts; Git enables repository/worktree features. Arch's Node.js package does
@@ -1467,12 +1830,11 @@ The package does not bundle their distributions, native agent executables,
 accounts, credentials or configuration. Package installation does not start or
 stop services, edit user homes or replace the user's tmux configuration.
 
-The product package version currently follows the desktop version: `VERSION`
-and `tray/CMakeLists.txt` are **0.42.0**. The independently versioned compatible
-CLI is **1.51.0**. CI rejects a product/desktop version mismatch; packaging
-records both versions in `build-info.json`, with the source commit when built
-from Git. For source-archive builds, the release manifest and archive SHA-256
-provide the commit provenance.
+The product package version follows `VERSION`; the client embeds it in
+`--build-info`. The compatible CLI has its own version in `Cargo.toml`.
+Packaging records both versions and the source commit in `build-info.json`
+when built from Git. For source-archive builds, the release manifest and archive
+SHA-256 provide commit provenance.
 Stable fixes use patch releases (`0.42.1`, `0.42.2`); feature releases use a new
 minor version. `DEV_VERSION` names the next planned stable release and trusted
 main CI embeds its growing sequence (`0.42.1-dev.215`). Android follows the same
@@ -1502,6 +1864,17 @@ target and conflict. It is idempotent, preserves existing files and dangling
 symlinks, and refuses root execution. An existing source installation needs an
 intentional migration: inspect and move aside conflicting executables before
 running it. Do not remove `~/.config/hgs` or agent/session state.
+
+The package also ships the desktop-service installer. Explicitly register the
+per-user backend with `zerus-setup --desktop-service`; it consumes the selected
+CLI's configuration-scoped definition and IPC readiness probe. It imports the
+current graphical login environment before service creation and enables
+`hgs-desktop.service` for `graphical-session.target`. IPC readiness does not
+enable background workers. Custom definitions and drop-ins are preserved.
+The default `zerus-setup` command still creates compatibility links only.
+Pacman install/upgrade hooks never register, start or restart user services;
+after a package backend upgrade, run the explicit service setup again. See
+[Linux desktop background service](linux-distribution.md#desktop-background-service).
 
 Old user unit files in `~/.config/systemd/user` can shadow packaged definitions;
 inspect `systemctl --user cat hgs-tray.service` and the worker units before
@@ -1560,11 +1933,64 @@ GitHub releases or a schedule.
 ### 1. Build and review a candidate
 
 `release.yml` runs quick checks plus full Linux CLI, Arch, macOS and Windows
-validation from one exact commit. macOS can be explicitly disabled; Windows
-cannot, because the candidate carries the portable zip that this run tested. It
+validation from one exact commit, including macOS and Windows (the latter ships
+the portable zip that this run tested). It
 consumes that run's Arch package and Windows zip, verifies their embedded
-version/source commit, assembles source and binary archives, rebuilds both stable
-recipes, runs namcap and seals the result.
+version/source commit and assembles source and binary archives. In parallel with
+verification, a credential-free, cache-free source-recipe job builds the exact
+`git archive` with `makepkg` including `check()`, then runs namcap and
+`check-package.py`. Final assembly regenerates the tarball and requires identical
+raw-tar and compressed SHA-256 digests, recipe and `.SRCINFO` before reusing that
+same run's checked source package. Changed source, metadata or package bytes fail
+closed. It builds and checks only `zerus-ade-bin` afterwards.
+
+The signed cask install check and final assembly run in parallel. Neither produces
+the final candidate alone: the sealing job waits for both selected checks, then
+validates and uploads the immutable candidate. Optional casks may be skipped only
+when disabled for this run. Source/package jobs and sealing receive no credentials
+or cache access.
+
+Each required test suite runs once per candidate. Stable unsigned Mac packaging
+keeps bundle/self-tests but delegates core/Tauri/frontend regressions to its
+same-SHA verification gate. The verification Arch package uses `--nocheck` only
+when this release's source-recipe job supplies `check()` and the seal consumes
+that job's exact digest receipt. Ordinary PR/manual/Nightly Arch checks still run
+`check()`. Windows unit/lint/connector filesystem contracts run in parallel with
+the release CLI, desktop and portable build; both jobs are required by the suite
+gate. Host, client, package and installer-survival checks still test the release
+binaries in the packaging job.
+
+Do not start a second full matrix, including candidate verification, while
+another full matrix already tests that exact SHA. Before a manual candidate or
+full CI dispatch, check the resolved source (the `Resolve commit` job), wait for
+an existing full run, or select only a missing platform where appropriate.
+An existing PR run is not a substitute for the release's own required gate. Main CI regression also
+observes exact-SHA upstream-main Stable/Nightly candidate verification before
+starting: an active (or already successful) verify in an active candidate run
+suppresses only the duplicate regression scheduling. This observation is read-only
+and is never a test-pass receipt. A failed candidate or unavailable/bounded API
+observation runs regression normally. A race in which a candidate starts after
+that observation still needs the same scheduling rule; never cancel an unrelated
+candidate or substitute another SHA to reduce runner use.
+
+A maintainer may measure the credential-free graph on a reviewed branch without
+calling `release.yml` or changing a release in progress:
+
+```sh
+gh workflow run ci.yml --ref REVIEWED_BRANCH -f release_rehearsal=true \
+  -f run_linux=true -f run_arch=true -f run_macos=true \
+  -f run_windows=true -f run_ios=true
+```
+
+Leave `ref` empty so the workflow and tested source are the same commit. This runs
+one full manual matrix alongside the same reusable source recipe and unsigned Mac
+build, then the same assembly and sealing helpers. Partial coverage cannot produce
+a successful rehearsal. It has no signing/notary/environment secrets and no draft
+or publication step; its final artifact is named `release-rehearsal-SHA`, which the
+publisher cannot consume. The measurement excludes protected signing/notarization
+and signed cask installation, so report those separately. Do not start this while
+a PR/full matrix already tests the SHA, or while an active release needs the Mac
+runner slots.
 Stable and nightly candidates call the common `checks.yml` workflow directly
 with read-only cache access. Their verification never includes the main-push dev
 publisher or requests its tag-writing permissions.
@@ -1620,9 +2046,11 @@ an empty output directory. Build artifacts are ignored and are never committed t
 the application or AUR repositories.
 
 Once the repository variable `MACOS_CASKS_ENABLED` is `true`, the candidate run
-also builds the Apple Silicon bundle against the pinned official Qt, signs and
-notarizes it in the main-only `macos-signing` environment and installs the result
-through a local tap before assembly (`macos-cask.yml`). The candidate then uses
+also builds the unsigned Apple Silicon Zerus Next bundle, without Qt (`--gui tauri`),
+in parallel with full verification. Only after verification and that same run's
+bundle both succeed does it sign and notarize in the main-only `macos-signing` environment and installs the result
+through a local tap alongside final assembly (`macos-cask-install.yml`); sealing
+waits for both. The candidate then uses
 release-info schema 2 and contains the `zerus-VERSION-macos-arm64.zip` asset and
 `homebrew/zerus.rb`. Until then, and with `-f macos_cask=false`, the candidate has
 no macOS asset. Details, secrets and retry rules are in
@@ -1734,6 +2162,42 @@ candidate for a publisher-only retry.
 Signing with an owner-controlled identity and appointing a backup maintainer are
 optional follow-ups. Checksums and exact run/commit provenance are provided;
 package/tag signing is not configured.
+
+### Manual native cleanup qualification
+
+`client/scripts/native-cleanup-smoke.py` is the only end-to-end check of the
+real Terminate + **Remove working folder** path with real program stops. It
+drives the built GUI through native ownership, the confirmation, the program
+stop and the folder outcome (see `client/scripts/native-cleanup-smoke.md`). A
+maintainer runs it on a Linux workstation, not in CI:
+
+- **When:** before requesting publication of each Stable candidate, and before
+  merging any change to Terminate/Remove working folder, the native program stop
+  and cleanup journals, desktop ownership/takeover or GUI startup. Run it once
+  on the candidate's exact source; run it twice in separate output folders for a
+  change to the program-stop path.
+- **Inputs:** CLI and canonical `com.hgdev.hgs-tray` GUI binaries built from that
+  clean commit in the maintainer's own Cargo target, as the smoke's guide shows.
+- **Evidence to keep:** the new output folder with its `SHA256SUMS`.
+  - `result.json` must have return code 0 and `owner_install_unchanged: true`.
+  - The run log must show the four stage results: clean `removed`, kept local
+    data, `unknown`, and the refused changed conversation.
+  - Each stage must have its `*-signal-proof.json`.
+  - Record the folder and the hash of its `SHA256SUMS` with the candidate's
+    review.
+
+CI keeps the walk from rotting without running it. `test_native_cleanup_smoke.py`
+in the ordinary `client/scripts` discovery pins every UI string the walk reads,
+the CLI subcommands it calls and the journal layout it checks to their product
+sources. It also pins the walk's safety margins: the person's homes are
+read-only, the walk stays in its own user and PID namespace, and an optimized
+interpreter is refused.
+
+The walk has no `workflow_dispatch` job. Hosted Ubuntu runners would need their
+unprivileged user-namespace restriction lifted, ImageMagick 7 (`magick`, which
+Ubuntu's archive does not ship) and a full feature GUI build for each run. Its
+OCR timing is also tuned to a workstation, and no self-hosted runner is attached
+to a development machine.
 
 ## Validation record
 

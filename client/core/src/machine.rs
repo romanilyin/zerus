@@ -9,6 +9,9 @@ use serde_json::Value;
 /// One computer's card data.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MachineMeta {
+    /// Physical identity from the current watch hello, separate from host/alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     pub host: Option<String>,
     pub hgs_version: Option<String>,
     /// `metrics.platform`, such as `linux`, `macos` or `windows`.
@@ -20,6 +23,9 @@ pub struct MachineMeta {
     pub local_sessions: Option<bool>,
     /// The Windows session host as found; None elsewhere.
     pub local_host: Option<LocalHost>,
+    /// None: an older peer needs the bounded binding poll. Some([]): this
+    /// stream carries launch results, and currently has none (HgsClient.cpp:279).
+    pub ended_launches: Option<Vec<crate::creation::EndedLaunch>>,
     pub metrics: Metrics,
     pub presence: Presence,
 }
@@ -112,12 +118,17 @@ impl MachineMeta {
                 error: text(host, "error"),
             });
         Self {
+            machine_id: text(meta, "machine_id").filter(|id| crate::creation::canonical_uuid(id)),
             host: text(meta, "host"),
             hgs_version: text(meta, "hgs_version"),
             platform: text(metrics, "platform"),
             ok: flag(meta, "ok"),
             local_sessions: flag(meta, "local_sessions"),
             local_host,
+            ended_launches: meta
+                .get("ended_launches")
+                .filter(|value| value.is_array())
+                .map(crate::creation::ended_launches),
             metrics: Metrics {
                 cpu_percent: number(metrics, "cpu_percent"),
                 cpu_count: count(metrics, "cpu_count"),

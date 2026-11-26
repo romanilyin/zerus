@@ -14,7 +14,9 @@ enum class SessionFilter(val id: String, val caption: String) {
     All("all", "All sessions"), Attention("attention", "Needs attention"), Active("active", "Active"),
     Saved("paused", "Saved sessions"), Archive("archived", "Archive")
 }
-data class SessionGroup(val key: ProjectKey, val name: String, val color: String, val sessions: List<Session>)
+/** `cards` nests child sessions under their parents (ChildSessions.nest); a group built without nesting lists each session. */
+data class SessionGroup(val key: ProjectKey, val name: String, val color: String, val sessions: List<Session>,
+    val cards: List<SessionCardEntry> = sessions.map { SessionCardEntry(it) })
 
 object SessionFilters {
     fun machineKey(target: Target) = MachineKey(target.connectionId, target.computerId)
@@ -35,8 +37,10 @@ object SessionFilters {
                 (recovery !in listOf("waiting", "dispatching", "retrying") || providerError in listOf("quota", "provider_policy")) ||
                 recovery in listOf("uncertain", "blocked", "exhausted"))
     }
+    /** A keep-warm ping is running: the agent works, but not on the person's turn (desktop core `keep_warm_turn`). */
+    fun keepWarmTurn(session: Session) = KeepWarmPresentation.turnActive(session.raw)
     fun working(session: Session, online: Boolean) = !archived(session) && currentActivity(session, online) &&
-        (session.raw.string("activity") == "busy" || backgroundIdle(session)) && !needsAction(session)
+        (session.raw.string("activity") == "busy" || backgroundIdle(session)) && !needsAction(session) && !keepWarmTurn(session)
     private fun positiveCount(value: Any?) = (value as? Number)?.toDouble()?.let { it.isFinite() && it > 0 && it % 1.0 == 0.0 } == true
     fun hasCoordinationWait(session: Session): Boolean {
         val wait = session.raw.optJSONObject("coordination_wait") ?: return false
@@ -61,7 +65,7 @@ object SessionFilters {
         return label + (if(includeProducer && name.isNotBlank()) " from $name" else "") + (if(includeProducer && host.isNotBlank()) " on $host" else "") +
             (if(wait.optInt("count") > 1) " (+${wait.optInt("count")-1})" else "") + (if(elapsed.isNotBlank()) " ($elapsed)" else "")
     }
-    fun replyInProgress(session: Session, online: Boolean) = currentActivity(session, online) &&
+    fun replyInProgress(session: Session, online: Boolean) = currentActivity(session, online) && !keepWarmTurn(session) &&
         (session.raw.string("activity") == "busy" || positiveCount(session.raw.optJSONObject("process_work")?.opt("count")) ||
             positiveCount(session.raw.opt("subagent_active_count") as? Number ?: session.raw.opt("subagent_count")) ||
             session.raw.string("activity") == "idle" && session.raw.string("phase") == "idle" && hasCoordinationWait(session))
@@ -118,12 +122,22 @@ object SessionFilters {
                 }
         }.mapTo(mutableSetOf()) { it.target.key }
     }
+    /**
+     * Needs attention as the status filters list and count it (desktop filterAttention, zerus-sa9qn.18): a quiet
+     * supervised child's unread reply, retry or provider limit waits for its parent, so only the person's own Review
+     * later mark lists it. Every other row keeps needsAttention: a child with a request only the person can answer is
+     * never quiet, and a muted session stays listed.
+     */
+    fun filterAttention(session: Session, online: Boolean): Boolean =
+        if (ChildSessions.quiet(session.raw)) !archived(session) &&
+            (session.raw.optBoolean("review_later") || session.raw.optBoolean("mobile_review_later"))
+        else needsAttention(session, online)
     fun active(session: Session, online: Boolean, hasDraft: Boolean = false) =
-        !archived(session) && (hasDraft || needsAttention(session, online) || working(session, online) || scheduled(session, online) ||
+        !archived(session) && (hasDraft || filterAttention(session, online) || working(session, online) || scheduled(session, online) ||
             replyInProgress(session, online) && session.raw.string("activity") == "idle" && session.raw.string("phase") == "idle")
     fun matches(session: Session, filter: SessionFilter, online: Boolean, hasDraft: Boolean = false): Boolean = when (filter) {
         SessionFilter.All -> !archived(session)
-        SessionFilter.Attention -> needsAttention(session, online)
+        SessionFilter.Attention -> filterAttention(session, online)
         SessionFilter.Active -> active(session, online, hasDraft)
         SessionFilter.Saved -> !archived(session) && state(session) != "running"
         SessionFilter.Archive -> archived(session)
@@ -158,6 +172,7 @@ object SessionFilters {
                 !RecoveryPresentation.resumed(raw.optJSONObject("recovery")) -> "Retrying"
             raw.string("phase") == "error" -> "Error"
             raw.string("phase") == "interrupted" -> "Interrupted"
+            keepWarmTurn(session) -> "Warming cache"
             raw.string("phase") == "compacting" -> "Compacting"
             raw.string("phase") == "starting" -> "Starting"
             raw.string("phase") == "tool" -> "Using a tool"
@@ -185,23 +200,31 @@ object SessionFilters {
         return roster?.keys()?.asSequence()?.flatMap { id -> sequenceOf(id, roster.optJSONObject(id)?.string("conversation_id").orEmpty()) }?.toList().orEmpty() +
             previews.flatMap { listOf(it.string("id", "agent_id"), it.string("conversation_id")) }
     }
-    fun counts(sessions: List<Session>, machines: List<Machine>, drafts: Set<String> = emptySet()): Map<SessionFilter, Int> {
+    /**
+     * The one rule a status tab's list, its count and the machine chooser share (zerus-sa9qn.19): the filter, and for
+     * Archive the loaded date window [from, until) (desktop archiveListed).
+     */
+    fun listed(session: Session, filter: SessionFilter, online: Boolean, hasDraft: Boolean = false, archiveRange: ArchiveRange = ArchiveRange()) =
+        matches(session, filter, online, hasDraft) &&
+            (filter != SessionFilter.Archive || session.raw.optDouble("archived_at", 0.0).let { at -> at >= archiveRange.from && at < archiveRange.until })
+    fun counts(sessions: List<Session>, machines: List<Machine>, drafts: Set<String> = emptySet(),
+        archiveRange: ArchiveRange = ArchiveRange()): Map<SessionFilter, Int> {
         val online = machines.filter { it.online }.mapTo(hashSetOf()) { MachineKey(it.connectionId, it.id) }
         val counts = SessionFilter.entries.associateWith { 0 }.toMutableMap()
         sessions.forEach { row ->
             val isOnline = machineKey(row.target) in online
             val hasDraft = row.target.key in drafts
-            SessionFilter.entries.forEach { filter -> if (matches(row, filter, isOnline, hasDraft)) counts[filter] = counts.getValue(filter) + 1 }
+            SessionFilter.entries.forEach { filter -> if (listed(row, filter, isOnline, hasDraft, archiveRange)) counts[filter] = counts.getValue(filter) + 1 }
         }
         return counts
     }
     /** Chooser counts precede machine selection and text search, retaining project/state scope. */
     fun machineCounts(sessions: List<Session>, machines: List<Machine>, filter: SessionFilter,
-        drafts: Set<String> = emptySet(), project: ProjectKey? = null): Map<MachineKey, Int> {
+        drafts: Set<String> = emptySet(), project: ProjectKey? = null, archiveRange: ArchiveRange = ArchiveRange()): Map<MachineKey, Int> {
         val result = machines.associate { MachineKey(it.connectionId, it.id) to 0 }.toMutableMap()
         val online = machines.filter { it.online }.mapTo(hashSetOf()) { MachineKey(it.connectionId, it.id) }
         for(session in sessions) if((project == null || session.projectKey == project) &&
-            matches(session, filter, machineKey(session.target) in online, session.target.key in drafts)) {
+            listed(session, filter, machineKey(session.target) in online, session.target.key in drafts, archiveRange)) {
             val key = machineKey(session.target)
             result[key] = result.getOrDefault(key, 0) + 1
         }

@@ -72,7 +72,7 @@ class DevBuildScriptTests(unittest.TestCase):
                 self.assertEqual(self.guard(MAC, 'run_tests', ZERUS_RUN_TESTS='false',
                                            ZERUS_RELEASE_CHANNEL='dev', ZERUS_DEV_BUILD_NUMBER=number).returncode, 2)
 
-    def rewrite_recipe(self, root, recipe, build_only):
+    def rewrite_recipe(self, root, recipe):
         copied = root / 'disposable/PKGBUILD'
         copied.parent.mkdir(exist_ok=True)
         copied.write_text(recipe)
@@ -80,40 +80,40 @@ class DevBuildScriptTests(unittest.TestCase):
         # Exercise only the embedded stdlib text transform, in this process.
         # No makepkg, Git, compiler, package validation helper or shell script.
         ast.parse(body)
-        with patch.object(sys, 'argv', ['fixture', str(copied), str(root), build_only]):
+        with patch.object(sys, 'argv', ['fixture', str(copied), str(root)]):
             exec(compile(body, 'disposable-recipe-transform', 'exec'), {})
         return copied.read_text()
 
-    def test_only_disposable_recipe_changes_and_default_keeps_testing_setting(self):
+    def test_only_disposable_recipe_changes_and_keeps_next_checks(self):
         recipe_path = ROOT / 'packaging/aur/zerus-git/PKGBUILD'
         original = recipe_path.read_bytes()
-        recipe = original.decode().replace('-DBUILD_TESTING=OFF', '-DBUILD_TESTING=ON')
+        recipe = original.decode()
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            rewritten = self.rewrite_recipe(root, recipe, 'false')
-            self.assertIn('-DBUILD_TESTING=ON', rewritten)
+            rewritten = self.rewrite_recipe(root, recipe)
+            self.assertEqual(rewritten.split('\ncheck() {\n', 1)[1], recipe.split('\ncheck() {\n', 1)[1])
             self.assertIn("source=('zerus::git+" + root.as_uri() + "')", rewritten)
             self.assertEqual(recipe_path.read_bytes(), original)
         self.assertIn('cp packaging/aur/zerus-git/PKGBUILD "$package_build/PKGBUILD"', ARCH)
-        self.assertIn('python3 - "$package_build/PKGBUILD" "$repo_root" "$build_only"', ARCH)
+        self.assertIn('python3 - "$package_build/PKGBUILD" "$repo_root" <<', ARCH)
 
-    def test_build_only_copy_disables_qt_tests_and_keeps_recipe_check_function(self):
+    def test_build_only_skips_makepkg_checks_without_rewriting_the_recipe(self):
         recipe = (ROOT / 'packaging/aur/zerus-git/PKGBUILD').read_text()
-        for setting in ('ON', 'OFF'):
-            with self.subTest(setting=setting), tempfile.TemporaryDirectory() as scratch:
-                candidate = recipe.replace('-DBUILD_TESTING=OFF', '-DBUILD_TESTING=' + setting)
-                rewritten = self.rewrite_recipe(Path(scratch), candidate, 'true')
-                self.assertIn('-DBUILD_TESTING=OFF', rewritten)
-                self.assertNotIn('-DBUILD_TESTING=ON', rewritten)
-                self.assertEqual(rewritten.split('\ncheck() {\n', 1)[1], recipe.split('\ncheck() {\n', 1)[1])
+        upstream = 'source=(\'zerus::git+https://github.com/ufna/zerus.git#branch=main\')'
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            rewritten = self.rewrite_recipe(root, recipe)
+            self.assertEqual(rewritten, recipe.replace(upstream, "source=('zerus::git+" + root.as_uri() + "')"))
+        self.assertIn('if [ "$build_only" = true ]; then makepkg_args+=(--nocheck); fi', ARCH)
 
-    def test_build_only_copy_refuses_missing_or_ambiguous_cmake_setting(self):
+    def test_disposable_copy_refuses_missing_or_ambiguous_upstream_source(self):
         recipe = (ROOT / 'packaging/aur/zerus-git/PKGBUILD').read_text()
-        for candidate in (recipe.replace('-DBUILD_TESTING=OFF', ''), recipe + '\n# -DBUILD_TESTING=ON\n'):
+        upstream = 'source=(\'zerus::git+https://github.com/ufna/zerus.git#branch=main\')'
+        for candidate in (recipe.replace(upstream, ''), recipe + '\n' + upstream + '\n'):
             with self.subTest(candidate=candidate[-60:]), tempfile.TemporaryDirectory() as scratch:
                 root = Path(scratch)
-                with self.assertRaisesRegex(AssertionError, 'one explicit package CMake testing setting'):
-                    self.rewrite_recipe(root, candidate, 'true')
+                with self.assertRaises(AssertionError):
+                    self.rewrite_recipe(root, candidate)
                 self.assertEqual((root / 'disposable/PKGBUILD').read_text(), candidate)
 
     def test_arch_package_and_artifact_validation_remain_required(self):
@@ -125,13 +125,18 @@ class DevBuildScriptTests(unittest.TestCase):
         self.assertNotIn('--skipinteg', ARCH)
 
     def test_mac_keeps_bundle_dependencies_source_identity_and_selftest(self):
-        self.assertIn('build_testing=ON', MAC)
-        self.assertIn('if [ "$run_tests" = false ]; then build_testing=OFF; fi', MAC)
-        self.assertIn('"-DBUILD_TESTING=$build_testing"', MAC)
+        self.assertIn('npm exec -- tauri build', MAC)
+        self.assertIn('--bundles app --features video', MAC)
+        self.assertIn('--ci --no-sign -- --locked', MAC)
+        self.assertIn('--manifest-features client/src-tauri/Cargo.toml=video', MAC)
+        self.assertNotIn('cmake', MAC)
+        self.assertNotIn('ctest', MAC)
         regression = re.search(r'(?s)if \[ "\$run_tests" = true \]; then\n(.*?)\nelse\n.*?\nfi', MAC)[1]
-        self.assertIn('ctest --test-dir', regression)
+        self.assertIn('npm run check && npm test', regression)
+        self.assertIn('cargo test --locked --release --manifest-path client/core/Cargo.toml', regression)
+        self.assertIn('client/src-tauri/Cargo.toml --features video', regression)
         after = MAC.split(regression, 1)[1]
-        for required in ('python3 scripts/package-macos.py', '--connector services/mobile/connector/target/release/zerus-mobile-connector',
+        for required in ('python3 scripts/package-macos.py --gui tauri', '--connector target/release/zerus-mobile-connector',
                          'python3 scripts/check-macos-bundle.py', '--selftest --source-commit "$(git rev-parse HEAD)"',
                          'ditto -c -k --keepParent'):
             self.assertIn(required, after)
@@ -148,14 +153,15 @@ class DevBuildScriptTests(unittest.TestCase):
         self.assertNotIn('secrets.', WORKFLOW)
         self.assertNotIn('environment: macos-signing', WORKFLOW)
 
-    def workflow_release(self, channel, run_tests):
+    def workflow_release(self, channel, run_tests, *, tests_in_verify='false', event='workflow_call'):
         body = textwrap.dedent(re.search(r"(?s)python3 - <<'PY'\n(.*?)\n          PY", WORKFLOW)[1])
         ast.parse(body)
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             (root / 'VERSION').write_text('0.1.0\n')
             (root / 'DEV_VERSION').write_text('0.2.0\n')
-            environment = {'CHANNEL': channel, 'RUN_TESTS': run_tests, 'COMMIT': 'a' * 40,
+            environment = {'CHANNEL': channel, 'RUN_TESTS': run_tests,
+                           'TESTS_IN_VERIFY': tests_in_verify, 'EVENT_NAME': event, 'COMMIT': 'a' * 40,
                            'RUN_NUMBER': '17', 'GITHUB_OUTPUT': str(root / 'output')}
             modules = {'macos_release': SimpleNamespace(cask_for=lambda name: name),
                        'nightly_common': SimpleNamespace(nightly_version=lambda *args: '0.1.0.r9.gaaaaaaa.n17')}
@@ -171,11 +177,24 @@ class DevBuildScriptTests(unittest.TestCase):
             with self.subTest(channel=channel):
                 self.assertIn('release=', self.workflow_release(channel, 'true'))
 
-    def test_workflow_refuses_fast_stable_nightly_and_invalid_boolean(self):
+    def test_workflow_refuses_ungated_fast_stable_nightly_and_invalid_boolean(self):
         for channel, flag in (('stable', 'false'), ('nightly', 'false'), ('other', 'false'), ('dev', 'no')):
             with self.subTest(channel=channel, flag=flag):
-                with self.assertRaisesRegex(SystemExit, 'Only Dev bundles'):
+                with self.assertRaisesRegex(SystemExit, 'Skipping bundle regression requires'):
                     self.workflow_release(channel, flag)
+
+    def test_fast_stable_requires_explicit_same_source_verification_and_manual_event(self):
+        self.assertEqual(self.workflow_release('stable', 'false', tests_in_verify='true',
+                                               event='workflow_dispatch'), 'release=0.1.0\n')
+        for verified in ('false', '', 'True', 'true '):
+            with self.subTest(verified=verified), self.assertRaises(SystemExit):
+                self.workflow_release('stable', 'false', tests_in_verify=verified,
+                                      event='workflow_dispatch')
+        for event in ('push', 'pull_request', 'schedule', 'workflow_call', ''):
+            with self.subTest(event=event), self.assertRaises(SystemExit):
+                self.workflow_release('stable', 'false', tests_in_verify='true', event=event)
+        with self.assertRaises(SystemExit):
+            self.workflow_release('nightly', 'false', tests_in_verify='true', event='workflow_dispatch')
 
 
 if __name__ == '__main__':

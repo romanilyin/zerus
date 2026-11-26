@@ -8,7 +8,7 @@ use super::{
     client::{ClientError, Connection, Event},
     link::{memory_pair, write_json, Link},
     protocol::{
-        Attach, Attached, Captured, ConsoleEvidence, ConsoleProcess, Control, CreateSession,
+        Attach, Attached, CallerSession, Captured, ConsoleEvidence, ConsoleProcess, Control, CreateSession,
         Created, Done, EnvValue, ErrorBody, ErrorCode, Grown, Hello, HelloAnswer, HelloReply,
         InputClaim, InputReady, Integrity, Key, Kind, LaunchState, Listed, Op, PaneDetails,
         Protocols, Resolved, Role, Signal, Size, SupervisorOp, SupervisorRegistration, Target,
@@ -1107,6 +1107,58 @@ fn variables_names_and_kills() {
     );
 }
 
+/// Task #14 (P2.4): `list` carries a structure counter that moves when a
+/// session starts, is renamed or ends, and a per-pane output counter that
+/// moves on every output of the pane and nothing else.
+#[test]
+fn list_counters_move_on_output_structure_and_exit() {
+    let (host, launcher) = new_host();
+    let mut client = connect(&host);
+    let list = |client: &mut Connection| client.call::<Listed>(Op::List).unwrap();
+    let empty = list(&mut client).structure.expect("a current host reports the structure");
+    client.call::<Created>(create("l", "claude/p/a")).unwrap();
+    client.call::<Created>(create("m", "claude/p/b")).unwrap();
+    let created = list(&mut client);
+    let structure = created.structure.unwrap();
+    assert!(structure > empty, "a new session moves the structure");
+    let output = |listed: &Listed, name: &str| listed.panes.iter().find(|pane| pane.session == name).and_then(|pane| pane.output);
+    let (a, b) = (output(&created, "claude/p/a").unwrap(), output(&created, "claude/p/b").unwrap());
+
+    // Output moves its own pane's counter, not the other's, nor the structure.
+    launcher.program(0).write(b"Do you trust this folder? 1. Yes 2. No\r\n");
+    eventually("the output counter", || output(&list(&mut client), "claude/p/a").unwrap() > a);
+    let written = list(&mut client);
+    assert_eq!(output(&written, "claude/p/b"), Some(b));
+    assert_eq!(written.structure, Some(structure));
+    // A variable is no structure change and no output.
+    client
+        .call::<Done>(Op::SetEnvironment { target: pane("claude/p/b"), name: RUN_MARKER.into(), value: Some("run-b".into()) })
+        .unwrap();
+    let marked = list(&mut client);
+    assert_eq!((marked.structure, output(&marked, "claude/p/b")), (Some(structure), Some(b)));
+
+    // A rename moves the structure.
+    client.call::<Done>(Op::Rename { target: Target::Session("$1".into()), name: "claude/p/c".into() }).unwrap();
+    let renamed = list(&mut client).structure.unwrap();
+    assert!(renamed > structure);
+
+    // The exit of its process: the pane is listed dead with a moved counter
+    // or has left the listing, which moves the structure.
+    let before = output(&list(&mut client), "claude/p/a").unwrap();
+    launcher.program(0).exit(0);
+    eventually("the exit", || {
+        let listed = list(&mut client);
+        match listed.panes.iter().find(|pane| pane.session == "claude/p/a") {
+            Some(pane) => pane.dead && pane.output.unwrap() > before,
+            None => listed.structure.unwrap() > renamed,
+        }
+    });
+    eventually("the end", || {
+        let listed = list(&mut client);
+        listed.sessions.len() == 1 && listed.structure.unwrap() > renamed
+    });
+}
+
 /// A supervisor on its own connection, answering with `evidence`.
 fn supervise(
     host: &Arc<Host<FakeLauncher>>,
@@ -1593,6 +1645,52 @@ fn foreground_is_the_newest_child_of_the_root() {
     assert_eq!(foreground(10, &[]), 10);
     let processes = [(20, 10, 5), (21, 10, 9), (22, 21, 12), (23, 99, 30)];
     assert_eq!(foreground(10, &processes), 21);
+}
+
+/// WhiteWh fork (owner, 2026-11-17): a client that attaches gets the lines
+/// above the screen first, so its terminal can scroll back to them; a slow
+/// client's repaint stays the screen alone.
+#[test]
+fn an_attaching_client_gets_the_history_before_the_screen() {
+    let (host, launcher) = new_host();
+    let mut connection = connect(&host);
+    connection
+        .call::<Created>(create("l", "claude/p/a"))
+        .unwrap();
+    let session = host.find(&pane("claude/p/a")).unwrap();
+    let program = launcher.program(0);
+    let mut printed = Vec::new();
+    for n in 1..=60 {
+        printed.extend(format!("answer line {n}\r\n").into_bytes());
+    }
+    printed.extend_from_slice(b"READY");
+    program.write(&printed);
+    eventually("the output", || {
+        capture(&mut connection, pane("claude/p/a")).contains("READY")
+    });
+    let client = Attachment::new(1, 1, Size { cols: 80, rows: 24 });
+    session.attach(client.clone()).unwrap();
+    session.detach(client.id);
+    let Some(Out::Stream(first)) = client.next() else {
+        panic!("no first output")
+    };
+    // 60 lines and the prompt on 24 rows: 37 lines are above the screen.
+    // Each is drawn once, in order, before the screen's own rows.
+    let text = String::from_utf8_lossy(&first).into_owned();
+    let drawn = |n: usize| text.match_indices(&format!("answer line {n}\x1b[0m")).map(|(at, _)| at).collect::<Vec<_>>();
+    let mut before = 0;
+    for n in 1..=60 {
+        let at = drawn(n);
+        assert_eq!(at.len(), 1, "line {n} is drawn once");
+        assert!(at[0] > before, "line {n} follows line {}", n - 1);
+        before = at[0];
+    }
+    assert!(text.find("READY").is_some_and(|ready| ready > before));
+    // The terminal ends on the screen the pane shows.
+    let mut terminal = crate::screen::ScreenModel::new(24, 80);
+    terminal.process(&first);
+    let shown = terminal.capture(crate::screen::Capture::Plain);
+    assert!(shown.starts_with("answer line 38\n") && shown.contains("answer line 60\nREADY"), "{shown}");
 }
 
 #[test]
@@ -3021,4 +3119,41 @@ mod terminal_backend {
         drop(stream);
         host.join().unwrap();
     }
+}
+
+/// Task #33: a process a Git Bash wrapper started in a session is not the
+/// session's descendant any more (the wrapper's process ended), but it is
+/// still in the session's job. The host names that session for the
+/// connection's own client, with its run marker; a process outside every
+/// session hears not_found.
+#[test]
+fn the_host_names_the_session_whose_job_holds_the_asking_process() {
+    let (host, launcher) = new_host();
+    let mut client = connect(&host);
+    let _: Created = client.call(create("launch-a", "claude/p/a")).unwrap();
+    let _: Created = client.call(create("launch-b", "claude/p/b")).unwrap();
+    client
+        .call::<Done>(Op::SetEnvironment {
+            target: pane("claude/p/a"),
+            name: RUN_MARKER.into(),
+            value: Some("run-a".into()),
+        })
+        .unwrap();
+    lock(&launcher.program(0).members).push(4242);
+    let found: CallerSession = connect_as(&host, 4242, Role::Cli).call(Op::CallerSession).unwrap();
+    assert_eq!(
+        found,
+        CallerSession {
+            session: "$0".into(),
+            name: "claude/p/a".into(),
+            pane: "%0".into(),
+            run_marker: "run-a".into(),
+        }
+    );
+    // A session's root process is its own.
+    let root: CallerSession = connect_as(&host, 1001, Role::Cli).call(Op::CallerSession).unwrap();
+    assert_eq!((root.name.as_str(), root.run_marker.as_str()), ("claude/p/b", ""));
+    // Outside every session.
+    let outside = connect_as(&host, 5555, Role::Cli).call::<CallerSession>(Op::CallerSession).unwrap_err();
+    assert_eq!(outside.code, ErrorCode::NotFound);
 }

@@ -12,9 +12,14 @@ import java.util.UUID
 class MessagePersistence private constructor(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val error = MutableStateFlow<Throwable?>(null)
+    private val outboxPins = OutboxPins()
+    fun retainOutbox(delivery: Set<String>, receipts: Set<String>, events: List<Event>) { outboxPins.retain(delivery, receipts, events) }
     private val initialized = scope.async {
         val store = PrivateStore(context.applicationContext)
-        OrderedStatePersistence(store.messageState(), scope, { store.saveMessageState(it) }, onResult = { error.value = it })
+        val writer = OutboxRetention.Normalizer(); val publication = OutboxRetention.Normalizer()
+        val initial = publication.normalize(writer.normalize(store.messageState(), outboxPins.snapshot()), outboxPins.snapshot())
+        OrderedStatePersistence(initial, scope, { store.saveMessageState(it) }, onResult = { error.value = it },
+            normalize = { writer.normalize(it, outboxPins.snapshot()) }, normalizePublished = { publication.normalize(it, outboxPins.snapshot()) })
     }
     suspend fun open() = initialized.await()
     companion object {
@@ -76,6 +81,17 @@ object MessageChanges {
         return state.copy(drafts = state.drafts.filterNot { it.key == recovered.key } + recovered,
             pickerDraft = if (state.pickerId == selectionId) null else state.pickerDraft,
             pickerId = if (state.pickerId == selectionId) "" else state.pickerId)
+    }
+    /** Local dismissal keeps the original outcome checkable and never changes the editor or payload. */
+    fun dismissOutgoing(state: MessageState, captured: OutgoingMessage, recoverInterruptedSending: Boolean = false): MessageState {
+        if (captured.requestId.isBlank()) return state
+        val saved = state.outgoing.singleOrNull { it.requestId == captured.requestId } ?: return state
+        // Only a caller that verified the original send has no live flight may recover this projection.
+        val current = if (recoverInterruptedSending && saved.status == "sending" && captured.status == "uncertain") saved.recover() else saved
+        if (current != captured || current.status !in setOf("uncertain", "failed") || current.deliveryDismissed) return state
+        return state.copy(outgoing = state.outgoing.map {
+            if (it.requestId == current.requestId) current.copy(deliveryDismissed = true) else it
+        })
     }
     fun result(state: MessageState, requestId: String, update: (OutgoingMessage) -> OutgoingMessage): MessageState = state.copy(outgoing = state.outgoing.map {
         if (it.requestId == requestId && it.status !in listOf("recorded", "reviewed")) update(it) else it

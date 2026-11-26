@@ -12,6 +12,8 @@ import { frameBudget, passes, recordFrames, stats, worstRun, type PacingStats, t
 export interface DiagnosticsTargets {
   scrollList: () => HTMLElement | null;
   scrollActivity: () => HTMLElement | null;
+  /** Only counts are recorded, so retained content growth is visible across runs. */
+  activityEvents?: () => number;
   /** Opens the session at `index` of the visible list and resolves once its Activity is in the DOM. */
   openSession: (index: number) => Promise<void>;
 }
@@ -71,12 +73,23 @@ export interface Summary {
   max: number;
 }
 
+export interface ActivityContent {
+  scroll_height: number;
+  activity_rows: number;
+  dom_nodes: number;
+  events: number;
+}
+
 export interface PacingRun {
   frames: number;
   interval_ms: PacingStats & { max: number };
   verdict: PacingVerdict;
   /** Intervals between scroll events (scroll scenarios). */
   scroll_event_ms?: Summary;
+  /** Accepted positions, not requested deltas; bounded counters only. */
+  scroll_travel?: { min_top_px: number; max_top_px: number; span_px: number; total_px: number };
+  activity_before?: ActivityContent;
+  activity_after?: ActivityContent;
 }
 
 export interface TimingRun {
@@ -121,6 +134,33 @@ export interface PerfReport {
   settings: Omit<Plan, "hz" | "hzSource">;
   scenarios: ScenarioResult[];
   resources?: Record<string, unknown>;
+  /** Where the Activity scenario's session came from (unattended runs); counts only. */
+  activity_source?: ActivitySource;
+}
+
+/** Which Activity the run measured: a replay or the live catalog, its size, scroll range and older pages read. Counts only, no names. */
+export interface ActivitySource {
+  replay: boolean;
+  events: number;
+  scroll_px: number;
+  older_pages: number;
+}
+
+/** The most sessions a live run tries for an Activity that scrolls. */
+export const ACTIVITY_CANDIDATE_CAP = 16;
+
+/**
+ * The sessions an unattended run tries for its Activity, a chosen one first.
+ * A live run stops at the cap; a replay run tries every card, so the long
+ * fixture session is found whatever the list order.
+ */
+export function activityCandidates(selected: string | undefined, cards: readonly string[], replay: boolean): string[] {
+  const all = [...new Set([selected, ...cards].filter((id): id is string => !!id))];
+  return replay ? all : all.slice(0, ACTIVITY_CANDIDATE_CAP);
+}
+
+export function activitySource(replay: boolean, best: { events: number; range: number; pages: number } | undefined): ActivitySource {
+  return { replay, events: best?.events ?? 0, scroll_px: Math.max(0, Math.floor(best?.range ?? 0)), older_pages: best?.pages ?? 0 };
 }
 
 export function summarize(values: readonly number[]): Summary {
@@ -217,9 +257,13 @@ async function pacingRuns(
   plan: Plan,
   start: () => (() => void) | void,
   scrollTarget?: HTMLElement,
+  activityContent?: () => ActivityContent,
 ): Promise<PacingRun[]> {
   const T = frameBudget(plan.hz);
   const once = async (ms: number): Promise<PacingRun> => {
+    const before = activityContent?.();
+    let previousTop = scrollTarget?.scrollTop ?? 0, minTop = previousTop, maxTop = previousTop, travel = 0;
+    const observed = (top: number) => { minTop = Math.min(minTop, top); maxTop = Math.max(maxTop, top); travel += Math.abs(top - previousTop); previousTop = top; };
     const scrollTimes: number[] = [];
     const onScroll = () => scrollTimes.push(performance.now());
     scrollTarget?.addEventListener("scroll", onScroll, { passive: true });
@@ -227,19 +271,25 @@ async function pacingRuns(
     let deltas: number[];
     try {
       deltas = await recordFrames(ms, {
-        onFrame: scrollTarget ? () => advance(scrollTarget, plan.stepPx) : undefined,
+        onFrame: scrollTarget ? () => observed(advance(scrollTarget, plan.stepPx)) : undefined,
       });
     } finally {
       stop?.();
       scrollTarget?.removeEventListener("scroll", onScroll);
     }
+    const after = activityContent?.();
     const s = stats(deltas, T);
     const run: PacingRun = {
       frames: deltas.length,
       interval_ms: { ...s, max: deltas.length ? Math.max(...deltas) : NaN },
       verdict: passes(s, T),
     };
-    if (scrollTarget) run.scroll_event_ms = summarize(scrollTimes.slice(1).map((t, i) => t - scrollTimes[i]));
+    if (scrollTarget) {
+      observed(scrollTarget.scrollTop);
+      run.scroll_event_ms = summarize(scrollTimes.slice(1).map((t, i) => t - scrollTimes[i]));
+      run.scroll_travel = { min_top_px: minTop, max_top_px: maxTop, span_px: maxTop - minTop, total_px: travel };
+    }
+    if (before && after) { run.activity_before = before; run.activity_after = after; }
     return run;
   };
   await once(plan.warmupMs);
@@ -254,12 +304,16 @@ const directions = new WeakMap<HTMLElement, number>();
 function advance(element: HTMLElement, step: number) {
   const direction = directions.get(element) ?? 1;
   const max = element.scrollHeight - element.clientHeight;
-  let next = element.scrollTop + direction * step;
+  const top = element.scrollTop;
+  let next = top + direction * step;
   if (next >= max || next <= 0) {
     directions.set(element, -direction);
     next = Math.min(Math.max(next, 0), max);
   }
-  element.scrollTop = next;
+  // CSS smooth scrolling would restart its animation every frame, so the
+  // advertised 16 px step would not be the work this scenario drives.
+  element.scrollTo({ top: next, behavior: "instant" });
+  return top;
 }
 
 function pacingResult(id: ScenarioId, plan: Plan, runs: PacingRun[]): ScenarioResult {
@@ -399,12 +453,30 @@ export async function runScenario(id: ScenarioId, targets: DiagnosticsTargets, s
     case "activity-scroll": {
       const element = id === "list-scroll" ? targets.scrollList() : targets.scrollActivity();
       if (!element) return skipped(id, "pacing", "interval_ms", "no scroll container");
-      if (element.scrollHeight - element.clientHeight < plan.stepPx * 4) return skipped(id, "pacing", "interval_ms", "nothing to scroll");
+      const range = element.scrollHeight - element.clientHeight;
+      if (range < plan.stepPx * 4) return skipped(id, "pacing", "interval_ms", `nothing to scroll (${Math.max(0, Math.floor(range))} px)`);
       const top = element.scrollTop;
       try {
-        return pacingResult(id, plan, await pacingRuns(plan, () => undefined, element));
+        if (id === "activity-scroll") {
+          // Use Activity's ordinary intent handler to release follow; layout
+          // scroll events intentionally cannot revoke the production end pin.
+          element.dispatchEvent(new WheelEvent("wheel", { deltaY: -plan.stepPx, bubbles: true, cancelable: true }));
+          element.scrollTo({ top: Math.max(0, Math.min(top, range) - plan.stepPx), behavior: "instant" });
+        }
+        const content = id === "activity-scroll" ? (): ActivityContent => ({
+          scroll_height: element.scrollHeight,
+          activity_rows: element.querySelectorAll('[id^="item-"]').length,
+          dom_nodes: element.querySelectorAll("*").length,
+          events: targets.activityEvents?.() ?? -1,
+        }) : undefined;
+        const runs = await pacingRuns(plan, () => undefined, element, content);
+        const result = pacingResult(id, plan, runs);
+        if (runs.some(run => run.frames >= 8 && (run.scroll_travel?.span_px ?? 0) <= plan.stepPx * 2)) {
+          return { ...result, skipped: "scrolling did not traverse the container", verdict: undefined };
+        }
+        return result;
       } finally {
-        element.scrollTop = top;
+        element.scrollTo({ top, behavior: "instant" });
       }
     }
     case "session-open":

@@ -1,5 +1,15 @@
 # Zerus Android
 
+For main Claude, Codex and Kimi conversations, a computer and relay advertising
+both `send_outcome` operations enable exact native send outcomes. Before the
+first POST, the encrypted outbox retains a bounded binding to the original UUID,
+machine/SID, run/conversation and native payload digest, including attachments.
+Only its matching closed `native_input_lock` proof shows **Not sent**. Review
+prepares an editable draft; sending it is a separate action with a new UUID.
+Missing, legacy, malformed or foreign proof stays delivery unknown. Receipt
+recovery uses a fresh read UUID and never sends the original message again.
+Existing controls and translations also cover this state; no new UI text is added.
+
 Independent-session waits declared through `hgs wait` appear as **Waiting for
 acceptance** or **Waiting for result**, with producer, computer and elapsed time.
 They remain in Active while the exact waiter is live and online; work and
@@ -47,6 +57,9 @@ activity and history reads first poll their retained receipt after 100 ms,
 then at 200 ms through the first eight polls, returning to the ordinary 800 ms
 cadence. The maximum
 poll count remains bounded; a pending receipt never resubmits its request.
+An advertised WebSocket readiness stream runs alongside these receipt checks.
+A readiness hint can wake a check early; a connected silent stream never delays
+the ordinary polling cadence. The watcher ends with its retained request.
 Encrypted receipt HTTP overlaps a fresh signed membership check, but the app
 requires the original protected request and active enrollment before fetching,
 and verifies current membership before decrypting or settling any result.
@@ -221,13 +234,25 @@ background reads instead of returning to the initial placeholder. Opening cached
 messages immediately shows a pinned status beneath the session tools, distinguishing
 saved messages from checking activity and loading history. The status remains outside
 the scrolling transcript; its two lines and indicator slot retain their geometry as
-reads settle. The Refresh action remains in place. Opening starts exact-target
-inspection and canonical history independently instead of serializing their relay
-round trips. Either may finish first; a complete page already covered by the opening
-inspection is not immediately fetched again. Cached messages remain readable, and
-only the fresh inspection permits actions. The periodic loop does not start another
-inspection while that verified opening is still waiting for its first history page;
-explicit refresh remains available. Later background reads
+reads settle. The Refresh action remains in place. Opening recent Activity uses
+the exact-target inspection's bounded recent messages, independently of complete
+history indexing and exact unread totals. Earlier messages load when requested;
+an actual saved older reading position may also restore its canonical page.
+Two compact arrows beside Jump to latest step through this conversation's own
+messages from the person, including desktop text, phone recordings and question
+answers. They skip inherited history, peer messages, agent replies, tools and system
+rows. A jump briefly outlines the message. Searches read one existing bounded page
+at a time in either direction, stop at the first match or history's end, and show a
+spinner while loading. Exhausted directions are disabled. Direction states stay
+fixed through a fling and refresh on an idle frame; one tapped direction waits
+for scrolling and the current history read to settle. The controls retain 48 dp
+touch targets and localized English/Russian TalkBack labels.
+Returning to the latest messages reads a fresh inspection and leaves the older
+window. Saved positions distinguish following the latest messages from reading
+an older page; older saved data retains its original reading semantics.
+An incomplete earlier-history read keeps recent messages available and offers
+an explicit retry. Cached messages remain readable, and only the fresh inspection
+permits actions. Later background reads
 show progress only after five seconds; manual refresh shows it immediately and
 reuses any matching in-flight read. Catalogs retain their thin progress bar.
 Pulling a conversation up past its newest
@@ -331,14 +356,23 @@ questions.
 
 Session cards follow the desktop cards. A checkout line shows a small Git branch
 mark and `folder / branch` (or detached HEAD); a linked worktree names its main
-checkout folder, and ordinary folders show only their name with a folder mark. A subagent counter uses
-the desktop's compact active count, such as `3`, `2+` or `?`. Tapping it lists
-the children that are working, waiting for input, paused or unknown,
+checkout folder, and ordinary folders show only their name with a folder mark. A card lists
+the subagents that are working, waiting for input, paused or unknown beneath it,
 in stable ID order. Finished and failed turns stay hidden, as with the desktop default,
 unless the child has an unsent draft on this phone. Profile groups are counted
 but not listed. Tapping a child opens its session and then the child's activity
-once that conversation is verified; Back returns to the session. Open subagent
-lists persist with the other Sessions state. A running session with pending
+once that conversation is verified; Back returns to the session. Child sessions
+nest under their parent card (the listing's `parent` link: machine UUID and
+session ID, conversation for an older parent record). One counter covers both,
+as on the desktop (`2 of 5` working, gray **Asking**, amber **Needs you**), and
+tapping it hides or shows both; the phone keeps a collapsed parent across
+relaunches by machine UUID and session ID. Without shown rows the counter keeps
+the desktop's compact active subagent count, such as `3`, `2+` or `?`. A child
+supervised by a live parent shows an arrow before its title and stays quiet:
+no notification and gray badges unless only the person can answer it
+(`client/core/tests/fixtures/supervised-attention.json`). Cards show the
+recorded account's mark and label next to the machine, in the color the
+session's computer keeps for that account (`account_mark`). A running session with pending
 optional Codex questions, which the agent keeps working without, shows an
 amber question-mark chip with their count (`99+` above 99) right after its
 status badge, as on the desktop; its spoken description says how many are
@@ -786,12 +820,45 @@ card from a screenshot and checks the card limit, the whole answer field, the
 footer gap, scrolling to the last option and a compact short question. It sends
 no answers.
 
+The conversation shows one fixed-height status strip above its messages
+(zerus-a4mub.10): a time-bound primary line such as **Updated 3 min ago**,
+**Saved copy · 2 h ago**, **Refreshing…**, **Offline · updated 5 min ago** or
+**Read not synced · …**, with the compact unread count and Questions on the
+right. Tapping it opens the details: the messages' source and observation time,
+the read in flight or its failure, the recent window, history pagination, the
+viewport position and the shared read acknowledgement (pending, confirmed or
+failed), plus an explicit **Refresh now**. It never says the conversation is
+current, and it is presentation only: answering, sending and read marks keep
+their own verified-frame checks. An explicit refresh shows progress at once; an
+automatic one stays quiet for its delay, so polling never flickers. The paths
+that decide `mark_read` report their observed outcome through
+`ZerusViewModel.noteSharedRead`; `ConversationSyncStatus` is plain Kotlin with
+JVM tests.
+
+`ConversationStatusSmokeInstrumentation` uses the same build, install and
+fresh-data steps against a synthetic relay. It covers delayed, failing and refused
+refreshes, reconnecting, a truncated history, shared read outcomes, background
+and foreground, and the keyboard, and checks that the messages, the draft and
+the editor keep their positions. Pass `-e pass narrow` after `wm density 540`
+and `settings put system font_scale 1.3` for the narrow, large-text run; the
+screenshots are written to the app's external files directory. It sends nothing.
+
 Multi-part questions show **Question 1/2** and an explicit **Next** action after
 the current answer is valid. Only the final **Send all** submits the complete
 request. The Other field's keyboard action follows the same steps. Earlier
 selections and custom text remain editable while navigating; an incomplete earlier
 answer is offered for review before submission. Existing exact-request, approval
 and cold-context consent checks still apply to the final send.
+
+`MobileDeliveryRecoverySmokeInstrumentation` checks an unconfirmed outgoing message
+without reposting it. Build with
+`-PzerusInstrumentationRunner=app.zerus.mobile.MobileDeliveryRecoverySmokeInstrumentation`
+using the same isolated emulator procedure. Run with `-e scenario recovery`, then
+force-stop the test app and run `-e scenario restart` without clearing its data.
+These phases check physical dismissal during a pending receipt lookup, persisted
+warning state and editor, a distinct next send, and exact original confirmation.
+On fresh test data, `-e scenario timeout` exercises the actual 45-second send and
+manual receipt deadlines. It does not shorten production timeouts.
 
 `QuestionDeliverySmokeInstrumentation` exercises physical Next/Enter/Send all controls,
 retained per-question answers, one complete synthetic answer, confirmed and missing
@@ -890,7 +957,7 @@ excluded from Android backup.
 ## App icons
 
 Launcher icons reuse the selected Swarm blades from
-[the canonical symbolic SVG](../../tray/resources/icons/hgs-zerus-symbolic.svg),
+[the canonical symbolic SVG](../../packaging/desktop/icons/hgs-zerus-symbolic.svg),
 with the original curves and three rotations. The adaptive foreground is mint
 `#67E8CB` on a full-bleed ink `#101517` background. Both layers use 108 dp; the
 mark is centered at (54, 54), has an outer radius below 33 dp and bounds about

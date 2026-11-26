@@ -4,6 +4,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { probeSpawns } from './dsh-spawn.mjs';
 const require = createRequire(process.env.HGS_DSH_TEST_PACKAGE + '/package.json');
 const { LlmAdapter } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-llm')));
 const { defineTool } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tools')));
@@ -11,9 +12,15 @@ class Adapter extends LlmAdapter {
   failedRecovery = new Set();
   providerInfo(provider) { return { id: provider, name: 'HGS test model' }; }
   async listModels(provider) { return [{ provider, id: 'test-a', name: 'Test A' }, { provider, id: 'test-b', name: 'Test B' }]; }
-  async resolveModel(provider,model) { return { provider,id:model,name:model,
+  async resolveModel(provider,model) {
+    const candidate = model === 'test-b' && this.holds && join(this.holds, 'MODEL_ADMISSION_HOLD');
+    const gate = candidate && existsSync(candidate + '.entered') && candidate;
+    if (gate && existsSync(gate)) writeFileSync(gate + '.resolving', '');
+    for (let i = 0; gate && existsSync(gate) && i < 300; i++) await new Promise(resolve => setTimeout(resolve, 50));
+    return { provider,id:model,name:model,inputModalities: model === 'test-b' ? ['text'] : ['text','image'],
     reasoning:{efforts:[{id:'off',name:'Off'},{id:'high',name:'High'}],defaultEffort:'high'} }; }
   async *stream(options) {
+    if (this.holds) writeFileSync(join(this.holds, 'SETTINGS_MODEL_STREAMS'), '1\n', {flag:'a'});
     await new Promise(resolve => setTimeout(resolve, 120));
     const prompt = options.messages.filter(m => m.role === 'user' && m.source?.kind === 'user').at(-1);
     const text = prompt?.content?.filter(b => b.type === 'text').map(b => b.text).join('') ?? '';
@@ -38,6 +45,47 @@ class Adapter extends LlmAdapter {
       yield {type:'block-start',index:0,blockType:'tool-call'};
       yield {type:'tool-call-delta',index:0,id:'guard-call',name,argumentsDelta:args};
       yield {type:'block-end',index:0,block:{type:'tool-call',id:'guard-call',name,arguments:args}};
+      yield {type:'finish',reason:{kind:'tool-calls'}};return;
+    }
+    if (text.startsWith('HGS_SPAWN_FIXTURE ') && last?.role !== 'tool') {
+      const args = JSON.stringify({action: text.slice('HGS_SPAWN_FIXTURE '.length)});
+      const name = 'hgs_test_spawns';
+      yield {type:'block-start',index:0,blockType:'tool-call'};
+      yield {type:'tool-call-delta',index:0,id:'spawn-probe',name,argumentsDelta:args};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'spawn-probe',name,arguments:args}};
+      yield {type:'finish',reason:{kind:'tool-calls'}};return;
+    }
+    if (text.startsWith('HGS_SELF_NATIVE_FIXTURE ') && last?.role !== 'tool') {
+      const args=JSON.stringify({command:text.slice('HGS_SELF_NATIVE_FIXTURE '.length),description:'Read fixture native identity and launch a child'});
+      yield {type:'block-start',index:0,blockType:'tool-call'};
+      yield {type:'tool-call-delta',index:0,id:'self-call',name:'bash',argumentsDelta:args};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'self-call',name:'bash',arguments:args}};
+      yield {type:'finish',reason:{kind:'tool-calls'}};return;
+    }
+    // zerus-ppd26: the same identity command as a background job, promoted
+    // after a short foreground timeout, or run by a child agent. Once per
+    // prompt: a later job or child notice must not start it again.
+    const shellPath = [['HGS_IDENTITY_BACKGROUND_FIXTURE ', {run_in_background:true}],
+      ['HGS_IDENTITY_PROMOTED_FIXTURE ', {timeoutMs:1000}], ['HGS_IDENTITY_CHILD_FIXTURE ', null]]
+      .find(([mark]) => text.startsWith(mark));
+    if (shellPath && !options.messages.slice(options.messages.indexOf(prompt) + 1).some(m => m.role === 'tool')) {
+      const [mark, extra] = shellPath, command = text.slice(mark.length);
+      const [name, args] = extra
+        ? ['bash', JSON.stringify({command, description:'Shell identity path fixture', ...extra})]
+        : ['subagent', JSON.stringify({description:'Shell identity child fixture', prompt:'HGS_IDENTITY_CHILD_CALL '+command})];
+      yield {type:'block-start',index:0,blockType:'tool-call'};
+      yield {type:'tool-call-delta',index:0,id:'identity-path-call',name,argumentsDelta:args};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'identity-path-call',name,arguments:args}};
+      yield {type:'finish',reason:{kind:'tool-calls'}};return;
+    }
+    // The child's own call: the native harness appends its parent instructions
+    // as a later text block, so only the first block is the command.
+    const childCall = prompt?.content?.find(block => block.type === 'text')?.text ?? '';
+    if (childCall.startsWith('HGS_IDENTITY_CHILD_CALL ') && last?.role !== 'tool') {
+      const args=JSON.stringify({command:childCall.slice('HGS_IDENTITY_CHILD_CALL '.length),description:'Shell identity child call'});
+      yield {type:'block-start',index:0,blockType:'tool-call'};
+      yield {type:'tool-call-delta',index:0,id:'identity-child-call',name:'bash',argumentsDelta:args};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'identity-child-call',name:'bash',arguments:args}};
       yield {type:'finish',reason:{kind:'tool-calls'}};return;
     }
     if ((text.includes('SHELL_BACKGROUND_FIXTURE') || text.includes('SHELL_FOREGROUND_FIXTURE')) && last?.role !== 'tool') {
@@ -78,17 +126,26 @@ class Adapter extends LlmAdapter {
     }
     // The official Schedule tool, when its optional bundle is loaded.
     if (text.includes('SCHEDULE_FIXTURE') && last?.role !== 'tool') {
-      const args=JSON.stringify({prompt:'Scheduled fixture check',title:'Fixture check',every_seconds:3600});
+      const modern = typeof this.schedule?.()?.edit === 'function';
+      const start = new Date(Date.now() + 3600000).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+      const args=JSON.stringify({prompt:'Scheduled fixture check',title:'Fixture check',...(modern
+        ? { rrule:`DTSTART:${start}\nRRULE:FREQ=HOURLY`, target:'this_session' } : {every_seconds:3600})});
       yield {type:'block-start',index:0,blockType:'tool-call'};
       yield {type:'tool-call-delta',index:0,id:'schedule-call',name:'schedule_create',argumentsDelta:args};
       yield {type:'block-end',index:0,block:{type:'tool-call',id:'schedule-call',name:'schedule_create',arguments:args}};
       yield {type:'finish',reason:{kind:'tool-calls'}};return;
     }
     if (text.includes('QUESTION') && last?.role !== 'tool') {
-      const args=JSON.stringify({ questions:[{id:'choice',question:'Which option?',options:[{label:'First'},{label:'Second'}]}] });
+      const questions=[{id:'choice',question:'Which option?',options:[{label:'First'},{label:'Second'}]}];
+      if(text.includes('QUESTION_MULTIPLE'))questions[0].multi_select=true;
+      if(text.includes('QUESTION_PARTS'))questions.push({id:'database',question:'Which database?',options:[{label:'Postgres'},{label:'SQLite'}]});
+      const mode=text.includes('QUESTION_TIMED')?'timed':text.includes('QUESTION_FOREVER')?'forever':
+        text.includes('QUESTION_INTENT_APPROVAL')?'approval':text.includes('QUESTION_INTENT_PLAN')?'plan':undefined;
+      const name=mode?'hgs_test_question_mode':'ask_user_question';
+      const args=JSON.stringify(mode?{mode}:{questions});
       yield {type:'block-start',index:0,blockType:'tool-call'};
-      yield {type:'tool-call-delta',index:0,id:'question-call',name:'ask_user_question',argumentsDelta:args};
-      yield {type:'block-end',index:0,block:{type:'tool-call',id:'question-call',name:'ask_user_question',arguments:args}};
+      yield {type:'tool-call-delta',index:0,id:'question-call',name,argumentsDelta:args};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id:'question-call',name,arguments:args}};
       yield {type:'finish',reason:{kind:'tool-calls'}};return;
     }
     const reply=text.includes('ATTACHMENT_ORDER_FIXTURE')
@@ -104,9 +161,36 @@ class Adapter extends LlmAdapter {
     yield {type:'finish',reason:{kind:'stop'}};
   }
 }
-export const inject=['llm','goals','tools','approval','jobs','agents'];
+export const inject=['llm','goals','tools','approval','jobs','agents','userQuestions'];
 export function apply(ctx,config) {
-  ctx.llm.registerAdapter(['hgs-test'],new Adapter());
+  const adapter = new Adapter();
+  adapter.holds = config?.holds;
+  adapter.schedule = () => ctx.get('schedule');
+  ctx.llm.registerAdapter(['hgs-test'],adapter);
+  ctx.tools.register(defineTool({name:'hgs_test_spawns',description:'Exercise the private native subprocess fixture',
+    parameters:{action:{type:'string',required:true}},
+    output:{schema:{type:'string'},render:(_args,value)=>[{type:'text',text:value}]},
+    async execute({action}, exec) {
+      return JSON.stringify(await probeSpawns(ctx, exec.agent.session.header.cwd, action, config.holds));
+    }
+  }));
+  // Instrument the SAME upstream serializer, without supplying a second queue.
+  // The second entry proves an image prompt reached admission while settings
+  // was blocked in native model resolution inside the first queue entry.
+  ctx.inject(['sessionController'], scope => {
+    const control = scope.sessionController.agents, serialize = control.serializeImageAdmission;
+    let entered = 0;
+    control.serializeImageAdmission = function(agent, operation) {
+      const gate = config?.holds && join(config.holds, 'MODEL_ADMISSION_HOLD');
+      if (gate && existsSync(gate) && ++entered === 2) writeFileSync(gate + '.queued', '');
+      if (!gate || !existsSync(gate)) entered = 0;
+      return serialize.call(this, agent, () => {
+        if (gate && existsSync(gate)) writeFileSync(gate + '.entered', '');
+        return operation();
+      });
+    };
+    return () => { control.serializeImageAdmission = serialize; };
+  });
   // Hold a marked child's first step, before it records its subagent
   // descriptor, until the test creates the release file (as a slow checkpoint).
   // An ARMED hold also arms the child's goal while it waits, so a test can see
@@ -194,6 +278,20 @@ export function apply(ctx,config) {
     async execute(args,exec){
       await ctx.agents.create({sessionId:args.sessionId,agentOptions:{provider:'hgs-test',model:'test-b'},meta:{cwd:exec.agent.session.header.cwd}});
       return args.sessionId;
+    }
+  }));
+  // Exercise the released service's wait and intent types without replacing
+  // the agent preset's ordinary ask_user_question tool or inventing its timers.
+  ctx.tools.register(defineTool({name:'hgs_test_question_mode',description:'Private native question modes',
+    parameters:{mode:{type:'string',required:true}},
+    output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+    async execute({mode},exec){
+      const intent=mode==='approval'?{kind:'approval',approve:'First',reject:'Second'}:
+        mode==='plan'?{kind:'plan-review',approve:'First'}:undefined;
+      const request={agent:exec.agent,signal:exec.signal,questions:[{id:'choice',question:'Which option?',
+        options:[{label:'First'},{label:'Second'}],...(intent?{intent,detail:'Private fixture review'}:{})}]};
+      if(mode==='timed')return ctx.userQuestions.askTimed(request,exec.callId,10000);
+      return ctx.userQuestions.ask({...request,...(mode==='forever'?{wait:{callId:exec.callId}}:{})});
     }
   }));
   ctx.tools.register(defineTool({name:'hgs_test_approval',description:'Keyless approval fixture',parameters:{},

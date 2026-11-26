@@ -101,6 +101,14 @@ pub(crate) fn serve_connection<L: Launcher>(
                     }
                 }
             }
+            // Task #33: answered for this connection's own client, whose
+            // process ID the kernel gave at authentication; never for a PID
+            // a request names.
+            Op::CallerSession => {
+                if !answer(host.caller_session(pid)) {
+                    return;
+                }
+            }
             op => {
                 if !answer(host.request(op)) {
                     return;
@@ -492,6 +500,7 @@ mod windows {
         );
         host.complete_launch_reports_in(crate::state::launches::folder_in(state));
         host.supervise_recovery_with(|| {
+            crate::self_exec::ensure().map_err(|error| error.to_string())?;
             let cli = worker::stable_cli()?;
             Worker::start("hgs-recovery-worker", move || {
                 console::spawn_hidden(&cli, &["recovery".into(), "worker".into()])

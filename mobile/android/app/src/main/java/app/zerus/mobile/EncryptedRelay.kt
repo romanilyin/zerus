@@ -213,7 +213,7 @@ internal suspend fun RelayApi.encryptedEvents(connection:Connection,after:Long,w
     return WorkspaceNotifications.events(connection,records,page,after,System.currentTimeMillis()/1000.0)
 }
 
-internal suspend fun RelayApi.encryptedPost(connection:Connection,body:JSONObject):JSONObject=withContext(Dispatchers.IO) {
+internal suspend fun RelayApi.encryptedPost(connection:Connection,body:JSONObject,attempt:SendAttempt):JSONObject=withContext(Dispatchers.IO) {
     val state=synchronizeWorkspace(connection);val membership=state.requireActive();val journal=journal()
     val id=WorkspaceProtocol.string(body,"request_id");WorkspaceProtocol.identifier(id)
     val computer=WorkspaceProtocol.string(body,"computer_id");val previous=journal.recordedRequest(connection,id)
@@ -226,11 +226,32 @@ internal suspend fun RelayApi.encryptedPost(connection:Connection,body:JSONObjec
     // Retain every identity at the endpoint; read hints never authorize native replay.
     val header=WorkspaceHeader(membership.workspaceId,state.identity.device.deviceId,recipient.deviceId,state.identity.device.keyGeneration,
         recipient.keyGeneration,route.gatewayId,route.routeId,id,"request",WorkspaceProtocol.operationClass(body.string("operation")),nowSeconds()+300,membership.revision,membership.head)
-    val envelope=RelayReadTiming.measure(RelayReadTiming.Stage.Seal) { WorkspaceEnvelope.seal(state.identity,recipient,header,plaintext) }
+    val envelope=RelayReadTiming.measure(RelayReadTiming.Stage.Seal) { sealEnvelope(state.identity,recipient,header,plaintext) }
     val hash=WorkspaceProtocol.encode(MessageDigest.getInstance("SHA-256").digest(plaintext))
     val retained=RelayReadTiming.measure(RelayReadTiming.Stage.Reserve) { journal.reserve(connection,id,hash,envelope) }
-    val result=call(connection.url,connection.token,"/v2/requests",JSONObject().put("envelope",retained.json()))
+    val result=call(connection.url,connection.token,"/v2/requests",JSONObject().put("envelope",retained.json()),attempt=attempt)
     decodeEncryptedReceipt(connection,state,result,id,retained.header)
+}
+
+/** A phone's signed latch statement for the gateway that routes [computer] (zerus-sa9qn.50): built and signed once, when the
+ * person's action is sent; that gateway's own service verifies it. The payload of session_question_route_person. */
+internal suspend fun RelayApi.signRoutePerson(connection:Connection,computer:String,sessionId:String,run:String,conversation:String,
+                                              personOff:Boolean,requestId:String,useRevision:Boolean=false,session:String=""):JSONObject=withContext(Dispatchers.IO) {
+    val state=synchronizeWorkspace(connection);val membership=state.requireActive()
+    val route=state.routes[computer] ?: error("Refresh this computer's encrypted route before sending.")
+    require(membership.members[route.gatewayId]?.role=="computer") { "The executing gateway is no longer enrolled." }
+    val revision = if(useRevision) {
+        require(session.isNotBlank())
+        val id=java.util.UUID.randomUUID().toString()
+        val payload=JSONObject().put("session_id",sessionId).put("expected_run_id",run).put("expected_conversation_id",conversation)
+        val receipt=await(connection,post(connection,computer,session,SessionQuestionRouting.personRevisionOperation,payload,id,SendAttempt()))
+        check(receipt.string("request_id")==id && receipt.string("state")=="completed") { receipt.string("error").ifBlank { "The child's question routing was not confirmed." } }
+        SessionQuestionRouting.latchRevision(receipt.getJSONObject("result"),id,sessionId,run,conversation)
+    } else null
+    val now=nowSeconds()
+    val statement=RoutePersonStatement(membership.workspaceId,state.identity.device.deviceId,route.gatewayId,sessionId,run,conversation,
+        personOff,requestId,now,now+RoutePersonStatement.LIFETIME,revision)
+    JSONObject().put("statement",statement.json()).put("signature",WorkspaceProtocol.encode(WorkspaceCrypto.sign(state.identity.keys,statement.frame())))
 }
 
 /** Establish local retained authority before registering any readiness watch.

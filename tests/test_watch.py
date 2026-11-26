@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -30,9 +31,9 @@ def steady(row):
 class Stream:
     """One running `hgs watch --json` and the frames it has written."""
 
-    def __init__(self, test, *args):
+    def __init__(self, test, *args, executable=HGS):
         self.test = test
-        self.process = subprocess.Popen([str(HGS), *args, 'watch', '--json'], env=test.env,
+        self.process = subprocess.Popen([str(executable), *args, 'watch', '--json'], env=test.env,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True)
         self.frames = queue.Queue()
@@ -145,7 +146,7 @@ class WatchStream(unittest.TestCase):
         self.assertEqual((hello['v'], hello['t'], hello['seq']), (1, 'hello', 1))
         self.assertEqual(hello['host'], 'test')
         self.assertEqual((hello['heartbeat_ms'], hello['max_frame_bytes']), (10000, 1048576))
-        self.assertEqual(hello['topics'], ['catalog', 'catalog.meta', 'activity', 'git', 'processes', 'tasks', 'organization'])
+        self.assertEqual(hello['topics'], ['catalog', 'catalog.meta', 'activity', 'git', 'processes', 'tasks', 'organization', 'team', 'organization.drive_folders'])
         self.assertEqual(hello['limits']['activity_subscriptions'], 16)
         self.assertEqual(hello['limits']['git_subscriptions'], 64)
         self.assertEqual(hello['limits']['processes_subscriptions'], 16)
@@ -160,13 +161,24 @@ class WatchStream(unittest.TestCase):
         expected = next(row for row in listing['sessions'] if row['name'] == self.name)
         self.assertEqual(steady(rows[self.key()]), steady(expected))
         self.assertNotIn('sessions', meta['value'])
-        self.assertEqual(set(meta['value']), set(listing) - {'sessions'})
+        self.assertEqual(set(meta['value']), (set(listing) - {'sessions'}) | {'ended_launches'})
+        self.assertEqual(meta['value']['ended_launches'], listing.get('ended_launches', []))
         self.assertEqual(meta['value']['host'], 'test')
         self.assertTrue(all(len(line.encode()) <= 1 << 20 for line in stream.raw))
         started = time.monotonic()
         self.assertEqual(stream.close(), 0)
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(stream.process.stderr.read(), '')
+
+    def test_launch_identity_is_additive_and_empty_results_advertise_support(self):
+        launch = str(uuid.uuid4())
+        self.record['launch_id'] = launch
+        self.write_record()
+        stream, _, snapshot, meta = self.start()
+        row = next(item['row'] for item in snapshot['items'] if item['key'] == self.key())
+        self.assertEqual(row['launch_id'], launch)
+        self.assertEqual(meta['value']['ended_launches'], [])
+        self.assertEqual(stream.close(), 0)
 
     def test_binding_changes_and_a_rename_are_upserts_on_the_run_key(self):
         stream, *_ = self.start()
@@ -188,6 +200,87 @@ class WatchStream(unittest.TestCase):
         stream.quiet(lambda f: False, 1.5)
         stream.quiet(lambda f: f['t'] == 'delta', 6)
         self.assertEqual(stream.close(), 0)
+
+    def test_internal_recovery_fields_stay_selected_only_across_catalog_updates(self):
+        keys = ('recovery_user_text', 'recovery_user_at', 'recovery_success_at',
+                'recovery_cancel_at', 'keep_warm_prompt_at')
+        self.record.update(dict(zip(keys, ['Exact recovery evidence\nКириллица', 1, 2, 3, 4])))
+        self.write_record()
+        stream, _, snapshot, _ = self.start()
+        row = next(item['row'] for item in snapshot['items'] if item['key'] == self.key())
+        self.assertFalse(set(keys) & row.keys())
+        self.record.update(prompt='Public change', recovery_user_text='Later exact recovery input')
+        self.write_record()
+        original = self.record_path.read_bytes()
+        delta = stream.next(lambda frame: frame['t'] == 'delta' and any(
+            item['key'] == self.key() and item['row'].get('prompt') == 'Public change'
+            for item in frame['upsert']), timeout=8)
+        row = next(item['row'] for item in delta['upsert'] if item['key'] == self.key())
+        self.assertFalse(set(keys) & row.keys())
+        selected = subprocess.run([str(HGS), 'inspect', self.name, '--skip-processes'],
+                                  env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        selected = json.loads(selected.stdout)
+        self.assertEqual({key: selected[key] for key in keys},
+                         {key: self.record[key] for key in keys})
+        self.assertEqual(stream.close(), 0)
+        self.assertEqual(self.record_path.read_bytes(), original)
+
+    def test_live_model_choices_stay_in_selected_details_across_catalog_updates(self):
+        # Compare the watch with the small canonical compatibility listing;
+        # indexed readiness has its own control, not a startup race here.
+        directory = self.state/'listing-metadata'
+        directory.mkdir(exist_ok=True)
+        disabled = directory/'disabled'
+        disabled.write_text('1\n')
+        disabled.chmod(0o600)
+        home = self.root/'.codex'
+        home.mkdir(exist_ok=True)
+        cache = home/'models_cache.json'
+        models = [dict(slug='fixture-a', display_name='Fixture A',
+                       supported_reasoning_levels=[dict(effort='high')]),
+                  dict(slug='fixture-b', display_name='Fixture B',
+                       supported_reasoning_levels=[dict(effort='low'), dict(effort='high')])]
+        cache.write_text(json.dumps(dict(models=models)))
+        self.record.update(model='fixture-a', effort='high')
+        self.write_record()
+
+        def details():
+            result = subprocess.run([str(HGS), 'inspect', self.name, '--skip-processes'],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        def choices(raw):
+            return [dict(id=row['slug'], label=row['display_name'],
+                         effort_options=[value['effort'] for value in row['supported_reasoning_levels']])
+                    for row in raw]
+
+        selected = details()
+        self.assertEqual(selected['model_options'], choices(models))
+        stream, _, snapshot, _ = self.start()
+        row = next(item['row'] for item in snapshot['items'] if item['key'] == self.key())
+        self.assertNotIn('model_options', row)
+        self.assertEqual(steady(row), steady(self.listed_row()))
+        models.append(dict(slug='fixture-c', display_name='Fixture C',
+                           supported_reasoning_levels=[dict(effort='high')]))
+        cache.write_text(json.dumps(dict(models=models)))
+        self.record['prompt'] = 'Model catalog changed'
+        self.write_record()
+        original = self.record_path.read_bytes()
+        delta = stream.next(lambda frame: frame['t'] == 'delta' and any(
+            item['key'] == self.key() and item['row'].get('prompt') == 'Model catalog changed'
+            for item in frame['upsert']), timeout=8)
+        row = next(item['row'] for item in delta['upsert'] if item['key'] == self.key())
+        self.assertNotIn('model_options', row)
+        self.assertEqual(steady(row), steady(self.listed_row()))
+        current = details()
+        self.assertEqual(current['model_options'], choices(models))
+        for key in ('model', 'effort', 'effort_options', 'settings_change_supported',
+                    'settings_change_reason', 'settings_apply_when', 'allowed_actions', 'reply_id'):
+            self.assertEqual(current.get(key), selected.get(key), key)
+        self.assertEqual(stream.close(), 0)
+        self.assertEqual(self.record_path.read_bytes(), original)
 
     def listed_row(self):
         return next(row for row in self.listing()['sessions'] if row['name'] == self.name)
@@ -308,6 +401,17 @@ class WatchStream(unittest.TestCase):
             return {key: {k: v for k, v in value[key].items() if k != 'sampled_at'} for key in ('processes', 'process_work')}
         self.assertEqual(set(state['value']), {'processes', 'process_work'})
         self.assertEqual(steady_value(state['value']), steady_value(inspection))
+        # A pre-extension client can still resubscribe to recover its first state.
+        stream.send(op='subscribe', topic='processes', session=self.session())
+        again = stream.next(lambda f: f['t'] == 'state' and f['topic'] == 'processes', timeout=10)
+        self.assertEqual(again['rev'], 1)
+        # Reconfigure and refresh this subscription without dropping the last
+        # inventory or resetting its revision. Older servers reset and resend 1.
+        stream.send(op='subscribe', topic='processes', session=self.session(),
+                    interval_ms=2500, refresh=True)
+        stream.send(op='ping', id='processes-configured')
+        stream.next(lambda f: f['t'] == 'pong' and f['id'] == 'processes-configured')
+        stream.quiet(lambda f: f['t'] == 'state' and f['topic'] == 'processes' and f['rev'] == 1, 1.25)
         # A recorded background job in the binding is read again and sent.
         self.record['shell_jobs'] = {'job-1': dict(id='job-1', status='running', background=True, observed=True,
                                                    run_id=self.run_id, command='sleep 600', started_at=time.time(), source='hooks')}
@@ -372,6 +476,94 @@ class WatchStream(unittest.TestCase):
         stream.next(lambda f: f['t'] == 'pong' and f['id'] == 'unsubscribed')
         self.task('add', '--project', 'orchard', text='Unwatched task')
         stream.quiet(lambda f: f['t'] == 'snapshot' and f['topic'] == 'tasks', 3)
+        self.assertEqual(stream.close(), 0)
+
+    def team_store(self, *rows):
+        """A team store with these heads, written as hgs writes it (rollback journal)."""
+        path = self.state / 'teams' / 'teams.sqlite3'
+        path.parent.mkdir(exist_ok=True)
+        with sqlite3.connect(path) as db:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute('CREATE TABLE IF NOT EXISTS teams(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,status TEXT NOT NULL,'
+                       'updated REAL NOT NULL,payload TEXT NOT NULL)')
+            db.execute('DELETE FROM teams')
+            for team_id, revision, status in rows:
+                payload = json.dumps(dict(id=team_id, name='Team ' + team_id, lead='lead'))
+                db.execute('INSERT INTO teams VALUES(?,?,?,?,?)', (team_id, revision, status, time.time(), payload))
+        return path
+
+    def test_team_heads_stream_as_rows_and_a_raised_revision_is_a_delta(self):
+        # Task 8: the client reads a team again only when its revision moved.
+        self.team_store(('t-one', 3, 'running'), ('t-two', 1, 'planning'))
+        stream, hello, *_ = self.start()
+        self.assertIn('team', hello['topics'])
+        stream.send(op='subscribe', topic='team')
+        snapshot = stream.next(lambda f: f['t'] == 'snapshot' and f['topic'] == 'team')
+        self.assertTrue(snapshot['last'])
+        rows = {item['key']: item['row'] for item in snapshot['items']}
+        self.assertEqual(set(rows), {'team:t-one', 'team:t-two', 'teams'})
+        self.assertEqual((rows['team:t-one']['revision'], rows['team:t-one']['status'], rows['team:t-one']['name']), (3, 'running', 'Team t-one'))
+        self.assertEqual(rows['teams'], dict(count=2, truncated=False))
+        # A change raises a revision; the other team stays out of the delta.
+        self.team_store(('t-one', 4, 'paused'), ('t-two', 1, 'planning'))
+        delta = stream.next(lambda f: f['t'] == 'delta' and f['topic'] == 'team', timeout=10)
+        changed = {item['key']: item['row'] for item in delta['upsert']}
+        self.assertEqual((changed['team:t-one']['revision'], changed['team:t-one']['status']), (4, 'paused'))
+        self.assertNotIn('team:t-two', changed)
+        self.assertGreater(delta['cursor'], snapshot['cursor'])
+        # A team that left is a removed key.
+        self.team_store(('t-one', 4, 'paused'))
+        delta = stream.next(lambda f: f['t'] == 'delta' and f['topic'] == 'team' and f['remove'], timeout=10)
+        self.assertEqual([removal['key'] for removal in delta['remove']], ['team:t-two'])
+        # Unsubscribed: no more team frames.
+        stream.send(op='unsubscribe', topic='team')
+        stream.send(op='ping', id='unsubscribed')
+        stream.next(lambda f: f['t'] == 'pong' and f['id'] == 'unsubscribed')
+        self.team_store(('t-one', 5, 'running'))
+        stream.quiet(lambda f: f.get('topic') == 'team', 3)
+        self.assertEqual(stream.close(), 0)
+
+    def test_a_windowed_task_subscription_carries_each_stage_s_first_rows(self):
+        catalog = {"projects": [{"id": "project-1", "name": "orchard", "color": "#123456", "folders": [], "sessions": []}]}
+        result = subprocess.run([str(HGS), 'swarm', 'initialize'], input=json.dumps(catalog), env=self.env,
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for n in range(5):
+            self.task('add', '--project', 'orchard', *(('--backlog',) if n % 2 else ()), text=f'Task {n}')
+        stream, hello, *_ = self.start()
+        self.assertEqual(hello['limits']['tasks_window'], 200)
+        stream.send(op='subscribe', topic='tasks', project='project-1', window=2)
+        key, items, value = self.tasks_snapshot(stream)
+        self.assertEqual(key, 'project-1')
+        expected = []
+        for stage in ('review', 'active', 'todo', 'backlog', 'done'):
+            expected += self.task('list', '--project', 'project-1', '--stage', stage, '--limit', '2')['tasks']
+        self.assertEqual(items, expected)
+        self.assertEqual(value['counts'], {'review': 0, 'active': 0, 'todo': 3, 'backlog': 2, 'done': 0})
+        window = value['window']
+        self.assertEqual((window['schema'], window['limit']), (1, 2))
+        self.assertEqual(window['stages']['todo']['total'], 3)
+        self.assertIsNone(window['stages']['backlog']['next'])
+        # The stage's next page comes from the paged list with that cursor.
+        more = self.task('list', '--project', 'project-1', '--stage', 'todo', '--limit', '2',
+                         '--after', window['stages']['todo']['next'])
+        all_todo = self.task('list', '--project', 'project-1', '--stage', 'todo')['tasks']
+        self.assertEqual([t['uuid'] for t in items if t['stage'] == 'todo'] + [t['uuid'] for t in more['tasks']],
+                         [t['uuid'] for t in all_todo])
+        self.assertRegex(value['revision'], '.+')
+        self.assertRegex(value['digest'], '^[0-9a-f]{64}$')
+        # A change sends the window again.
+        self.task('add', '--project', 'orchard', '--position', '1', text='At the top')
+        _, items, changed = self.tasks_snapshot(stream, lambda v: v['digest'] != value['digest'], timeout=10)
+        self.assertEqual(changed['counts']['todo'], 4)
+        self.assertEqual(items[0]['text'], 'At the top')
+        # Windows outside 1..200 are refused, without ending the stream.
+        for bad in (0, 201):
+            stream.send(op='subscribe', topic='tasks', project='project-1', window=bad)
+            error = stream.next(lambda f: f['t'] == 'error' and f.get('topic') == 'tasks' and f['code'] == 'bad_request')
+            self.assertFalse(error['fatal'])
+        stream.send(op='ping', id='alive')
+        stream.next(lambda f: f['t'] == 'pong' and f['id'] == 'alive')
         self.assertEqual(stream.close(), 0)
 
     @staticmethod
@@ -461,6 +653,43 @@ class WatchStream(unittest.TestCase):
         self.assertEqual(stream.next(lambda f: f['t'] == 'gap')['reason'], 'reset')
         self.assertEqual(stream.close(), 0)
 
+    def test_an_older_page_is_read_by_position_and_leaves_the_subscription_alone(self):
+        rows = []
+        for n in range(7):
+            rows.append(self.journal('Stop', detail=f'reply {n}'))
+            # Other sessions write between this one's rows: sequence numbers are shared.
+            for other in range(3):
+                self.journal('Stop', name='codex/other/session', detail=f'other {n} {other}')
+        stream, hello, *_ = self.start()
+        self.assertEqual(hello['limits']['activity_older'], 200)
+        stream.send(op='subscribe', topic='activity', session=self.session(), tail=2)
+        tail = stream.next(lambda f: f['t'] == 'events')
+        self.assertEqual([event['seq'] for event in tail['events']], rows[-2:])
+        stream.next(lambda f: f['t'] == 'state')
+        stream.send(op='subscribe', topic='activity', session=self.session(), before=rows[5], tail=3)
+        page = stream.next(lambda f: f['t'] == 'older')
+        self.assertEqual([event['seq'] for event in page['events']], rows[2:5])
+        self.assertEqual((page['topic'], page['key'], page['cursor'], page['last'], page['more']),
+                         ('activity', self.key(), rows[2], True, True))
+        stream.send(op='subscribe', topic='activity', session=self.session(), before=page['cursor'], tail=3)
+        first = stream.next(lambda f: f['t'] == 'older')
+        self.assertEqual([event['seq'] for event in first['events']], rows[:2])
+        self.assertEqual((first['cursor'], first['last'], first['more']), (rows[0], True, False))
+        stream.send(op='subscribe', topic='activity', session=self.session(), before=first['cursor'])
+        empty = stream.next(lambda f: f['t'] == 'older')
+        self.assertEqual((empty['events'], empty['cursor'], empty['last'], empty['more']), ([], rows[0], True, False))
+        # The subscription was neither replaced nor moved: no new tail or
+        # state came, and a new row follows the cursor it had.
+        self.assertEqual(sum(1 for f in stream.seen if f['t'] == 'events'), 1)
+        new = self.journal('Stop', detail='after the pages')
+        live = stream.next(lambda f: f['t'] == 'events')
+        self.assertEqual(([event['seq'] for event in live['events']], live['cursor']), ([new], new))
+        # A page belongs to a followed session.
+        stream.send(op='subscribe', topic='activity', session=dict(name='sh/unfollowed'), before=5)
+        error = stream.next(lambda f: f['t'] == 'error')
+        self.assertEqual((error['code'], error['key']), ('bad_request', 'name:sh/unfollowed'))
+        self.assertEqual(stream.close(), 0)
+
     def test_subscription_limit_unknown_topics_and_bad_requests_are_errors(self):
         stream, *_ = self.start()
         for index in range(16):
@@ -524,7 +753,7 @@ class WatchStream(unittest.TestCase):
 
     def test_git_follows_commits_checkouts_and_session_edits_until_unsubscribed(self):
         repo = self.repository()
-        stream, *_ = self.start()
+        stream, hello, *_ = self.start()
         stream.send(op='subscribe', topic='git', path=str(repo))
         first = stream.next(self.git_state(repo), timeout=10)
         volatile = ('sampled_at', 'remote_age_seconds')
@@ -556,7 +785,10 @@ class WatchStream(unittest.TestCase):
         (repo / 'tracked').write_text('edited by the agent\n')
         stream.quiet(self.git_state(repo, lambda v: v['changed_files'] == 1), 1.5)
         self.journal('PostToolUse', name=name, tool='Edit', detail=str(repo / 'tracked'))
-        edited = stream.next(self.git_state(repo, lambda v: v['changed_files'] == 1), timeout=5)
+        # Use the stream's advertised liveness bound, still well before the
+        # 30 s safety poll could conceal a missed file-changing hook.
+        edited = stream.next(self.git_state(repo, lambda v: v['changed_files'] == 1),
+                             timeout=hello['heartbeat_ms'] / 1000)
         self.assertEqual(edited['value']['branch'], 'feature')
         self.assertLess(time.monotonic() - started, 25)
         # An unchanged checkout sends nothing more, and unsubscribed nothing at all.
@@ -567,6 +799,40 @@ class WatchStream(unittest.TestCase):
         self.git('-C', str(repo), 'checkout', '-q', 'main')
         stream.quiet(lambda f: f['t'] == 'state' and f['topic'] == 'git', 2.5)
         self.assertTrue(all(len(line.encode()) <= 1 << 20 for line in stream.raw))
+        self.assertEqual(stream.close(), 0)
+
+    def test_git_rechecks_after_a_file_changing_hook_commits_through_a_busy_journal(self):
+        repo = self.repository()
+        name = 'codex/git-busy-journal'
+        saved = dict(version=1, name=name, agent='codex', run_id=str(uuid.uuid4()),
+                     conversation_id=str(uuid.uuid4()), cwd=str(repo), activity='idle', phase='idle',
+                     active_tools={}, subagents={}, last_event_at=time.time(), created=time.time())
+        (self.state / (hashlib.sha256(name.encode()).hexdigest() + '.json')).write_text(json.dumps(saved))
+        self.journal('UserPromptSubmit', name=name)
+        stream, hello, *_ = self.start()
+        stream.send(op='subscribe', topic='git', path=str(repo))
+        first = stream.next(self.git_state(repo))
+        self.assertEqual(first['value']['changed_files'], 0)
+        # Let Git's own late index metadata write settle before the edit.
+        stream.quiet(lambda f: False, 1.5)
+        with sqlite3.connect(self.state / 'events.sqlite3') as db:
+            db.execute('BEGIN EXCLUSIVE')
+            (repo / 'tracked').write_text('edited while the journal is busy\n')
+            payload = dict(type='PostToolUse', at=time.time(), agent_id='', tool='Edit',
+                           detail=str(repo / 'tracked'))
+            db.execute('INSERT INTO events(name, conversation, payload) VALUES (?, ?, ?)',
+                       (name, saved['conversation_id'], json.dumps(payload)))
+            # The real reader's 250 ms SQLite budget expires while the write
+            # is uncommitted; reopening must not baseline away this hook.
+            stream.quiet(lambda f: False, 1.5)
+        db.close()
+        # A conservative recheck may already have seen the edit while the
+        # journal was locked. Keep that frame rather than waiting for a duplicate.
+        matches = self.git_state(repo, lambda v: v.get('changed_files') == 1)
+        changed = next((frame for frame in stream.seen if matches(frame)), None)
+        if changed is None:
+            changed = stream.next(matches, timeout=hello['heartbeat_ms'] / 1000)
+        self.assertGreater(changed['rev'], first['rev'])
         self.assertEqual(stream.close(), 0)
 
     def test_git_folders_answer_like_git_status_and_are_limited(self):
@@ -614,6 +880,55 @@ class WatchStream(unittest.TestCase):
         self.assertEqual(process.stderr.read(), b'')
         process.stdin.close()
         process.stderr.close()
+
+    def install(self, path, mode=0o755):
+        """Puts a copy of the built CLI at `path` the way install.sh does:
+        a staged file renamed over it, so the running file stays as it was."""
+        staged = path.with_name(path.name + '.new')
+        shutil.copy2(HGS, staged)
+        staged.chmod(mode)
+        os.replace(staged, path)
+
+    def assert_replaced_ends(self, stream, installed):
+        """Only a ready replacement ends the stream: a missing path or a file
+        that is not executable yet keeps it running (two checks each)."""
+        stream.quiet(lambda f: f['t'] == 'error', 6)
+        installed.unlink()
+        stream.quiet(lambda f: f['t'] == 'error', 11)
+        self.assertIsNone(stream.process.poll())
+        self.install(installed, 0o644)
+        stream.quiet(lambda f: f['t'] == 'error', 11)
+        self.assertIsNone(stream.process.poll())
+        installed.chmod(0o755)
+        ready = time.monotonic()
+        error = stream.next(lambda f: f['t'] == 'error', timeout=15)
+        self.assertEqual((error['code'], error['fatal']), ('hgs_replaced', True), error)
+        # The same file read twice, 5 s apart: at most two checks after it.
+        self.assertLess(time.monotonic() - ready, 12)
+        self.assertEqual(stream.process.wait(timeout=5), 0)
+        self.assertEqual(stream.process.stderr.read(), '')
+
+    def test_a_replaced_executable_ends_the_stream_so_the_client_starts_the_new_one(self):
+        # zerus-5wmh.66.2.46: an update renames a new file over the CLI, as
+        # install.sh does; a stream left running would keep the old code's
+        # summaries (Clear's reason among them) beside the new CLI's commands.
+        installed = self.root / 'installed' / 'hgs'
+        installed.parent.mkdir()
+        self.install(installed)
+        stream = Stream(self, executable=installed)
+        stream.next(lambda f: f['t'] == 'snapshot' and f['topic'] == 'catalog.meta')
+        self.assert_replaced_ends(stream, installed)
+
+    def test_a_peer_whose_executable_is_replaced_ends_its_stream_through_ssh(self):
+        self.script('ssh', '#!/bin/sh\nfor argument do last="$argument"; done\nexec /bin/sh -c "$last"\n')
+        peer = self.root / '.local/bin/hgs'
+        peer.unlink()
+        self.install(peer)
+        stream = Stream(self, '@remote')
+        stream.next(lambda f: f['t'] == 'snapshot' and f['topic'] == 'catalog' and f['last'])
+        # The local `hgs @remote watch` only waits on ssh; the peer's own
+        # watcher sees its file replaced, and its last frame reaches the client.
+        self.assert_replaced_ends(stream, peer)
 
     def test_usage_marker_and_dry_run(self):
         result = subprocess.run([str(HGS), '-h'], env=self.env, text=True, capture_output=True, timeout=10)

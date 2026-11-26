@@ -43,8 +43,12 @@ pub enum OrganizationUpdate {
 
 /// What an edit of the organization starts from: the organization the user
 /// saw and the versions observed with it, for one digest.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrganizationSnapshot {
+    /// The same source's identities, rather than identities inferred from an
+    /// alias or another cached listing. The CLI exposes node_id as machine_id.
+    pub node_id: String,
+    pub swarm_id: String,
     pub digest: String,
     /// `swarm get`'s `organization`.
     pub base: Value,
@@ -99,25 +103,7 @@ pub fn rebuild(rows: &BTreeMap<String, Value>) -> Option<Value> {
 
 /// The project ID of every member of `swarm get`'s object.
 pub fn membership(value: &Value) -> BTreeMap<String, String> {
-    let mut members = BTreeMap::new();
-    for project in value["organization"]["projects"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        let Some(id) = project["id"].as_str() else {
-            continue;
-        };
-        for member in project["sessions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            members.insert(member.to_owned(), id.to_owned());
-        }
-    }
-    members
+    crate::swarm::members(&value["organization"])
 }
 
 fn change(computer: &ComputerId, update: OrganizationUpdate) -> Change {
@@ -147,6 +133,8 @@ impl OrganizationState {
     pub fn snapshot(&self) -> Option<OrganizationSnapshot> {
         let full = self.full.as_ref()?;
         Some(OrganizationSnapshot {
+            node_id: full["node_id"].as_str().unwrap_or_default().to_owned(),
+            swarm_id: full["swarm_id"].as_str().unwrap_or_default().to_owned(),
             digest: full["digest"].as_str().unwrap_or_default().to_owned(),
             base: full["organization"].clone(),
             versions: full["versions"].clone(),
@@ -282,6 +270,14 @@ mod tests {
     use serde_json::json;
     use zerus_watch_protocol::{CatalogItem, Removal};
 
+    #[test]
+    fn a_session_listed_by_two_projects_maps_to_the_first() {
+        // Qt's indexSessions keeps the first (tray/src/SessionOrganization.cpp:46-48).
+        let value = json!({"organization": {"projects": [
+            {"id": "alpha", "sessions": ["h\ns"]}, {"id": "beta", "sessions": ["h\ns"]}]}});
+        assert_eq!(membership(&value)["h\ns"], "alpha");
+    }
+
     fn full(sessions: &[&str], digest: &str) -> Value {
         json!({
             "schema": 1, "node_id": "node-1", "swarm_id": "swarm-1", "digest": digest, "initialized": true,
@@ -369,6 +365,8 @@ mod tests {
             json!(["a"])
         );
         let snapshot = organization.snapshot().unwrap();
+        assert_eq!(snapshot.node_id, "node-1");
+        assert_eq!(snapshot.swarm_id, "swarm-1");
         assert_eq!(snapshot.digest, "d1");
         assert_eq!(snapshot.versions, json!({"project:alpha:name": ["op-1"]}));
         assert_eq!(snapshot.base["projects"][0]["id"], "alpha");

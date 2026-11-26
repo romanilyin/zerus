@@ -46,6 +46,25 @@ def shows_prefix(rows,text):
  spaces=len(rest)-len(rest.lstrip(' '))
  return any(shows_prefix(rows[1:],tail) for i in range(spaces+1) for tail in [rest[i:]]*bool(rows[0])+[rest[i+1:]]*rest[i:].startswith('\n'))
 
+def failure_evidence(fixture):
+ """Bounded synthetic API evidence when Claude's collapsed TUI hides a result.
+
+ A completed turn does not prove a shell command succeeded. Keep its actual
+ tool result beside the screen, including child results, before owned cleanup.
+ """
+ results=[]
+ requests=getattr(fixture,'native_requests',getattr(fixture,'requests',[]))
+ for request in requests[-8:]:
+  for message in request.get('messages',[])[-8:]:
+   content=message.get('content',[])
+   if not isinstance(content,list):continue
+   for part in content[-8:]:
+    if part.get('type')=='tool_result':
+     result={key:part[key] for key in ('tool_use_id','is_error') if key in part}
+     result['content']=str(part.get('content',''))[:4096]
+     if result not in results:results.append(result)
+ return json.dumps(dict(work=str(fixture.root/'work'),tool_results=results[-8:]),ensure_ascii=False)
+
 @unittest.skipUnless(CLAUDE,'Set HGS_CLAUDE_TEST_BIN to test the installed native Claude against a local fake API')
 class NativeClaudeQuestions(unittest.TestCase):
  script=fixtures.InputTransport.script
@@ -67,7 +86,7 @@ class NativeClaudeQuestions(unittest.TestCase):
    result=callback()
    if result:return result
    time.sleep(.04)
-  self.fail('Native fixture timed out:\n'+self.tmux('capture-pane','-p','-t',self.pane,check=False))
+  self.fail('Native fixture timed out:\n'+self.tmux('capture-pane','-p','-t',self.pane,check=False)+'\nNative tool evidence: '+failure_evidence(self))
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory(prefix='hgs-claude-native-');self.addCleanup(self.temp.cleanup)
   self.root=Path(self.temp.name).resolve();self.bin=self.root/'.local/bin';self.bin.mkdir(parents=True);self.state=self.root/'state';self.state.mkdir()
@@ -81,10 +100,15 @@ class NativeClaudeQuestions(unittest.TestCase):
   # Claude Code 2.1.296 and later offer auto mode once; only its own suite keeps that offer.
   offer={} if getattr(self,'auto_mode_offer',False) else dict(hasSeenAutoDefaultNudge=True)
   (self.root/'.claude.json').write_text(json.dumps(dict(hasCompletedOnboarding=True,**offer,bypassPermissionsModeAccepted=True,theme='dark',customApiKeyResponses=dict(approved=['fixture-key'],rejected=[]),projects={str(work):dict(hasTrustDialogAccepted=True)})))
+  # An explicit config directory isolates macOS Keychain identity and makes
+  # Claude read its master config beside that directory's credentials.
+  (self.root/'.claude/.claude.json').write_bytes((self.root/'.claude.json').read_bytes())
   permission_mode=getattr(self,'native_permission_mode','default' if self.approval_fixture or self.message_fixture else 'bypassPermissions')
   settings={'permissions':{'defaultMode':permission_mode}}
   if hasattr(self,'native_settings'):settings.update(self.native_settings(work))
   if channel:settings.setdefault('hooks',{})['PermissionRequest']=[{'matcher':'AskUserQuestion','hooks':[{'type':'command','command':shlex.quote(str(fixtures.HGS))+' __state answer-channel','timeout':86400}]}]
+  import hook_caller_fixtures
+  self.native_hook_socket=hook_caller_fixtures.install_native(settings,self.root)
   (self.root/'.claude/settings.json').write_text(json.dumps(settings))
   fixture=self;self.native_requests=[]
   class Server(BaseHTTPRequestHandler):
@@ -97,7 +121,7 @@ class NativeClaudeQuestions(unittest.TestCase):
     blocks=[dict(type='tool_use',id='toolu_native_fixture',name=fixture.tool_name,input=fixture.tool_input or dict(questions=fixture.items))] if asks and not answered else [dict(type='text',text='Fixture complete.')]
     if hasattr(fixture,'native_response_blocks'):blocks=fixture.native_response_blocks(body)
     asks=any(block['type']=='tool_use' for block in blocks)
-    message=dict(id='msg_fixture',type='message',role='assistant',model=body.get('model','claude-sonnet-4-6'),content=blocks,stop_reason='tool_use' if asks else 'end_turn',stop_sequence=None,usage=dict(input_tokens=100,output_tokens=30))
+    message=dict(id='msg_fixture',type='message',role='assistant',model=body.get('model','claude-sonnet-4-6'),content=blocks,stop_reason='tool_use' if asks else 'end_turn',stop_sequence=None,usage=getattr(fixture,'native_response_usage',dict(input_tokens=100,output_tokens=30)))
     self.send_response(200)
     if body.get('stream'):
      self.send_header('Content-Type','text/event-stream');self.end_headers()
@@ -122,7 +146,9 @@ class NativeClaudeQuestions(unittest.TestCase):
   # tmux's default size for a session no client has attached to yet.
   columns,rows=('80','24') if tall or '_80x24' in self._testMethodName else ('87' if wrapped else '120','45')
   hgs_env=['HGS_SESSION='+self.name,'HGS_RUN_ID='+self.run_id,'HGS_STATE_DIR='+str(self.state),'HGS_CONFIG_DIR='+str(self.root/'config')]+(['HGS_ANSWER_CHANNEL_SECONDS='+str(self.channel_seconds)] if hasattr(self,'channel_seconds') else [])
-  self.tmux('new-session','-d','-s',self.name,'-x',columns,'-y',rows,'-c',str(work),'env','-i','HOME='+str(self.root),'PATH='+os.environ['PATH'],'SHELL=/bin/bash','TERM=xterm-256color','LANG=C.UTF-8','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1','ANTHROPIC_API_KEY=fixture-key','ANTHROPIC_BASE_URL=http://127.0.0.1:'+str(server.server_port),*getattr(self,'native_env',()),*(hgs_env if channel else []),CLAUDE,*(['--dangerously-skip-permissions'] if permission_mode=='bypassPermissions' else []),'--model','claude-sonnet-4-6','Ask questions with the tool now.')
+  # Disable the unrelated asynchronous marketplace clone in this private
+  # HOME before input/approval tests and their bounded pane teardown.
+  self.tmux('new-session','-d','-s',self.name,'-x',columns,'-y',rows,'-c',str(work),'env','-i','HOME='+str(self.root),'CLAUDE_CONFIG_DIR='+str(self.root/'.claude'),'DISABLE_AUTOUPDATER=1','PATH='+os.environ['PATH'],'SHELL=/bin/bash','TERM=xterm-256color','LANG=C.UTF-8','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1','CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1','ANTHROPIC_API_KEY=fixture-key','ANTHROPIC_BASE_URL=http://127.0.0.1:'+str(server.server_port),*getattr(self,'native_env',()),*hgs_env,CLAUDE,*(['--dangerously-skip-permissions'] if permission_mode=='bypassPermissions' else []),'--model','claude-sonnet-4-6','Ask questions with the tool now.')
   self.pane=self.tmux('display-message','-p','-t','='+self.name+':','#{pane_id}').strip()
   # A drawn panel does not prove Claude has created its transcript yet. Both
   # must be ready within the existing startup wait before the fixture binds it.
@@ -137,6 +163,7 @@ class NativeClaudeQuestions(unittest.TestCase):
   self.record=dict(version=1,name=self.name,agent='claude',run_id=self.run_id,conversation_id=self.conversation_id,pane=self.pane,pid=pid,process_start=start,activity='busy',phase='input',active_tools={},subagents={},last_event_at=time.time(),created=time.time(),transcript=str(transcript))
   if self.message_fixture:
    self.record.update(activity='idle',phase='idle');self.write_record();return
+  self.wait_for(lambda:self.native_hook_socket.exists())
   self.write_record();self.hook(dict(hook_event_name='PreToolUse',tool_name=self.tool_name,tool_use_id='toolu_native_fixture',tool_input=self.tool_input or dict(questions=self.items)))
   if self.approval_fixture:
    # Claude's real PermissionRequest carries no tool_use_id.
@@ -470,10 +497,19 @@ sys.exit(result.returncode)
   self.channel_card();waiting,folder=self.channel()
   event=dict(hook_event_name='PermissionRequest',tool_name='AskUserQuestion',session_id=self.conversation_id,tool_input=dict(questions=self.items))
   env=dict(self.env,HGS_SESSION=self.name,HGS_RUN_ID=self.run_id)
+  original=json.loads(self.record_path.read_text())
+  # Copied markers still grant no authority to this external controller.
+  unproven=subprocess.run([str(fixtures.HGS),'__state','answer-channel'],input=json.dumps(event),text=True,capture_output=True,env=env,timeout=30)
+  self.assertIn('Claude hook caller cannot be proven',unproven.stderr)
+  self.assertEqual(json.loads((folder/'waiting.json').read_text()),waiting)
+  import hook_caller_fixtures
   started=time.monotonic()
-  second=subprocess.run([str(fixtures.HGS),'__state','answer-channel'],input=json.dumps(event),text=True,capture_output=True,env=env,timeout=30)
+  second=hook_caller_fixtures.run(self,event,env,timeout=30,command='answer-channel')
+  self.assertEqual(second.args[1:],['__state','answer-channel'])
   self.assertEqual((second.returncode,second.stdout,second.stderr),(0,'',''));self.assertLess(time.monotonic()-started,8)
   self.assertEqual(json.loads((folder/'waiting.json').read_text()),waiting);self.assertFalse((folder/'closed.json').exists())
+  current=json.loads(self.record_path.read_text())
+  self.assertEqual(tuple(current.get(key) for key in ('pid','process_start','run_id','conversation_id')),tuple(original.get(key) for key in ('pid','process_start','run_id','conversation_id')))
   receipt=self.answer();self.assertEqual((receipt['status'],receipt['transport']),('answered','claude_hook'))
  def test_channel_single_claimed_answer_is_never_sent_again(self):
   self.channel_card();waiting,folder=self.channel();os.kill(waiting['pid'],signal.SIGKILL)

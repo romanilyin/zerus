@@ -11,6 +11,13 @@ use std::time::Duration;
 
 /// How long a job that no live session holds is not looked for again.
 const UNHELD: Duration = Duration::from_secs(60);
+// Native process/window metadata, not a transcript. Claim admission reads both
+// registries while retaining the global writer: neither may wait or grow unbound.
+const REGISTRY_BYTES: u64 = 64 * 1024;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "continuations/registry_tests.rs"]
+mod registry_tests;
 
 /// The Claude process that runs this hook, when Claude named it for this event's
 /// own conversation rather than an outer Claude passing its variables on.
@@ -55,18 +62,80 @@ fn registry(pid: u32) -> Option<Value> {
     let dir = nonempty_env("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".claude"));
+    registry_in(&dir, pid)
+}
+
+fn registry_in(dir: &Path, pid: u32) -> Option<Value> {
     let path = dir.join("sessions").join(format!("{pid}.json"));
-    let entry: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let file = crate::platform::no_follow(fs::OpenOptions::new().read(true)).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > REGISTRY_BYTES { return None; }
+    let mut bytes = Vec::new();
+    file.take(REGISTRY_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > REGISTRY_BYTES { return None; }
+    let entry: Value = serde_json::from_slice(&bytes).ok()?;
     (entry["pid"] == pid).then_some(entry)
+}
+
+/// Capture the effective directory before exec without changing Claude's
+/// environment: unset and explicit-default directories use different Mac logins.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn launch_registry_home() -> Option<String> {
+    let dir = nonempty_env("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+        .or_else(|| crate::platform::home_dir().map(|home| home.join(".claude")))?;
+    std::path::absolute(dir).ok()?.to_str().map(str::to_owned)
+}
+
+/// A caller-selected config directory is only a routing hint. The window's
+/// recorded account must independently hold this job in its own registry.
+fn registry_for(record: &Value, pid: u32) -> Option<Value> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // HOME is caller-selected too; an absent account is not a default binding.
+        let recorded = record.get("claude_registry_home").map_or_else(
+            || string(record, "agent_home"), |home| home.as_str().unwrap_or(""));
+        let dir = Path::new(recorded);
+        if !dir.is_absolute() { return None; }
+        registry_in(dir, pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = record;
+        registry(pid)
+    }
 }
 
 /// The background job the session's live agent window holds.
 fn parked(record: &Value) -> Option<String> {
-    if !process_alive(record) {
+    parked_with(record, process_alive)
+}
+
+fn parked_with(record: &Value, alive: fn(&Value) -> bool) -> Option<String> {
+    if !alive(record) {
         return None;
     }
-    let entry = registry(u32::try_from(record["pid"].as_u64()?).ok()?)?;
+    let entry = registry_for(record, u32::try_from(record["pid"].as_u64()?).ok()?)?;
     Some(string(&entry, "parkedJobId").to_owned()).filter(|job| !job.is_empty())
+}
+
+/// Read-only correlation for a hook already bound to this window's run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn caller_job(record: &Value, alive: fn(&Value) -> bool) -> Option<u32> {
+    let pid = claude_process(string(record, "conversation_id"))?;
+    if record["pid"].as_u64() == Some(u64::from(pid)) { return None; }
+    holds_job_with(record, pid, alive).then_some(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn holds_job(record: &Value, pid: u32) -> bool {
+    holds_job_with(record, pid, process_alive)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn holds_job_with(record: &Value, pid: u32, alive: fn(&Value) -> bool) -> bool {
+    let Some(entry) = registry_for(record, pid).filter(|entry| entry["kind"] == "bg") else { return false; };
+    let job = string(&entry, "jobId");
+    !job.is_empty() && parked_with(record, alive).as_deref() == Some(job)
 }
 
 /// The live session whose agent window holds the Claude background job that this
@@ -76,6 +145,10 @@ pub(super) fn background_session() -> Option<Value> {
     let sid = nonempty_env("CLAUDE_CODE_SESSION_ID")?;
     let claude: u32 = nonempty_env("CLAUDE_PID")?.parse().ok()?;
     if !runs_under(claude) {
+        return None;
+    }
+    // Nor through a recorded DeepSeek host (zerus-ppd26.15).
+    if super::dsh::host_check() != super::dsh::HostCheck::Outside {
         return None;
     }
     let job = registry(claude)
@@ -123,9 +196,10 @@ fn unheld(link: &Value, path: &Path) -> bool {
 
 /// The live session whose agent window moved the background job that runs this
 /// hook. A job that continues the session's conversation takes it on unchanged.
-pub(super) fn owner(event: &Value, sid: &str, panes: &Snapshot) -> Result<Option<Value>> {
-    let Some(job) = claude_process(sid)
-        .and_then(registry)
+pub(super) fn owner(event: &Value, sid: &str, panes: &Snapshot) -> Result<Option<(Value, hook_caller::Caller)>> {
+    let Some(pid) = claude_process(sid) else { return Ok(None); };
+    let mut caller = hook_caller::background(pid)?;
+    let Some(job) = registry(pid)
         .filter(|entry| entry["kind"] == "bg")
         .map(|entry| string(&entry, "jobId").to_owned())
         .filter(|job| !job.is_empty())
@@ -140,13 +214,19 @@ pub(super) fn owner(event: &Value, sid: &str, panes: &Snapshot) -> Result<Option
         None => {
             let mut holding = records()?.into_iter().filter(|record| {
                 string(record, "agent") == "claude"
-                    && matches(record, panes.get(string(record, "name")))
+                    && matches(record, panes_of(panes, record))
                     && parked(record).as_deref() == Some(job.as_str())
             });
             let found = match (holding.next(), holding.next()) {
                 (Some(record), None) => Some(record),
                 _ => None,
             };
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if found.is_none() {
+                hook_caller::unheld();
+                return Ok(None);
+            }
+            if let Some(record) = &found { caller.bind_owner(record)?; }
             // A link outlives neither its window's hold on the job nor, unheld, a minute.
             for entry in fs::read_dir(links()).into_iter().flatten().flatten() {
                 let old = read_link(&entry.path());
@@ -165,14 +245,21 @@ pub(super) fn owner(event: &Value, sid: &str, panes: &Snapshot) -> Result<Option
             record
         }
     };
-    if string(&record, "conversation_id") != sid && continued_in(&record).as_deref() == Some(sid) {
+    caller.bind_owner(&record)?;
+    // Owner routing precedes hook admission. A pending Terminate still needs
+    // completion observations for its original conversation, never adoption of
+    // a continued conversation before that admission gate can inspect it.
+    if !terminating::pending(&record)
+        && string(&record, "conversation_id") != sid
+        && continued_in(&record).as_deref() == Some(sid)
+    {
         record["conversation_id"] = json!(sid);
         if !string(event, "transcript_path").is_empty() {
             record["transcript"] = event["transcript_path"].clone();
         }
         write(&mut record)?;
     }
-    Ok(Some(record))
+    Ok(Some((record, caller)))
 }
 
 /// The conversation that the mark ending the session's transcript names. Claude

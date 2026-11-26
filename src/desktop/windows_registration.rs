@@ -1,0 +1,295 @@
+//! Explicit per-user native registration, isolated in this exact CLI image.
+use super::registration::trace;
+use super::{registration, store::Location};
+use crate::config::Config;
+use anyhow::{bail, ensure, Context, Result};
+use serde_json::{json, Value};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, time::Duration};
+use zerus_client_core::actions::{Exit, Invocation};
+
+mod native;
+const CAP: usize = super::windows_registration_policy::CAP;
+const ENTRY: &str = "__desktop-registration-native";
+const ABI: &str = "desktop-native-registration-v1";
+
+pub(super) fn entry(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        Some(ENTRY) => Some(native::serve(&args[1..])),
+        Some(native::mode::ENTRY) => Some(native::mode::serve(&args[1..])),
+        _ => None,
+    }
+}
+
+pub(super) fn refresh_info(config: &Config, location: &Location) -> Result<Value> {
+    native::mode::command(
+        config,
+        location,
+        json!({"schema":1,"operation":"refresh_info","configuration":location.configuration}),
+    )
+}
+pub(super) fn refresh_command(
+    config: &Config,
+    location: &Location,
+    id: &str,
+    target: &str,
+) -> Result<Value> {
+    let target =
+        super::windows_registration_policy::mode::refresh::Target::decode(target.as_bytes())?;
+    native::mode::command(
+        config,
+        location,
+        json!({"schema":1,"operation":"refresh","request_id":id,"target":target}),
+    )
+}
+pub(super) fn refresh_result(config: &Config, location: &Location, id: &str) -> Result<Value> {
+    native::mode::refresh_result(config, location, id)
+}
+pub(super) fn cancel_refresh(config: &Config, location: &Location, id: &str) -> Result<Value> {
+    native::mode::command(
+        config,
+        location,
+        json!({"schema":1,"operation":"refresh_cancel","request_id":id}),
+    )
+}
+
+pub(super) fn mode_command(config: &Config, location: &Location, mode: &str) -> Result<Value> {
+    ensure!(
+        matches!(mode, "passive" | "background"),
+        "Mode must be background or passive."
+    );
+    native::mode::command(
+        config,
+        location,
+        json!({"schema":1,"operation":"switch","mode":mode}),
+    )
+}
+pub(super) fn cancel_rollback(config: &Config, location: &Location, id: &str) -> Result<Value> {
+    native::mode::command(
+        config,
+        location,
+        json!({"schema":1,"operation":"cancel_rollback","request_id":id}),
+    )
+}
+
+pub(super) fn review_mode(config: &Config, location: &Location, id: &str) -> Result<Value> {
+    ensure!(uuid::Uuid::parse_str(id).is_ok_and(|u| !u.is_nil() && u.to_string() == id),
+        "Pass the exact original transition UUID.");
+    native::mode::command(config, location, json!({"schema":1,"operation":"review","request_id":id}))
+}
+
+pub(super) fn mode_after_review(config: &Config, location: &Location, mode: &str, reviewed: &str, request: &str) -> Result<Value> {
+    ensure!(matches!(mode, "background" | "passive") && [reviewed, request].iter().all(|s|
+        uuid::Uuid::parse_str(s).is_ok_and(|u| !u.is_nil() && u.to_string() == *s)) && reviewed != request,
+        "Select the exact reviewed UUID and a NEW canonical request UUID.");
+    native::mode::command(config, location,
+        json!({"schema":1,"operation":"switch","mode":mode,"after_review":reviewed,"request_id":request}))
+}
+
+/// A FIRST explicit background choice from a plain passive registration, with
+/// the caller's retained NEW request UUID. The native helper refuses it while
+/// any original is pending, interrupted or reviewed.
+pub(super) fn first_choice(config: &Config, location: &Location, request: &str) -> Result<Value> {
+    ensure!(uuid::Uuid::parse_str(request).is_ok_and(|u| !u.is_nil() && u.to_string() == request),
+        "Select a NEW canonical request UUID.");
+    // Before caller capture and the helper spawn; the helper fences it again.
+    native::mode::ensure_first_layout(config, location)?;
+    native::mode::command(config, location,
+        json!({"schema":1,"operation":"switch","mode":"background","request_id":request}))
+}
+
+pub(super) fn mode_result(config: &Config, location: &Location, request: &str) -> Result<Value> {
+    ensure!(uuid::Uuid::parse_str(request).is_ok_and(|u| !u.is_nil() && u.to_string() == request),
+        "Pass the exact original choice UUID.");
+    native::mode::result(config, location, request)
+}
+
+fn helper_environment(trace_path: &str) -> Result<Vec<(String, String)>> {
+    let mut path = [0u16; 32768];
+    let length = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            path.as_mut_ptr(),
+            path.len() as u32,
+        )
+    } as usize;
+    ensure!(
+        length > 0 && length < path.len(),
+        "Windows system directory unavailable"
+    );
+    let system = std::path::PathBuf::from(OsString::from_wide(&path[..length]));
+    let windows = system.parent().context("Windows directory unavailable")?;
+    let temp = std::env::temp_dir();
+    let mut result = Vec::new();
+    for (key, path) in [
+        ("SystemRoot", windows.to_path_buf()),
+        ("WINDIR", windows.to_path_buf()),
+        ("PATH", system.clone()),
+        ("TEMP", temp.clone()),
+        ("TMP", temp),
+    ] {
+        result.push((
+            key.into(),
+            path.to_str()
+                .context("Windows helper path is not Unicode")?
+                .to_owned(),
+        ));
+    }
+    result.push((
+        "HGS_DESKTOP_REGISTRATION_TRACE_FILE".into(),
+        trace_path.into(),
+    ));
+    Ok(result)
+}
+fn invocation(operation: &str, plan: &Value) -> Result<Invocation> {
+    ensure!(
+        matches!(operation, "check" | "status" | "install" | "remove"),
+        "invalid registration operation"
+    );
+    let request = serde_json::to_vec(&json!({"schema":1,"operation":operation,"plan":plan}))?;
+    ensure!(
+        !request.is_empty() && request.len() <= CAP,
+        "desktop registration request exceeds its bound"
+    );
+    Ok(Invocation {
+        args: vec![ENTRY.into(), request.len().to_string()],
+        stdin: Some(request),
+        timeout: Duration::from_secs(15),
+        request_id: None,
+    })
+}
+fn exchange(operation: &str, plan: &Value) -> Result<Value> {
+    let invocation = invocation(operation, plan)?;
+    // The selected service CLI may be a maintained copy or custom selector.
+    // The implementation worker is always this original caller's own image.
+    let program = crate::self_exec::current()?;
+    let trace = trace::Trace::new();
+    let environment = helper_environment(trace.path().unwrap_or(""))?;
+    let environment: Vec<_> = environment
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let result =
+        zerus_client_core::run::run_hidden_limited(&program, &invocation, &environment, CAP);
+    trace.finish();
+    let result = result.map_err(|error| {
+        use zerus_client_core::run::HiddenError;
+        match error {
+            HiddenError::OutputTooLarge(_) => anyhow::anyhow!("desktop registration helper output exceeded its bound; inspect status before retrying"),
+            HiddenError::TerminationPending { child } => anyhow::anyhow!("desktop registration helper termination is pending (original pid {}, creation FILETIME {:?}); outcome unavailable, preserve its identity and inspect before retrying", child.pid, child.creation_filetime),
+            HiddenError::PreviousExchangePending { child } => anyhow::anyhow!("desktop registration previous helper is still unsettled ({child:?}); no new helper was started"),
+        }
+    })?;
+    let (code, stdout) = match result {
+        Exit::Code { code, stdout, .. } => (code, stdout),
+        _ => bail!("desktop registration outcome is unavailable; inspect status before retrying"),
+    };
+    let envelope: Value = serde_json::from_slice(&stdout)
+        .context("invalid native registration receipt; inspect status before retrying")?;
+    ensure!(
+        envelope["abi"] == ABI,
+        "native registration implementation changed; inspect status before retrying"
+    );
+    if code != 0 {
+        bail!(
+            "desktop registration refused: {}",
+            envelope["error"]
+                .as_str()
+                .unwrap_or("helper failed; inspect status before retrying")
+        );
+    }
+    let value = envelope["reply"].clone();
+    ensure!(
+        value["schema"] == 1
+            && value["operation"] == operation
+            && value["configuration"] == plan["configuration"]
+            && value["task_name"] == plan["task_name"]
+            && value["registered"].is_boolean()
+            && value["changed"].is_boolean(),
+        "desktop registration receipt mismatch; inspect status before retrying"
+    );
+    Ok(value)
+}
+
+pub(super) fn command(config: &Config, location: &Location, operation: &str) -> Result<Value> {
+    ensure!(
+        matches!(operation, "install" | "remove" | "status"),
+        "invalid desktop registration operation"
+    );
+    let mut plan = registration::windows_plan(config, location)?;
+    // Complete the finite request preflight and reject foreign registrations
+    // before changing the stable CLI. Registration itself never starts a task.
+    let mut checked = exchange(
+        if operation == "install" {
+            "check"
+        } else {
+            "status"
+        },
+        &plan,
+    )?;
+    if operation == "status" {
+        let record = native::mode::pending_status(config, location, &plan)?;
+        checked["pending_transition"] = record["pending_transition"].clone();
+        checked["cancelled_request_id"] = record["cancelled_request_id"].clone();
+        checked["completed_request_id"] = record["completed_request_id"].clone();
+        checked["reviewed_transition"] = record["reviewed_transition"].clone();
+        checked["activation_automatic_blocked"] = record["activation_automatic_blocked"].clone();
+        checked["mode_choice"] = record["mode_choice"].clone();
+        checked["first_choice"] = record["first_choice"].clone();
+        checked["first_choice_lost"] = record["first_choice_lost"].clone();
+        checked["first_choice_unavailable"] = record["first_choice_unavailable"].clone();
+        let status = super::status(location)?;
+        let lifecycle = &status["lifecycle"];
+        checked["running_mode"] = if lifecycle["configuration"] == location.configuration
+            && lifecycle["ipc_ready"] == true
+        {
+            lifecycle["mode"].clone()
+        } else {
+            Value::Null
+        };
+        if lifecycle["configuration"] == location.configuration && lifecycle["ipc_ready"] == true {
+            checked["service_epoch"] = lifecycle["epoch"].clone();
+            checked["service_generation"] = lifecycle["generation"].clone();
+        }
+        checked["pending_restart"] = (checked["registered"] == true
+            && (checked["pending_transition"].is_object()
+                || checked["selected_mode"] != checked["running_mode"]))
+            .into();
+        return Ok(checked);
+    }
+    let explicit = std::env::var_os("HGS_EXECUTABLE").is_some_and(|value| !value.is_empty());
+    let mut staged = None;
+    if operation == "install" && !explicit {
+        let layout = crate::host::staging::Layout::new(&config.home, &config.dir);
+        let cli = crate::host::staging::install_cli(&layout, &std::env::current_exe()?)?;
+        staged = Some(json!({"path":cli.path,"sha256":cli.sha256,"changed":cli.changed}));
+        plan = registration::windows_plan(config, location)?;
+    }
+    let mut result = exchange(operation, &plan)?;
+    result["started"] = false.into();
+    result["stopped"] = false.into();
+    if let Some(cli) = staged {
+        result["cli"] = cli;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_worker_uses_fixed_argv_and_the_original_framed_request() {
+        let plan =
+            json!({"argv":["C:/Example/CLI & tools/hgs.exe"],"configuration":"a".repeat(64)});
+        let inv = invocation("status", &plan).unwrap();
+        assert_eq!(
+            inv.args,
+            [ENTRY, &inv.stdin.as_ref().unwrap().len().to_string()]
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(inv.stdin.as_ref().unwrap()).unwrap()["plan"],
+            plan
+        );
+        assert_eq!(inv.timeout, Duration::from_secs(15));
+        assert!(invocation("start", &plan).is_err());
+        assert!(invocation("install", &json!({"oversize":"x".repeat(CAP)})).is_err());
+    }
+}

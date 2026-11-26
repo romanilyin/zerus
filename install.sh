@@ -22,17 +22,24 @@ else
     exit 1
 fi
 
-export PATH="$(dirname "$cargo_bin"):$PATH"
+PATH="$(dirname "$cargo_bin"):$PATH"
+export PATH
 "$cargo_bin" build --manifest-path "$here/Cargo.toml" --locked --release
 build_dir="${CARGO_TARGET_DIR:-$here/target}"
 mkdir -p "$prefix/bin"
 binary_stage="$(mktemp "$prefix/bin/.hgs.XXXXXXXX")"
 shim_stage="$(mktemp "$prefix/bin/.hgs-state.XXXXXXXX")"
 connector_stage=""
-trap 'rm -f "$binary_stage" "$shim_stage" ${connector_stage:+"$connector_stage"}' EXIT
+lore_stage="$(mktemp "$prefix/bin/.lore.XXXXXXXX")"
+trap 'rm -f "$binary_stage" "$shim_stage" "$lore_stage" ${connector_stage:+"$connector_stage"}' EXIT
+# Task 182: hgs runs lore as a subprocess from beside itself.
+"$cargo_bin" build --manifest-path "$here/crates/lore-bin/Cargo.toml" --locked --release --target-dir "$build_dir"
+install -m 0755 "$build_dir/release/lore" "$lore_stage"
 install -m 0755 "$build_dir/release/hgs" "$binary_stage"
 install -m 0644 "$here/hgs_state.py" "$shim_stage"
 changed=0
+desktop_changed=0
+if [ -L "$prefix/bin/hgs" ] || ! cmp -s "$binary_stage" "$prefix/bin/hgs"; then desktop_changed=1; fi
 replace_if_changed() {
     if [ ! -L "$2" ] && cmp -s "$1" "$2"; then
         rm -f "$1"
@@ -53,6 +60,13 @@ else
 fi
 if [ "$changed" -eq 1 ]; then echo "Installed hgs Rust CLI."; fi
 "$prefix/bin/hgs" --version
+if [ ! -L "$prefix/bin/lore" ] && cmp -s "$lore_stage" "$prefix/bin/lore"; then
+    rm -f "$lore_stage"
+else
+    mv -f "$lore_stage" "$prefix/bin/lore"
+    echo "Installed lore."
+fi
+"$prefix/bin/lore" --version
 # The Rust mobile connector builds hyper, rustls, ring and SQLite, so until
 # gateways run it a source install builds it only when asked
 # (HGS_MOBILE_CONNECTOR=1) or to update an installed copy; 0 always skips. Its
@@ -95,23 +109,47 @@ if [ "$build_connector" -eq 1 ]; then
     fi
     "$connector" --version
 fi
+# macOS /bin/bash 3.2 treats an empty "${array[@]}" as unbound under set -u and,
+# with the EXIT trap above, stops here with status 0: guard every optional list.
 if [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${HGS_STATE_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
     session_args=()
     if [ "$changed" -eq 1 ]; then session_args+=(--restart); fi
-    python3 "$here/scripts/install-macos-session-service.py" "$prefix/bin/hgs" "${session_args[@]}"
+    python3 "$here/scripts/install-macos-session-service.py" "$prefix/bin/hgs" ${session_args[@]+"${session_args[@]}"}
 fi
 if [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${HGS_STATE_DIR:-}" ] && [ "${HGS_RECOVERY_SERVICE:-1}" != "0" ]; then
     worker_args=()
     if [ "$changed" -eq 1 ]; then worker_args+=(--restart); fi
-    python3 "$here/scripts/install-recovery-service.py" "$prefix/bin/hgs" "${worker_args[@]}"
+    python3 "$here/scripts/install-recovery-service.py" "$prefix/bin/hgs" ${worker_args[@]+"${worker_args[@]}"}
 fi
 if [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${HGS_STATE_DIR:-}" ] && [ -z "${HGS_CONFIG_DIR:-}" ] && [ "${HGS_SWARM_SERVICE:-1}" != "0" ]; then
     swarm_args=()
     if [ "$changed" -eq 1 ]; then swarm_args+=(--restart); fi
-    python3 "$here/scripts/install-swarm-service.py" "$prefix/bin/hgs" "${swarm_args[@]}"
+    python3 "$here/scripts/install-swarm-service.py" "$prefix/bin/hgs" ${swarm_args[@]+"${swarm_args[@]}"}
 fi
 if [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${HGS_STATE_DIR:-}" ] && [ -z "${HGS_CONFIG_DIR:-}" ] && [ "${HGS_VOICE_SERVICE:-1}" != "0" ]; then
     voice_args=()
     if [ "$changed" -eq 1 ]; then voice_args+=(--restart); fi
-    python3 "$here/scripts/install-voice-service.py" "$prefix/bin/hgs" "${voice_args[@]}"
+    python3 "$here/scripts/install-voice-service.py" "$prefix/bin/hgs" ${voice_args[@]+"${voice_args[@]}"}
+fi
+# Only deliberate per-user source upgrades refresh an existing desktop service.
+# Package/staging/root/foreign configuration installs never touch user services.
+# Run after the existing connector/worker steps: a headless pending desktop
+# refresh must not prevent those independent updates from completing.
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ] && \
+   [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${DESTDIR:-}" ] && \
+   [ -z "${HGS_CONFIG_DIR:-}" ] && [ -z "${HGS_STATE_DIR:-}" ]; then
+    desktop_status=0
+    python3 "$here/scripts/install-linux-desktop-service.py" refresh --hgs "$prefix/bin/hgs" || desktop_status=$?
+    case "$desktop_status" in
+        0) ;;
+        3) echo "Desktop backend refresh pending. CLI, connector and worker installation completed; refresh from the current graphical session." ;;
+        *) exit "$desktop_status" ;;
+    esac
+fi
+
+# Desktop refusals must not interrupt the existing workers' update path.
+if [ -z "${HGS_INSTALL_PREFIX:-}" ] && [ -z "${HGS_STATE_DIR:-}" ] && [ -z "${HGS_CONFIG_DIR:-}" ] && [ "$(uname -s)" = Darwin ]; then
+    desktop_args=(--refresh-runner)
+    if [ "$desktop_changed" -eq 1 ]; then desktop_args+=(--restart); fi
+    python3 "$here/scripts/install-macos-desktop-service.py" "$prefix/bin/hgs" ${desktop_args[@]+"${desktop_args[@]}"}
 fi

@@ -3,15 +3,33 @@ use super::*;
 
 pub(super) fn grouped_active(record: &Value) -> u64 {
     if record["kimi_native_roster"] == true { return 0; }
+    let now = super::now();
     record["subagent_groups"]
         .as_object()
         .map(|groups| {
             groups
-                .values()
-                .map(|group| group["active_count"].as_u64().unwrap_or(0))
+                .iter()
+                .map(|(profile, group)| {
+                    // zerus-63rru.93 round 2: a revived Kimi profile child
+                    // quiet for the settle period counts as ended at read
+                    // time, with no write; the member reads free.
+                    if quiet_revived(record, profile, now) {
+                        0
+                    } else {
+                        group["active_count"].as_u64().unwrap_or(0)
+                    }
+                })
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// A Kimi profile child revived by a racing start that has had no event of
+/// its own for the settle period (zerus-63rru.93 round 2): read as ended.
+pub(super) fn quiet_revived(record: &Value, profile: &str, now: f64) -> bool {
+    record["subagents"]
+        .get(profile)
+        .is_some_and(|child| quiet_revived_child(child, now))
 }
 
 /// An unknown child never establishes current work: listings count it as
@@ -19,6 +37,19 @@ pub(super) fn grouped_active(record: &Value) -> u64 {
 pub(super) fn child_working(record: &Value, child: &Value) -> bool {
     child["state"] == "working" && child["display_state"] != "unknown" && (record["kimi_native_roster"] != true
         || child["external"] == true || child["native_roster"] == true)
+        // zerus-63rru.93 round 3: a revived Kimi profile child quiet for the
+        // settle period counts as ended here too, so settled(), work_remains
+        // and every idle-only action see it exactly as the listing does.
+        && !quiet_revived_child(child, super::now())
+}
+
+/// A child revived by a racing start that has had no event of its own for
+/// the settle period: read as ended everywhere.
+fn quiet_revived_child(child: &Value, now: f64) -> bool {
+    child["revived_at"].as_f64().is_some()
+        && child["updated"]
+            .as_f64()
+            .is_some_and(|at| now - at >= super::journal::REVIVED_KIMI_SETTLE_SECONDS)
 }
 
 /// Whether the listing names this child. A Kimi hook names only a profile,
@@ -45,7 +76,21 @@ pub(super) fn work_remains(record: &Value) -> bool {
 /// of them acts while the listing shows work, and none waits for a Kimi hook
 /// entry the native roster has replaced.
 pub(super) fn settled(record: &Value) -> bool {
-    string(record, "activity") == "idle" && string(record, "phase") == "idle" && !work_remains(record)
+    // zerus-63rru.93 round 3: a busy activity whose every working child is
+    // a quiet revived one reads settled too, so the idle-only actions do not
+    // wait for an event that will never come. Any other busy with no work
+    // keeps its settled reading as before.
+    let quiet_only = record["main_done"].as_bool().unwrap_or(false)
+        && string(record, "activity") == "busy"
+        && record["subagents"].as_object().is_some_and(|children| {
+            children
+                .values()
+                .any(|child| quiet_revived_child(child, super::now()))
+        })
+        && !work_remains(record);
+    (string(record, "activity") == "idle" || quiet_only)
+        && (string(record, "phase") == "idle" || quiet_only)
+        && !work_remains(record)
 }
 
 /// Kimi external hooks expose a profile name, not the Swarm child's identity.
@@ -122,10 +167,12 @@ fn children(record: &Value) -> Value {
     if profiles && !external {
         result["subagent_source"] = json!("hook_profiles");
         result["subagent_counts_complete"] = json!(record["subagent_groups_complete"] == true);
+        result["subagent_groups_complete"] = json!(record["subagent_groups_complete"] == true);
         let Some(groups) = groups else {
             return result;
         };
-        let mut previews:Vec<_>=groups.iter().filter(|(_,group)|group["active_count"].as_u64().unwrap_or(0)>0)
+        let now = super::now();
+        let mut previews:Vec<_>=groups.iter().filter(|(profile,group)|group["active_count"].as_u64().unwrap_or(0)>0 && !quiet_revived(record, profile, now))
             .map(|(profile,group)|json!({"id":format!("profile:{profile}"),"label":profile,
                 "state":"working","detail":journal::clipped(&group["detail"],240),"current_tool":"","group":true,
                 "active_count":group["active_count"],"completed_count":group["completed_count"],
@@ -137,11 +184,21 @@ fn children(record: &Value) -> Value {
             ("total_count", "subagent_total_count"),
         ] {
             result[field] = json!(groups
-                .values()
-                .map(|g| g[key].as_u64().unwrap_or(0))
+                .iter()
+                .map(|(profile, g)| {
+                    let settled = quiet_revived(record, profile, now);
+                    match key {
+                        "active_count" if settled => 0,
+                        "completed_count" if settled => {
+                            g[key].as_u64().unwrap_or(0).saturating_add(1)
+                        }
+                        _ => g[key].as_u64().unwrap_or(0),
+                    }
+                })
                 .sum::<u64>());
         }
         result["subagent_previews"] = json!(previews);
+        result["subagent_process_unknown_count"] = json!(0);
         return result;
     }
     if !observed && children.is_none_or(|children| children.is_empty()) {
@@ -149,7 +206,7 @@ fn children(record: &Value) -> Value {
     }
     let mut active = 0;
     let mut completed = if native_kimi { 0 } else { record["subagents_completed_pruned"].as_u64().unwrap_or(0) };
-    let mut unknown = 0;
+    let mut unknown = record["subagents_ended_pruned"].as_u64().unwrap_or(0);
     let mut previews = Vec::new();
     let mut roster = serde_json::Map::new();
     if let Some(children) = children {
@@ -162,7 +219,7 @@ fn children(record: &Value) -> Value {
                 "provider":child.get("provider").unwrap_or(&record["agent"]),"external":child["external"],"model":child["model"],"reply_id":child["reply_id"],
                 "detail":journal::clipped(&child["detail"],240),
                 "current_tool":string(child,"current_tool"),"updated":child["updated"],
-                "completion_source":child["completion_source"],"tracking_evidence":child["tracking_evidence"]}));
+                "completion_source":child["completion_source"],"tracking_evidence":child["tracking_evidence"],"process_state":child["process_state"]}));
             let state = if string(child, "display_state") == "unknown" {
                 "unknown"
             } else {
@@ -199,9 +256,16 @@ fn children(record: &Value) -> Value {
     } else {
         "hooks"
     });
+    // zerus-63rru.68 round 2: the legacy flag keeps its exact old combined
+    // meaning for every unchanged reader (Android and iOS childCount, the
+    // client core); the new field is the profile groups' own completeness,
+    // purely additive, read only by the Teams fleet's MayRunNow sources.
     result["subagent_counts_complete"] = json!(
         unknown == 0
             && (!profiles || groups.is_none() || record["subagent_groups_complete"] == true)
+    );
+    result["subagent_groups_complete"] = json!(
+        !profiles || groups.is_none() || record["subagent_groups_complete"] == true
     );
     result["subagent_active_count"] = json!(active);
     result["subagent_completed_count"] = json!(completed);
@@ -209,6 +273,16 @@ fn children(record: &Value) -> Value {
     result["subagent_total_count"] = json!(active + completed + unknown);
     result["subagent_previews"] = json!(previews);
     result["subagents"] = json!(roster);
+    // The counts stay numeric for every reader; this separate number says how
+    // many listed children may still run but cannot be bound, which the Teams
+    // reader treats as unsettled. Other readers ignore it.
+    let unbound = children.map_or(0, |children| {
+        children
+            .values()
+            .filter(|child| listed(record, child) && child["process_unknown"] == true)
+            .count()
+    });
+    result["subagent_process_unknown_count"] = json!(unbound);
     result
 }
 
@@ -226,6 +300,15 @@ fn newest(previews: &mut Vec<Value>) {
     }
 }
 
+/// Apply only the display label after the caller has observed its questions.
+/// Phase, attention identity, work and answer authority remain the caller's.
+pub(super) fn pending_input_summary(output: &mut Value, pending: bool) {
+    // This specific label also identifies a request only the person may answer.
+    if pending && output["phase"] == "input" && output["activity_summary"] != "Sign in required" {
+        output["activity_summary"] = json!("Needs attention");
+    }
+}
+
 pub(super) fn summary(
     record: &Value,
     activity: &Value,
@@ -234,6 +317,20 @@ pub(super) fn summary(
 ) -> Value {
     let mut result = children(record);
     let live = string(activity, "runtime_state") == "live";
+    if !live {
+        let active = result["subagent_active_count"].as_u64().unwrap_or(0);
+        if active > 0 {
+            result["subagent_active_count"] = json!(0);
+            result["subagent_unknown_count"] = json!(result["subagent_unknown_count"].as_u64().unwrap_or(0)+active);
+            result["subagent_counts_complete"] = json!(false);
+        }
+        for child in result["subagents"].as_object_mut().into_iter().flat_map(|children|children.values_mut()) {
+            if child["state"] == "working" {child["display_state"] = json!("unknown");}
+        }
+        for child in result["subagent_previews"].as_array_mut().into_iter().flatten() {
+            if child["state"] == "working" {child["state"] = json!("unknown");}
+        }
+    }
     let busy = live && string(activity, "activity") == "busy";
     let phase = string(activity, "phase");
     let label = if !live {
@@ -320,6 +417,37 @@ pub(super) fn remaining_work() -> Vec<(&'static str, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_input_summary_is_provider_independent_and_changes_only_the_label() {
+        for agent in ["claude", "codex", "kimi", "dsh", "opencode"] {
+            for earlier in ["Working", "Ready", "Bash", "Waiting for input"] {
+                let before = json!({"agent":agent,"activity_summary":earlier,"phase":"input",
+                    "activity":"busy","attention_id":"question","process_work":{"count":1},
+                    "run_id":"run","conversation_id":"conversation","pending_questions":[{"can_answer":false}]});
+                let mut expected = before.clone();
+                expected["activity_summary"] = json!("Needs attention");
+                let mut shown = before.clone();
+                pending_input_summary(&mut shown, true);
+                assert_eq!(shown, expected);
+                let mut unknown = before.clone();
+                pending_input_summary(&mut unknown, false);
+                assert_eq!(unknown, before);
+                let mut sign_in = before.clone();
+                sign_in["activity_summary"] = json!("Sign in required");
+                let original = sign_in.clone();
+                pending_input_summary(&mut sign_in, true);
+                assert_eq!(sign_in, original);
+                for phase in ["approval", "error", "working", "compacting", "idle", "ended"] {
+                    let mut shown = before.clone();
+                    shown["phase"] = json!(phase);
+                    let original = shown.clone();
+                    pending_input_summary(&mut shown, true);
+                    assert_eq!(shown, original, "{agent}: {phase}");
+                }
+            }
+        }
+    }
     #[test]
     fn a_replaced_kimi_hook_child_is_no_work_and_listed_work_remains() {
         let stale = stale_hook_child();

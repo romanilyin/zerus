@@ -56,7 +56,7 @@ class Signing(unittest.TestCase):
         args=['sign-macos.py','--app',str(self.app),'--identity','-','--team-id','ABCDE12345',
               '--version',version,'--output',str(Path(self.temporary.name)/'signed')]
         for release in [version,version+'.r812.gabcdef0.n41',base+'-dev.685']:
-            self.write('Contents/Info.plist',plistlib.dumps({'CFBundleShortVersionString':version,'ZerusReleaseVersion':release}))
+            self.write('Contents/Info.plist',plistlib.dumps({'CFBundleShortVersionString':version,'ZerusReleaseVersion':release,'ZerusGUI':'tauri'}))
             with self.subTest(release=release),mock.patch.object(sys,'argv',args+['--release',release]), \
                     mock.patch.object(sign,'signing_order',return_value=[]),mock.patch.object(sign.subprocess,'run') as execute, \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -114,6 +114,65 @@ class Signing(unittest.TestCase):
             sign.release_archive(self.app, output, "0.38.0", "0123abcd-4567-89ef-0123-456789abcdef",
                                  "6.11.2", "ABCDE12345", image)
         self.assertFalse(output.exists())
+
+    def disk_image_attempts(self, image, results):
+        def execute(command, **kwargs):
+            if command[0] == "hdiutil":
+                self.assertFalse(image.exists())
+                image.write_bytes(b"partial image")
+            return results.pop(0)
+        return execute
+
+    def test_disk_image_create_retries_resource_busy_then_succeeds(self):
+        image = Path(self.temporary.name) / "Zerus.dmg"
+        results = [subprocess.CompletedProcess([], 0),
+                   subprocess.CompletedProcess([], 1, "Creating disk\n", "hdiutil: create failed - Resource busy\n"),
+                   subprocess.CompletedProcess([], 0, "created: Zerus.dmg\n", "")]
+        output = io.StringIO()
+        with mock.patch.object(sign.subprocess, "run",
+                               side_effect=self.disk_image_attempts(image, results)) as run, \
+                mock.patch.object(sign.time, "sleep") as sleep, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            sign.create_disk_image(self.app, image)
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["ditto", "hdiutil", "hdiutil"])
+        self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        for call in run.call_args_list[1:]:
+            self.assertEqual(call.kwargs, {"capture_output": True, "text": True})
+        self.assertIn("Creating disk\n", output.getvalue())
+        self.assertIn("hdiutil: create failed - Resource busy\n", output.getvalue())
+        self.assertIn("created: Zerus.dmg\n", output.getvalue())
+
+    def test_disk_image_create_stops_after_three_resource_busy_failures(self):
+        image = Path(self.temporary.name) / "Zerus.dmg"
+        results = [subprocess.CompletedProcess([], 0)] + [
+            subprocess.CompletedProcess([], 1, "", "hdiutil: create failed - Resource busy\n")] * 3
+        output = io.StringIO()
+        with mock.patch.object(sign.subprocess, "run",
+                               side_effect=self.disk_image_attempts(image, results)) as run, \
+                mock.patch.object(sign.time, "sleep") as sleep, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                sign.create_disk_image(self.app, image)
+        self.assertEqual(error.exception.returncode, 1)
+        self.assertEqual([call.args[0][0] for call in run.call_args_list],
+                         ["ditto", "hdiutil", "hdiutil", "hdiutil"])
+        self.assertEqual(sleep.call_args_list, [mock.call(2), mock.call(5)])
+        self.assertEqual(output.getvalue().count("Resource busy"), 3)
+
+    def test_disk_image_create_does_not_retry_other_failures(self):
+        image = Path(self.temporary.name) / "Zerus.dmg"
+        results = [subprocess.CompletedProcess([], 0),
+                   subprocess.CompletedProcess([], 1, "", "hdiutil: create failed - Invalid argument\n")]
+        output = io.StringIO()
+        with mock.patch.object(sign.subprocess, "run",
+                               side_effect=self.disk_image_attempts(image, results)) as run, \
+                mock.patch.object(sign.time, "sleep") as sleep, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(subprocess.CalledProcessError):
+                sign.create_disk_image(self.app, image)
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["ditto", "hdiutil"])
+        sleep.assert_not_called()
+        self.assertIn("Invalid argument", output.getvalue())
 
     def test_notary_failure_or_malformed_response_never_staples_the_disk_image(self):
         identifier = "0123abcd-4567-89ef-0123-456789abcdef"
@@ -248,6 +307,21 @@ class Signing(unittest.TestCase):
         self.assertEqual(sign.notary_credentials(key, "ABC123DEF4", ""),
                          ["--key", str(key), "--key-id", "ABC123DEF4"])
 
+
+    def test_a_tauri_switch_bundle_signs_with_the_hardened_runtime_and_app_entitlements(self):
+        app = Path(self.temporary.name) / "Tauri/Zerus.app"
+        (app / "Contents/MacOS").mkdir(parents=True)
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "hgs-tray", "ZerusGUI": "tauri"}))
+        (app / "Contents/MacOS/hgs-tray").write_bytes(MACH_O)
+        (app / "Contents/Resources/setup").mkdir(parents=True)
+        (app / "Contents/Resources/setup/com.hgdev.hgs-tray.plist").write_text("<plist/>")
+        self.assertEqual(sign.signing_order(app), [app], "one executable: the app is the only code object")
+        command = sign.codesign_command(app, "-", sign.entitlements_for(app, app))
+        self.assertEqual(command[command.index("--options") + 1], "runtime")
+        entitlements = plistlib.loads(sign.APP_ENTITLEMENTS.read_bytes())
+        self.assertTrue(entitlements["com.apple.security.device.audio-input"])
+        self.assertTrue(entitlements["com.apple.security.automation.apple-events"])
+        self.assertNotIn("com.apple.security.cs.allow-jit", entitlements, "WKWebView runs JavaScript out of process")
 
 if __name__ == "__main__":
     unittest.main()

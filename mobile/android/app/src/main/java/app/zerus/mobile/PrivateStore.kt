@@ -3,10 +3,13 @@ package app.zerus.mobile
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.system.Os
+import android.system.OsConstants
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
+import java.io.File
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -17,6 +20,20 @@ class PrivateStore(context: Context) {
     private val notificationContext = context.applicationContext
     private val preferences = context.getSharedPreferences("zerus_private", Context.MODE_PRIVATE)
     internal val workspaceJournal by lazy { AndroidWorkspaceJournal(context.applicationContext) }
+    internal val taskEditDrafts by lazy {
+        val root = File(notificationContext.noBackupFilesDir, "task-edit-drafts-v1")
+        TaskEditDraftFiles(root, { key }, syncDirectory = {
+            val descriptor = Os.open(root.absolutePath, OsConstants.O_RDONLY, 0)
+            try { Os.fsync(descriptor) } finally { Os.close(descriptor) }
+        })
+    }
+    internal val taskContentDrafts by lazy {
+        val root = File(notificationContext.noBackupFilesDir, "task-content-drafts-v1")
+        TaskContentDraftFiles(root, { key }, syncDirectory = {
+            val descriptor = Os.open(root.absolutePath, OsConstants.O_RDONLY, 0)
+            try { Os.fsync(descriptor) } finally { Os.close(descriptor) }
+        })
+    }
     companion object { private val keyCreationLock=Any(); internal val notificationLock=Any(); private val pushLock=Any() }
     private val key: SecretKey by lazy { synchronized(keyCreationLock) {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -72,6 +89,9 @@ class PrivateStore(context: Context) {
     internal fun speechConfigOperations() = SpeechConfigProtocol.decode(read("speech_configuration_ops_v1"))
     internal fun saveSpeechConfigOperations(pending: List<SpeechConfigOperation>) = write("speech_configuration_ops_v1", SpeechConfigProtocol.encode(pending))
     fun accounts()=AccountSnapshots.decode(read("account_catalog_v1"))
+    /** Collapsed parents by machine UUID and session ID (TeamCollapse). */
+    fun collapsedTeams()=ChildSessions.parseTeams(read("collapsed_teams_v1"))
+    fun saveCollapsedTeams(ids:List<String>)=write("collapsed_teams_v1",JSONArray(ids))
     fun saveAccounts(state:List<AccountCatalog>)=write("account_catalog_v1",AccountSnapshots.encode(state))
     fun readState()=ConversationReadPolicies.decode(read("conversation_read_v1"))
     fun saveReadState(state:ConversationReadState)=write("conversation_read_v1",ConversationReadPolicies.encode(state))

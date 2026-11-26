@@ -1,0 +1,826 @@
+//! The native live Remove pipeline. Model entries are presentation holders,
+//! never serialized permissions; loss/expiry cannot rebuild a continuation.
+use super::*;
+use crate::actions::Claim;
+use zerus_client_core::{end_action::Captured, worktree_programs::stop::State as StopState};
+
+/// The app side of the program pipeline: model change notifications, the
+/// cleanup driver after a watcher's review, and folder-removed events. Tauri's
+/// AppHandle in production; the real controls supply their own, so publish,
+/// its passive watcher and the Force glue run for real (zerus-fojet).
+pub(super) trait PipelineApp: Clone + Send + 'static {
+    fn changed(&self, model: &mut Model);
+    fn drive(&self, inner: &Arc<Inner>, id: String, step: Step);
+    fn removed(&self, label: String);
+}
+impl PipelineApp for AppHandle {
+    fn changed(&self, model: &mut Model) {
+        changed(self, model)
+    }
+    fn drive(&self, inner: &Arc<Inner>, id: String, step: Step) {
+        inner.drive(self.clone(), id, step, false)
+    }
+    fn removed(&self, label: String) {
+        let _ = self.emit("termination-folder-removed", label);
+    }
+}
+
+pub(super) fn expire_offer(inner: &Arc<Inner>, id: &str) {
+    let weak = Arc::downgrade(inner);
+    let id = id.to_owned();
+    tauri::async_runtime::spawn_blocking(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let mut m = lock(&inner.model);
+        let Some(index) = m.offers.iter().position(|o| o.id == id) else {
+            return;
+        };
+        let Some(programs) = m.offers[index].programs.as_ref() else {
+            return;
+        };
+        if programs.current() {
+            continue;
+        }
+        let offer = m.offers.remove(index);
+        drop(m);
+        if let Some(programs) = offer.and_then(|o| o.programs) {
+            let _ = programs.close();
+        }
+        return;
+    });
+}
+
+pub(super) enum ProgramJob {
+    Stopped(Box<programs::Stopped>),
+    Force {
+        id: String,
+        revision: u64,
+        offer: Box<programs::ForceOffer>,
+    },
+    /// The original continuation of a refused normal stop (zerus-1y897.9).
+    Original(Box<programs::Continuation>),
+    /// A removal that could not settle or close (zerus-1y897.9).
+    Removal(Box<programs::Removal>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ProgramReservation {
+    pub revision: u64,
+    pub request_id: String,
+    pub binding: String,
+    pub capture: Capture,
+}
+
+impl ProgramJob {
+    pub(super) fn identity(&self) -> (String, String, Capture) {
+        match self {
+            Self::Stopped(stopped) => stopped.identity(),
+            Self::Force { offer, .. } => offer.identity(),
+            Self::Original(original) => (String::new(), String::new(), original.capture.clone()),
+            Self::Removal(removal) => removal.identity(),
+        }
+    }
+
+    pub(super) fn matches(&self, reservation: &ProgramReservation) -> bool {
+        let (request_id, binding, capture) = self.identity();
+        reservation.request_id == request_id
+            && reservation.binding == binding
+            && reservation.capture == capture
+    }
+
+    pub(super) fn retirement(&self) -> run::Retirement {
+        match self {
+            Self::Stopped(stopped) => stopped.retirement(),
+            Self::Force { .. } | Self::Original(_) | Self::Removal(_) => run::Retirement::Failed,
+        }
+    }
+    /// Physical DATA only; a Force offer reuses its previous stop's result.
+    pub(super) fn physical_retirement(&self) -> run::Retirement {
+        match self {
+            Self::Stopped(stopped) => stopped.physical_retirement(),
+            Self::Force { offer, .. } => offer.physical_retirement(),
+            Self::Original(original) => original.physical_retirement(),
+            Self::Removal(removal) => removal.physical_retirement(),
+        }
+    }
+    fn remaining_millis(&self) -> u64 {
+        match self {
+            Self::Stopped(stopped) => stopped.remaining_millis(),
+            Self::Force { offer, .. } => offer.remaining_millis(),
+            Self::Original(original) => original.remaining_millis(),
+            Self::Removal(removal) => removal.remaining_millis(),
+        }
+    }
+    fn holder_unavailable(&self) -> bool {
+        match self {
+            Self::Stopped(stopped) => stopped.holder_unavailable(),
+            Self::Force { offer, .. } => offer.holder_unavailable(),
+            Self::Original(original) => original.holder_unavailable(),
+            Self::Removal(removal) => removal.holder_unavailable(),
+        }
+    }
+    pub(super) fn current(&self) -> bool {
+        match self {
+            Self::Stopped(stopped) => stopped.current(),
+            Self::Force { offer, .. } => offer.current(),
+            Self::Original(original) => original.current(),
+            Self::Removal(removal) => removal.current(),
+        }
+    }
+    pub(super) fn normal_refusal(&self) -> bool {
+        matches!(self, Self::Stopped(stopped) if stopped.normal_refusal())
+    }
+    pub(super) fn reviewable_refusal(&self) -> bool {
+        matches!(self, Self::Stopped(stopped) if stopped.reviewable_refusal())
+    }
+    pub(super) fn can_force(&self) -> bool {
+        matches!(self, Self::Stopped(stopped) if stopped.can_force())
+    }
+}
+impl TerminationCleanup {
+    pub(crate) fn program_claim(
+        &self,
+        id: &str,
+        captures: &[Captured],
+    ) -> Result<Option<Arc<Claim>>, String> {
+        let m = lock(&self.0.model);
+        let offer = m.offers.iter().find(|o| o.id == id).ok_or(STATE_CHANGED)?;
+        let Some(programs) = &offer.programs else {
+            return Ok(None);
+        };
+        if captures.len() != 1
+            || captures[0].target != offer.capture.target
+            || captures[0].action != zerus_client_core::Action::Terminate
+            || !captures[0].valid()
+            || !programs.current()
+        {
+            return Err(STATE_CHANGED.into());
+        }
+        Ok(Some(programs.claim()))
+    }
+}
+struct Reservation(Arc<Inner>);
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut m = lock(&self.0.model);
+        m.reserved = m.reserved.saturating_sub(1);
+    }
+}
+pub(super) async fn confirm(
+    inner: Arc<Inner>,
+    app: AppHandle,
+    actions: &crate::actions::Actions,
+    id: String,
+    offer: programs::Offer,
+    delayed: Option<(Captured, Arc<Claim>)>,
+) -> Result<Outcome, String> {
+    let reservation = Reservation(inner.clone());
+    let capture = offer.capture().clone();
+    let confirmation = offer.consume(id.clone())?;
+    let (outcome, continuation) =
+        crate::actions::dispatch_program_termination(actions, confirmation, delayed).await?;
+    if let (Outcome::Done { receipt, cleanup }, Some(continuation)) = (&outcome, continuation) {
+        if let Some(entry) = capture.entry(cleanup.as_ref()) {
+            let mut m = lock(&inner.model);
+            m.jobs.push_back(Job {
+                id: id.clone(),
+                cleanup: Cleanup::after_termination(vec![entry]),
+                busy: true,
+                phase: "stopping",
+                manual_review: false,
+                dismissed: false,
+                program_review_pending: true,
+                program_retirement: None,
+                lookup_only: false,
+                physically_released: false,
+                source: Some(capture.target.clone()),
+                restore_supported: true,
+                reservation: None,
+                archive: Some(ArchiveIdentity {
+                    version: 1,
+                    archive_id: receipt["result_target"]["archive_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .into(),
+                    name: capture.target.name.clone(),
+                    run_id: capture.target.run_id.clone(),
+                    conversation_id: capture.target.conversation_id.clone(),
+                    owner_id: capture.owner_id.clone(),
+                    launch_owned: !capture.owner_id.is_empty(),
+                }),
+                programs: None,
+            });
+            changed(&app, &mut m);
+            drop(m);
+            let worker_inner = inner.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                stop_and_publish(worker_inner, app, id, continuation)
+            });
+        }
+    }
+    drop(reservation);
+    Ok(outcome)
+}
+/// The original's blocking half: wait for the original call's own join while
+/// its source is current, then stop and publish.
+pub(super) fn stop_and_publish<A: PipelineApp>(
+    inner: Arc<Inner>,
+    app: A,
+    id: String,
+    continuation: programs::Continuation,
+) {
+    // A returned native receipt is not physical pipe settlement.
+    while continuation.current() && !continuation.original_call_joined() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stopped = stop_original(Box::new(continuation));
+    publish(inner, app, id, stopped);
+}
+/// A stop that was not confirmed, with whatever custody its producer handed
+/// back (zerus-1y897.8).
+pub(super) struct Unconfirmed {
+    pub(super) held: Option<ProgramJob>,
+}
+/// Waits for the stop's own phase to settle while its source is current. A
+/// stop that cannot settle is never closed or dropped here: it stays held,
+/// unconfirmed, until the watcher's physical_retirement() releases it.
+pub(super) fn settle(mut stopped: programs::Stopped) -> Result<programs::Stopped, Unconfirmed> {
+    while stopped.current() {
+        match stopped.try_retire() {
+            Ok(true) => return Ok(stopped),
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    Err(Unconfirmed {
+        held: Some(ProgramJob::Stopped(Box::new(stopped))),
+    })
+}
+/// The original's normal stop, settled. A refused one keeps the original
+/// continuation held (zerus-1y897.9).
+pub(super) fn stop_original(
+    continuation: Box<programs::Continuation>,
+) -> Result<programs::Stopped, Unconfirmed> {
+    match continuation.normal() {
+        Ok(stopped) => settle(stopped),
+        Err((continuation, _)) => Err(Unconfirmed {
+            held: Some(ProgramJob::Original(continuation)),
+        }),
+    }
+}
+pub(super) fn publish<A: PipelineApp>(
+    inner: Arc<Inner>,
+    app: A,
+    id: String,
+    stopped: Result<programs::Stopped, Unconfirmed>,
+) {
+    let stopped = match stopped {
+        Ok(stopped)
+            if stopped
+                .report()
+                .is_ok_and(|report| report.state == StopState::Complete) =>
+        {
+            finish_cleanup(inner, app, id, stopped);
+            return;
+        }
+        other => other,
+    };
+    let mut m = lock(&inner.model);
+    let Some(job) = m.jobs.iter_mut().find(|j| j.id == id) else {
+        return;
+    };
+    let live = record_stop(job, stopped);
+    app.changed(&mut m);
+    drop(m);
+    if live {
+        watch_job(&inner, app, id);
+    }
+}
+/// The model half of `publish` for a stop that did not complete: a known
+/// normal refusal becomes a retained, read-only cleanup that only Check again
+/// reviews (no automatic removal), every entry is Kept, and the result says
+/// whether a passive watcher must follow the retained original.
+pub(super) fn record_stop(job: &mut Job, stopped: Result<programs::Stopped, Unconfirmed>) -> bool {
+    job.busy = false;
+    job.phase = "checking";
+    let (detail, live) = match stopped {
+        Ok(stopped) => {
+            if stopped.reviewable_refusal() {
+                job.cleanup = Cleanup::retained(std::mem::take(&mut job.cleanup.entries));
+                job.program_review_pending = false;
+            }
+            job.program_retirement = None;
+            let detail = match stopped.report() {
+                Ok(report) if report.state == StopState::Complete => zerus_client_core::source!("Programs have stopped. Checking the working folder…"),
+                Ok(report) if report.state == StopState::Incomplete => zerus_client_core::source!("Some programs are still running. Review them before choosing Force stop."),
+                Ok(report) if report.state == StopState::Refused => "The program list changed or could not be checked. Review the working folder again.",
+                _ => zerus_client_core::source!("The program stop is unconfirmed. Check the original result before continuing."),
+            };
+            job.programs = Some(ProgramJob::Stopped(Box::new(stopped)));
+            (detail, true)
+        }
+        Err(unconfirmed) => {
+            job.program_retirement = Some(ProgramRetirement::StopUnconfirmed);
+            // An unconfirmed stop never offers Check again, Force or consent
+            // (zerus-1y897.8). Whatever custody its producer handed back stays
+            // held until the watcher's physical_retirement() releases it.
+            job.lookup_only = true;
+            let live = unconfirmed.held.is_some();
+            job.programs = unconfirmed.held;
+            (
+                zerus_client_core::source!(
+                    "The program stop is unconfirmed. Check the original result before continuing."
+                ),
+                live,
+            )
+        }
+    };
+    for entry in &mut job.cleanup.entries {
+        entry.status = Some(Status::Kept);
+        entry.detail = detail.into();
+    }
+    live
+}
+fn watch_job<A: PipelineApp>(inner: &Arc<Inner>, app: A, id: String) {
+    // Expiry is one-way. Retaining a UI row never keeps an Actions claim
+    // indefinitely or renews consent after source/authority loss.
+    let weak = Arc::downgrade(inner);
+    tauri::async_runtime::spawn_blocking(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        match watch_once(&inner, &id, |m| app.changed(m)) {
+            Watch::Continue => {}
+            Watch::Stop => return,
+            Watch::Review(step) => {
+                app.drive(&inner, id, step);
+                return;
+            }
+        }
+    });
+}
+pub(super) enum Watch {
+    Continue,
+    Stop,
+    Review(Step),
+}
+/// One passive watcher pass. It runs without the app handle so the real
+/// program controls can drive it; the result says what the loop does next.
+pub(super) fn watch_once(inner: &Inner, id: &str, emit: impl Fn(&mut Model)) -> Watch {
+    let (reservation, program) = {
+        let mut m = lock(&inner.model);
+        let Some(job) = m.jobs.iter_mut().find(|j| j.id == id) else {
+            return Watch::Stop;
+        };
+        let Some(program) = &job.programs else {
+            if job.busy && job.reservation.is_some() && !job.dismissed {
+                return Watch::Continue;
+            }
+            return Watch::Stop;
+        };
+        if !job.busy && job.program_review_pending && job.reservation.is_some() {
+            return Watch::Stop;
+        }
+        if program.current() {
+            // A finished control worker is observable failure data, never a
+            // physical-drain proof. Keep the original resources/expiry exactly
+            // as before; only disable presentation of a usable Force offer.
+            if program.holder_unavailable() && job.program_retirement.is_none() {
+                job.program_retirement = Some(ProgramRetirement::HolderUnavailable);
+                emit(&mut m);
+            }
+            return Watch::Continue;
+        }
+        job.program_retirement
+            .get_or_insert(if program.remaining_millis() == 0 {
+                ProgramRetirement::Expired
+            } else {
+                ProgramRetirement::SourceUnavailable
+            });
+        job.busy = true;
+        let reservation = job.reservation.clone();
+        let program = job.programs.take().expect("retained program");
+        (reservation, program)
+    };
+    // A reviewable refusal keeps its own retirement and review path. Any other
+    // result only waits for its original call, mutation and source owner to
+    // physically retire (zerus-1y897.5); nothing is closed, observed or renewed.
+    let release = !program.reviewable_refusal();
+    let retired = if release {
+        program.physical_retirement()
+    } else {
+        program.retirement()
+    };
+    let mut m = lock(&inner.model);
+    let Some(job) = m.jobs.iter_mut().find(|j| j.id == id) else {
+        return Watch::Stop;
+    };
+    if !job.busy
+        || job.programs.is_some()
+        || job.reservation != reservation
+        || reservation
+            .as_ref()
+            .is_some_and(|reservation| !program.matches(reservation))
+    {
+        return Watch::Stop;
+    }
+    match retired {
+        run::Retirement::Pending => {
+            job.programs = Some(program);
+            job.program_review_pending = true;
+            emit(&mut m);
+            Watch::Continue
+        }
+        run::Retirement::Failed => {
+            job.programs = Some(program);
+            job.busy = false;
+            job.program_review_pending = true;
+            emit(&mut m);
+            Watch::Stop
+        }
+        run::Retirement::Retired if release => {
+            // The resources are released; the unrefused result stays a
+            // lookup-only row. No Check again, Force, review or consent.
+            job.lookup_only = true;
+            job.physically_released = true;
+            job.busy = false;
+            job.program_review_pending = true;
+            emit(&mut m);
+            Watch::Stop
+        }
+        run::Retirement::Retired => {
+            if program.normal_refusal() {
+                job.program_review_pending = false;
+            }
+            let step = job.cleanup.step();
+            let review = reservation.is_some();
+            job.programs = None;
+            job.reservation = None;
+            job.busy = review;
+            if review {
+                job.manual_review = true;
+            }
+            emit(&mut m);
+            drop(m);
+            if review {
+                Watch::Review(step)
+            } else {
+                Watch::Stop
+            }
+        }
+    }
+}
+
+pub(super) async fn force_offer<A: PipelineApp>(
+    inner: Arc<Inner>,
+    app: A,
+    id: String,
+) -> Result<super::ForceView, String> {
+    let stopped = {
+        let mut m = lock(&inner.model);
+        let job = m
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id)
+            .ok_or(STATE_CHANGED)?;
+        let stopped = take_force(job)?;
+        app.changed(&mut m);
+        stopped
+    };
+    #[cfg(test)]
+    let lost = fixture_offer_lost(&id);
+    let offered = tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(test)]
+        if lost {
+            panic!("fixture: the blocking offer task ended without handing back its stop");
+        }
+        stopped.offer_force()
+    })
+    .await
+    .map_err(|error| error.to_string());
+    let mut m = lock(&inner.model);
+    let revision = m.revision.wrapping_add(1);
+    let job = m
+        .jobs
+        .iter_mut()
+        .find(|job| job.id == id)
+        .ok_or(STATE_CHANGED)?;
+    let result = record_offer(job, revision, offered);
+    let live = job.programs.is_some();
+    app.changed(&mut m);
+    drop(m);
+    if live {
+        watch_job(&inner, app, id);
+    }
+    result
+}
+/// Fixture-only (zerus-y7quu): job ids whose next blocking Force offer task
+/// panics, so force_offer meets a real JoinError and the task drops the stop.
+#[cfg(test)]
+static LOST_OFFERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(super) fn fixture_lose_offer(id: &str) {
+    lock(&LOST_OFFERS).push(id.to_owned());
+}
+#[cfg(test)]
+fn fixture_offer_lost(id: &str) -> bool {
+    let mut lost = lock(&LOST_OFFERS);
+    let at = lost.iter().position(|lost| lost == id);
+    at.map(|at| lost.remove(at)).is_some()
+}
+/// Force offer admission: takes the job's own incomplete normal stop.
+pub(super) fn take_force(job: &mut Job) -> Result<Box<programs::Stopped>, String> {
+    if job.busy || job.lookup_only || !job.programs.as_ref().is_some_and(ProgramJob::can_force) {
+        return Err(STATE_CHANGED.into());
+    }
+    let Some(ProgramJob::Stopped(stopped)) = job.programs.take() else {
+        return Err(STATE_CHANGED.into());
+    };
+    job.busy = true;
+    Ok(stopped)
+}
+/// Records the blocking offer's result on its job (zerus-1y897.7). A refused
+/// offer gives back the SAME stop, which keeps its custody until the watcher's
+/// physical_retirement() proves Retired; while it is held, has_programs()
+/// keeps the native Check admission closed.
+pub(super) fn record_offer(
+    job: &mut Job,
+    revision: u64,
+    offered: Result<Result<programs::ForceOffer, programs::RefusedOffer>, String>,
+) -> Result<super::ForceView, String> {
+    job.busy = false;
+    match offered {
+        Ok(Ok(offer)) => {
+            let confirmation = uuid::Uuid::new_v4().to_string();
+            let programs = offer.programs();
+            let remaining_millis = offer.remaining_millis();
+            job.programs = Some(ProgramJob::Force {
+                id: confirmation.clone(),
+                revision,
+                offer: Box::new(offer),
+            });
+            Ok(super::ForceView {
+                confirmation,
+                programs,
+                remaining_millis,
+                revision,
+            })
+        }
+        Ok(Err((stopped, error))) => {
+            job.programs = Some(ProgramJob::Stopped(stopped));
+            job.program_retirement = Some(ProgramRetirement::OfferUnavailable);
+            Err(error)
+        }
+        Err(error) => {
+            // The blocking task ended without handing the stop back, so its
+            // custody is gone: only a lookup-only row remains.
+            job.lookup_only = true;
+            job.program_retirement = Some(ProgramRetirement::OfferUnavailable);
+            Err(error)
+        }
+    }
+}
+pub(super) async fn force_confirm<A: PipelineApp>(
+    inner: Arc<Inner>,
+    app: A,
+    id: String,
+    confirmation: String,
+) -> Result<View, String> {
+    let offer = {
+        let mut m = lock(&inner.model);
+        let job = m
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id)
+            .ok_or(STATE_CHANGED)?;
+        let offer = take_confirm(job, &confirmation)?;
+        app.changed(&mut m);
+        offer
+    };
+    let copy = inner.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = confirm_force(offer);
+        publish(copy, app, id, result);
+    });
+    Ok(lock(&inner.model).view())
+}
+/// Force confirmation admission: takes the job's own offer for that handle.
+pub(super) fn take_confirm(
+    job: &mut Job,
+    confirmation: &str,
+) -> Result<Box<programs::ForceOffer>, String> {
+    if job.busy
+        || !matches!(&job.programs, Some(ProgramJob::Force { id, .. }) if id == confirmation)
+    {
+        return Err(STATE_CHANGED.into());
+    }
+    let Some(ProgramJob::Force { offer, .. }) = job.programs.take() else {
+        return Err(STATE_CHANGED.into());
+    };
+    job.busy = true;
+    job.phase = "stopping";
+    Ok(offer)
+}
+/// The blocking half of force_confirm.
+pub(super) fn confirm_force(
+    offer: Box<programs::ForceOffer>,
+) -> Result<programs::Stopped, Unconfirmed> {
+    match offer.confirm() {
+        Ok(stopped) => settle(stopped),
+        // A refused confirmation keeps the previous stop's custody, as a
+        // stop: the offer itself is never confirmed again.
+        Err((offer, _)) => Err(Unconfirmed {
+            held: Some(ProgramJob::Stopped(Box::new(offer.cancel()))),
+        }),
+    }
+}
+pub(super) fn force_cancel(
+    inner: &Arc<Inner>,
+    app: &AppHandle,
+    id: &str,
+    confirmation: &str,
+) -> Result<View, String> {
+    let mut m = lock(&inner.model);
+    let job = m
+        .jobs
+        .iter_mut()
+        .find(|job| job.id == id)
+        .ok_or(STATE_CHANGED)?;
+    if job.busy
+        || !matches!(&job.programs, Some(ProgramJob::Force { id, .. }) if id == confirmation)
+    {
+        return Err(STATE_CHANGED.into());
+    }
+    let Some(ProgramJob::Force { offer, .. }) = job.programs.take() else {
+        return Err(STATE_CHANGED.into());
+    };
+    job.programs = Some(ProgramJob::Stopped(Box::new((*offer).cancel())));
+    changed(app, &mut m);
+    Ok(m.view())
+}
+
+fn finish_cleanup<A: PipelineApp>(
+    inner: Arc<Inner>,
+    app: A,
+    id: String,
+    stopped: programs::Stopped,
+) {
+    {
+        let mut model = lock(&inner.model);
+        let Some(job) = model.jobs.iter_mut().find(|job| job.id == id) else {
+            return;
+        };
+        job.busy = true;
+        job.phase = "removing";
+        app.changed(&mut model);
+    }
+    // No model lock across native preparation, child I/O, deletion or join.
+    // Taking Stopped consumes the only live Remove continuation. Every result,
+    // including a lost reply, ends this pipeline; there is no automatic retry.
+    let result = run_removal(Box::new(stopped));
+    let mut model = lock(&inner.model);
+    let Some(job) = model.jobs.iter_mut().find(|job| job.id == id) else {
+        return;
+    };
+    let (removed, live) = record_removal(job, result);
+    if removed {
+        let labels: Vec<_> = job
+            .cleanup
+            .entries
+            .iter()
+            .map(|entry| leaf(entry.row["path"].as_str().unwrap_or("")))
+            .collect();
+        model.jobs.retain(|job| job.id != id);
+        for label in labels {
+            app.removed(label);
+        }
+    }
+    app.changed(&mut model);
+    drop(model);
+    if live {
+        watch_job(&inner, app, id);
+    }
+}
+/// What the removal phase left: its result, whether the holder physically
+/// closed, and any custody a refusal handed back (zerus-1y897.9).
+pub(super) struct Removed {
+    result: Result<zerus_client_core::worktree_programs::cleanup::Report, String>,
+    physically_closed: bool,
+    held: Option<ProgramJob>,
+}
+/// The blocking half of finish_cleanup: the distinct deletion phase. A
+/// refused cleanup keeps the Complete stop held (zerus-1y897.9).
+pub(super) fn run_removal(stopped: Box<programs::Stopped>) -> Removed {
+    match stopped.cleanup() {
+        Ok(removal) => settle_removal(Box::new(removal)),
+        Err((stopped, error)) => Removed {
+            result: Err(error),
+            physically_closed: false,
+            held: Some(ProgramJob::Stopped(stopped)),
+        },
+    }
+}
+/// Waits for the removal phase to settle while its source is current, then
+/// closes the read-only holder. A removal that cannot settle or close is
+/// never closed or dropped here: it stays held until the watcher's
+/// physical_retirement() releases it (zerus-1y897.9).
+pub(super) fn settle_removal(mut removal: Box<programs::Removal>) -> Removed {
+    let error = loop {
+        if !removal.current() {
+            break crate::desktop_service::termination_outcome::UNCONFIRMED.into();
+        }
+        match removal.try_retire() {
+            Ok(true) => {
+                let report = removal.report().cloned().map_err(str::to_owned);
+                // The read-only holder closes only AFTER the mutating helper,
+                // descendants, all readers and its loan physically retire.
+                match removal.close() {
+                    Ok(()) => {
+                        return Removed {
+                            result: report,
+                            physically_closed: true,
+                            held: None,
+                        }
+                    }
+                    Err(error) => break error,
+                }
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => break error,
+        }
+    };
+    Removed {
+        result: Err(error),
+        physically_closed: false,
+        held: Some(ProgramJob::Removal(removal)),
+    }
+}
+/// Records the removal result; says whether the job was removed and whether
+/// a passive watcher must follow held custody. Held custody keeps the row
+/// lookup-only until physical retirement releases it.
+pub(super) fn record_removal(job: &mut Job, removed: Removed) -> (bool, bool) {
+    let gone = record_cleanup_result(job, &removed.result, removed.physically_closed);
+    let live = removed.held.is_some();
+    if live {
+        job.programs = removed.held;
+        job.lookup_only = true;
+    }
+    (gone, live)
+}
+
+/// Called only after the known-complete stop's cleanup and holder close return.
+/// This is result retention, not an execution or custody admission.
+pub(super) fn record_cleanup_result(
+    job: &mut Job,
+    result: &Result<zerus_client_core::worktree_programs::cleanup::Report, String>,
+    physically_closed: bool,
+) -> bool {
+    job.busy = false;
+    job.phase = "checking";
+    job.programs = None;
+    job.program_retirement = Some(
+        if physically_closed
+            && result.as_ref().is_ok_and(|report| {
+                matches!(
+                    report.state,
+                    zerus_client_core::worktree_programs::cleanup::State::Removed
+                        | zerus_client_core::worktree_programs::cleanup::State::Kept
+                )
+            })
+        {
+            ProgramRetirement::CleanupSettled
+        } else {
+            ProgramRetirement::CleanupUnconfirmed
+        },
+    );
+    use zerus_client_core::worktree_programs::cleanup::State;
+    let removed = result
+        .as_ref()
+        .is_ok_and(|report| report.state == State::Removed);
+    // A parsed reply alone is not physical retirement. This observation is
+    // set only after try_retire AND holder close above, never worker_finished.
+    // A settled missing/invalid reply is Unknown and may be dismissed singly.
+    job.program_review_pending = !physically_closed;
+    for entry in &mut job.cleanup.entries {
+        entry.status = Some(match result {
+            Ok(report) if report.state == State::Removed => Status::Removed,
+            Ok(report) if report.state == State::Kept => Status::Kept,
+            _ => Status::Unconfirmed,
+        });
+        entry.detail = match result {
+            Ok(report) if report.state == State::Removed => String::new(),
+            Ok(report) if report.state == State::Kept => zerus_client_core::source!(
+                "The working folder changed or is still in use. Review it before removing it."
+            )
+            .into(),
+            _ => zerus_client_core::source!(
+                "Removal could not be confirmed. Check the original result before continuing."
+            )
+            .into(),
+        };
+    }
+    removed
+}

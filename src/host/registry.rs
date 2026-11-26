@@ -31,7 +31,7 @@ use super::{
     link::Link,
     log,
     protocol::{
-        Attach, Attached, Captured, ClientEntry, ClientList, ConsoleEvidence, CreateSession,
+        Attach, Attached, CallerSession, Captured, ClientEntry, ClientList, ConsoleEvidence, CreateSession,
         Created, Done, EnvValue, ErrorBody, ErrorCode, Grown, HostStatus, InputClaim, InputReady,
         LaunchState, Listed, Op, PaneDetails, PaneEntry, Resolved, SessionEntry, Signal,
         SupervisorOp, SupervisorRegistration, Target, RUN_MARKER,
@@ -195,6 +195,10 @@ pub(crate) struct Host<L: Launcher> {
     enabled: fn() -> bool,
     registry: Mutex<Registry>,
     changed: Condvar,
+    /// Task #14 (P2.4): raised when a session starts, ends, is renamed or a
+    /// client attaches or leaves; `list` reports it, so a reader sees the structure move without
+    /// comparing every entry.
+    structure: std::sync::atomic::AtomicU64,
     /// Creates run one at a time, so names and launch IDs are checked once.
     creating: Mutex<()>,
     recovery: Mutex<Recovery>,
@@ -287,6 +291,7 @@ impl<L: Launcher> Host<L> {
                 supervisors: HashMap::new(),
             }),
             changed: Condvar::new(),
+            structure: std::sync::atomic::AtomicU64::new(0),
             creating: Mutex::new(()),
             recovery: Mutex::default(),
             launch_reports: OnceLock::new(),
@@ -352,6 +357,13 @@ impl<L: Launcher> Host<L> {
 
     fn changed(&self) {
         self.changed.notify_all();
+    }
+
+    /// Task #14: `changed`, when a session started, ended, was renamed or
+    /// gained or lost a client: `list`'s structure counter moves.
+    fn restructured(&self) {
+        self.structure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed();
     }
 
     /// The session `target` names.
@@ -514,6 +526,11 @@ impl<L: Launcher> Host<L> {
                 ErrorCode::Invalid,
                 "this request changes the connection and needs one of its own",
             )),
+            // Task #33: only the connection knows its client's process.
+            Op::CallerSession => Err(error(
+                ErrorCode::Invalid,
+                "caller_session is answered for a connection's own client",
+            )),
             Op::Unsupported => Err(error(
                 ErrorCode::Unsupported,
                 "this session host does not know the request",
@@ -617,10 +634,10 @@ impl<L: Launcher> Host<L> {
             drop(registry);
             session.kill();
             session.finish(None);
-            self.changed();
+            self.restructured();
             return Err(error);
         }
-        self.changed();
+        self.restructured();
         Ok(Created {
             session: session.session_id(),
             pane: session.pane_id(),
@@ -753,12 +770,15 @@ impl<L: Launcher> Host<L> {
             channel.close();
         }
         session.finish(code);
-        self.changed();
+        self.restructured();
     }
 
     fn list(&self) -> Listed {
         let sessions: Vec<_> = self.registry().sessions.values().cloned().collect();
-        let mut listed = Listed::default();
+        let mut listed = Listed {
+            structure: Some(self.structure.load(std::sync::atomic::Ordering::SeqCst)),
+            ..Listed::default()
+        };
         for session in &sessions {
             let name = session.name();
             let clients = clients_of(session);
@@ -781,6 +801,7 @@ impl<L: Launcher> Host<L> {
                 // (platform::current_directories), so a program that changes
                 // directory is still listed where it started.
                 current_path: session.cwd.clone(),
+                output: Some(session.output_count()),
             });
             listed.clients.extend(clients);
         }
@@ -825,6 +846,8 @@ impl<L: Launcher> Host<L> {
             ));
         }
         session.set_name(name);
+        drop(registry);
+        self.restructured();
         Ok(())
     }
 
@@ -946,14 +969,30 @@ impl<L: Launcher> Host<L> {
             name: session.name(),
             pane: session.pane_id(),
         };
-        self.changed();
+        self.restructured();
         Ok((session, client, attached))
     }
 
     /// A client left its session.
     pub(crate) fn detached(&self, session: &Session, client: &Attachment) {
         session.detach(client.id);
-        self.changed();
+        self.restructured();
+    }
+
+    /// Task #33: the session whose root process or job holds `client_pid`,
+    /// the connection's own kernel-verified client. Session jobs never share a
+    /// process and forbid breakaway, so at most one session holds it.
+    pub(crate) fn caller_session(&self, client_pid: u32) -> Result<Value, ErrorBody> {
+        let sessions: Vec<Arc<Session>> = self.registry().sessions.values().cloned().collect();
+        let found = sessions.iter().find(|session| session.holds(client_pid)).ok_or_else(|| {
+            error(ErrorCode::NotFound, "this process runs in no session of this host")
+        })?;
+        payload(&CallerSession {
+            session: found.session_id(),
+            name: found.name(),
+            pane: found.pane_id(),
+            run_marker: found.variable(RUN_MARKER).unwrap_or_default(),
+        })
     }
 
     /// Accept `link` as the supervisor channel of a session (D10), from a

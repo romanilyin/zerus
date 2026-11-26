@@ -14,13 +14,35 @@ ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_USERS = {'example', 'user', 'test', 'test user', 'remote', 'alice', 'bob'}
 HOME_PATH = re.compile(r'/(?:Users|home)/([^/"\'`\n<>]+)(?:/|["\'`])')
 PRIVATE_KEY = re.compile(rb'-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----')
+# The secret scanners' shared vectors hold a PEM header as a whole JSON string,
+# with no key after it, so each scanner proves it finds one. CodeLore keeps a
+# copy pinned by hash. A header followed by anything else there still counts.
+SECRET_VECTORS = 'tests/fixtures/secret-scan-vectors.json'
+BARE_PEM_HEADER = re.compile(rb'"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"')
+
+
+def private_key_material(name, data):
+    """Whether these bytes hold private key material (a bare vector header is none)."""
+    found = len(PRIVATE_KEY.findall(data))
+    if name == SECRET_VECTORS:
+        found -= len(BARE_PEM_HEADER.findall(data))
+    return found > 0
 EMAIL = re.compile(r'(?<![\w.+-])[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}')
 # The owner explicitly approved this public maintainer address for AUR/Git.
 PUBLIC_CONTACTS = {'ufna@ufna.dev'}
 # Vendored third-party code and verbatim license texts keep their authors'
 # contact addresses, as do the notices Google libraries embed, copied verbatim.
-THIRD_PARTY = ('tray/vendor/', 'packaging/windows/licenses/')
+THIRD_PARTY = ('packaging/windows/licenses/',)
 THIRD_PARTY_FILES = {'mobile/android/app/src/main/assets/licenses/google-notices.txt'}
+# Notices of Rust crates that publish none, copied unchanged into one folder per
+# crate; the README beside those folders is ours.
+RUST_NOTICES = 'packaging/rust-licenses/'
+
+
+def verbatim_notice(name):
+    """Third-party texts that keep their authors' contact addresses."""
+    return (name.startswith(THIRD_PARTY) or name in THIRD_PARTY_FILES
+            or (name.startswith(RUST_NOTICES) and '/' in name[len(RUST_NOTICES):]))
 # Beads attributes records to the Git identities the team works with; the owner
 # accepted those addresses there. Free text in the same records is still checked.
 BEADS_ATTRIBUTION = {'owner', 'created_by', 'assignee', 'author'}
@@ -55,7 +77,7 @@ def findings(name, text):
                 problems.append((line_no, 'non-example absolute home path'))
         if re.search(r'(?<![A-Za-z0-9])/' + 'w/', line):
             problems.append((line_no, 'absolute workspace path'))
-        if not name.startswith(THIRD_PARTY) and name not in THIRD_PARTY_FILES:
+        if not verbatim_notice(name):
             for address in EMAIL.findall(addresses):
                 domain = address.rsplit('@', 1)[1].lower()
                 if address in PUBLIC_CONTACTS | {'git@github.com', 'aur@aur.archlinux.org'} or domain.endswith(('.png', '.svg', '.icns', '.rb', '.rb.in')):
@@ -80,7 +102,7 @@ def main():
         if path.name in {'.env', 'id_rsa', 'id_ed25519', 'credentials.json', 'auth.json'}:
             problems.append((name, 0, 'credential filename'))
         data = path.read_bytes()
-        if PRIVATE_KEY.search(data):
+        if private_key_material(name, data):
             problems.append((name, 0, 'private key material'))
         # Compressed image bytes can accidentally resemble paths/email addresses.
         # Binary assets need a separate metadata/visual audit.

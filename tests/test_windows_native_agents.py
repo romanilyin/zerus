@@ -53,6 +53,7 @@ model's requests. Each case stops what it started, its sessions, the host and th
 model, and waits for every agent and supervisor through handles opened while they ran,
 and until nothing holds its executables, before its folders go.
 """
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -63,11 +64,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 import uuid
 
 import model_api_fixture as api
 import test_windows_host as host
+from codex_resume_diagnostics import ResumeDiagnostics
 
 TESTS = Path(__file__).resolve().parent
 EXE = ".exe" if os.name == "nt" else ""
@@ -77,6 +80,33 @@ CODEX = os.environ.get("HGS_CODEX_TEST_BIN")
 CONPTY = os.environ.get("HGS_TEST_CONPTY_DIR")
 KEY = "fixture-key"
 DEAD_PROXY = "http://127.0.0.1:9"
+
+# Claude 2.1.319's shared permission dialog rejects input for 150 ms after
+# first paint. A complete hook card is an observation, not an input-ready ACK.
+CLAUDE_PERMISSION_INPUT_GUARD = 0.150
+
+
+def wait_claude_permission_guard(card, read, observed, now=None, pause=None):
+    """Wait out the native window on this original card, before ONE key.
+
+    This does not claim to explain the historical Windows missed Enter. An
+    unchanged prompt after that key still fails; it never authorizes replay.
+    """
+    now = now or time.monotonic
+    pause = pause or time.sleep
+    fields = ('question_id', 'question_hash', 'run_id', 'conversation_id',
+              'tool_call_id', 'agent_id', 'source')
+    until = observed + CLAUDE_PERMISSION_INPUT_GUARD
+    while True:
+        current = read()
+        if (not current or not current.get('panel_verified') or not current.get('can_answer')
+                or any(current.get(field) != card.get(field) for field in fields)):
+            raise AssertionError('The original Claude permission panel changed before Terminal input')
+        remaining = until - now()
+        if remaining <= 0:
+            return
+        pause(min(remaining, 0.040))
+
 # Seconds an agent may take to start, finish a turn, pause or exit: Claude Code starts
 # in about 9 s under ConPTY on the development PC (spike S6), and a hosted runner scans
 # a freshly linked executable on its first start.
@@ -86,7 +116,9 @@ WAIT = 120
 CLEARED_PREFIXES = ("CLAUDE", "ANTHROPIC_", "CODEX_", "OPENAI_", "KIMI_", "VSCODE_", "TERM_", "WT_", "CONEMU",
                     "ACTIONS_")
 CLEARED = {"COLORTERM", "FORCE_COLOR", "NO_COLOR", "GITHUB_TOKEN", "GH_TOKEN", "HTTP_PROXY", "HTTPS_PROXY",
-           "ALL_PROXY", "NO_PROXY", "NODE_OPTIONS"}
+           "ALL_PROXY", "NO_PROXY", "NODE_OPTIONS",
+           # A runner inside a Zerus session must not lend it to the case.
+           "HGS_SESSION", "HGS_RUN_ID", "HGS_AGENT", "HGS_ACCOUNT_ID", "HGS_EXPECTED_ID", "HGS_REQUESTED_ID"}
 # Messages `hgs send` must deliver exactly: plain, non-ASCII, ending in a backslash
 # (which Claude reads as a line continuation before Enter), and multiline.
 MESSAGES = ("Plain fixture message.", "Привет, ünïcödé ✓ 漢字.", "Continue the fixture\\",
@@ -147,6 +179,8 @@ class NativeAgent:
     # The glyph that starts the agent's composer row.
     COMPOSER = None
     CLEARS_WITH_KEYS = False
+    # The flag that keeps an agent from asking to review the hooks hgs installs.
+    NO_HOOK_REVIEW = None
 
     def setUp(self):
         # Handles on the agents and supervisors this case saw running, by (PID, start), and
@@ -159,6 +193,8 @@ class NativeAgent:
         self.project_parent = Path(tempfile.mkdtemp(prefix="hgs-native-", dir=project_parent())).resolve()
         self.project = self.project_parent / "project"
         self.agent_home = self.root / f"{self.AGENT}-home"
+        # The account a switch moved the session to, once the case made it.
+        self.second_home = None
         self.api_root = self.root / "api"
         for folder in (self.project, self.agent_home, self.api_root, *(self.root / name for name in
                                                                          ("appdata", "localappdata", "temp"))):
@@ -171,7 +207,7 @@ class NativeAgent:
                         HGS_SELF="test", HGS_PEERS="", HGS_TAB="0")
         self.api_url = f"http://127.0.0.1:{self.start_api()}"
         self.env.update(
-            ANTHROPIC_BASE_URL=self.api_url, ANTHROPIC_API_KEY=KEY, OPENAI_API_KEY=KEY,
+            ANTHROPIC_BASE_URL=self.api_url, ANTHROPIC_API_KEY=KEY, OPENAI_API_KEY=KEY, FIXTURE_API_KEY=KEY,
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1", DISABLE_UPDATES="1",
             DISABLE_INSTALLATION_CHECKS="1", CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL="1",
             DISABLE_TELEMETRY="1", DISABLE_ERROR_REPORTING="1",
@@ -230,6 +266,10 @@ class NativeAgent:
         """The agent's private home, as a user who has finished onboarding left it."""
         raise NotImplementedError
 
+    def prepare_account(self, folder):
+        """A second, signed-in account of the same agent in its own profile folder (U53)."""
+        raise NotImplementedError
+
     # hgs and what it reports.
 
     def hgs(self, *args, input=None, rc=0):
@@ -279,12 +319,31 @@ class NativeAgent:
                           rc=None)
         return json.loads(result.stdout)["ok"]["text"] if result.returncode == 0 else f"(no capture: {result.stderr})"
 
+    def pane(self, name):
+        """The host's pane facts, including where its caret is, in cells."""
+        result = self.hgs("__host", "call", json.dumps({"op": "pane_info", "target": {"name": name}}), rc=None)
+        return json.loads(result.stdout)["ok"] if result.returncode == 0 else {}
+
     def describe(self):
-        """The screens, the listing, the host's log and the fake model's requests, for failure messages."""
+        """The screens, the caret, the listing, the host's log and the fake model's requests, for
+        failure messages."""
         parts = []
+        diagnostic = getattr(self, 'resume_diagnostic', None)
+        if diagnostic is not None:
+            parts.append('original Codex resume evidence:\n' + diagnostic.finish(self.agent_home))
         for name in self.names:
             try:
                 parts.append(f"screen of {name}:\n{self.capture(name)}")
+                pane = self.pane(name)
+                parts.append(f"pane of {name}: " + json.dumps(
+                    {key: pane.get(key) for key in ("width", "height", "cursor_x", "cursor_y", "dead")}))
+                styled = self.hgs("__host", "call", json.dumps(
+                    {"op": "capture", "target": {"name": name}, "styled": True}), rc=None)
+                rows = (json.loads(styled.stdout)["ok"]["text"].splitlines()
+                        if styled.returncode == 0 else [])
+                cursor_y = pane.get("cursor_y")
+                if isinstance(cursor_y, int) and 0 <= cursor_y < len(rows):
+                    parts.append(f"styled row {cursor_y} of {name}: {rows[cursor_y]!r}")
                 parts.append(f"record of {name}: " + json.dumps(
                     {key: self.record(name).get(key) for key in ("activity", "phase", "conversation_id", "run_id",
                                                                "expected_id", "error", "input_pending_at",
@@ -338,11 +397,21 @@ class NativeAgent:
         finally:
             host.KERNEL32.CloseHandle(handle)
 
+    def stop_team_worker(self):
+        r"""Task #52 (team ede724c4): a case's `hgs team` command starts the team worker from the
+        case's portable hgs.exe, and the worker runs until no team runs. It is no session and no
+        host process, so nothing else stopped it, and it held portable\hgs.exe when the case's
+        folder went (CI #21: PermissionError [WinError 5] after the U54 team swap). It is asked to
+        end in the case's own state; a case that started no worker hears "no team worker runs"."""
+        if getattr(self, "hgs_exe", None) and self.hgs_exe.is_file():
+            self.hgs("team", "worker", "--stop", rc=None)
+
     def stop_host(self):
         """Kill the sessions and stop the host (HostCase), then wait for every agent and
         supervisor of the case, and for its executables to be released, before its
         folders go; end and report any process that stays."""
         try:
+            self.stop_team_worker()
             for name in self.names:
                 self.pin_session(name)
             super().stop_host()
@@ -401,10 +470,30 @@ class NativeAgent:
             return second if first == second and composer else None
         return self.until(f"{name}'s composer", same)
 
+    def sample_resume(self):
+        diagnostic = getattr(self, 'resume_diagnostic', None)
+        if diagnostic is None:
+            return
+        def query(request):
+            try:
+                result = subprocess.run([str(self.hgs_exe), '__host', 'call', json.dumps(request)],
+                    env=self.env, cwd=self.work, stdin=subprocess.DEVNULL, capture_output=True,
+                    timeout=2, creationflags=host.HIDDEN)
+                if result.returncode == 0 and len(result.stdout) <= 64 * 1024:
+                    return json.loads(result.stdout).get('ok')
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+            return None
+        try:
+            diagnostic.sample(self.record(diagnostic.name), query)
+        except (OSError, ValueError):
+            pass  # Diagnostics never replace the original test assertion.
+
     def ready(self, name):
         """The listing row once the session takes a message: what hgs itself reports for a
         conversation the agent has yet to confirm, else idle with a settled composer."""
         def check():
+            self.sample_resume()
             row, state = self.row(name), self.inspect(name)
             if row.get("runtime_state") != "live" or state.get("pending_questions"):
                 return None
@@ -582,7 +671,10 @@ class NativeAgent:
                          dict(runtime_state="stopped", process_state="exited", resumable=True,
                               conversation_id=row["conversation_id"]))
         self.until("the paused agent to exit", lambda: not self.alive(*process))
+        if self.AGENT == 'codex':
+            self.resume_diagnostic = ResumeDiagnostics(name, record)
         self.hgs("resume", name, "-d")
+        self.sample_resume()
         self.until("the resumed session", lambda: (lambda row: row.get("runtime_state") == "live"
                                                    and row.get("run_id") != record["run_id"])(self.row(name)))
         self.pin_session(name)
@@ -604,12 +696,87 @@ class NativeAgent:
                          dict(state="archived", runtime_state="stopped", conversation_id=row["conversation_id"]))
         self.until("the terminated agent to exit", lambda: not self.alive(*process))
 
+    # Changing the account of a running session (U53).
+
+    def second_account(self):
+        """A second account of this agent, signed in on this computer, and its folder."""
+        self.hgs("account", "add", "second", "--provider", self.AGENT, "--label", "Second", "--json")
+        folder = self.home / ".config" / "hgs" / "accounts" / "second"
+        self.assertTrue(folder.is_dir(), "the account profile folder is missing")
+        self.prepare_account(folder)
+        self.second_home = folder
+        return folder
+
+    def check_switch_account(self, tag):
+        """`hgs switch-account` moves the running session to another account of the same
+        agent: the same conversation, folder and name, copied into the new account's native
+        store, and the agent resumes it there; the old account keeps its own copy."""
+        name = self.launch(tag, *([self.NO_HOOK_REVIEW] if self.NO_HOOK_REVIEW else []))
+        # A refused send names which empty-composer check refused and where the
+        # caret is (Claude 2.1.312 parks it outside the prompt row).
+        self.env["HGS_INPUT_TRACE"] = "1"
+        # A real turn first: Claude writes its transcript only after the first prompt, and
+        # Codex names it in the record only then.
+        self.deliver(name, MESSAGES[0])
+        row = self.ready(name)
+        conversation = row["conversation_id"]
+        before = self.record(name)
+        transcript = Path(before["transcript"])
+        self.assertTrue(transcript.is_file(), before)
+        original = transcript.read_bytes()
+        folder = self.second_account()
+        receipt = self.json("switch-account", name, "--account", "second",
+                            "--request-id", str(uuid.uuid4()))
+        self.assertEqual(receipt["status"], "switched", receipt)
+        self.assertEqual((receipt["conversation_id"], receipt["from"]["account_id"],
+                          receipt["to"]["account_id"]), (conversation, "native-" + self.AGENT, "second"))
+        # The same conversation, folder and name, on the new account.
+        switched = self.record(name)
+        self.assertEqual((switched["name"], switched["launch_dir"], switched["conversation_id"],
+                          switched["account_id"], switched["agent_home"]),
+                         (name, str(self.project), conversation, "second", str(folder)))
+        self.assertNotEqual(switched["run_id"], before["run_id"])
+        # A resumed Codex is a deferred resume until its first turn: its own
+        # supervisor keeps the expected id equal to the conversation. Claude's
+        # SessionStart confirms the resume and clears it. Neither may name
+        # another conversation.
+        expected = switched.get("expected_id")
+        if self.AGENT == "codex":
+            self.assertIn(expected, (None, "", conversation), expected)
+        else:
+            self.assertFalse(expected, expected)
+        # The copy is in the new account's store and starts with the conversation's
+        # records: the resumed agent may append to it. The old account's file is
+        # final only after its agent stops: it may grow past the snapshot taken
+        # before the switch (Claude appends its cost-state record while stopping),
+        # and the copy holds those final bytes.
+        copy = next(folder.rglob(f"*{conversation}.jsonl"))
+        copied = copy.read_bytes()
+        old_final = transcript.read_bytes()
+        self.assertTrue(old_final.startswith(original), "the old account's records were rewritten")
+        self.assertTrue(copied.startswith(old_final), "the copy does not hold the old file's final records")
+        self.assertTrue(transcript.is_file())
+        # The listing and the inspection both name the account.
+        self.assertEqual((self.row(name)["account_id"], self.row(name)["account_label"]),
+                         ("second", "Second"))
+        inspected = self.inspect(name)
+        self.assertEqual((inspected["account_id"], inspected["account_label"]), ("second", "Second"))
+        # The resumed agent answers a second prompt in that exact conversation.
+        self.pin_session(name)
+        text = "After the account switch."
+        self.deliver(name, text)
+        self.assertEqual(self.row(name)["conversation_id"], conversation)
+        self.assertEqual(self.accepted(name, text, conversation), 1, self.describe())
+        self.assertEqual(self.accepted(name, MESSAGES[0], conversation), 1, self.describe())
+        self.until(f"{text!r} at the model", lambda: any(
+            text in json.dumps(request) for request in api.requests(self.api_root)))
+
 
 @unittest.skipUnless(CLAUDE and HGS_SET, "set HGS_TEST_BIN and HGS_CLAUDE_TEST_BIN to run real Claude Code")
 class NativeWindowsClaude(NativeAgent, host.HostCase):
     AGENT = "claude"
     BINARY = CLAUDE
-    ARGS = ("--model", "claude-sonnet-4-6")
+    ARGS = ("--model", "claude-sonnet-4-6", "--permission-mode", "manual")
     COMPOSER = "❯"
     CLEARS_WITH_KEYS = True
 
@@ -624,8 +791,30 @@ class NativeWindowsClaude(NativeAgent, host.HostCase):
                                                        encoding="utf-8")
         self.env["CLAUDE_CONFIG_DIR"] = str(self.agent_home)
 
+    def prepare_account(self, folder):
+        """A managed account's session blanks ANTHROPIC_* (accounts::select); its own
+        settings carry the fixture's base URL and key, as a signed-in account's
+        preferences carry its own configuration."""
+        projects = {form: {"hasTrustDialogAccepted": True, "allowedTools": []} for form in path_forms(self.project)}
+        (folder / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True, "theme": "dark", "autoUpdates": False,
+            "customApiKeyResponses": {"approved": [KEY[-20:]], "rejected": []},
+            "officialMarketplaceAutoInstallAttempted": True, "hasSeenAutoDefaultNudge": True,
+            "projects": projects}), encoding="utf-8")
+        (folder / "settings.json").write_text(json.dumps({
+            "permissions": {"defaultMode": "default"}, "theme": "dark",
+            "env": {"ANTHROPIC_BASE_URL": self.api_url, "ANTHROPIC_API_KEY": KEY,
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}}), encoding="utf-8")
+
     def transcript_rows(self, conversation_id):
-        paths = list((self.agent_home / "projects").glob(f"*/{conversation_id}.jsonl"))
+        # After a switch the conversation lives in the new account's store; the
+        # old account keeps only its own copy of the same rows.
+        homes = ([self.second_home] if self.second_home else []) + [self.agent_home]
+        paths = []
+        for home in homes:
+            paths = list((home / "projects").glob(f"*/{conversation_id}.jsonl"))
+            if paths:
+                break
         rows = []
         for path in paths:
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -650,6 +839,22 @@ class NativeWindowsClaude(NativeAgent, host.HostCase):
         forms = (text, [{"type": "text", "text": text}])
         return sum(row.get("type") == "user" and row.get("message", {}).get("content") in forms
                    for row in self.transcript_rows(conversation_id))
+
+    def test_project_powershell_wrapper_keeps_existing_tracking_and_exact_messages(self):
+        # Initialize this private profile through the native CLI once. A project
+        # script is deliberately not run as a version probe for fresh hooks.
+        prime = self.launch("prime-hooks")
+        self.until("the native conversation", lambda: self.row(prime).get("conversation_id"))
+        self.hgs("terminate", prime)
+        self.until("the prime archive", lambda: self.row(prime).get("state") == "archived")
+        settings = (self.agent_home / "settings.json").read_bytes()
+        program = str(self.bin / "claude.exe").replace("'", "''")
+        (self.project / "run_claude.ps1").write_text(f"& '{program}' @args; exit $LASTEXITCODE\n", encoding="utf-8-sig")
+        name = self.launch("wrapper")
+        self.until("the wrapper's native conversation", lambda: self.row(name).get("conversation_id"))
+        self.assertTrue(self.inspect(name)["tracked"])
+        self.assertEqual((self.agent_home / "settings.json").read_bytes(), settings)
+        self.check_messages(name)
 
     def test_a_tracked_launch_reports_its_hooks_and_send_delivers_exact_messages(self):
         name = self.launch("messages")
@@ -818,9 +1023,20 @@ class NativeWindowsClaude(NativeAgent, host.HostCase):
         for key, check in (("Enter", approved.is_file),
                            ("Escape", lambda: "What should Claude do instead?" in self.capture(name))):
             card = self.hook_card(name, api.BASH)
+            def current():
+                return next((item for item in self.inspect(name).get('pending_questions', [])
+                             if item.get('question_id') == card['question_id']), None)
+            card = self.until('the original complete Bash permission panel',
+                              lambda: (item := current()) and item.get('panel_verified') and item)
+            carded = time.monotonic()
             worker = self.worker()
+            wait_claude_permission_guard(card, current, carded)
             self.keys(name, {"named": key})
-            self.until(f"Terminal's {key}", check)
+            # zerus-dy5u: an intermittent Enter without effect; the failure
+            # must tell a key sent before the panel from one that was lost.
+            sent = (f"panel_verified=True, native_guard={CLAUDE_PERMISSION_INPUT_GUARD:.3f} s, "
+                    f"sent {time.monotonic() - carded:.3f} s after the complete card")
+            self.until(f"Terminal's {key} ({sent})", check)
             self.until(f"the hook to end after {key}", lambda: not self.alive(*worker))
             self.until("no pending card", lambda: not self.inspect(name).get("pending_questions"))
             self.refused(name, card, self.choose(card, "No"))
@@ -861,6 +1077,38 @@ class NativeWindowsClaude(NativeAgent, host.HostCase):
     def test_pause_resume_and_terminate(self):
         name = self.launch("lifecycle")
         self.check_lifecycle(name)
+
+    def test_a_switch_to_another_account_keeps_the_conversation_folder_and_name(self):
+        self.check_switch_account("switch")
+
+    def test_a_team_swap_moves_the_lead_through_u53(self):
+        """U54: one owner action moves a team's lead to another account through the
+        same U53 switch, keeping its session, conversation and name."""
+        name = self.launch("swap")
+        self.deliver(name, MESSAGES[0])
+        conversation = self.ready(name)["conversation_id"]
+        self.second_account()
+        team = self.json("team", "create", "--json", input=json.dumps({
+            "request_id": str(uuid.uuid4()), "name": "Swap", "by": "human",
+            "lead": {"id": "lead", "role": "Lead", "agent": "claude",
+                     "session": {"name": name, "host": ""}}}))
+        receipt = self.json("team", "swap-member", "--json", input=json.dumps({
+            "request_id": str(uuid.uuid4()), "team": team["team"], "by": "human",
+            "from_account": "native-claude", "to_account": "second", "provider": "claude"}))
+        self.assertEqual(receipt["status"], "swapped", receipt)
+        self.assertEqual([entry["member"] for entry in receipt["members"]], ["lead"], receipt)
+        # The same session, conversation and name, now on the second account.
+        switched = self.record(name)
+        self.assertEqual((switched["name"], switched["conversation_id"], switched["account_id"]),
+                         (name, conversation, "second"))
+        # The roster reads the real account from the session.
+        status = self.json("team", "status", "--json", input=json.dumps({"team": team["team"], "by": "human"}))
+        lead = next(member for member in status["members"] if member["id"] == "lead")
+        self.assertEqual(lead["session_account"], "second", lead)
+        # The moved lead still answers in that conversation.
+        text = "After the team swap."
+        self.deliver(name, text)
+        self.assertEqual(self.accepted(name, text, conversation), 1, self.describe())
 
     def test_input_keys_reach_claude_through_the_host(self):
         self.check_keys(self.launch("keys"))
@@ -941,9 +1189,83 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
             "stream_max_retries = 0", "", *trusted]), encoding="utf-8")
         self.env["CODEX_HOME"] = str(self.agent_home)
 
+    def prepare_account(self, folder):
+        """A managed account's session drops OPENAI_API_KEY (accounts::select), so its
+        provider reads the fixture's key from a variable that is its own."""
+        config = (self.agent_home / "config.toml").read_text(encoding="utf-8")
+        (folder / "config.toml").write_text(
+            config.replace('env_key = "OPENAI_API_KEY"', 'env_key = "FIXTURE_API_KEY"'), encoding="utf-8")
+
+    def test_native_subagent_keeps_the_parent_transcript_and_accepts_more_input(self):
+        name = self.launch("child", self.NO_HOOK_REVIEW, "--enable", "multi_agent")
+        self.deliver(name, "Parent fixture before spawning.")
+        parent = self.record(name)
+        self.assertTrue(parent.get("conversation_id"), self.describe())
+        self.assertTrue(parent.get("transcript"), self.describe())
+        self.deliver(name, api.CODEX_SUBAGENT)
+        outputs = [result for entry in api.requests(self.api_root) if entry.get("prompt") == api.CODEX_SUBAGENT
+                   for result in entry.get("results") or []]
+        self.assertFalse(any(isinstance(result, str) and result.startswith(
+            ("unsupported call:", "failed to parse function arguments:")) for result in outputs), outputs)
+
+        def child_finished():
+            record = self.record(name)
+            for key in ("conversation_id", "transcript", "run_id", "pid"):
+                self.assertEqual(record.get(key), parent[key], key)
+            children = record.get("subagents") or {}
+            return next(((sid, child) for sid, child in children.items()
+                         if child.get("state") == "finished" and not child.get("external")), None)
+
+        sid, child = self.until("the native child's separate result", child_finished)
+        self.assertEqual(child["detail"], api.REPLY)
+        paths = list((self.agent_home / "sessions").rglob(f"*{sid}.jsonl"))
+        self.assertEqual(len(paths), 1)
+        with paths[0].open(encoding="utf-8") as transcript:
+            meta = json.loads(transcript.readline())["payload"]
+        self.assertIn("subagent", meta["source"])
+        self.assertEqual(meta["parent_thread_id"], parent["conversation_id"])
+        self.deliver(name, "Parent fixture after spawning.")
+        self.assertEqual(self.record(name)["conversation_id"], parent["conversation_id"])
+        for text in ("Parent fixture before spawning.", api.CODEX_SUBAGENT, "Parent fixture after spawning."):
+            self.assertEqual(self.accepted(name, text, parent["conversation_id"]), 1)
+
+    def test_permission_combinations_match_the_native_argument_parser(self):
+        # Completion parses the real installed CLI arguments and exits without
+        # starting an agent, requesting a model or setting up a Windows sandbox.
+        cases = [
+            ({}, [], True),
+            ({"approve_for_me": "on"}, ["--approve-for-me"], True),
+            ({"approval": "on-request", "sandbox": "workspace-write"},
+             ["-a", "on-request", "-s", "workspace-write"], True),
+        ]
+        for key, flag, value in (("approval", "-a", "on-request"), ("approval", "-a", "never"),
+                                 ("sandbox", "-s", "workspace-write"), ("sandbox", "-s", "read-only")):
+            cases.append(({"approve_for_me": "on", key: value}, ["--approve-for-me", flag, value], False))
+        for selection, flags, valid in cases:
+            with self.subTest(selection=selection):
+                native = subprocess.run([str(self.BINARY), *flags, "completion", "bash"], env=self.env,
+                                        capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                                        creationflags=host.HIDDEN, stdin=subprocess.DEVNULL)
+                self.assertEqual(native.returncode, 0 if valid else 2, native.stderr)
+                mode = "native:" + json.dumps(selection, separators=(",", ":"))
+                planned = self.hgs("codex", str(self.project), "--dry-run", "-d", "--permissions", mode,
+                                   rc=0 if valid else 1)
+                if not valid:
+                    self.assertIn("cannot be combined", planned.stderr)
+                elif selection.get("approve_for_me"):
+                    self.assertIn("codex --approve-for-me", planned.stdout)
+
     def transcript_rows(self, conversation_id):
+        # After a switch the conversation lives in the new account's store; the
+        # old account keeps only its own copy of the same rows.
+        homes = ([self.second_home] if self.second_home else []) + [self.agent_home]
+        paths = []
+        for home in homes:
+            paths = sorted((home / "sessions").rglob(f"rollout-*{conversation_id}.jsonl"))
+            if paths:
+                break
         rows = []
-        for path in sorted((self.agent_home / "sessions").rglob(f"rollout-*{conversation_id}.jsonl")):
+        for path in paths:
             for line in path.read_text(encoding="utf-8").splitlines():
                 try:
                     rows.append(json.loads(line))
@@ -974,6 +1296,39 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         conversation_id = conversation_id or self.row(name).get("conversation_id")
         return self.user_messages(conversation_id).count(text) if conversation_id else 0
 
+    def turn_ended(self, name, since):
+        # inspect takes the writer lock also needed by the native five-second
+        # Stop hook. New sessions journal by durable ID, and a renamed legacy
+        # session retains its original journal; neither key is its current label.
+        # Do not repeatedly launch inspectors ahead of that hook on
+        # a busy runner. Observe its journal read-only, then retain the public
+        # Stop/idle assertions; a missing or timed-out hook still fails the test.
+        record = self.record(name)
+        run, conversation = record.get("run_id"), record.get("conversation_id")
+        if not run or not conversation:
+            return None
+        path = self.state / "events.sqlite3"
+        try:
+            with closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=0)) as database:
+                stopped = database.execute(
+                    "SELECT 1 FROM events WHERE name=? AND conversation=? "
+                    "AND json_extract(payload, '$.run_id')=? "
+                    "AND json_extract(payload, '$.type')='Stop' "
+                    "AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main') "
+                    "AND json_extract(payload, '$.at')>=? ORDER BY seq DESC LIMIT 1",
+                    (record.get("journal_name") or name, conversation, run, since)).fetchone()
+        except sqlite3.OperationalError:
+            return None  # Not created yet or momentarily busy; the original end still applies.
+        return super().turn_ended(name, since) if stopped else None
+
+    def test_project_powershell_wrapper_reports_native_hooks_and_exact_messages(self):
+        program = str(self.bin / "codex.exe").replace("'", "''")
+        (self.project / "run_codex.ps1").write_text(f"& '{program}' @args; exit $LASTEXITCODE\n", encoding="utf-8-sig")
+        name = self.launch("wrapper", self.NO_HOOK_REVIEW)
+        self.check_messages(name)
+        self.assertTrue(self.inspect(name)["tracked"])
+        self.check_hook_form()
+
     def test_a_tracked_launch_reports_its_hooks_and_send_delivers_exact_messages(self):
         name = self.launch("messages", self.NO_HOOK_REVIEW)
         # Codex 0.162 starts its conversation with the first message, whose hooks confirm it;
@@ -1000,9 +1355,15 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         self.assertEqual(self.accepted(name, text), 1, self.describe())
 
     def test_hgs_answers_request_user_input_async(self):
+        (self.api_root / 'hold-codex-questions').touch()
         name = self.launch("question", self.NO_HOOK_REVIEW)
-        # The question does not block the turn: Codex accepts it and the turn ends.
-        self.deliver(name, api.QUESTIONS)
+        # Keep a genuine question alive. Once its turn ends, Codex clears it;
+        # answering a stale card from an idle composer is not question coverage.
+        row = self.ready(name)
+        self.send(name, self.message(row, api.QUESTIONS))
+        self.until('the native optional question', lambda: any(
+            card.get('source') == 'codex_async' for card in self.inspect(name).get('pending_questions', [])))
+        self.keys(name, {'named': 'S-Left'})
         card = self.card(name, "codex_async")
         item, = card["questions"]
         self.assertEqual((item["question"], [option["label"] for option in item["options"]]),
@@ -1025,6 +1386,14 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         self.until("the answered card to go", lambda: not [
             card for card in self.inspect(name).get("pending_questions", []) if card.get("source") == "codex_async"])
 
+    def test_optional_questions_close_when_codex_finishes_the_turn(self):
+        name = self.launch('question-end', self.NO_HOOK_REVIEW)
+        self.deliver(name, api.QUESTIONS)
+        self.assertEqual(self.inspect(name)['pending_questions'], [], self.describe())
+        self.assertEqual(self.row(name)['optional_questions']['count'], 0, self.describe())
+        self.assertFalse(any('<send_user_message_question_reply>' in text
+                             for text in self.user_messages(self.record(name)['conversation_id'])))
+
     def test_hgs_trusts_the_hooks_it_installed(self):
         # Without the bypass Codex stops at its review of the new hooks before SessionStart.
         name = self.launch("approval")
@@ -1039,6 +1408,207 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         self.assertEqual(self.accepted(name, MESSAGES[0]), 1, self.describe())
         events = [event["type"] for event in self.inspect(name)["events"]]
         self.assertTrue({"SessionStart", "UserPromptSubmit", "Stop"} <= set(events), events)
+
+    def tool_approval_fixture(self, automatic):
+        # Escalation goes straight to the permission flow, without setting up
+        # or executing inside a Windows sandbox. Nothing uses a real reviewer
+        # account: the automatic case exercises Codex's documented allow hook.
+        self.ARGS = ()
+        config = self.agent_home / "config.toml"
+        config.write_text(config.read_text(encoding="utf-8")
+                          .replace('approval_policy = "never"', 'approval_policy = "on-request"')
+                          .replace('sandbox_mode = "danger-full-access"', 'sandbox_mode = "read-only"'),
+                          encoding="utf-8")
+        if automatic:
+            decision = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                        "decision": {"behavior": "allow"}}})
+            # Leave time for listing polls while the native approval decision
+            # is still automatic and its tracking hook has already arrived.
+            command = "Start-Sleep -Seconds 2; Write-Output '" + decision + "'"
+            (self.agent_home / "hooks.json").write_text(json.dumps({"hooks": {"PermissionRequest": [
+                {"hooks": [{"type": "command", "commandWindows": command, "command": command}]}]}}),
+                encoding="utf-8")
+        name = self.launch("tool-auto" if automatic else "tool-manual", self.NO_HOOK_REVIEW)
+        self.send(name, self.message(self.ready(name), api.CODEX_ESCALATION))
+        if automatic:
+            def started_without_attention():
+                view = self.row(name)
+                self.assertNotEqual(view["phase"], "approval", view)
+                return (self.project / api.CODEX_STARTED).is_file()
+            self.until("automatic approval without a human-attention phase", started_without_attention)
+        return name
+
+    def check_continuing_permission(self, name):
+        self.until("the approved native command to start", lambda: (self.project / api.CODEX_STARTED).is_file())
+        # Codex sent PermissionRequest but has not sent PostToolUse. Waiting
+        # for the command to finish would leave a false approval toast up.
+        record = self.record(name)
+        self.assertEqual(record["phase"], "approval", self.describe())
+        self.assertTrue(any(event["type"] == "PermissionRequest" for event in self.inspect(name)["events"]))
+        for _ in range(3):
+            for view in (self.row(name), self.inspect(name)):
+                self.assertEqual(view["phase"], "tool", view)
+                self.assertEqual(view["session_state"], "working", view)
+            time.sleep(0.1)
+        (self.project / api.CODEX_RELEASE).touch()
+        self.until("the approved command's turn to finish", lambda: self.turn_ended(name, 0))
+
+    def test_a_hook_allowed_codex_command_does_not_request_human_approval(self):
+        self.check_continuing_permission(self.tool_approval_fixture(automatic=True))
+
+    def test_codex_model_review_does_not_request_human_approval(self):
+        self.ARGS = ()
+        config = self.agent_home / "config.toml"
+        config.write_text(config.read_text(encoding="utf-8")
+                          .replace('approval_policy = "never"', 'approval_policy = "on-request"\n'
+                                   'approvals_reviewer = "auto_review"')
+                          .replace('sandbox_mode = "danger-full-access"', 'sandbox_mode = "read-only"'),
+                          encoding="utf-8")
+        name = self.launch("tool-review", self.NO_HOOK_REVIEW)
+        self.send(name, self.message(self.ready(name), api.CODEX_ESCALATION))
+        try:
+            self.until("the local model reviewer", lambda: (self.project / api.CODEX_REVIEW_STARTED).is_file())
+            self.until("the native review status with command details",
+                       lambda: "Reviewing approval request" in self.capture(name) and "└" in self.capture(name))
+            self.assertFalse((self.project / api.CODEX_STARTED).exists())
+            self.assertEqual(self.record(name)["phase"], "approval")
+            for _ in range(3):
+                for view in (self.row(name), self.inspect(name)):
+                    self.assertEqual((view["phase"], view["session_state"]), ("tool", "working"), view)
+        finally:
+            (self.project / api.CODEX_REVIEW_RELEASE).touch()
+        self.check_continuing_permission(name)
+
+    def test_a_codex_terminal_approval_clears_before_the_command_finishes(self):
+        name = self.tool_approval_fixture(automatic=False)
+        self.until("the native permission chooser", lambda: "Would you like to run the following command?" in self.capture(name))
+        for view in (self.row(name), self.inspect(name)):
+            self.assertEqual((view["phase"], view["session_state"]), ("approval", "user"), view)
+        self.assertFalse((self.project / api.CODEX_STARTED).exists())
+        self.keys(name, {"named": "Enter"})
+        self.check_continuing_permission(name)
+
+    def untrusted_folder(self, git=False):
+        config = self.agent_home / 'config.toml'
+        config.write_text(config.read_text(encoding='utf-8').split('[projects.', 1)[0], encoding='utf-8')
+        target = self.project.parent if git else self.project
+        (target / '.codex').mkdir()
+        (target / '.codex/config.toml').write_text('# Synthetic project, no hooks or commands.\n', encoding='utf-8')
+        if git:
+            subprocess.run(['git', 'init', '-q', str(target)], check=True, env=self.env, timeout=15)
+        name = self.launch('folder-trust', self.NO_HOOK_REVIEW)
+        card = self.card(name, 'codex_folder_trust')
+        self.assertNotIn('projects', tomllib.loads(config.read_text(encoding='utf-8')))
+        self.assertFalse(self.record(name).get('conversation_id'))
+        return name, card, target
+
+    def test_explicit_folder_trust_names_the_git_root_then_sends(self):
+        name, card, target = self.untrusted_folder(git=True)
+        question = card['questions'][0]
+        self.assertEqual(question['question'], 'Trust this Git repository?')
+        self.assertIn(str(target).lower(), question['options'][0]['description'].lower())
+        payload, receipt = self.answer(name, card, [dict(question_id='trust', selected_option_ids=['trust_0'], text='')])
+        self.assertEqual(self.json('answer', name, '--json', input=json.dumps(payload)), receipt)
+        projects = tomllib.loads((self.agent_home / 'config.toml').read_text(encoding='utf-8'))['projects']
+        self.assertEqual({path.lower() for path, value in projects.items() if value['trust_level'] == 'trusted'},
+                         {str(target).lower()})
+        # Windows 0.167 opens a separate sandbox NUX after folder consent,
+        # even with this fixture's YOLO launch. Trust succeeded; the following
+        # chooser must still block input. Never set up a sandbox in this test.
+        notice = 'Set up the Codex agent sandbox'
+        self.until('the separate Windows sandbox setup chooser', lambda: notice in self.capture(name))
+        blocked = self.hgs('send', name, '--json', input=json.dumps(self.message(self.row(name), MESSAGES[0])), rc=None)
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+        self.assertIn('Codex is waiting for your sandbox setup choice', blocked.stderr)
+        self.assertEqual(api.requests(self.api_root), [])
+        self.assertFalse(any(q.get('source') == 'codex_folder_trust'
+                             for q in self.inspect(name).get('pending_questions', [])))
+        # This is the fixture user's Terminal action, not an app trust answer
+        # or a sandbox/Administrator choice. The same process then takes input.
+        self.keys(name, {'named': 'Escape'})
+        self.until('sandbox setup dismissed in Terminal', lambda: notice not in self.capture(name))
+        self.assertIsNone(tomllib.loads((self.agent_home / 'config.toml').read_text(encoding='utf-8')).get('windows', {}).get('sandbox'))
+        self.deliver(name, MESSAGES[0])
+
+    def test_explicit_sandbox_setup_quit_is_bound_and_never_configures_or_replays(self):
+        # Exercise ordinary Codex permissions, not this suite's YOLO default.
+        # The native header then has no permissions row (history_cell/session.rs).
+        config = self.agent_home / 'config.toml'
+        config.write_text(config.read_text(encoding='utf-8')
+                          .replace('sandbox_mode = "danger-full-access"', 'sandbox_mode = "workspace-write"')
+                          .replace('approval_policy = "never"', 'approval_policy = "on-request"'), encoding='utf-8')
+        # hgs's native-account default is bypass; explicit launch switches
+        # take precedence without changing that private account default.
+        self.ARGS = ('--sandbox', 'workspace-write', '--ask-for-approval', 'on-request')
+        name, trust, _ = self.untrusted_folder()
+        self.answer(name, trust, [dict(question_id='trust', selected_option_ids=['trust_0'], text='')])
+        card = self.card(name, 'codex_sandbox_setup')
+        screen = self.capture(name)
+        self.assertNotIn('permissions: YOLO mode', screen)
+        evidence = TESTS.parent / 'artifacts/test-results/codex-sandbox-setup-native.txt'
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_text(screen, encoding='utf-8')
+        self.assertEqual([o['label'] for o in card['questions'][0]['options']], [
+            'Set up default sandbox (requires Administrator permissions)',
+            'Use non-admin sandbox (higher risk if prompt injected)', 'Quit'])
+        self.assertEqual(card['answer_transport'], 'codex_tui')
+        self.assertEqual(card['run_id'], self.row(name)['run_id'])
+        self.assertEqual(api.requests(self.api_root), [])
+        original = self.record(name)
+        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', original['base'])
+        self.assertFalse(original.get('conversation_id'))
+        self.assertIsNone(tomllib.loads((self.agent_home/'config.toml').read_text(encoding='utf-8')).get('windows', {}).get('sandbox'))
+        # Even an agent-marked CLI must not drive this picker. Use only Quit
+        # for the native refusal control: a regression cannot request setup.
+        markers = ('HGS_SESSION', 'HGS_RUN_ID', 'HGS_SESSION_ID')
+        inherited = {key:self.env.get(key) for key in markers}
+        try:
+            self.env.update(HGS_SESSION='codex/fixture/unrelated', HGS_RUN_ID=str(uuid.uuid4()),
+                            HGS_SESSION_ID=str(uuid.uuid4()))
+            agent = dict(request_id=str(uuid.uuid4()), expected_run_id=card['run_id'],
+                         expected_conversation_id='', question_id=card['question_id'],
+                         expected_question_hash=card['question_hash'],
+                         answers=[dict(question_id='sandbox', selected_option_ids=['sandbox_2'], text='')])
+            refused = self.hgs('answer', name, '--json', input=json.dumps(agent), rc=None)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
+            self.assertIn('person', refused.stderr)
+        finally:
+            for key, value in inherited.items():
+                if value is None: self.env.pop(key, None)
+                else: self.env[key] = value
+        self.assertEqual(self.card(name, 'codex_sandbox_setup')['question_hash'], card['question_hash'])
+        # A stale card cannot drive even one navigation key. This is a new
+        # rejected request, not a retry of an uncertain submission.
+        stale = dict(request_id=str(uuid.uuid4()), expected_run_id=card['run_id'],
+                     expected_conversation_id='', question_id=card['question_id'], expected_question_hash='0'*64,
+                     answers=[dict(question_id='sandbox', selected_option_ids=['sandbox_2'], text='')])
+        rejected = self.hgs('answer', name, '--json', input=json.dumps(stale), rc=None)
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+        self.assertEqual(self.card(name, 'codex_sandbox_setup')['question_hash'], card['question_hash'])
+        # Only this fixture person's explicit Quit is delivered. No setup
+        # executable is extracted; neither setup nor elevation is requested.
+        payload, receipt = self.answer(name, card, [dict(question_id='sandbox', selected_option_ids=['sandbox_2'], text='')])
+        self.assertEqual(self.json('answer', name, '--json', input=json.dumps(payload)), receipt)
+        self.until('the original Codex process to exit after Quit',
+                   lambda: not self.alive(original['pid'], original['process_start']))
+        self.assertEqual(api.requests(self.api_root), [])
+        current = self.record(name)
+        if current:
+            self.assertEqual((current.get('pid'), current.get('process_start'), current['run_id']),
+                             (original['pid'], original['process_start'], original['run_id']))
+        self.assertIsNone(tomllib.loads((self.agent_home/'config.toml').read_text(encoding='utf-8')).get('windows', {}).get('sandbox'))
+
+    def test_explicit_folder_cancel_keeps_trust_unchanged(self):
+        name, card, _ = self.untrusted_folder()
+        cancel = card['questions'][0]['options'][1]['label']
+        self.assertIn(cancel, ('Quit', 'Back to Agent Command Center'))
+        payload, receipt = self.answer(name, card, [dict(question_id='trust', selected_option_ids=['trust_1'], text='')])
+        self.assertEqual(self.json('answer', name, '--json', input=json.dumps(payload)), receipt)
+        if cancel == 'Back to Agent Command Center':
+            self.until('Back to the live command center', lambda: 'Agent command center' in self.capture(name))
+            self.assertEqual(self.row(name)['process_state'], 'running')
+        self.assertNotIn('projects', tomllib.loads((self.agent_home / 'config.toml').read_text(encoding='utf-8')))
+        self.assertFalse(self.record(name).get('conversation_id'))
 
     def test_clear_context_starts_a_new_conversation_in_the_same_agent(self):
         name = self.launch("clear", self.NO_HOOK_REVIEW)
@@ -1058,8 +1628,17 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         self.assertEqual(self.inspect(name)["session_clear"]["type"], "SessionCleared")
 
     def test_pause_resume_and_terminate(self):
+        self.env['RUST_LOG'] = 'warn,codex_core::rollout=debug,codex_state=debug,codex_tui::session_resume=debug'
         name = self.launch("lifecycle", self.NO_HOOK_REVIEW)
-        self.check_lifecycle(name)
+        try:
+            self.check_lifecycle(name)
+        finally:
+            diagnostic = getattr(self, 'resume_diagnostic', None)
+            if diagnostic is not None:
+                print('ZERUS_CODEX_RESUME_EVIDENCE=' + diagnostic.finish(self.agent_home), flush=True)
+
+    def test_a_switch_to_another_account_keeps_the_conversation_folder_and_name(self):
+        self.check_switch_account("switch")
 
     def test_input_keys_reach_codex_through_the_host(self):
         self.check_keys(self.launch("keys", self.NO_HOOK_REVIEW))

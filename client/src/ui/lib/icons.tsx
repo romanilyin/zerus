@@ -1,5 +1,6 @@
-import type { JSX } from "solid-js";
+import { Show, type JSX } from "solid-js";
 import { ICONS } from "./icons.generated";
+import { logoOf, nextLogoId, uniqueIds } from "./agent-logos";
 import { QT_ICONS, ZERUS_PETAL } from "./qt-icons";
 import type { AgentKind } from "../sessions/types";
 
@@ -14,16 +15,25 @@ const AGENT_GLYPHS: Record<AgentKind, string> = {
   codex: rotations(6, (d) => `<path transform="rotate(${d} 12 12)" d="M12 5C20 2 23 12 16 15L10 12L10 7"/>`),
   claude: rotations(8, (d) => `<path transform="rotate(${d} 12 12)" d="M12 15V21"/>`),
   kimi: `<path d="M6 4V20M6 12L18 4M6 12L18 20"/>`,
+  qwen: `<circle cx="11" cy="11" r="7"/><path d="M16 16L21 21"/>`,
+  // Hermes Agent: a winged staff (WhiteWh fork, original glyph).
+  hermes: `<path d="M12 3V21M12 7C9 4 5 5 3 7C6 7 8 8 12 10C16 8 18 7 21 7C19 5 15 4 12 7M9 14C11 13 13 13 15 14M9 18C11 17 13 17 15 18"/>`,
   opencode: `<path d="M8 5L3 12L8 19M16 5L21 12L16 19M14 5L10 19"/>`,
   deepseek: `<path d="M3 10C5 5 15 4 18 10L23 7L22 13L18 13C15 22 3 19 3 10Z"/><circle cx="8" cy="10" r=".6" fill="currentColor"/>`,
+  ollama: `<path d="M7 3V8M17 3V8M5 10A7 7 0 0 1 19 10V14A7 7 0 0 1 5 14Z"/><circle cx="9.5" cy="11" r=".6" fill="currentColor"/><circle cx="14.5" cy="11" r=".6" fill="currentColor"/>`,
+  sh: QT_ICONS.terminal.body,
 };
 
 export const AGENT_LABEL: Record<AgentKind, string> = {
   claude: "Claude",
   codex: "Codex",
   kimi: "Kimi",
+  qwen: "Qwen Code",
+  hermes: "Hermes Agent",
   deepseek: "DeepSeek",
   opencode: "OpenCode",
+  ollama: "Ollama",
+  sh: "Shell",
 };
 
 // Lucide names used across the mockup that mean the same thing as a Qt glyph.
@@ -116,20 +126,53 @@ export function Icon(props: IconProps) {
   );
 }
 
+/**
+ * The provider's own logo (agent-logos.ts) in its colors, its monochrome parts
+ * in the theme's text color as in Qt's agentLogoIcon; renders `fallback` for an
+ * agent without a logo.
+ */
+export function AgentLogo(props: { agent: string | undefined; size?: number; class?: string; fallback?: JSX.Element }) {
+  const uid = nextLogoId();
+  return (
+    <Show when={logoOf(props.agent)} fallback={props.fallback}>
+      {(logo) => (
+        <svg
+          class={props.class ? `agent-logo ${props.class}` : "agent-logo"}
+          width={props.size ?? 12}
+          height={props.size ?? 12}
+          viewBox="0 0 24 24"
+          fill={logo().fill}
+          fill-rule={logo().rule}
+          style={{ color: "var(--z-color-text)", flex: "none" }}
+          aria-hidden="true"
+          innerHTML={uniqueIds(logo().inner, uid)}
+        />
+      )}
+    </Show>
+  );
+}
+
 export function AgentGlyph(props: { agent: AgentKind; size?: number; class?: string }) {
   return (
-    <svg
+    <AgentLogo
+      agent={props.agent}
+      size={props.size}
       class={props.class}
-      width={props.size ?? 12}
-      height={props.size ?? 12}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-      innerHTML={AGENT_GLYPHS[props.agent]}
+      fallback={
+        <svg
+          class={props.class}
+          width={props.size ?? 12}
+          height={props.size ?? 12}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+          innerHTML={AGENT_GLYPHS[props.agent]}
+        />
+      }
     />
   );
 }

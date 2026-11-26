@@ -47,11 +47,16 @@ fn live_smoke() {
                     *statuses.entry(status.name()).or_default() += 1;
                     "computer"
                 }
+                Change::Retry { .. } => "retry",
                 Change::Activity { .. } => "activity",
                 Change::Processes { .. } => "processes",
                 Change::Tasks { .. } => "tasks",
+                Change::Git { .. } => "git",
                 Change::Machine { .. } => "machine",
                 Change::Organization { .. } => "organization",
+                Change::Teams { .. } => "teams",
+                Change::TeamHeads { .. } => "team_heads",
+                Change::TeamViews { .. } => "team_views",
             };
             *kinds.entry(kind).or_default() += 1;
             coalescer.push(change);

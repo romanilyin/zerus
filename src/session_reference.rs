@@ -16,6 +16,10 @@ pub(crate) struct Reference {
     pub run: String,
     pub archive: String,
     pub agent: String,
+    /// The durable session ID (zerus-ucck P1c). Parsed and verified when a
+    /// reference carries it; emission needs the P3 fleet transition gate,
+    /// because older parsers refuse an unknown field.
+    pub session: String,
 }
 fn encode(value: &str) -> String {
     value
@@ -68,6 +72,7 @@ impl Reference {
                 "run",
                 "archive",
                 "agent",
+                "session",
             ]
             .contains(&key.as_str())
                 || fields.insert(key, decode(value)?).is_some()
@@ -87,6 +92,7 @@ impl Reference {
             run: take("run"),
             archive: take("archive"),
             agent: take("agent"),
+            session: take("session"),
         };
         if !uuid::Uuid::parse_str(&reference.machine)
             .is_ok_and(|id| !id.is_nil() && id.to_string() == reference.machine)
@@ -101,6 +107,7 @@ impl Reference {
             || reference.name.len() > 512
             || !reference.name.contains('/')
             || (reference.conversation.is_empty() && reference.run.is_empty())
+            || (!reference.session.is_empty() && !state::session_id::canonical(&reference.session))
             || [
                 &reference.name,
                 &reference.conversation,
@@ -124,6 +131,7 @@ impl Reference {
             ("run", &self.run),
             ("archive", &self.archive),
             ("agent", &self.agent),
+            ("session", &self.session),
         ];
         format!(
             "zerus://session?{}",
@@ -197,8 +205,23 @@ pub(crate) fn create(config: &Config, args: &[String]) -> cli::Result<i32> {
         run: text("run_id"),
         archive,
         agent,
+        session: emitted_session(config, &details),
     };
     print(&reference, as_json, json!({}))
+}
+
+/// The optional reference field stays absent until every answering route is
+/// compatible. This is metadata only; the receiver verifies all selectors.
+fn emitted_session(config: &Config, record: &Value) -> String {
+    record["session_id"]
+        .as_str()
+        .filter(|id| {
+            state::session_id::canonical(id)
+                && uuid::Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())
+        })
+        .filter(|_| swarm::session_labels::cached(config))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn print(reference: &Reference, as_json: bool, extra: Value) -> cli::Result<i32> {
@@ -207,6 +230,9 @@ fn print(reference: &Reference, as_json: bool, extra: Value) -> cli::Result<i32>
     if as_json {
         let mut output = json!({"schema":1,"uri":uri,"name":reference.name,"machine_id":reference.machine,
         "host":reference.host,"run_id":reference.run,"conversation_id":reference.conversation,"archive_id":reference.archive,"agent_id":reference.agent});
+        if !reference.session.is_empty() {
+            output["session_id"] = json!(reference.session);
+        }
         for (key, value) in extra.as_object().into_iter().flatten() {
             output[key] = value.clone();
         }
@@ -218,24 +244,48 @@ fn print(reference: &Reference, as_json: bool, extra: Value) -> cli::Result<i32>
 }
 
 /// `hgs self`: the reference of the agent whose process runs this CLI, under
-/// its current name. Only verified native ancestry identifies the caller.
+/// its current name. Verified native ancestry identifies the caller, or for a
+/// DeepSeek tool command (task #34) the binding of its DSH_SESSION_ID. Native
+/// shell claims are explicitly distinguished from process proof and never enter
+/// caller(), the send/graph attribution path.
 pub(crate) fn current(config: &Config, args: &[String]) -> cli::Result<i32> {
     let as_json = match args {
         [] => false,
         [flag] if flag == "--json" => true,
         _ => return Err(Error::new(1, "usage: hgs self [--json]")),
     };
-    let (reference, provider) = caller(config)?
-        .ok_or_else(|| Error::new(1, "hgs self: no live Zerus session owns this process"))?;
-    print(&reference, as_json, json!({"provider": provider}))
+    let (record, source) = match state::session_graph::caller_record() {
+        // zerus-ppd26: a hosted DeepSeek call is proven by its host's per-call
+        // token under the host's ancestry, never by an agent process of its own.
+        Some(record) if record["caller_proof"]["kind"] == "hosted_call" => (record, "hosted_call"),
+        Some(record) => (record, "process"),
+        // A native claim stays a claim. Without one, a command under a
+        // recorded DeepSeek host says so (zerus-ppd26.15).
+        None => (state::parent_link::native_self().map_err(|e| Error::new(1, e))?
+            .ok_or_else(|| match state::dsh::host_refusal() {
+                Some(refusal) => Error::new(1, format!("hgs self: {refusal}")),
+                None => Error::new(1, "hgs self: no live Zerus session owns this process"),
+            })?, "claimed"),
+    };
+    let (reference, provider) = from_record(config, &record)?;
+    let parent = json!({"session_id":record["session_id"],"name":record["name"],"run_id":record["run_id"],"conversation_id":record["conversation_id"]});
+    let mut fields = json!({"provider":provider,"identity_source":source,"session_id":record["session_id"],"parent_identity":parent});
+    if source == "hosted_call" {
+        fields["proof_limit"] = json!(state::session_graph::HOSTED_LIMIT);
+    }
+    print(&reference, as_json, fields)
 }
 
 /// The reference and provider of the live agent whose process runs this CLI,
 /// under its current name; `None` when no agent's ancestry owns it.
 fn caller(config: &Config) -> cli::Result<Option<(Reference, String)>> {
-    let Some(record) = state::session_graph::caller_record() else {
+    let Some(record) = self_record() else {
         return Ok(None);
     };
+    from_record(config, &record).map(Some)
+}
+
+fn from_record(config: &Config, record: &Value) -> cli::Result<(Reference, String)> {
     let text = |key: &str| record[key].as_str().unwrap_or_default().to_owned();
     let reference = Reference {
         machine: swarm::local_node_id(config).map_err(|e| Error::new(1, e.to_string()))?,
@@ -245,8 +295,20 @@ fn caller(config: &Config) -> cli::Result<Option<(Reference, String)>> {
         run: text("run_id"),
         archive: String::new(),
         agent: String::new(),
+        session: emitted_session(config, record),
     };
-    Ok(Some((reference, text("agent"))))
+    let provider = record["agent"].as_str().filter(|s| !s.is_empty())
+        .or_else(|| record["backend"].as_str()).unwrap_or_default().to_owned();
+    Ok((reference, provider))
+}
+
+/// The calling agent's record. Task #34: a DeepSeek tool command has no hgs
+/// session environment and runs under the shared DeepSeek host, so ancestry
+/// never names it ("hgs self: no live Zerus session owns this process"); its
+/// harness exports the conversation as DSH_SESSION_ID, whose binding is the
+/// session, as `hgs run` and `hgs team` take it.
+fn self_record() -> Option<serde_json::Value> {
+    state::session_graph::caller_record().or_else(state::dsh_caller_record)
 }
 
 /// The text a guarded send of the calling agent delivers: `text` inside one
@@ -347,6 +409,85 @@ pub(crate) fn inspect(config: &Config, reference: &Reference) -> cli::Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task #34 (audit #29 P6): `hgs self` from a DeepSeek tool command said
+    /// "no live Zerus session owns this process": it has no hgs session
+    /// environment and no hgs process above it. The binding of its
+    /// DSH_SESSION_ID is its session now.
+    #[test]
+    fn hgs_self_takes_a_deepseek_tool_commands_binding() {
+        let root = tempfile::tempdir().unwrap();
+        state::with_test_state_root(root.path(), || {
+            if state::session_graph::caller_record().is_some() {
+                return; // run inside a real session: its own record answers first
+            }
+            assert!(self_record().is_none(), "no session and no DeepSeek conversation");
+            state::builds_test_support::write_qa_binding();
+            state::builds_test_support::set_dsh_session(Some("session-10e9dd92-4a7a-49be-a139-da281115f842"));
+            let found = self_record();
+            state::builds_test_support::set_dsh_session(None);
+            let found = found.expect("the DeepSeek binding is the caller");
+            assert_eq!(found["name"], "dsh/Zerus/zerus-next-for-the-fork-qa");
+            assert_eq!(found["run_id"], "ba3d8c92-041c-4e14-81b2-b2e63f0e7ee7");
+        });
+    }
+
+    #[test]
+    fn session_emission_needs_a_fresh_open_gate_and_a_canonical_stored_id() {
+        use std::{
+            collections::BTreeMap,
+            time::{Duration, Instant},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            home: root.path().to_string_lossy().into(),
+            dir: root.path().join("config"),
+            state: root.path().join("state"),
+            selves: vec!["fixture".into()],
+            peers: vec![],
+            base_peers: vec![],
+            peers_from_environment: false,
+            machines: BTreeMap::new(),
+            tab: false,
+            tab_colors: String::new(),
+        };
+        for path in [&config.dir, &config.state, &config.dir.join("swarm")] {
+            crate::platform::private_dir(path).unwrap();
+        }
+        let machine = "11111111-1111-4111-8111-111111111111";
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let raw = json!({"node_id":machine,"catalog":{"schema":1,"swarm_id":"33333333-3333-4333-8333-333333333333","operations":{}},"imported":true,"bindings":{},"peers":{}});
+        std::fs::write(config.dir.join("swarm/catalog.json"), raw.to_string()).unwrap();
+        let record = json!({"session_id":sid});
+        assert_eq!(emitted_session(&config, &record), "");
+        swarm::session_labels::refresh_local(&config, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(emitted_session(&config, &record), sid);
+        for id in ["", "not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            assert_eq!(emitted_session(&config, &json!({"session_id":id})), "");
+        }
+        let reference = Reference {
+            machine: machine.into(),
+            host: "fixture".into(),
+            name: "claude/example/shared".into(),
+            conversation: "conversation".into(),
+            run: "run".into(),
+            archive: String::new(),
+            agent: String::new(),
+            session: emitted_session(&config, &record),
+        };
+        let uri = reference.uri();
+        assert_eq!(Reference::parse(&uri).unwrap().session, sid);
+        let message = envelope(&reference.name, &reference.host, &uri, "hello");
+        let (_, copied, _) = sender_message(&message).unwrap();
+        assert_eq!(Reference::parse(&copied).unwrap().session, sid);
+        std::fs::write(
+            config.dir.join("swarm/session-id-memberships.json"),
+            b"damaged primary",
+        )
+        .unwrap();
+        assert_eq!(emitted_session(&config, &record), "");
+    }
     #[test]
     fn strict_uri_round_trip_and_ambiguous_fields() {
         let reference = Reference {
@@ -357,6 +498,7 @@ mod tests {
             run: "run".into(),
             archive: String::new(),
             agent: String::new(),
+            session: String::new(),
         };
         let uri = reference.uri();
         assert_eq!(Reference::parse(&uri).unwrap().name, reference.name);
@@ -374,6 +516,41 @@ mod tests {
         }
     }
 
+    /// zerus-ucck P1c: references do not emit `session` until every reader
+    /// parses it. One built as `hgs reference` and `hgs self` build it uses
+    /// only the fields the strict parser of older hgs accepts, and still parses.
+    #[test]
+    fn an_emitted_reference_keeps_the_strict_shape_older_parsers_accept() {
+        const OLDER: [&str; 7] = ["machine", "host", "name", "conversation", "run", "archive", "agent"];
+        let reference = Reference {
+            machine: "11111111-1111-4111-8111-111111111111".into(),
+            host: "fixture".into(),
+            name: "claude/project/a".into(),
+            conversation: "conversation".into(),
+            run: "run".into(),
+            archive: "22222222-2222-4222-8222-222222222222".into(),
+            agent: "agent".into(),
+            session: String::new(),
+        };
+        let uri = reference.uri();
+        let query = uri.strip_prefix("zerus://session?").unwrap();
+        for pair in query.split('&') {
+            let key = pair.split_once('=').unwrap().0;
+            assert!(OLDER.contains(&key), "{key} in {uri}");
+        }
+        assert_eq!(Reference::parse(&uri).unwrap().session, "");
+        // The current parser accepts a session ID, exactly once and canonical.
+        let session = "3f2a9c1d-0b4e-4d6a-9c1d-2e3f4a5b6c7d";
+        assert_eq!(Reference::parse(&format!("{uri}&session={session}")).unwrap().session, session);
+        for tail in [
+            "&session=NOT-A-UUID".to_owned(),
+            format!("&session={}", session.to_uppercase()),
+            format!("&session={session}&session={session}"),
+        ] {
+            assert!(Reference::parse(&format!("{uri}{tail}")).is_err(), "{tail}");
+        }
+    }
+
     #[test]
     fn the_sender_envelope_names_an_exact_copyable_reference() {
         let reference = Reference {
@@ -384,6 +561,7 @@ mod tests {
             run: "run".into(),
             archive: String::new(),
             agent: String::new(),
+            session: String::new(),
         };
         let uri = reference.uri();
         let text = envelope(&reference.name, &reference.host, &uri, "Line one.\n\nLine two.");

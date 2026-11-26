@@ -1,41 +1,37 @@
 Work in an agent team (hgs guide team)
 
-A team has a lead and members on any agent, model or computer. The lead
-plans tasks; Zerus hands ready ones to free members and reports to the lead.
-Requests need a lowercase canonical UUID (uuidgen); reuse it to retry.
+A lead plans tasks and Zerus hands each ready task to a free member, on any agent and
+computer. Requests are JSON on stdin with a lowercase UUID "request_id"; reuse one to retry.
+A doorbell in your terminal means unread messages: {} | hgs team inbox --json.
+Work only on what hgs team current shows, else ask the lead. A #N in a lead message
+for a task you do not hold is a reference, not work.
 
-Lead, from your own session:
-  {"request_id":"UUID","name":"Checkout","goal":"...","folder":"DIR"} |
-    hgs team create --json        prints the team id; you lead it
-  plan while Planning (the whole plan):
-    {"request_id":"UUID","team":"ID","members":[{"id":"api","role":"Backend",
-     "agent":"codex"}],"tasks":[{"id":1,"title":"...","criteria":["..."],
-     "assignee":"api","deps":[{"task":2}]}]} | hgs team plan --json
-  hard waits for Accepted, soft for In progress. The owner approves
-  in Zerus; nothing runs before.
-  {"team":"ID"} | hgs team status --json   tasks, attempts, waits, findings
-  {"team":"ID"} | hgs team inbox --json    reports, questions, your tasks
-  Reports arrive as [Zerus team messages; decide each:
-    {"request_id":"UUID","team":"ID","task":N} | hgs team accept --json
-    add "reason" to reject (it returns); "hold":true keeps it back:
-    {"request_id":"UUID","team":"ID","task":N} | hgs team release --json
-    gives it out; hgs team hold --json holds a pending task.
-  reassign, retry, cancel take the same fields; a free peer of the same
-  role may get it; reassign pins it. Members ask with hgs team ask and
-  answer with hgs team reply; native questions and permission requests need
-  hgs team answer. Allow only what the task needs; else ask the owner.
-  When a member stops: message, retry, reassign or ask the owner.
-  Phases, extend, finish: hgs guide team-lead
-  A DeepSeek (dsh) lead acts as Lead, not the owner: owner-only decisions
-  are refused to it.
-
-Member: the task message names your task and attempt. Do it, then report once:
+Report once, when the task is done:
   {"request_id":"UUID","team":"ID","task":N,"attempt":"ATTEMPT","text":"..."} |
     hgs @LEAD team report --json
-  Ask the lead when blocked; the attempt stays open:
-    {"request_id":"UUID","team":"ID","attempt":"ATTEMPT","text":"..."} |
-    hgs team ask --json
-  Your task again: {"attempt":"ATTEMPT"} | hgs team current --json
-  A progress line is not a report.
-Say what changed and how you checked it. A report for a task taken from you
-is refused. Sub-teams: hgs guide team-tree.
+Say what changed and how you checked it. A progress line is interim; only hgs team
+report reports, and a report on a task you did not take is refused.
+
+Remove the builds, extra CARGO_TARGET_DIRs, worktrees and package folders you made for
+a task when you report (keep your target); never another's; rmdir a node_modules junction.
+
+Blocked: ask the lead. The attempt stays open:
+  {"request_id":"UUID","team":"ID","attempt":"ATTEMPT","text":"..."} | hgs team ask --json
+A question goes through hgs team ask, never a report. Anything else for the lead:
+  {"request_id":"UUID","to":"lead","text":"...","urgent":true} | hgs team message --json
+A task that can go on only after CI, an install or a card: never poll or sleep, park it
+(hgs guide team-park). A job past its estimate: {"label":"x","minutes":15} | hgs team
+expect --json. Your pulse for the lead, each part at most 500 characters:
+  {"attempt":"ATTEMPT","done":"...","next":"...","blocked":"..."} | hgs team note --json
+
+First: hgs team lore find; code and docs: hgs guide code. Builds and tests: hgs guide
+team-run, team-tests (Codex on Windows: team-run too). Leading a team: hgs guide team-lead.
+
+Scratch teams (the QA right). With the operate profile you run live checks in your own
+scratch teams: hgs team create --json from your session with a folder under the team's
+scratch root (its scratch_root, or <team folder>/.qa-scratch). You lead it, its plan needs
+no card, the parent's caps apply. Outside the root, without the right, or before the
+owner's standing rule, a create is refused. Zerus stops it when that task is decided.
+
+A performance run checks the machine first; a comparison alternates binaries in rounds
+(hgs guide team-tests). Tauri shows archive stubs; open a report to read that task only.

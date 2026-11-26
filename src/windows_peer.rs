@@ -72,17 +72,10 @@ pub fn command(args: &[String]) -> Result<String> {
         line.push(' ');
         line.push_str(&quote(argument)?);
     }
-    Ok(line)
-}
-
-/// The remote command line that runs hgs with `args` on `alias`, whichever
-/// kind of computer it is.
-pub fn hgs(config: &Config, alias: &str, args: &[String]) -> Result<String> {
-    if is_windows(config, alias) {
-        command(args)
-    } else {
-        Ok(format!("~/.local/bin/hgs {}", platform::remote_join(args)))
+    if args.first().is_some_and(|arg| arg == "rules") {
+        return Ok(format!(r#"{REMOTE_HGS} --help | findstr /L /C:"iron-rules-v1" >nul && {line}"#));
     }
+    Ok(line)
 }
 
 /// The `ConnectTimeout` option for `alias`: a Windows computer's sshd starts a

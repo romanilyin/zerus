@@ -101,14 +101,21 @@ fn a_store_that_stays_refused_is_reported_with_its_fix_until_it_is_private() {
         assert!(stores[0]["reason"].as_str().unwrap().contains("outside Zerus's folders"));
         let fix = stores[0]["fix"].as_str().unwrap();
         #[cfg(windows)]
-        assert_eq!(fix, format!("icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"", foreign.display()));
+        assert_eq!(fix, format!("icacls \"{0}\" /reset; icacls \"{0}\" /inheritance:r /grant:r \"{1}:F\"", foreign.display(), crate::private_stores::windows_user()));
         #[cfg(unix)]
         assert_eq!(fix, format!("chmod 600 '{}'", foreign.display()));
         // The same refusal again keeps its first record (a notice is raised once).
         let at = stores[0]["at"].clone();
         assert!(!ensure(&foreign, Private::File).unwrap());
         assert_eq!(refused()[0]["at"], at);
-        // Once the owner applies the fix, the next check clears it.
+        // Once the owner applies the fix, the next check clears it. Task #48:
+        // on Windows the printed line itself, run in Windows PowerShell.
+        #[cfg(windows)]
+        {
+            let (ran, said) = crate::state::teams::environment::run_in_powershell(fix);
+            assert!(ran, "the printed fix runs in PowerShell: {said}");
+        }
+        #[cfg(unix)]
         platform::owner_only_file(&foreign).unwrap();
         assert!(ensure(&foreign, Private::File).unwrap());
         assert!(refused().is_empty());
@@ -188,4 +195,51 @@ fn the_journal_keeps_the_newest_lines_within_its_bounds() {
         assert_eq!(lines.last().unwrap()["path"], "259");
         assert!(platform::verify_private(&root.join(JOURNAL), Private::File).unwrap());
     });
+}
+
+#[test]
+fn a_canonical_windows_path_is_compared_without_its_verbatim_prefix() {
+    // The desktop presence fence opens `\\?\C:\...`; the roots are plain.
+    assert_eq!(plain(Path::new(r"\\?\C:\Users\a\.local\state\hgs\x.lock")).as_ref(),
+        Path::new(r"C:\Users\a\.local\state\hgs\x.lock"));
+    assert_eq!(plain(Path::new(r"\\?\UNC\server\share\x")).as_ref(), Path::new(r"\\?\UNC\server\share\x"));
+    assert_eq!(plain(Path::new("/home/user/x")).as_ref(), Path::new("/home/user/x"));
+}
+
+/// Task #383: a refusal whose path is gone - a test's temporary file, a
+/// removed folder - drops out at the next read and is never shown again.
+#[test]
+fn a_refusal_whose_path_vanished_drops_out() {
+    with_root(|root| {
+        let gone = root.join("tmp-test").join("read-marks.json");
+        let kept = root.join("kept.json");
+        fs::write(&kept, b"{}").unwrap();
+        write_failed(&gone, Private::File, &"it is not private");
+        write_failed(&kept, Private::File, &"it is not private");
+        let paths = |stores: Vec<Value>| stores.iter().map(|store| store["path"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        assert_eq!(paths(refused()), vec![kept.display().to_string()]);
+        // The current set no longer holds it either.
+        assert_eq!(paths(stores()), vec![kept.display().to_string()]);
+        fs::remove_file(&kept).unwrap();
+        assert!(refused().is_empty());
+        assert!(!current_path().exists(), "an empty set leaves no file");
+    });
+}
+
+/// Task #383: tests never write the person's private-store list. A test that
+/// sets no state folder of its own records in the test process's folder
+/// (storage::test_default_root), and the person's file is left as it was.
+#[test]
+fn a_test_never_writes_the_persons_private_store_list() {
+    let person = crate::state::watch_source::state_root();
+    let home = std::path::PathBuf::from(platform::home().unwrap_or_default());
+    let real = home.join(".local/state/hgs/sessions");
+    assert_ne!(person, real, "a test's state folder is never the person's");
+    assert!(!person.starts_with(&real));
+    let before = fs::read(real.join(CURRENT)).ok();
+    let probe = std::env::temp_dir().join(format!("zerus-383-{}", std::process::id())).join("read-marks.json");
+    write_failed(&probe, Private::File, &"it is not private");
+    assert_eq!(fs::read(real.join(CURRENT)).ok(), before, "the person's list is untouched");
+    // The refusal went to the test's own list, where the vanished path drops out.
+    assert!(refused().iter().all(|store| store["path"] != probe.display().to_string()));
 }

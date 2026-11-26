@@ -1,4 +1,5 @@
 """Inspect the Windows portable zip without extracting or executing anything."""
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ UNPACKED_LIMIT = 500_000_000
 ENTRY_LIMIT = 10_000
 MANIFEST_LIMIT = 64 * 1024
 # Standard SPDX license and exception identifiers named by the SPDX documents
-# of the bundled Qt modules; packaging/windows/licenses holds a <ID>.txt for each.
+# of immutable old Qt modules. Read-only validation retains their archived names.
 QT_LICENSE_TEXTS = (
     "AFL-2.1", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "BSD-Source-Code", "BSL-1.0", "CC0-1.0", "FTL",
     "GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "HPND", "HPND-sell-variant", "IJG", "ISC", "Imlib2",
@@ -39,6 +40,22 @@ REQUIRED = (
     "licenses/conpty-NOTICE.md", "licenses/rust/inventory.json",
     *(f"licenses/qt/{name}.txt" for name in QT_LICENSE_TEXTS),
 )
+# New packages use Tauri and the separately installed Evergreen runtime. Keep
+# legacy inspection for immutable published Qt archives; new Tauri packages
+# cannot quietly carry an old Qt runtime alongside the replacement executable.
+NEXT_REQUIRED = (
+    "hgs.exe", "lore.exe", "hgs-tray.exe", "zerus-mobile-connector.exe", "build-info.json", "README.txt", "LICENSE", "THIRD_PARTY_NOTICES.md",
+    "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "conpty.dll", "OpenConsole.exe",
+    "licenses/conpty-LICENSE.txt", "licenses/conpty-NOTICE.md", "licenses/rust/inventory.json",
+    "licenses/rust/desktop/inventory.json", "licenses/frontend/inventory.json",
+)
+NEXT_FORBIDDEN = re.compile(r"(?i)(?:^|/)(?:qt[^/]*\.(?:dll|exe|pak)|qwindows\.dll)$|/licenses/qt/")
+# Task 182: lore fetches model weights at runtime; they never travel in a package.
+MODEL_FORBIDDEN = re.compile(r"(?i)(?:^|/)(?:[^/]+\.(?:gguf|safetensors|onnx|pt|pth|npz)|models/[^/]+)$")
+# WhiteWh fork, task #388 (owner, 2026-11-08, "forget Qt"): a Tauri zip carries
+# no Qt at all. The one-release fallback of task #65 (qt/zerus-qt.exe, declared
+# as "qt_fallback") is retired, and so is any qt/ folder.
+QT_FOLDER = re.compile(r"(?i)^[^/]+/qt/")
 # Never shipped: windeployqt copies ICU from the build machine's System32 (a
 # forwarder to icu.dll on current Windows; Qt6Core uses the system ICU), the
 # Mesa software OpenGL fallback has no notices in the bundle, and Microsoft's
@@ -52,6 +69,11 @@ CONPTY_NAMES = {name.casefold() for name in conpty_pair.NAMES}
 WINDOWS_INVALID = re.compile(r'[\x00-\x1f\x7f<>:"|?*\\]')
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
 VERSION = re.compile(r"\d+\.\d+\.\d+")
+# WhiteWh fork (zerus-y0cj): the model-free artifact executor and its notices.
+EXECUTOR = "hgs-executor.exe"
+EXECUTOR_REQUIRED = (EXECUTOR, "licenses/executor/build.json", "licenses/executor/inventory.json",
+                     "licenses/executor/NOTICES.md", "executor/README.md")
+EXECUTOR_LIMIT = 128 * 1024 * 1024
 
 
 def asset_name(version):
@@ -83,7 +105,7 @@ def pinned_entry(archive, name, pinned):
     return conpty_pair.matches(pinned, data)
 
 
-def inspect(path, required=REQUIRED):
+def inspect(path, required=None):
     """Return build-info.json after checking every entry, the expected layout and
     the pinned ConPTY pair."""
     path = Path(path)
@@ -119,19 +141,25 @@ def inspect(path, required=REQUIRED):
             folded.add(name.casefold())
             total += entry.file_size
         require(total <= UNPACKED_LIMIT, "Windows portable bundle unpacks beyond its size limit.")
-        missing = sorted(item for item in required if f"{TOP}/{item}" not in names)
-        require(not missing, "Windows portable bundle lacks: " + ", ".join(missing))
         # `hgs session-host install` stages the pair from the folder of hgs.exe into
         # the host image, which loads conpty.dll and runs OpenConsole.exe (spec D2,
         # D6): a different binary under either name fails.
-        for name, pinned in conpty_pair.PIN["files"].items():
-            require(f"{TOP}/{name}" in names and pinned_entry(archive, name, pinned),
-                    f"Windows portable {name} is not the pinned {conpty_pair.PACKAGE} "
-                    f"{conpty_pair.PIN['version']} build.")
+        pair = {name: f"{TOP}/{name}" in names and pinned_entry(archive, name, pinned)
+                for name, pinned in conpty_pair.PIN["files"].items()}
+        require(f"{TOP}/build-info.json" in names, "Windows portable bundle lacks: build-info.json")
         info = archive.getinfo(f"{TOP}/build-info.json")
         require(info.file_size <= MANIFEST_LIMIT, "Windows portable build-info.json is too large.")
         with archive.open(info) as stream:
             raw = stream.read(MANIFEST_LIMIT + 1)
+        executor_sha256 = None
+        if f"{TOP}/{EXECUTOR}" in names:
+            entry = archive.getinfo(f"{TOP}/{EXECUTOR}")
+            require(entry.file_size <= EXECUTOR_LIMIT, "Windows portable hgs-executor.exe is too large.")
+            hasher = hashlib.sha256()
+            with archive.open(entry) as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(block)
+            executor_sha256 = hasher.hexdigest()
     require(len(raw) <= MANIFEST_LIMIT, "Windows portable build-info.json is too large.")
     try:
         manifest = json.loads(raw.decode("utf-8"))
@@ -145,7 +173,36 @@ def inspect(path, required=REQUIRED):
         require(manifest["mobile_connector_bundled"] is True and
                 f"{TOP}/zerus-mobile-connector.exe" in names,
                 "Windows portable mobile connector declaration requires its executable.")
-    for key in ("version", "cli_version", "qt_version"):
+    desktop = manifest.get("desktop")
+    require(desktop in (None, "tauri"), "Unsupported Windows portable desktop.")
+    if desktop == "tauri":
+        require(manifest.get("webview2_runtime") == "evergreen" and "qt_version" not in manifest,
+                "Tauri portable bundles require WebView2 Evergreen, without Qt.")
+        require("qt_fallback" not in manifest and not any(QT_FOLDER.match(name) for name in names),
+                "Tauri portable bundle carries no Qt fallback: the fork ships only the Tauri desktop.")
+        require(not any(NEXT_FORBIDDEN.search(name) for name in names),
+                "Tauri portable bundle must not contain Qt deployment files.")
+        require(not any(MODEL_FORBIDDEN.search(name) for name in names),
+                "lore model weights must be fetched at runtime, never shipped")
+    executor = manifest.get("artifact_executor")
+    if executor is None:
+        require(executor_sha256 is None, "Windows portable hgs-executor.exe needs its artifact_executor declaration.")
+    else:
+        require(isinstance(executor, dict) and manifest.get("fork") is not None,
+                "Only a fork bundle declares the artifact executor.")
+        missing = sorted(item for item in EXECUTOR_REQUIRED if f"{TOP}/{item}" not in names)
+        require(not missing, "Windows portable artifact executor lacks: " + ", ".join(missing))
+        require(executor.get("binary") == EXECUTOR and executor.get("binary_sha256") == executor_sha256 and
+                all(isinstance(executor.get(key), str) and re.fullmatch(r"[0-9a-f]{40,64}", executor[key])
+                    for key in ("source_sha256", "desync_revision")),
+                "Windows portable hgs-executor.exe differs from its declared identity.")
+    wanted = required if required is not None else (NEXT_REQUIRED if desktop == "tauri" else REQUIRED)
+    missing = sorted(item for item in wanted if f"{TOP}/{item}" not in names)
+    require(not missing, "Windows portable bundle lacks: " + ", ".join(missing))
+    for name, matches in pair.items():
+        require(matches, f"Windows portable {name} is not the pinned {conpty_pair.PACKAGE} "
+                f"{conpty_pair.PIN['version']} build.")
+    for key in (("version", "cli_version") if desktop == "tauri" else ("version", "cli_version", "qt_version")):
         require(isinstance(manifest.get(key), str) and VERSION.fullmatch(manifest[key]),
                 f"Invalid Windows portable {key}.")
     require(isinstance(manifest.get("source_commit"), str) and re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]),

@@ -12,6 +12,7 @@ import struct
 import subprocess
 import tempfile
 import itertools
+from types import SimpleNamespace
 import test_ci_security as security
 import unittest
 from unittest.mock import patch
@@ -54,6 +55,19 @@ class Fixture:
 
 
 class ArtifactControls(unittest.TestCase):
+    def test_seed_provenance_is_admitted_before_any_debug_handoff_seal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            f=Fixture(Path(folder));destination=f.root/'new-handoff'
+            helper=SimpleNamespace(verify=unittest.mock.Mock(side_effect=ValueError('seed source mismatch')))
+            args=['macos-debug-artifact.py','seal','--directory',str(destination)]
+            with patch.object(artifact,'ROOT',f.root),patch.object(artifact,'context',return_value=f.bound), \
+                 patch.object(artifact,'toolchain',return_value=f.compiler),patch.object(artifact,'seed_helper',return_value=helper), \
+                 patch.object(artifact,'seal') as seal,patch.object(artifact.sys,'argv',args):
+                with self.assertRaisesRegex(ValueError,'seed source mismatch'):artifact.main()
+                seal.assert_not_called()
+            helper.verify.assert_called_once_with(f.root,f.root/'target/debug/hgs-effort-seed.json',f.root/artifact.FILES['hgs'])
+            self.assertFalse(destination.exists())
+
     def test_read_only_cargo_hardlinks_become_exclusive_handoff_copies(self):
         with tempfile.TemporaryDirectory() as folder:
             f = Fixture(Path(folder))
@@ -73,8 +87,8 @@ class ArtifactControls(unittest.TestCase):
             f = Fixture(Path(folder))
             data = f.verify(bound={**f.bound, 'attempt': 3})
             self.assertEqual(data['producer_attempt'], 1)
-            self.assertEqual(set(p.name for p in f.directory.iterdir()), {'manifest.json', 'hgs', 'fake_agent'})
-            for name in ('hgs', 'fake_agent'):
+            self.assertEqual(set(p.name for p in f.directory.iterdir()), {'manifest.json', 'hgs', 'fake_agent','effort_seed'})
+            for name in ('hgs', 'fake_agent','effort_seed'):
                 self.assertEqual(data['files'][name]['sha256'], hashlib.sha256((f.directory / name).read_bytes()).hexdigest())
             self.assertEqual(data['toolchain'], f.compiler)
 
@@ -146,8 +160,11 @@ class ArtifactControls(unittest.TestCase):
                   '--manifest-sha256',f.sha,'--producer-attempt','1','--rust-release','1.99.1']
             with patch.object(artifact,'ROOT',f.root),patch.object(artifact,'context',return_value=current), \
                  patch.object(artifact,'prerequisites',return_value={'python':'fixture','node':'v24','tmux':'3.8'}), \
+                 patch.object(artifact,'seed_receipt') as seed_receipt, \
                  patch.dict(os.environ,GITHUB_RUN_ATTEMPT='2'),patch.object(artifact.sys,'argv',args):
                 artifact.main()
+            seed_receipt.assert_called_once()
+            self.assertEqual(seed_receipt.call_args.args[1]['files'],f.verify()['files'])
             record=json.loads((f.root/'artifacts/test-results/debug-input.json').read_text())
             self.assertEqual((record['producer_attempt'],record['consumer_attempt']),(1,2))
             self.assertEqual(record['artifact_id'],'123')
@@ -167,7 +184,8 @@ class ArtifactControls(unittest.TestCase):
             fake.unlink()
             with patch.object(artifact, 'toolchain', return_value=f.compiler):
                 artifact.install(f.root, f.directory, data, check_rust=True)
-            for relative in artifact.FILES.values(): self.assertEqual((f.root / relative).stat().st_mode & 0o777, 0o755)
+            for name,relative in artifact.FILES.items():
+                self.assertEqual((f.root / relative).stat().st_mode & 0o777,0o500 if name=='effort_seed' else 0o755)
 
 
 class CliPhases(unittest.TestCase):
@@ -182,16 +200,48 @@ class CliPhases(unittest.TestCase):
                 path=binaries/name
                 path.write_text('#!/bin/sh\n[ -z "${HGS_SHOULD_NOT_EXIST:-}" ] || exit 88\nprintf "%s:%s\\n" '+name+' "$*" >> "$CALL_LOG"\n')
                 path.chmod(0o755)
-            results={}
-            for phase in ('all','debug','remaining','unknown'):
-                log=root/(phase+'.log');env=dict(os.environ, PATH=str(binaries)+':/usr/bin:/bin', CALL_LOG=str(log), HGS_SHOULD_NOT_EXIST='contaminated')
-                result=subprocess.run([selected_bash,str(script),*([phase] if phase!='all' else [])],env=env,capture_output=True,text=True)
-                self.assertEqual(result.returncode, 2 if phase=='unknown' else 0,result.stderr)
-                results[phase]=log.read_text().splitlines() if log.exists() else []
-            debug=['python3:-','cargo:test --locked','cargo:build --locked','cargo:build --locked --example fake_agent']
-            remaining=['python3:-','bash:tests/test_hgs.sh','python3:scripts/ci/python-tests.py','cargo:build --release --locked']
-            self.assertEqual(results['debug'],debug);self.assertEqual(results['remaining'],remaining)
-            self.assertEqual(results['all'],debug+remaining[1:]);self.assertEqual(results['unknown'],[])
+            # Exercise both native branches without depending on the host.
+            uname=binaries/'uname'
+            uname.write_text('#!/bin/sh\nprintf "%s\\n" "$CLI_PHASE_TEST_SYSTEM"\n')
+            uname.chmod(0o755)
+            for system in ('Linux','Darwin'):
+                results={}
+                for phase in ('all','debug','remaining','unknown'):
+                    log=root/(system+'-'+phase+'.log')
+                    env=dict(os.environ, PATH=str(binaries)+':/usr/bin:/bin', CALL_LOG=str(log),
+                             CLI_PHASE_TEST_SYSTEM=system, HGS_SHOULD_NOT_EXIST='contaminated')
+                    result=subprocess.run([selected_bash,str(script),*([phase] if phase!='all' else [])],
+                                          env=env,capture_output=True,text=True)
+                    with self.subTest(system=system,phase=phase):
+                        self.assertEqual(result.returncode, 2 if phase=='unknown' else 0,result.stderr)
+                    results[phase]=log.read_text().splitlines() if log.exists() else []
+                debug=['python3:-']
+                if system=='Linux':
+                    # zerus-5sl7r: the pinned-image real-child resume test runs
+                    # before the full suite, so its failures never hide it.
+                    debug+=['cargo:build --locked','cargo:build --locked --example fake_agent',
+                            'cargo:test --locked --bin hgs desktop::session_resume::tests::actor::real_cli::'
+                            'real_cli_resume_from_the_pinned_image_starts_its_supervisor_and_sends'
+                            ' -- --ignored --exact --test-threads=1']
+                debug+=['cargo:test --locked','cargo:build --locked']
+                native_cases=[
+                    'real_cli_recover_only_reconciles_the_original_receipt_and_never_falls_back_to_terminal_input',
+                    'real_cli_original_child_kill_and_revoke_never_release_input_or_replay_after_reopen',
+                ]
+                if system=='Linux':
+                    native_cases.append('real_cli_actor_sigkill_keeps_original_custody_and_restart_never_reconstructs_consent')
+                debug += ['cargo:test --locked --bin hgs desktop::task_start_reconcile::tests::'+case+
+                          ' -- --ignored --exact --test-threads=1' for case in native_cases]
+                debug.append('cargo:build --locked --example fake_agent')
+                remaining=['python3:-','bash:tests/test_hgs.sh',
+                           'cargo:+1.99.1 test --locked --test voice_recovery_fixture --no-run --target-dir target/speech-recovery --message-format=json',
+                           'python3:scripts/ci/speech-recovery-executable.py artifacts/test-results/speech-recovery-build.jsonl',
+                           'python3:scripts/ci/python-tests.py','cargo:build --release --locked']
+                with self.subTest(system=system):
+                    self.assertEqual(results['debug'],debug)
+                    self.assertEqual(results['remaining'],remaining)
+                    self.assertEqual(results['all'],debug+remaining[1:])
+                    self.assertEqual(results['unknown'],[])
 
 
 class WorkflowContracts(unittest.TestCase):
@@ -347,19 +397,30 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_selected_and_full_suite_gate_requires_new_native_even_if_aggregate_is_faked_success(self):
         body=security.job(self.checks,'gate');code=compile(security.inline_python(body),'suite-results','exec')
-        mac=('cli-macos-debug','cli-macos-core','cli-macos-native','cli-macos','connector-macos','mac-desktop')
-        always=('source','quick','relay','connector','android')
-        for linux,macos in itertools.product((False,True),repeat=2):
+        mac=('cli-macos-debug','cli-macos-core','cli-macos-native','cli-macos','connector-macos','clippy-macos')
+        windows=('windows-tests','windows-desktop','windows-host','client-native-windows')
+        always=('source','quick','client-frontend','relay','connector','android')
+        for linux,macos,win in itertools.product((False,True),repeat=3):
             results={name:{'result':'success'} for name in always}
             results.update({name:{'result':'success' if macos else 'skipped'} for name in mac})
-            results.update({name:{'result':'skipped'} for name in ('arch','arch-package','ios','windows-host','windows-desktop')})
+            results.update({name:{'result':'skipped'} for name in ('arch-package','ios')})
+            results.update({name:{'result':'success' if win else 'skipped'} for name in windows})
             results['cli']={'result':'success' if linux else 'skipped'}
-            env=dict(RESULTS=json.dumps(results),RUN_LINUX=json.dumps(linux),RUN_MACOS=json.dumps(macos),RUN_ARCH='false',RUN_WINDOWS='false',RUN_IOS='false')
+            results['client-native-linux']={'result':'success' if linux else 'skipped'}
+            results['client-native-macos-core']={'result':'success' if macos else 'skipped'}
+            results['client-native-macos-tauri']={'result':'success' if macos else 'skipped'}
+            env=dict(RESULTS=json.dumps(results),RUN_LINUX=json.dumps(linux),RUN_MACOS=json.dumps(macos),RUN_ARCH='false',RUN_WINDOWS=json.dumps(win),RUN_IOS='false')
             with patch.dict(os.environ,env):exec(code,{})
             for name in mac[:4]:
                 for result in ('failure','cancelled','skipped' if macos else 'success'):
                     changed=copy.deepcopy(results);changed[name]={'result':result}
                     with self.subTest(linux=linux,macos=macos,name=name,result=result),patch.dict(os.environ,{**env,'RESULTS':json.dumps(changed)}),self.assertRaises(SystemExit):exec(code,{})
+                changed=copy.deepcopy(results);del changed[name]
+                with patch.dict(os.environ,{**env,'RESULTS':json.dumps(changed)}),self.assertRaises(KeyError):exec(code,{})
+            for name in windows:
+                for result in ('failure','cancelled','skipped' if win else 'success'):
+                    changed=copy.deepcopy(results);changed[name]={'result':result}
+                    with self.subTest(linux=linux,macos=macos,windows=win,name=name,result=result),patch.dict(os.environ,{**env,'RESULTS':json.dumps(changed)}),self.assertRaises(SystemExit):exec(code,{})
                 changed=copy.deepcopy(results);del changed[name]
                 with patch.dict(os.environ,{**env,'RESULTS':json.dumps(changed)}),self.assertRaises(KeyError):exec(code,{})
 

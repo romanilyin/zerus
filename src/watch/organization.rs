@@ -1,8 +1,8 @@
 //! The `organization` topic: the shared project catalog as `hgs swarm get`
 //! shows it, as keyed rows a client applies like the catalog's. A worker
-//! thread reads the stored catalog without its lock, never saving it and never
-//! supervising the catalog worker, so following the organization changes
-//! nothing. The catalog is read again when a stat of its files changes and at
+//! thread may bootstrap a missing catalog only when Qt settings are definitely
+//! absent. Initialized reads stay lock-free, never saving or supervising the
+//! catalog worker. The catalog is read again when a stat of its files changes and at
 //! least every 30 s, at most once a second. The first rows go out as a paged
 //! `snapshot`; later changes as one `delta` of the changed rows, or a new
 //! snapshot when they would not fit one frame.
@@ -34,6 +34,8 @@ pub(super) const CHUNK: usize = 1000;
 /// One read for the worker.
 pub(super) struct Job {
     pub token: u64,
+    /// Only an explicit subscription may try a first-use bootstrap.
+    bootstrap: bool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -47,7 +49,7 @@ pub(super) struct Done {
 
 /// Runs one read with `snapshot` (the catalog as `swarm get` shows it).
 pub(super) fn read(job: Job, snapshot: impl Fn() -> Result<Value, String>) -> Done {
-    let Job { token, cancelled } = job;
+    let Job { token, cancelled, .. } = job;
     if cancelled.load(Ordering::SeqCst) {
         return Done { token, value: None };
     }
@@ -58,30 +60,50 @@ pub(super) fn read(job: Job, snapshot: impl Fn() -> Result<Value, String>) -> Do
 
 /// The worker thread that reads the catalog with this computer's configuration.
 pub(super) struct Pool {
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::SyncSender<Job>,
 }
 
 impl Pool {
     pub(super) fn spawn(finished: impl Fn(Done) + Send + 'static) -> Self {
-        let (jobs, queue) = mpsc::channel::<Job>();
+        let (jobs, queue) = mpsc::sync_channel::<Job>(1);
         std::thread::Builder::new()
             .name("hgs-watch-organization".into())
             .spawn(move || {
                 let config = crate::config::Config::load().map_err(|error| error.to_string());
-                let snapshot = || match &config {
-                    Ok(config) => crate::swarm::organization(config).map_err(|error| format!("{error:#}")),
+                let snapshot = |first| match &config {
+                    Ok(config) => crate::swarm::organization(config, first).map_err(|error| format!("{error:#}")),
                     Err(error) => Err(error.clone()),
                 };
                 while let Ok(job) = queue.recv() {
-                    finished(read(job, snapshot));
+                    let first = job.bootstrap;
+                    finished(read(job, || snapshot(first)));
                 }
             })
             .expect("start the organization worker");
         Self { jobs }
     }
 
-    pub(super) fn run(&self, job: Job) {
-        let _ = self.jobs.send(job);
+    pub(super) fn spawn_drive(finished: impl Fn(Done) + Send + 'static) -> Self {
+        let (jobs, queue) = mpsc::sync_channel::<Job>(1);
+        std::thread::Builder::new()
+            .name("hgs-watch-drive-folders".into())
+            .spawn(move || {
+                let config = crate::config::Config::load().map_err(|error| error.to_string());
+                while let Ok(job) = queue.recv() {
+                    finished(read(job, || match &config {
+                        Ok(config) => crate::swarm::drive_folders::watch_snapshot(config)
+                            .map_err(|error| format!("{error:#}")),
+                        Err(error) => Err(error.clone()),
+                    }));
+                }
+            })
+            .expect("start the drive-folder worker");
+        Self { jobs }
+    }
+
+    /// Reject without blocking the watch loop or losing the original token.
+    pub(super) fn run(&self, job: Job) -> Result<(), mpsc::TrySendError<Job>> {
+        self.jobs.try_send(job)
     }
 }
 
@@ -117,6 +139,36 @@ pub(super) fn rows(snapshot: &Value) -> BTreeMap<String, Value> {
     rows
 }
 
+/// The bounded capable drive projection, split into independently pageable rows.
+pub(super) fn drive_rows(snapshot: &Value) -> BTreeMap<String, Value> {
+    let mut rows = BTreeMap::new();
+    let mut summary = snapshot.clone();
+    if let Some(object) = summary.as_object_mut() {
+        object.remove("records");
+        object.remove("versions");
+        object.remove("conflicts");
+    }
+    let records = snapshot["records"].as_array().cloned().unwrap_or_default();
+    summary["records"] = json!(records.iter().map(|record| record["id"].clone()).collect::<Vec<_>>());
+    summary["conflicts"] = json!(snapshot["conflicts"].as_object().into_iter().flatten().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+    rows.insert("drive_folders".into(), summary);
+    for record in records {
+        if let Some(id) = record["id"].as_str() {
+            rows.insert(format!("record:{id}"), record);
+        }
+    }
+    for (token, operations) in snapshot["versions"].as_object().into_iter().flatten() {
+        rows.insert(format!("version:{token}"), operations.clone());
+    }
+    for (id, variants) in snapshot["conflicts"].as_object().into_iter().flatten() {
+        let variants = variants.as_array().cloned().unwrap_or_default();
+        for (index, chunk) in variants.chunks(16).enumerate() {
+            rows.insert(format!("conflict:{id}:{index}"), json!({"operations":chunk}));
+        }
+    }
+    rows
+}
+
 /// What to send next.
 #[derive(Debug, PartialEq)]
 pub(super) enum Plan {
@@ -135,6 +187,8 @@ pub(super) struct Organization {
     again: bool,
     started: Instant,
     due: Option<Instant>,
+    /// An initial read not yet admitted still has its original bootstrap choice.
+    retry_bootstrap: bool,
     files: Vec<PathBuf>,
     stamp: Option<u64>,
     /// The rows of the latest read, with their digests.
@@ -142,6 +196,7 @@ pub(super) struct Organization {
     /// The digests of the rows the client holds; None sends a snapshot.
     sent: Option<BTreeMap<String, Digest32>>,
     rev: i64,
+    drive: bool,
 }
 
 fn encoded(key: &str, row: &Value) -> usize {
@@ -158,21 +213,27 @@ impl Organization {
             again: false,
             started: Instant::now(),
             due: None,
+            retry_bootstrap: false,
             files: Vec::new(),
             stamp: None,
             current: None,
             sent: None,
             rev: 0,
+            drive: false,
         }
     }
 
-    fn job(&mut self, now: Instant) -> Job {
+    pub(super) fn new_drive() -> Self {
+        Self { drive: true, ..Self::new() }
+    }
+
+    fn job(&mut self, now: Instant, bootstrap: bool) -> Job {
         self.token += 1;
         self.running = true;
         self.again = false;
         self.started = now;
         self.due = None;
-        Job { token: self.token, cancelled: Arc::clone(&self.cancelled) }
+        Job { token: self.token, bootstrap, cancelled: Arc::clone(&self.cancelled) }
     }
 
     /// Follows the organization, watching `files`; following it again sends
@@ -183,13 +244,14 @@ impl Organization {
         self.cancelled = Arc::new(AtomicBool::new(false));
         self.files = files;
         self.stamp = Some(stamp);
-        self.job(now)
+        self.job(now, true)
     }
 
     pub(super) fn unsubscribe(&mut self) -> bool {
         let was = std::mem::take(&mut self.subscribed);
         self.cancelled.store(true, Ordering::SeqCst);
         self.running = false;
+        self.retry_bootstrap = false;
         self.current = None;
         self.sent = None;
         was
@@ -210,7 +272,20 @@ impl Organization {
             }
         }
         let due = self.due.is_some_and(|at| now >= at) || now >= self.started + SAFETY;
-        (!self.running && due).then(|| self.job(now))
+        if self.running || !due {
+            return None;
+        }
+        let bootstrap = std::mem::take(&mut self.retry_bootstrap);
+        Some(self.job(now, bootstrap))
+    }
+
+    /// Queue pressure is not a read failure. Retry only the still-current job.
+    pub(super) fn defer(&mut self, job: Job, now: Instant) {
+        if self.subscribed && job.token == self.token {
+            self.running = false;
+            self.due = Some(now + GAP);
+            self.retry_bootstrap = job.bootstrap;
+        }
     }
 
     /// Takes a finished read; an error is returned for the client.
@@ -224,7 +299,7 @@ impl Organization {
         }
         match done.value? {
             Ok(snapshot) => {
-                let rows = rows(&snapshot);
+                let rows = if self.drive { drive_rows(&snapshot) } else { rows(&snapshot) };
                 self.current = Some(rows.into_iter().map(|(key, row)| {
                     let digest = catalog::digest(&row);
                     (key, (row, digest))
@@ -344,6 +419,65 @@ mod tests {
     }
 
     #[test]
+    fn unsubscribed_callback_cannot_cross_the_detail_fence() {
+        let mut state = Organization::new();
+        let old = state.subscribe(Vec::new(), 0, Instant::now());
+        state.unsubscribe();
+        let current = state.subscribe(Vec::new(), 0, Instant::now());
+        assert!(old.token < current.token);
+        state.done(Done { token: old.token, value: Some(Ok(snapshot(1, false))) });
+        assert!(state.plan(524288).is_none());
+        state.done(Done { token: current.token, value: Some(Ok(snapshot(1, false))) });
+        assert!(state.plan(524288).is_some());
+    }
+
+    #[test]
+    fn slow_read_and_two_resubscriptions_deliver_latest_rows_without_error() {
+        let start = Instant::now();
+        let (jobs, receiver) = mpsc::sync_channel::<Job>(1);
+        let pool = Pool { jobs };
+        let (started, ready) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        let (finished, results) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            while let Ok(job) = receiver.recv() {
+                let done = read(job, || {
+                    if first {
+                        started.send(()).unwrap();
+                        blocked.recv_timeout(SECOND * 5).unwrap();
+                    }
+                    Ok(snapshot(1, false))
+                });
+                first = false;
+                finished.send(done).unwrap();
+            }
+        });
+        let mut state = Organization::new();
+        assert!(pool.run(state.subscribe(Vec::new(), 0, start)).is_ok());
+        ready.recv_timeout(SECOND * 5).unwrap(); // The original read is actually running.
+        state.unsubscribe();
+        assert!(pool.run(state.subscribe(Vec::new(), 0, start)).is_ok());
+        state.unsubscribe();
+        let latest = state.subscribe(Vec::new(), 0, start);
+        let Err(mpsc::TrySendError::Full(job)) = pool.run(latest) else { panic!("the superseded job fills the slot") };
+        state.defer(job, start);
+        assert!(state.pulse(start + GAP / 2, |_| 0).is_none());
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(state.done(results.recv_timeout(SECOND * 5).unwrap()), None);
+        }
+        assert!(state.plan(1 << 20).is_none(), "stale completions cannot supply rows");
+        let retry = state.pulse(start + GAP, |_| 0).expect("retry before the safety interval");
+        assert!(retry.bootstrap, "no initial read was admitted for this subscription");
+        assert!(pool.run(retry).is_ok());
+        assert_eq!(state.done(results.recv_timeout(SECOND * 5).unwrap()), None);
+        assert!(matches!(state.plan(1 << 20), Some(Plan::Snapshot(_))));
+        drop(pool);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn rows_rebuild_the_snapshot_and_chunk_large_projects() {
         let original = snapshot(2500, false);
         let rows = rows(&original);
@@ -354,6 +488,22 @@ mod tests {
         assert_eq!(rebuild(&rows), without_written(original));
         let empty = json!({"schema": 1, "initialized": false, "organization": {"version": 2, "default_project": "ungrouped", "projects": []}, "versions": {}});
         assert_eq!(rebuild(&super::rows(&empty)), empty);
+    }
+
+    #[test]
+    fn only_a_new_subscription_may_attempt_bootstrap() {
+        let start = Instant::now();
+        let mut organization = Organization::new();
+        let first = organization.subscribe(vec![], 1, start);
+        assert!(first.bootstrap);
+        organization.done(Done { token: first.token, value: Some(Err("uncertain Qt presence".into())) });
+        let changed = organization.pulse(start + GAP, |_| 2).unwrap();
+        assert!(!changed.bootstrap, "a refresh must not retry an undecidable probe");
+        organization.done(Done { token: changed.token, value: Some(Err("still unavailable".into())) });
+        let safety = organization.pulse(start + SAFETY * 2, |_| 2).unwrap();
+        assert!(!safety.bootstrap);
+        let retried = organization.subscribe(vec![], 2, start + SAFETY * 3);
+        assert!(retried.bootstrap, "an explicit subscription may try again");
     }
 
     #[test]

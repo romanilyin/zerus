@@ -25,5 +25,9 @@ needs every child stopped or done. Cancelling or reassigning a task that holds
 a sub-team needs "subteam":"stop" or "keep".
 
 Limits: two levels below the master (settings tree_depth) and sixteen sessions
-in the whole tree (tree_sessions), checked at create, add-member, swap-member
-and extend. Sub-teams are approved by their parent lead, or by the owner.
+in the whole tree (tree_sessions), checked at create, add-member, scale,
+swap-member and extend. Sub-teams are approved by their parent lead, or by the
+owner.
+Sub-lead: hgs team sub-lead {"member":"qalead","sub":true}; reports-to
+{member, parent} sets who it reviews. A sub-lead with reports and no session
+yet is started for them; it then hears its brief and inbox.

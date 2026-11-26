@@ -69,6 +69,9 @@ member; work continues outside any attempt.
 - **A6. Replace a captured report.** While a captured report is undecided, the
   member may send the real report for the same attempt; it replaces the
   captured text and is marked as such. Owner: yes.
+- **A7. A captured report holds its member.** Until a captured report is
+  decided or replaced, its member gets no new task, rebalance or work ahead
+  and does not starve. Owner: yes (2026-10-29). Spec: team delivery 7a.
 
 ## B. Sandbox, permissions and permission requests
 
@@ -1215,6 +1218,163 @@ sets them in the catalog, the team settings or the plan; members never do.
   name; a failed launch returns to the old account, an unconfirmed one is
   reported uncertain and never retried. Nothing changes until the owner
   chooses; a team member's account changes only through swap-member.
+- **U59. Free planning: an open phase that takes tasks as they come (owner,
+  2026-10-30).** Besides the standard mode (phases that are planned, approved,
+  run and close with their integration and build), a team can plan in the free
+  mode: its phase is not closed when its tasks are done, and the owner and the
+  lead keep adding tasks to it.
+  - *The modes:* `standard` (the default and today's behaviour) and `free`.
+    A free phase runs each task as it is added, under the same pipelines,
+    reports and acceptance; it never closes by itself, and an empty queue is
+    idle, not done. Integration and a build run when the owner or the lead asks
+    (a lead task added to the phase), never as a phase barrier. The owner
+    closes a free phase explicitly; the team then continues in standard mode.
+  - *Choosing at the start:* when planning begins (Start planning, a new goal,
+    a next phase), the lead reads the goal and the tasks and proposes one of
+    the two modes with a one-line reason (a known scope with a release: standard;
+    a stream of small independent requests, support or polishing: free). The
+    owner chooses one of the two; with no choice, standard.
+  - *Switching to free:* only on the owner's confirmation. The lead (or the
+    owner through the lead's chat) requests it; Zerus shows a pop-up dialog
+    with the reason and Switch to free / Keep standard, bound to the request
+    id (U57 later moves it onto the shared confirmation card). Deny keeps standard and its
+    reason reaches the lead. Switching back to standard is the owner's close
+    of the free phase.
+  - The mode is shown beside the phase (status, the plan header, Graph and
+    Board), and `hgs team status` carries `plan_mode`. The lead protocol says
+    to propose a mode at the start, never to switch to free without the
+    dialog, and to add incoming work to the open phase instead of planning a
+    new one.
+- **U58. Changing a plan on the go costs less than the work (owner, 2026-10-30).**
+  From team 6d0aabee (RogueDOD QA bot): a task was cancelled and copied under
+  a new id three times to start it earlier, fully cancelled phases stayed on
+  the dashboard as approved, and a queued phase could not be edited.
+  - `move-task {task, phase}` moves a task that has not started (no delivered
+    attempt) to another phase, keeping its id, its deps checked against the
+    target phase; `reassign` keeps the id for a member change, as today.
+  - A queued or approved phase with no delivered attempt is edited like a
+    draft (extend, edit-draft, remove tasks) by the lead; the scope the owner
+    approved is the work, not its numbering.
+  - A phase whose tasks are all cancelled reads `cancelled`; status and the
+    dashboard hide cancelled tasks and phases by default, with a toggle.
+  - The owner's word by text (the CLI fallback of U57) is not spent when its
+    change fails, and one sentence naming a member and its tasks applies both,
+    the member first.
+  - A reply that only says it waits (a build lock, a queue) is a status, never
+    a captured report.
+  - Role and task text normalises CRLF to LF; a refused control character
+    names the field and its position.
+  - Work ahead (U31) stays an owner setting, off by default.
+- **U57. The owner confirms a lead's change in the chat, not by a phrase (owner,
+  2026-10-30).** Today the lead asks the owner to type an exact sentence
+  ("add a member", "план принят") and the change is refused when the words
+  differ. Instead the lead proposes the change and the owner answers a card in
+  the lead's chat, the same way a subagent start is approved:
+  - *What is proposed:* adding members, adding tasks to a running phase,
+    removing (cancelling) tasks, discarding a phase, and the existing roster
+    kinds (remove, swap, next goal). The proposal carries the exact change
+    (members with role/agent/model, task titles and ids, the phase).
+  - *The card:* in the lead's conversation (TeamConversation and the session
+    window), in Activity and in the U50/U55 waiting list: what changes, who
+    asks, Allow and Deny, and for Deny an optional reason that reaches the
+    lead. Allow applies exactly that change, bound to the proposal id and a
+    hash of its content; a changed or stale proposal is refused, never
+    re-applied. The owner word by text stays as a fallback for the CLI.
+  - *A phase with no work done:* a phase whose tasks are all cancelled or
+    never started (none accepted, none with a delivered attempt) may be
+    discarded, by the owner directly or by the lead through this card, even
+    when it is running; its numbering closes up as for a draft.
+  - The lead protocol says to propose and wait for the card, never to ask the
+    owner for a sentence.
+- **U56. A stuck member never blocks its tasks silently (owner, 2026-10-29).**
+  From team 6d0aabee (RogueDOD QA bot): member b-body stayed in context
+  compaction for over 80 minutes after its report; its pinned tasks #15/#16
+  were never handed out, the only signal was a starved notice about another
+  member, named by role, and the lead could neither release nor relaunch.
+  - *Stuck.* A member busy in one phase (compacting, a turn) with no session
+    event for 10 minutes (setting `stuck_minutes`) is marked stuck
+    (`state_reason: compaction_timeout | no_progress`); the lead gets one
+    `member_stuck` item naming the member id, phase, duration and the tasks
+    that wait for it. The member's open attempt, if any, keeps today's silent
+    rule.
+  - *Tasks waiting for an unavailable member.* A pending task pinned to a
+    stuck, stopped or offline member says so in its waits and in one inbox
+    item, with the commands that free it.
+  - *Ids, not roles.* Every notice names the member id with its role
+    ("b-body (backend-opus)"); several members may share a role.
+  - *The lead on a stuck member.* With the owner's team setting
+    `lead_restarts_stuck` (default off), the lead may interrupt or relaunch a
+    member Zerus marks stuck; otherwise the item tells the lead to ask the
+    owner and names the command.
+  - *Status without inspect.* `hgs team status` shows each member's phase,
+    activity summary and minutes without progress.
+  - *Small fixes.* A refused owner's word names the expected sentence ("plan
+    approved", "phase N approved"); the lead may discard an empty draft phase;
+    `hgs team draft` seen documents its request_id; a captured reply that says
+    it still waits ("waiting for the editor to close") is not made a report;
+    a team setting `keep_assignees` (default off) pins every planned assignee.
+- **U55. What waits for the owner is shown where the owner looks (owner,
+  2026-10-29).** Mock-up #530 waited a day for the owner, who never knew. An
+  item that waits for the owner (the kinds of U50's `hgs team waiting`: a
+  draft phase or plan, an escalated report or permission, the owner's word
+  asked, a task the owner holds or a report marked for the owner, a finished
+  team) shows as a banner at the top of the session's chat and Activity, and
+  under Activity in the team view: what waits, for how long, and its action
+  (Open, Approve, Accept). Several fold into one line with a count. The first
+  time an item starts waiting, one desktop notification says so; it never
+  repeats for the same item. A member's report that names the owner ("ready
+  for the owner") is the lead's to decide unless the lead escalates it; the
+  lead protocol says so.
+- **U54. Move a team to another account (owner, 2026-10-29).** Moving team
+  528aebfe's Claude members and its lead off an account near its weekly limit
+  took two owner scripts in an outside PowerShell, a manual pause of six old
+  sessions and a folder fix. Zerus handles it as one ordinary owner action:
+  - *One action for a team.* "Move members on account X to account Y" (the
+    team's members menu; `swap-member` takes a list) swaps every member of
+    that provider whose session runs on X, the lead included, after one
+    confirmation that names them. The roster shows each member's real
+    account, read from its session, not only the configured one: an empty
+    `account` used to hide that the lead and reviewer ran on Additional.
+  - *Keep the conversation where it can.* With U53, a same-provider account
+    change resumes the member's own conversation on the new account (same
+    name, folder and attempt) instead of a fresh session with a continuation.
+    A fresh session stays the fallback, and the owner's choice for another
+    agent.
+  - *The old session never blocks the new one.* A fresh member session
+    reuses the member's session name, and `hgs` refused the launch ("This
+    session already has an account") while the old session lived. The swap
+    pauses the old session once it is idle (never a kill; its conversation
+    stays under Saved) before launching, or waits for idle with that reason.
+    A busy old session is never interrupted without the owner's choice.
+    A pause alone is not enough: the paused session keeps its account
+    binding, and `--new` with an explicit account is still refused, so the
+    swap also renames the old session to `<name>-<old account label>` (its
+    conversation and account kept) before the launch.
+  - *A failed launch after a swap is retried.* The failed first launch cleared
+    `launch_after_swap`, so after the owner's relaunch the member stayed Not
+    created until work was ready. A relaunch of a swapped member launches it
+    at once, and the error names its fix.
+  - *A member folder left on a task branch.* frontend2's worktree was on
+    `team/528aebfe/frontend2-570`, so its launch failed ("is not this member's
+    folder"). When the folder is clean and the task branch is already merged
+    into the member's or the lead's branch, Zerus checks out the member's
+    branch again (the task branch is kept) and records it in the feed;
+    otherwise the error offers that checkout as a review action, never a
+    reset.
+  - *The lead on the owner's word.* The lead may swap, relaunch and pause the
+    old sessions of its own team on the owner's word in its session (the U26
+    roster rule), so the owner does not need an outside shell. A swap to an
+    existing session (the lead moving to a new session) stays owner-confirmed.
+  - *A renamed member session stays the member.* After the new lead's session
+    was renamed (work-e1f3aa6e to Zerus_Iterations), every team command from
+    it was refused ("This session is not a member"): the caller is matched by
+    the stored session name only. A rename keeps the member: the caller is
+    matched by its run and conversation, and the team record follows the
+    session's rename, as `hgs inspect` already does.
+  - *The new lead gets the old lead's context.* A lead swapped to another
+    conversation gets, in its brief, the previous lead's session name and
+    conversation, the path of its transcript and its latest compact summary
+    (bounded), and the old lead stays paused, not stopped.
 
 ## Phases 37-40 (replanned 2026-10-27)
 
@@ -1260,6 +1420,115 @@ phase 37. Lanes are balanced by volume and cost (U28 rule 9), not by count.
   their tokens on the server, `hgs team profile` with the ranked losses,
   the Profile view and the heat overlay, the lead protocol and docs;
   integration, review, QA and the build.
+
+## Free planning in phase 43 (owner, 2026-10-30)
+
+- U59 joins phase 43 as its last work, before the phase's integration,
+  review, QA, build and the fork release: the plan mode on the server and
+  its status field, the lead's proposal at the start of planning, the
+  switch-to-free dialog bound to the request, adding tasks to an open phase
+  and closing it, the mode in the desktop and Android views, the lead
+  protocol and docs. The dialog is its own confirmation bound to the request
+  id; U57 (phase 45) later moves it onto the shared confirmation card.
+
+## Model servers in phase 48 (owner, 2026-10-30)
+
+- U60: phase 48 is a general model servers feature, not one machine. A model
+  server is any computer on the LAN, or this one, that serves LLMs through an
+  OpenAI- or Anthropic-compatible API (vLLM, llama.cpp, Ollama, LM Studio,
+  LiteLLM or similar). Code, docs and tests never name a particular server,
+  host, model size or vendor command.
+- Configuration is per computer, local and never committed: a name, the API
+  URL and its kind, an optional key in the private store, an optional SSH
+  host (one of Zerus's Machines or an alias, reached through hgs's own SSH
+  transport) and optional control commands for status, up, down and logs.
+  Status reads a Zerus JSON contract or plain `NAME: STATE` lines. Without
+  control commands the server is read only, from the API's model list.
+- LLM access: New session starts a chosen agent on this computer (Codex,
+  OpenCode, Claude Code) on the server's API and model with session-scoped
+  provider settings, as the local agents design separates the agent from its
+  inference provider (2026-10-13-local-agents-design.md).
+- A server may be shared: every down asks first and says so, and nothing
+  retries on its own. A computer without a server shows no tab. Image
+  generation is a later phase.
+
+## Auto-accepted drafts stay drafts until work starts (owner, 2026-10-30)
+
+- U61: with Auto-accept drafts on, the next phase is not accepted when it is
+  drafted. While the members work in the current phase and nobody has taken a
+  task of the next auto-accepted phase, it stays a draft: the lead adds,
+  edits, moves and removes its tasks freely.
+- The draft is fixed (accepted by Auto) at the moment the first member is
+  handed one of its tasks: when the current phase is done, or earlier when
+  the lead lets idle members start it.
+- Whether a member may take work from an auto-accepted draft early is the
+  lead's decision, per phase; its reports need no owner approval, as the
+  phase is auto-accepted.
+
+## Test discipline (owner, 2026-10-30)
+
+- U62: the big suites are cut into small pieces by area, so a task runs only
+  the tests of what it touches. A member runs the tests its task touches;
+  a phase's integration runs the tests of everything the phase touched.
+- The full run is the owner's call: only before a release (the owner said to
+  publish or release a version), and only after the lead asks the owner to
+  confirm it with how long it takes, unless the owner gave an explicit
+  standing permission. Nobody runs the full suites otherwise.
+- Zerus carries the rule: a test map from source areas to test targets and
+  filters, a command that names the affected tests of a change with their
+  time, a testing policy in every hand-off and the lead's guide, and full-run
+  templates that need the owner's grant.
+- Test requests go to a queue: Zerus runs them as a milestone when the
+  machine has room (suites declare CPU, GPU and RAM needs), returns each
+  result to whoever submitted it, and anyone may force one test to run now.
+- Every result goes to a local database with its time, commit and a short
+  log excerpt; the lead gets a card linking to it and reads it only when
+  needed. A suite whose inputs did not change reuses its last result, marked
+  as reused and due for a new measurement; when enough reused results pile
+  up, Zerus proposes a full run.
+- A suite that fails and then passes on one retry is marked flaky with its
+  history; three flaky episodes become a lead item. A suite that grows more
+  than half over its recorded time is flagged.
+- The team gets a Tests view (queue, running, history, flaky, reused), and
+  the profiler and a task's drawer show its test runs.
+- A test that touches the user's own paths (settings, zerus.log, the temp or
+  crash dump folders outside its own) fails a check.
+- Strengthened (owner, 2026-10-30, "take all"):
+  - The map comes from the build itself (CMake: which objects each test
+    binary links; Rust: the module graph, widened for shared modules) and is
+    checked against coverage weekly; an unmapped file widens to its area.
+  - Zerus, not the author, computes a task's affected set from its diff;
+    only the runner writes results, bound to the exact commit that merges.
+  - A crash (abnormal exit, a dump, a sanitizer report, heap corruption) is
+    never retried to green; a flaky quarantine is visible and expires.
+  - Qt results are reused by the test binary's hash and its data; Rust is not
+    cached (it runs in seconds when filtered).
+  - One shared build cache (sccache for Rust, ccache for MSVC) for every
+    worktree of the team: builds, not tests, cost the most today.
+  - A merge queue: each accepted report merges into the lead branch at once
+    and runs its affected tests there, so a phase integration is a formality.
+  - The release full run is the fork CI's run of the candidate, after the
+    owner confirms it; a nightly full run in the fork CI catches map gaps.
+  - Bloat guard: each report counts the test lines and functions it adds and
+    removes; suites have a time and size budget; a monthly coverage report
+    names tests without unique coverage.
+  - Isolation by construction: the runner gives every suite its own HOME,
+    APPDATA, LOCALAPPDATA, TEMP and XDG folders and keeps test crash dumps in
+    the run's folder; a fingerprint check of the user's paths is the second line.
+  - The scheduler reads the machine's real load and puts forced and short
+    suites first; long ones go to the night run or the CI.
+  - Later (phase 57): remote runners on the owner's other computers over
+    hgs's SSH for Linux, macOS and Android suites.
+- Every project configures it (owner, 2026-10-30: another user may want the
+  tests set up differently): the mechanism is Zerus's, this repository's
+  values are one configuration. A project file (.zerus/tests.toml) names its
+  test providers (cargo, ctest, pytest, gradle, npm or any command), how the
+  affected set is found (from the build, from a path map, or everything), the
+  resource and platform classes, where the full run happens (here, a CI, a
+  runner), the full-run policy, retries, budgets, the isolated environment
+  and whether the build cache and the merge queue are on; the owner may
+  override it in the team's settings. Without the file Zerus detects common
+  stacks and proposes defaults, and a team without any keeps today's flow.
 
 ## Order of work (proposal)
 

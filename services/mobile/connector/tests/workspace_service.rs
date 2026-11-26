@@ -54,15 +54,27 @@ elif a[1]=='start':
    durable(intent,{'pending':False,'outcome':'reaped-after-error','pid':p.pid})
   raise
 elif a[1]=='show':
+ if q.get('pause_started_show') and q.get('starts',0)>0:
+  (r/'ack-show-ready').write_text('ready')
+  end=time.monotonic()+8
+  while not (r/'ack-show-release').exists():
+   if time.monotonic()>end:raise RuntimeError('synthetic acknowledgement barrier timed out')
+   time.sleep(.01)
  if q.get('show_delay'):time.sleep(q['show_delay'])
  q['shows']=q.get('shows',0)+1;s.write_text(json.dumps(q))
  if q.get('refuse_on_show')==q['shows']:q.setdefault('properties',{})['ConsistsOf']='synthetic-native.scope';s.write_text(json.dumps(q))
  pid=q['pid'];alive=False
  try:alive=Path('/proc/'+str(pid)+'/stat').read_text().rsplit(') ',1)[1].split()[0]!='Z'
  except FileNotFoundError:pass
+ cg=r/'cgroup';cg.mkdir(exist_ok=True)
+ group=q.get('group','/fixture/zerus-mobile-connector.service')
+ (cg/'proc-cgroup').write_text('0::'+group+'\n')
+ directory=cg/'fixture/zerus-mobile-connector.service';directory.mkdir(parents=True,exist_ok=True)
+ (directory/'cgroup.procs').write_text(str(pid)+'\n'+('999999\n' if q.get('extra_process') else ''))
+ if q.get('extra_scope'):(directory/'native.scope').mkdir(exist_ok=True)
  command=q.get('override') or q['loaded'];argv=command+' --config '+str(r/'connector.json')
  drop=r/'systemd/zerus-mobile-connector.service.d/70-zerus-workspace-connector.conf'
- values={'LoadState':'loaded','ActiveState':'active' if alive else 'inactive','SubState':'running' if alive else 'dead','MainPID':str(pid) if alive else '0','InvocationID':q['invocation'] if alive else '', 'KillMode':'process','Restart':'on-failure','Type':'simple','RemainAfterExit':'no','ExitType':'main','FailureAction':'none','SuccessAction':'none','WatchdogUSec':'0','RuntimeMaxUSec':'infinity','Result':'success','ExecMainStatus':'0','StopWhenUnneeded':'no','MemoryMax':'268435456','MemoryHigh':'infinity','CPUQuotaPerSecUSec':'infinity','TasksMax':'64','FragmentPath':str(r/'base.service'),'DropInPaths':str(drop) if drop.exists() else '', 'ExecStart':'{ path='+command+' ; argv[]='+argv+' ; ignore_errors=no ; }'}
+ values={'ControlGroup':group,'LoadState':'loaded','ActiveState':'active' if alive else 'inactive','SubState':'running' if alive else 'dead','MainPID':str(pid) if alive else '0','InvocationID':q['invocation'] if alive else '', 'KillMode':'process','Restart':'on-failure','Type':'simple','RemainAfterExit':'no','ExitType':'main','FailureAction':'none','SuccessAction':'none','WatchdogUSec':'0','RuntimeMaxUSec':'infinity','Result':'success','ExecMainStatus':'0','StopWhenUnneeded':'no','MemoryMax':'268435456','MemoryHigh':'infinity','CPUQuotaPerSecUSec':'infinity','TasksMax':'64','FragmentPath':str(r/'base.service'),'DropInPaths':str(drop) if drop.exists() else '', 'ExecStart':'{ path='+command+' ; argv[]='+argv+' ; ignore_errors=no ; }'}
  values.update(q.get('properties',{}))
  for k in a[a.index('--property')+1].split(','):
   v=values.get(k,'')
@@ -152,6 +164,8 @@ impl Fixture {
             std::env::var_os("ZERUS_WORKSPACE_SERVICE_FIXTURE")
                 .expect("Pass the exact normal Cargo example artifact"),
         );
+        assert!(std::fs::metadata(&source).unwrap().len() <= 64 * 1024 * 1024,
+            "Build the private Cargo example with -C strip=debuginfo; oversized-image refusal is not causal RED");
         let old = r.join("old/zerus-mobile-connector");
         let new = r.join("new/zerus-mobile-connector");
         std::fs::copy(&source, &old).unwrap();
@@ -200,6 +214,8 @@ impl Fixture {
             manager: self.path("manager"),
             binary: self.new.clone(),
             dropin: self.dropin.clone(),
+            cgroup: self.path("cgroup"),
+            acknowledgement_waiting: None,
         }
     }
     async fn drain(&self) -> Option<Value> {
@@ -393,11 +409,14 @@ impl Fixture {
         status
     }
     async fn cooperative_stop(&self, revision: &str, generation: &str) {
-        let result = zerus_mobile_connector::workspace::manage(
-            "stop",
-            &self.config,
-            json!({"expected_revision":revision,"generation":generation}),
-            false,
+        let result = service::test_scope(
+            self.paths(),
+            zerus_mobile_connector::workspace::manage(
+                "stop",
+                &self.config,
+                json!({"expected_revision":revision,"generation":generation}),
+                false,
+            ),
         )
         .await
         .unwrap();
@@ -772,6 +791,193 @@ async fn exact_pending_destination_survives_repeated_draining_checks() {
     }
     assert_eq!(f.signals(), 1);
     f.finish().await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn stop_preflight_refuses_unsafe_or_changed_service_before_any_marker() {
+    let mut f = Fixture::new().await;
+    assert_eq!(f.drain().await.unwrap()["phase"], "draining");
+    f.finish().await;
+    assert!(f.drain().await.is_none());
+    let revision = f.activate();
+    let current = f.start(NODE, &revision).await;
+    let state = PathBuf::from(value(&f.config)["state_dir"].as_str().unwrap());
+    let control = value(&state.join("workspace-control.json"));
+    let manager = value(&f.path("manager.json"));
+    let record_path = f.private.join("legacy-service-handover.json");
+    let record = value(&record_path);
+    let input = json!({"expected_revision":revision,"generation":current["generation"]});
+    // Every case retains the exact running fixture and must fail before the
+    // cooperative Stop marker exists. The fake manager refuses all Stop jobs.
+    for fault in [
+        "kill-mode",
+        "scope",
+        "extra-process",
+        "extra-subgroup",
+        "pid",
+        "invocation",
+        "missing-record",
+        "record-node",
+        "control-pid",
+        "control-generation",
+        "second-read",
+        "unreadable-unit",
+        "foreign-definition",
+    ] {
+        save(&f.path("manager.json"), &manager);
+        f.replace_private("legacy-service-handover.json", &record);
+        save(&state.join("workspace-control.json"), &control);
+        let drop_bytes = std::fs::read(&f.dropin).unwrap();
+        match fault {
+            "kill-mode" => f.mutate(|q| q["properties"]["KillMode"] = json!("control-group")),
+            "scope" => f.mutate(|q| q["properties"]["ConsistsOf"] = json!("native.scope")),
+            "extra-process" => f.mutate(|q| q["extra_process"] = json!(true)),
+            "extra-subgroup" => f.mutate(|q| q["extra_scope"] = json!(true)),
+            "pid" => f.mutate(|q| q["properties"]["MainPID"] = json!(f.child.id().to_string())),
+            "invocation" => f.mutate(|q| q["invocation"] = json!("replacement")),
+            "missing-record" => std::fs::remove_file(&record_path).unwrap(),
+            "record-node" => {
+                let mut q = record.clone();
+                q["managed_node_id"] = json!("replacement");
+                f.replace_private("legacy-service-handover.json", &q);
+            }
+            "control-pid" => {
+                let mut q = control.clone();
+                q["pid"] = json!(f.child.id());
+                save(&state.join("workspace-control.json"), &q);
+            }
+            "control-generation" => {
+                let mut q = control.clone();
+                q["generation"] = json!("f".repeat(32));
+                save(&state.join("workspace-control.json"), &q);
+            }
+            "second-read" => {
+                f.mutate(|q| q["refuse_on_show"] = json!(q["shows"].as_u64().unwrap() + 2))
+            }
+            "unreadable-unit" => f.mutate(|q| q["properties"]["LoadState"] = json!("error")),
+            "foreign-definition" => {
+                std::fs::write(&f.dropin, "[Service]\nKillMode=control-group\n").unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let refused = service::test_scope(
+            f.paths(),
+            zerus_mobile_connector::workspace::manage("stop", &f.config, input.clone(), false),
+        )
+        .await;
+        // A control record of another generation means this call's target is gone,
+        // which is no refusal of it. Every other case is the closed result.
+        if fault == "control-generation" {
+            assert!(refused.is_err(), "{refused:?}");
+        } else {
+            let refused = refused.unwrap();
+            assert_eq!(refused["ok"], false, "{fault}");
+            assert_eq!(refused["refusal"], "stop-refused-before-effect", "{fault}");
+            assert_eq!(refused["generation"], input["generation"], "{fault}");
+            assert_eq!(
+                refused["expected_revision"], input["expected_revision"],
+                "{fault}"
+            );
+        }
+        assert!(!state.join("workspace-stop.json").exists(), "{fault}");
+        assert!(
+            owned_start(control["pid"].as_i64().unwrap() as i32).is_some(),
+            "{fault}"
+        );
+        std::fs::write(&f.dropin, drop_bytes).unwrap();
+        let subgroup = f.path("cgroup/fixture/zerus-mobile-connector.service/native.scope");
+        if subgroup.exists() {
+            std::fs::remove_dir(subgroup).unwrap();
+        }
+    }
+    // A refusal leaves another generation's marker exactly as it was, and the
+    // running connector ignores that marker.
+    save(&f.path("manager.json"), &manager);
+    f.replace_private("legacy-service-handover.json", &record);
+    save(&state.join("workspace-control.json"), &control);
+    f.mutate(|q| q["properties"]["KillMode"] = json!("control-group"));
+    let marker = state.join("workspace-stop.json");
+    let other = json!({"version":1,"generation":"f".repeat(32)});
+    write(&marker, &serde_json::to_vec(&other).unwrap(), 0o600);
+    let stale = std::fs::read(&marker).unwrap();
+    let refused = service::test_scope(
+        f.paths(),
+        zerus_mobile_connector::workspace::manage("stop", &f.config, input.clone(), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["refusal"], "stop-refused-before-effect");
+    assert_eq!(std::fs::read(&marker).unwrap(), stale);
+    std::fs::remove_file(&marker).unwrap();
+    save(&f.path("manager.json"), &manager);
+    f.replace_private("legacy-service-handover.json", &record);
+    save(&state.join("workspace-control.json"), &control);
+    f.cooperative_stop(&revision, current["generation"].as_str().unwrap())
+        .await;
+    let calls = std::fs::read_to_string(f.path("manager.calls")).unwrap();
+    assert!(calls.lines().all(|line| {
+        let args: Vec<String> = serde_json::from_str(line).unwrap();
+        matches!(args[1].as_str(), "show" | "daemon-reload" | "start")
+    }));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_already_in_effect_is_never_the_closed_refusal() {
+    let mut f = Fixture::new().await;
+    f.drain().await;
+    f.finish().await;
+    assert!(f.drain().await.is_none());
+    let revision = f.activate();
+    let current = f.start(NODE, &revision).await;
+    let state = PathBuf::from(value(&f.config)["state_dir"].as_str().unwrap());
+    let input = json!({"expected_revision":revision,"generation":current["generation"]});
+    let stop = || {
+        service::test_scope(
+            f.paths(),
+            zerus_mobile_connector::workspace::manage("stop", &f.config, input.clone(), false),
+        )
+    };
+    // The admission refuses in this state, which the closed result first proves.
+    f.mutate(|q| q["properties"]["KillMode"] = json!("control-group"));
+    let refused = stop().await.unwrap();
+    assert_eq!(refused["refusal"], "stop-refused-before-effect");
+    // With this generation's marker in effect nothing may say nothing changed. The
+    // connector honors the marker within its poll, so it may already have gone.
+    let marker = json!({"version":1,"generation":current["generation"]});
+    write(
+        &state.join("workspace-stop.json"),
+        &serde_json::to_vec(&marker).unwrap(),
+        0o600,
+    );
+    let in_effect = stop().await;
+    assert!(
+        in_effect
+            .as_ref()
+            .map_or(true, |reply| reply.get("refusal").is_none()),
+        "{in_effect:?}"
+    );
+    until(|| {
+        value(&f.path("manager.json"))["pid"]
+            .as_u64()
+            .is_some_and(|p| owned_start(p as i32).is_none())
+    })
+    .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_stop_needs_exact_lock_owner_generation_and_no_active_service() {
+    let mut f = Fixture::new().await;
+    f.drain().await;
+    f.finish().await;
+    assert!(f.drain().await.is_none());
+    let revision = f.activate();
+    let current = f.start(NODE, &revision).await;
+    std::fs::remove_file(f.private.join("legacy-service-handover.json")).unwrap();
+    f.mutate(|q| {
+        q["group"] = json!("/fixture/session.scope");
+        q["properties"] = json!({"LoadState":"not-found","ActiveState":"inactive","MainPID":"0"});
+    });
+    // Same fixture process, generation and held journal; only the fake
+    // supervisor is now known absent. No service job is issued by Stop.
+    f.cooperative_stop(&revision, current["generation"].as_str().unwrap())
+        .await;
 }
 #[tokio::test(flavor = "current_thread")]
 async fn managed_start_stop_start_admits_only_the_observed_clean_generation() {
@@ -1600,4 +1806,158 @@ async fn retired_switch_recovers_published_destination_from_exact_archived_histo
             .count(),
         1
     );
+}
+
+async fn contended_start(
+    f: &Fixture,
+    revision: &str,
+    change: &str,
+) -> (
+    zerus_mobile_connector::error::Result<Option<Value>>,
+    Vec<u8>,
+) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let waiting = Arc::new(AtomicBool::new(false));
+    let mut paths = f.paths();
+    paths.acknowledgement_waiting = Some(waiting.clone());
+    f.mutate(|v| v["pause_started_show"] = json!(true));
+    let (cfg, _) = workspace_cli::read_config(&f.config).unwrap();
+    let state = PathBuf::from(cfg["state_dir"].as_str().unwrap());
+    let completed = std::cell::Cell::new(false);
+    let retained = std::cell::RefCell::new(Vec::new());
+    let start = async {
+        let result = service::test_scope(
+            paths,
+            service::test_start(&f.config, &f.private, NODE, revision),
+        )
+        .await;
+        completed.set(true);
+        result
+    };
+    let contend = async {
+        until(|| f.path("ack-show-ready").exists() || completed.get()).await;
+        assert!(
+            f.path("ack-show-ready").exists(),
+            "Start returned before the acknowledgement barrier"
+        );
+        until(|| {
+            zerus_mobile_connector::workspace_lifecycle::status(&state)
+                .is_ok_and(|status| status["running"] == true)
+        })
+        .await;
+        let held = Store::lock(&f.private, false).unwrap();
+        std::fs::write(f.path("ack-show-release"), b"release").unwrap();
+        until(|| waiting.load(Ordering::SeqCst) || completed.get()).await;
+        assert!(
+            !completed.get(),
+            "acknowledgement returned while the Store was held"
+        );
+        assert!(
+            value(&f.private.join("legacy-service-handover.json"))["details"]["managed"].is_null()
+        );
+        match change {
+            "none" => {}
+            "record" => {
+                let mut record = value(&f.private.join("legacy-service-handover.json"));
+                record["reason"] = json!("synthetic concurrent change");
+                let expected = Store::revision(
+                    held.read("legacy-service-handover.json")
+                        .unwrap()
+                        .as_deref(),
+                );
+                held.replace(
+                    "legacy-service-handover.json",
+                    &expected,
+                    &serde_json::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            }
+            "config" => {
+                let (mut cfg, expected) = workspace_cli::read_config(&f.config).unwrap();
+                cfg["fixture_changed"] = json!(true);
+                workspace_cli::replace_config(&f.config, &expected, &cfg).unwrap();
+            }
+            "generation" => {
+                let path = state.join("workspace-control.json");
+                let mut control = value(&path);
+                control["generation"] = json!("0".repeat(32));
+                save(&path, &control);
+            }
+            "invocation" => f.mutate(|v| v["invocation"] = json!("synthetic-changed")),
+            _ => panic!("unknown private fixture case"),
+        }
+        *retained.borrow_mut() = held.read("legacy-service-handover.json").unwrap().unwrap();
+        drop(held);
+    };
+    let (result, ()) = futures_util::future::join(start, contend).await;
+    assert_eq!(value(&f.path("manager.json"))["starts"], 1);
+    (result, retained.into_inner())
+}
+async fn activated_fixture() -> (Fixture, String) {
+    let mut f = Fixture::new().await;
+    f.drain().await;
+    f.finish().await;
+    assert!(f.drain().await.is_none());
+    let revision = f.activate();
+    (f, revision)
+}
+#[tokio::test(flavor = "current_thread")]
+async fn successful_start_acknowledgement_waits_for_temporary_store_contention() {
+    let (f, revision) = activated_fixture().await;
+    let (result, _) = contended_start(&f, &revision, "none").await;
+    assert!(result.is_ok(), "acknowledgement refused after verified launch and temporary private Store contention: {result:?}");
+    let status = result.unwrap().unwrap();
+    assert_eq!(
+        value(&f.private.join("legacy-service-handover.json"))["details"]["managed"]["generation"],
+        status["generation"]
+    );
+    assert_eq!(
+        f.start(NODE, &revision).await["generation"],
+        status["generation"]
+    );
+    assert_eq!(value(&f.path("manager.json"))["starts"], 1);
+    f.stop_new().await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn acknowledgement_wait_keeps_record_and_config_cas() {
+    for change in ["record", "config"] {
+        let (f, revision) = activated_fixture().await;
+        let (result, retained) = contended_start(&f, &revision, change).await;
+        assert!(result.is_err(), "{change}");
+        assert_eq!(
+            std::fs::read(f.private.join("legacy-service-handover.json")).unwrap(),
+            retained
+        );
+        f.stop_new().await;
+        assert!(service::test_scope(
+            f.paths(),
+            service::test_start(&f.config, &f.private, NODE, &revision)
+        )
+        .await
+        .is_err());
+        assert_eq!(value(&f.path("manager.json"))["starts"], 1);
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn acknowledgement_wait_rechecks_native_generation_and_service_identity() {
+    for change in ["generation", "invocation"] {
+        let (f, revision) = activated_fixture().await;
+        let (result, retained) = contended_start(&f, &revision, change).await;
+        assert!(result.is_err(), "{change}");
+        assert_eq!(
+            std::fs::read(f.private.join("legacy-service-handover.json")).unwrap(),
+            retained
+        );
+        f.stop_new().await;
+        assert!(service::test_scope(
+            f.paths(),
+            service::test_start(&f.config, &f.private, NODE, &revision)
+        )
+        .await
+        .is_err());
+        assert_eq!(value(&f.path("manager.json"))["starts"], 1);
+    }
 }

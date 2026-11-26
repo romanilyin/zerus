@@ -8,6 +8,7 @@
       "page": "#161b21",
       "pane": "#161b21",
       "surface": "#1c2229",
+      "members-surface": "#151a20",
       "raised": "#1c2229",
       "card": "#1c2229",
       "card-border": "#333c47",
@@ -36,6 +37,7 @@
       "warn": "#edbd77",
       "warn-bg": "rgba(237,189,119,.11)",
       "danger": "#ff9ca8",
+      "danger-text": "#33151c",
       "danger-bg": "rgba(255,156,168,.11)",
       "info": "#98bdeb",
       "info-bg": "rgba(152,189,235,.11)",
@@ -48,6 +50,16 @@
       "status-error": "{color.danger}",
       "status-ready": "{color.muted}",
       "status-offline": "{color.dim}",
+      "plan-done": "#5ec98a",
+      "plan-done-bg": "rgba(94,201,138,.12)",
+      "plan-work": "#6fb6ff",
+      "plan-work-bg": "rgba(111,182,255,.13)",
+      "plan-review": "#2f7fd6",
+      "plan-review-bg": "rgba(47,127,214,.18)",
+      "plan-notstarted": "#b7c0cc",
+      "plan-notstarted-bg": "rgba(183,192,204,.09)",
+      "plan-cancelled": "#7f8a99",
+      "plan-cancelled-bg": "rgba(127,138,153,.10)",
       "unread": "{color.accent}",
       "draft": "{color.info}",
       "entity-base": "#171e25",
@@ -67,12 +79,15 @@
       "row-hover": "#242c34",
       "row-selected": "#303b47",
       "row-selected-border": "#8295a9",
-      "attention-ink": "#392900"
+      "attention-ink": "#392900",
+      "members-surface": "#151a20"
     },
     "agent": {
       "claude": "#e8b29b",
       "codex": "#a6d8c5",
       "kimi": "#bac1ff",
+      "qwen": "#b7b3ff",
+      "hermes": "#e0a96d",
       "deepseek": "#8cb9ff",
       "opencode": "#a6d8c5"
     },
@@ -95,6 +110,11 @@
       "badge-scheduled-fg": "#9fe0f0",
       "badge-waiting-bg": "#443a25",
       "badge-waiting-fg": "#edd096",
+      "state-deps": "#6fa8ff",
+      "state-cooling": "#56c8e0",
+      "state-cold": "#8fa6c4",
+      "state-build": "#4cc98a",
+      "state-stopped": "#8b939e",
       "badge-neutral-bg": "#2b343e",
       "badge-neutral-fg": "#b6c2d0",
       "badge-muted": "#c4ccd5",
@@ -113,6 +133,8 @@
       "frame-muted": "#c4ccd5",
       "tile-surface": "#1c2229",
       "tile-border": "#29313a",
+      "agent-tile": "#0f1318",
+      "agent-tile-border": "#232932",
       "tone-working": "#55e39a",
       "tone-background": "#aac0df",
       "tone-error": "#ffabb6",
@@ -214,6 +236,10 @@
     "rail": "icons",
     "sessions-pane": "left",
     "inspector": "docked",
-    "activity-column": "centered"
+    "activity-column": "centered",
+    "side-panel": "tabs",
+    "chrome": "system",
+    "new-session": "dense"
   }
 }
+

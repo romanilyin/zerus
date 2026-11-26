@@ -13,6 +13,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Data-only capability exchange with the actual mobile journal owner. This
+/// grants no native-operation, session, Stop or delivery authority.
+pub mod session_labels;
+
 /// The `v` of every frame.
 pub const VERSION: u32 = 1;
 /// The ABI name a client looks for before it starts the stream.
@@ -35,10 +39,16 @@ pub const GIT_SUBSCRIPTIONS: usize = 64;
 pub const PROCESSES_SUBSCRIPTIONS: usize = 16;
 /// Concurrent tasks subscriptions (projects) per stream.
 pub const TASKS_SUBSCRIPTIONS: usize = 8;
+/// The team heads the `team` topic carries at most (the most recently changed).
+pub const TEAM_ROWS: usize = 1000;
+/// The most rows of each stage a windowed tasks subscription carries.
+pub const TASKS_WINDOW: usize = 200;
 /// The most events an Activity tail or tail snapshot carries.
 pub const ACTIVITY_TAIL: usize = 100;
 /// The most journal rows one Activity read returns.
 pub const ACTIVITY_READ: usize = 200;
+/// The most rows one older Activity page (`before`) carries.
+pub const ACTIVITY_OLDER: usize = 200;
 /// The longest control line the server accepts, without its newline.
 pub const CONTROL_LINE_BYTES: usize = 64 << 10;
 
@@ -61,6 +71,24 @@ pub mod topic {
     pub const TASKS: &str = "tasks";
     /// The shared project catalog as `hgs swarm get` shows it, as keyed rows.
     pub const ORGANIZATION: &str = "organization";
+    /// Every team's head (id, name, lead, status, revision, updated) as keyed
+    /// rows: a client reads a team again with `hgs team` when its revision
+    /// changes, instead of polling. One per stream.
+    pub const TEAM: &str = "team";
+    /// Task #16 of team c536f0e5 (P2.5): the Teams views as keyed rows, each
+    /// exactly what its `hgs team <read> --json` returns: `list`, `waiting`
+    /// and, for the team a subscription names (`team`), `status:<id>`,
+    /// `inbox:<id>` and `feed:<id>`. A row too large for a frame is an error
+    /// row (`{"error":{"code":"too_large",...}}`) read with its command. One
+    /// per stream; a later subscribe replaces the team.
+    pub const TEAM_VIEWS: &str = "team.views";
+    /// Task #20 of team c536f0e5 (P2.6c): the computer's swarm head as one
+    /// row `swarm`, `{catalog, tasks}`: the digest of its catalog operations
+    /// and the fingerprint of its stored tasks. A member whose desktop sees a
+    /// peer's head move asks its swarm worker to sync with that peer at once.
+    pub const SWARM: &str = "swarm";
+    /// The separately persisted, capable-only Windows drive-folder projection.
+    pub const DRIVE_FOLDERS: &str = "organization.drive_folders";
 }
 
 /// Why a catalog key was removed. Clients treat an unknown reason as unknown.
@@ -81,6 +109,13 @@ pub mod reason {
     pub const RESET: &str = "reset";
 }
 
+/// Codes of `error` frames that clients act on.
+pub mod code {
+    /// Fatal: an update replaced the `hgs` executable this stream runs.
+    /// Start the stream again to run the new version; rows stay as known.
+    pub const HGS_REPLACED: &str = "hgs_replaced";
+}
+
 /// One line of the stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
@@ -98,6 +133,7 @@ pub enum Body {
     Snapshot(Snapshot),
     Delta(Delta),
     Events(Events),
+    Older(Older),
     Event(EventUpdate),
     State(State),
     Heartbeat(Heartbeat),
@@ -139,6 +175,14 @@ pub struct Limits {
     /// 0 from a server without the tasks topic.
     #[serde(default)]
     pub tasks_subscriptions: usize,
+    /// The largest `window` a tasks subscription may ask for; 0 from a server
+    /// that always sends the whole list.
+    #[serde(default)]
+    pub tasks_window: usize,
+    /// The most rows one older Activity page (`before`) carries; 0 from a
+    /// server without older pages, which reads earlier Activity by `after`.
+    #[serde(default)]
+    pub activity_older: usize,
 }
 
 impl Default for Limits {
@@ -153,6 +197,8 @@ impl Default for Limits {
             git_subscriptions: GIT_SUBSCRIPTIONS,
             processes_subscriptions: PROCESSES_SUBSCRIPTIONS,
             tasks_subscriptions: TASKS_SUBSCRIPTIONS,
+            tasks_window: TASKS_WINDOW,
+            activity_older: ACTIVITY_OLDER,
         }
     }
 }
@@ -211,6 +257,25 @@ pub struct Events {
     pub events: Vec<Value>,
     /// The journal `seq` to resume after.
     pub cursor: i64,
+}
+
+/// One page of a followed session's Activity before a journal `seq`, oldest
+/// first: the answer to a subscribe with `before`. It never moves the
+/// subscription's cursor. A read may span several frames; the one with `last`
+/// ends it and says whether older rows remain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Older {
+    pub topic: String,
+    pub key: String,
+    pub events: Vec<Value>,
+    /// The `before` of the next older page: the oldest journal `seq` this read
+    /// covered, also when every row of it was left out.
+    pub cursor: i64,
+    /// The read's final frame.
+    pub last: bool,
+    /// On the final frame: rows older than `cursor` remain.
+    #[serde(default)]
+    pub more: bool,
 }
 
 /// A replacement of one open event by its stable ID; a higher `rev` wins.
@@ -291,12 +356,36 @@ pub struct Subscription {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Processes polling interval, clamped by the server to 1–600 seconds.
+    /// Older watch-v1 servers ignore this additive field and keep their default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+    /// Request one processes read after its minimum gap, without dropping state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<bool>,
     /// Resume Activity after this journal `seq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
-    /// How many recent events a subscription without `after` starts with.
+    /// How many recent events a subscription without `after` starts with, or
+    /// how many rows an older page (`before`) carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<u32>,
+    /// Activity: read one page of the followed session's rows before this
+    /// journal `seq` (at most `tail`, up to `activity_older`), answered with
+    /// `older` frames. The subscription itself, its cursor and its state stay
+    /// as they are. Only for a server whose `activity_older` limit is above 0:
+    /// one without it ignores this additive field and subscribes anew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    /// Tasks: only the first `window` rows of each stage (1 to `tasks_window`),
+    /// with each stage's total and the cursor of its next page, instead of the
+    /// whole list. Servers without it ignore this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u32>,
+    /// Team views (task #16, P2.5): the team whose status, inbox and feed
+    /// rows the subscription adds. Servers without the topic ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 /// The exact session a subscription follows.
@@ -487,6 +576,14 @@ mod tests {
                 events: vec![json!({"type":"Stop","seq":41,"at":1787840176.25})],
                 cursor: 41,
             }),
+            Body::Older(Older {
+                topic: topic::ACTIVITY.into(),
+                key: "run:r1".into(),
+                events: vec![json!({"type":"Stop","seq":7,"at":1787840100.25})],
+                cursor: 7,
+                last: true,
+                more: true,
+            }),
             Body::Event(EventUpdate {
                 topic: topic::ACTIVITY.into(),
                 key: "run:r1".into(),
@@ -521,6 +618,23 @@ mod tests {
             }),
             Body::Pong(Pong { id: Some(json!(7)) }),
         ]
+    }
+
+    #[test]
+    fn processes_options_are_additive_and_absent_on_older_controls() {
+        let Control::Subscribe(old) = decode_control(
+            r#"{"op":"subscribe","topic":"processes","session":{"name":"codex/p/t"}}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(old.interval_ms, None);
+        assert_eq!(old.refresh, None);
+        let value = serde_json::to_value(Control::Subscribe(old)).unwrap();
+        assert!(value.get("interval_ms").is_none() && value.get("refresh").is_none());
+        let Control::Subscribe(new) = decode_control(r#"{"op":"subscribe","topic":"processes","session":{"name":"codex/p/t"},"interval_ms":2500,"refresh":true}"#).unwrap() else { panic!() };
+        assert_eq!(new.interval_ms, Some(2500));
+        assert_eq!(new.refresh, Some(true));
     }
 
     #[test]
@@ -664,10 +778,43 @@ mod tests {
         assert_eq!(older.git_subscriptions, 0);
         assert_eq!(older.processes_subscriptions, 0);
         assert_eq!(older.tasks_subscriptions, 0);
+        assert_eq!(older.tasks_window, 0);
+        assert_eq!(older.activity_older, 0);
+        assert_eq!(Limits::default().activity_older, ACTIVITY_OLDER);
+        // An older page is an additive option of an Activity subscribe.
+        let Control::Subscribe(page) = decode_control(
+            r#"{"op":"subscribe","topic":"activity","session":{"name":"codex/p/t","run_id":"r1"},"before":41,"tail":100}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!((page.before, page.tail, page.after), (Some(41), Some(100), None));
+        let Control::Subscribe(plain) =
+            decode_control(r#"{"op":"subscribe","topic":"activity","session":{"name":"codex/p/t"}}"#).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(plain.before, None);
         assert_eq!(
             Limits::default().processes_subscriptions,
             PROCESSES_SUBSCRIPTIONS
         );
+        assert_eq!(Limits::default().tasks_window, TASKS_WINDOW);
+    }
+
+    #[test]
+    fn a_tasks_window_is_additive_on_the_wire() {
+        let old: Subscription = serde_json::from_str(r#"{"topic":"tasks","project":"p"}"#).unwrap();
+        assert_eq!(old.window, None);
+        let plain = serde_json::to_value(&old).unwrap();
+        assert!(
+            plain.get("window").is_none(),
+            "an unwindowed request is unchanged"
+        );
+        let windowed: Subscription =
+            serde_json::from_str(r#"{"topic":"tasks","project":"p","window":50}"#).unwrap();
+        assert_eq!(windowed.window, Some(50));
+        assert_eq!(serde_json::to_value(&windowed).unwrap()["window"], 50);
     }
 
     #[test]

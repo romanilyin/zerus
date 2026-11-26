@@ -85,6 +85,26 @@ class Payload(unittest.TestCase):
         self.assertIn("installation.json", lines)
         self.assertEqual(windows_installer.problems(self.stage, expected), [])
 
+    def test_the_payload_list_bytes_do_not_depend_on_the_build_host(self):
+        # Text mode on Windows turns every "\n" written without newline="" into "\r\n",
+        # so the list's own CR LF became CR CR LF in CI-built installers.
+        write_text = Path.write_text
+
+        def windows_text_mode(path, data, encoding=None, errors=None, newline=None):
+            if newline is None:
+                data, newline = data.replace("\n", "\r\n"), ""
+            return write_text(path, data, encoding=encoding, errors=errors, newline=newline)
+
+        with patch.object(Path, "write_text", windows_text_mode):
+            _, expected = windows_installer.stage(self.zip(), self.stage)
+        listing = (self.stage / "uninstall" / "payload.txt").read_bytes()
+        self.assertNotIn(b"\r\r\n", listing)
+        self.assertEqual(listing, "".join(name.replace("/", "\\") + "\r\n" for name in sorted(expected)
+                                          if name != windows_installer.PAYLOAD_LIST).encode("utf-8"))
+        self.assertEqual(expected[windows_installer.PAYLOAD_LIST], windows_installer.sha256(
+            self.stage / "uninstall" / "payload.txt"))
+        self.assertTrue((self.stage / "installation.json").read_bytes().endswith(b"}\n"))
+
     def test_a_nightly_installer_records_its_nightly_version(self):
         nightly = f"0.45.0.r812.g{COMMIT[:7]}.n42"
         record, _ = windows_installer.stage(self.zip(), self.stage, nightly)
@@ -174,7 +194,7 @@ class Packager(unittest.TestCase):
         definitions = dict(item[2:].split("=", 1) for item in command[2:-1])
         self.assertEqual(definitions, {"AppVersion": "0.45.0.r3.gabcdef0.n9", "NumericVersion": "0.45.0.9",
                                        "PayloadDir": str(Path("/payload")), "OutputDir": str(output.parent),
-                                       "OutputName": output.stem, "IconFile": str(packager.ICON)})
+                                       "OutputName": output.stem, "IconFile": str(packager.ICON), "TauriDesktop": "0"})
         required = set(re.findall(r"(?m)^#ifndef (\w+)$", ISS.read_text(encoding="utf-8")))
         self.assertEqual(required, set(definitions))
         self.assertTrue(packager.ICON.is_file())
@@ -213,6 +233,29 @@ class PackagerVersions(unittest.TestCase):
             self.main("--version", "0.99.0", "--stage-only", str(staged), "--output", str(self.root / "setup.exe"))
         self.assertEqual(list(staged.iterdir()), [])
 
+    def test_compiled_ci_metadata_binds_both_stable_and_nightly_payloads(self):
+        import windows_installer_release
+        before = self.archive.read_bytes()
+        for index, version in enumerate(["0.45.0", f"0.45.0.r812.g{COMMIT[:7]}.n42"]):
+            with self.subTest(version=version):
+                output = self.root / f"setup-{index}.exe"
+                info = self.root / f"setup-{index}.json"
+                def compile_(command, **kwargs):
+                    definitions = dict(arg[2:].split("=", 1) for arg in command[2:-1])
+                    record = json.loads((Path(definitions["PayloadDir"]) / "installation.json").read_text())
+                    self.assertEqual(definitions["AppVersion"], version)
+                    self.assertEqual(record["version"], version)
+                    output.write_bytes(b"MZsynthetic compiled installer")
+                with patch.object(self.packager, "compiler", return_value=Path("ISCC.exe")), \
+                        patch.object(self.packager.subprocess, "run", side_effect=compile_):
+                    self.main("--version", version, "--output", str(output), "--info", str(info))
+                windows_installer_release.require_build(output, self.archive, info, version, "0.45.0", COMMIT)
+                self.assertEqual(self.archive.read_bytes(), before)
+                with patch.object(self.packager.subprocess, "run") as compile_:
+                    with self.assertRaisesRegex(ValueError, "fresh compiled"):
+                        self.main("--version", version, "--output", str(output), "--info", str(info))
+                    compile_.assert_not_called()
+
     def test_the_compiler_receives_the_version_installation_json_records(self):
         nightly = f"0.45.0.r812.g{COMMIT[:7]}.n42"
         staged = self.root / "staged"
@@ -241,9 +284,35 @@ class Script(unittest.TestCase):
         # Upgrades and the uninstaller find earlier installs by this identity.
         self.assertEqual(self.setup["AppId"], "{{6F1B0C52-7E3A-4D8B-9C41-2A5E8F0D3B17}")
 
+    def test_tauri_checks_evergreen_before_changes_and_login_is_an_explicit_unchecked_task(self):
+        prepare = self.procedure("PrepareToInstall")
+        self.assertLess(prepare.index("if not WebView2Installed()"), prepare.index("LinkedPath"))
+        self.assertIn("HKCU", self.procedure("WebView2Installed"))
+        self.assertIn("HKLM32", self.procedure("WebView2Installed"))
+        self.assertIn("F3017226-FE2A-4295-8BDF-00C3A9A7E4C5", self.procedure("WebView2Installed"))
+        self.assertIn('Name: "login"; Description: "Start Zerus at login"; Flags: unchecked', self.text)
+        self.assertIn('Parameters: "--install-login-item"; Tasks: login;', self.text)
+        uninstall = self.text.split("[UninstallRun]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('Parameters: "--remove-login-item"', uninstall)
+        self.assertNotIn("RegWrite", self.text)
+        self.assertNotIn("RegDelete", self.text)
+        self.assertNotIn("/silent /install", self.text)
+        hook = self.procedure("DesktopServiceRegistration")
+        self.assertIn("desktop registration install --json", hook)
+        self.assertIn("desktop notification-registration install --json", hook)
+        self.assertLess(hook.index("desktop registration install"), hook.index("desktop notification-registration install"))
+        self.assertIn("if not Installing then", hook)
+        self.assertIn("UI-only removal keeps", hook)
+        self.assertNotIn("desktop registration remove", hook)
+        self.assertNotIn("notification-registration remove", hook)
+        self.assertNotIn("schtasks", hook.lower())
+        self.assertNotIn("desktop revoke", hook)
+        self.assertIn("DesktopServiceRegistration(True)", self.procedure("CurStepChanged"))
+        self.assertIn("DesktopServiceRegistration(False)", self.procedure("CurUninstallStepChanged"))
+
     def test_it_touches_nothing_outside_its_folder_and_the_start_menu(self):
         sections = set(re.findall(r"(?m)^\[(\w+)\]$", self.text))
-        self.assertEqual(sections, {"Setup", "Files", "Icons", "Run", "UninstallDelete", "Code"})
+        self.assertEqual(sections, {"Setup", "Files", "Icons", "Run", "Tasks", "UninstallRun", "UninstallDelete", "Code"})
         body = self.text.split("[Setup]", 1)[1]
         for forbidden in ("{userprofile}", "{%USERPROFILE", "{localappdata}\\hgs", ".local", ".config",
                           "{commonpf}", "{sys}", "restartreplace", "uninsneveruninstall", "Registry",
@@ -252,7 +321,10 @@ class Script(unittest.TestCase):
         self.assertEqual(re.findall(r"(?m)^Source: (.*)$", self.text),
                          ['"{#PayloadDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs'])
         self.assertEqual(re.findall(r"(?m)^Name: (.*)$", self.text.split("[Icons]", 1)[1].split("\n[", 1)[0]),
-                         ['"{autoprograms}\\Zerus"; Filename: "{app}\\hgs-tray.exe"; WorkingDir: "{app}"'])
+                         ['"{autoprograms}\\Zerus"; Filename: "{app}\\hgs-tray.exe"; WorkingDir: "{app}"; '
+                          'AppUserModelID: "com.hgdev.hgs-tray"; '
+                          'AppUserModelToastActivatorCLSID: "0F0F70A2-1D40-47D8-AC5E-D6A9B789605F"',
+                          '"{autoprograms}\\Zerus"; Filename: "{app}\\hgs-tray.exe"; WorkingDir: "{app}"'])
 
     def procedure(self, name):
         """The body of a [Code] function or procedure, up to the next one."""
@@ -285,7 +357,7 @@ class Script(unittest.TestCase):
         # FILE_ATTRIBUTE_REPARSE_POINT: junctions, symbolic links, mount points.
         self.assertRegex(self.text, r"(?m)^  ReparsePoint = \$400;")
         # The sweep and the scan test for a link before they treat an entry as a folder.
-        for name in ("RemoveStale", "FindLink"):
+        for name in ("RemoveStale", "FindLink", "HoldsFiles"):
             body = self.procedure(name)
             self.assertLess(body.index("(Find.Attributes and ReparsePoint) <> 0"),
                             body.index("(Find.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0"), name)
@@ -302,11 +374,167 @@ class Script(unittest.TestCase):
         self.assertIn("ExtractFileDir(Current)", linked)
         self.assertRegex(linked, r"refuse rather than guess\. }\s+Result := Path;\s+end;")
 
+    def test_setup_installs_only_into_an_empty_or_owned_folder(self):
+        # A non-empty folder the installer does not own, such as an extracted
+        # portable zip, would get the payload mixed into files it never cleans up.
+        code = self.text.split("[Code]", 1)[1]
+        # Pascal Script needs OwnedFolder declared before PrepareToInstall calls it.
+        self.assertLess(code.index("function OwnedFolder"), code.index("function PrepareToInstall"))
+        prepare = self.procedure("PrepareToInstall")
+        refusal = prepare.index("if not OwnedFolder() then")
+        # Links are refused first, with their own message, and stop there.
+        self.assertLess(prepare.index("Link := FindLink(ExpandConstant('{app}'));"), refusal)
+        self.assertRegex(prepare[:refusal], r"Log\(Result\);\s+Exit;\s+end;")
+        self.assertRegex(prepare[refusal:],
+                         r"if not OwnedFolder\(\) then\s+if HoldsFiles\(ExpandConstant\('\{app\}'\)\) and \(Unreadable = ''\) then")
+        self.assertIn("is not empty and is not a Zerus installation folder", prepare)
+        self.assertIn("Nothing was changed.", prepare[refusal:])
+        # Only files make a folder non-empty: an uninstall can leave empty folders behind.
+        holds = self.procedure("HoldsFiles")
+        self.assertIn("Result := HoldsFiles(AddBackslash(Folder) + Find.Name)", holds)
+        self.assertNotRegex(holds, r"DeleteFile|RemoveDir|DelTree")
+
+    def test_a_folder_setup_cannot_list_refuses_instead_of_passing_as_empty(self):
+        # An unlistable folder might hide a link or foreign files: both scans fail closed.
+        for name in ("FindLink", "HoldsFiles"):
+            body = self.procedure(name)
+            failed = body.index("if not FindFirst(AddBackslash(Folder) + '*', Find) then")
+            self.assertRegex(body[failed:], r"then\s+begin\s+(\{[^}]*\}\s+)?if DirExists\(Folder\)", name)
+            self.assertIn("Unreadable := Folder;", body, name)
+        self.assertRegex(self.procedure("HoldsFiles"), r"Unreadable := Folder;\s+Result := True;")
+        prepare = self.procedure("PrepareToInstall")
+        # Reset before the scans, refused after them, with its own message, before any change.
+        self.assertLess(prepare.index("Unreadable := '';"), prepare.index("LinkedPath(ExpandConstant('{app}'))"))
+        refusal = prepare.index("if (Result = '') and (Unreadable <> '') then")
+        self.assertLess(prepare.index("if not OwnedFolder() then"), refusal)
+        self.assertIn("cannot be listed", prepare[refusal:])
+        self.assertIn("Nothing was changed.", prepare[refusal:])
+
     def test_only_a_silent_self_update_relaunches_the_app(self):
         runs = re.findall(r"(?m)^Filename: (.*)$", self.text.split("[Run]", 1)[1].split("\n[", 1)[0])
-        self.assertEqual(runs, ['"{app}\\hgs-tray.exe"; Description: "Start Zerus"; Flags: nowait postinstall skipifsilent',
+        self.assertEqual(runs, ['"{app}\\hgs-tray.exe"; Parameters: "--install-login-item"; Tasks: login; Flags: runhidden',
+                                '"{app}\\hgs-tray.exe"; Description: "Start Zerus"; Flags: nowait postinstall skipifsilent',
                                 '"{app}\\hgs-tray.exe"; Flags: nowait; Check: Relaunch'])
         self.assertIn("CompareText(ParamStr(I), '/RELAUNCH') = 0", self.text)
+
+
+class InstallerEnvironment(unittest.TestCase):
+    def test_shell_profile_is_real_but_backend_home_and_roots_stay_private(self):
+        from test_windows_installer_survival import installer_environment
+        isolated = {'HOME': 'C:/Example/private', 'USERPROFILE': 'C:/Example/private',
+                    'APPDATA': 'C:/Example/private/roaming', 'LOCALAPPDATA': 'C:/Example/private/local',
+                    'HGS_CONFIG_DIR': 'C:/Example/private/config', 'HGS_STATE_DIR': 'C:/Example/private/state'}
+        original = {'USERPROFILE': 'C:/Users/example', 'APPDATA': 'C:/Users/example/AppData/Roaming',
+                    'LOCALAPPDATA': 'C:/Users/example/AppData/Local'}
+        selected = installer_environment(isolated, original)
+        self.assertEqual({key: selected[key] for key in original}, original)
+        for key in ('HOME', 'HGS_CONFIG_DIR', 'HGS_STATE_DIR'):
+            self.assertEqual(selected[key], isolated[key])
+        self.assertEqual(isolated['USERPROFILE'], 'C:/Example/private')
+        self.assertNotIn('USERPROFILE', installer_environment(isolated, {}))
+
+    def test_setup_and_uninstall_share_the_selected_shell_environment(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from test_windows_installer_survival import Installer
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = Installer()
+            case.root = case.app = root
+            case.setup_exe = root / 'setup.exe'
+            (root / 'uninstall').mkdir()
+            (root / 'uninstall' / 'unins000.exe').write_bytes(b'synthetic uninstaller, never executed')
+            case.logs = 0
+            case.unique = 'installer-environment-control'
+            case.backend_tracking = False
+            case.installer_env = {'HOME': str(root), 'USERPROFILE': 'C:/Users/example'}
+            case.env = {'USERPROFILE': str(root)}
+            case.wait_for = Mock()
+            with patch('test_windows_installer_survival.subprocess.run',
+                       return_value=SimpleNamespace(returncode=0, stdout=b'', stderr=b'')) as run:
+                self.assertEqual(Installer.setup(case)[0], 0)
+                Installer.uninstall(case)
+            self.assertEqual(run.call_count, 2)
+            for call in run.call_args_list:
+                self.assertIs(call.kwargs['env'], case.installer_env)
+
+    def test_setup_log_survives_the_private_profile_cleanup(self):
+        import os
+        from types import SimpleNamespace
+        from test_windows_installer_survival import Installer
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile, logs = root / 'profile', root / 'ci-logs'
+            profile.mkdir()
+            case = Installer()
+            case.root = case.app = profile
+            case.setup_exe = profile / 'synthetic-never-executed.exe'
+            case.logs = 0
+            case.unique = 'installer-persistent-log-control'
+            case.backend_tracking = False
+            case.installer_env = {}
+            def setup(argv, **kwargs):
+                path = Path(next(arg[5:] for arg in argv if arg.startswith('/LOG=')))
+                self.assertEqual(path.parent, logs)
+                path.write_text('synthetic setup progress before a hang')
+                return SimpleNamespace(returncode=0)
+            with patch.dict(os.environ, {'HGS_TEST_INSTALLER_LOG_DIR': str(logs)}), \
+                    patch('test_windows_installer_survival.subprocess.run', side_effect=setup):
+                self.assertEqual(Installer.setup(case), (0, 'synthetic setup progress before a hang'))
+            profile.rmdir()
+            self.assertEqual((logs / 'installer-persistent-log-control-setup-1.log').read_text(),
+                             'synthetic setup progress before a hang')
+
+
+class BackendProfileRetention(unittest.TestCase):
+    def test_unknown_backend_cleanup_retains_its_selected_cli_profile(self):
+        from unittest.mock import Mock
+        from test_windows_installer_survival import Installer
+        case = object.__new__(Installer)
+        case.backend_clean = False
+        case.root = Path("C:/Example/private-fixture")
+        case.temp = Mock()
+        Installer.cleanup_temp(case)
+        case.temp._finalizer.detach.assert_called_once_with()
+        case.temp.cleanup.assert_not_called()
+
+    def test_unconfirmed_ui_uninstall_keeps_profile_even_after_backend_cleanup(self):
+        from unittest.mock import Mock, patch
+        from test_windows_installer_survival import Installer
+        case = object.__new__(Installer)
+        case.backend_clean = True
+        case.root = case.app = Path("C:/Example/private-fixture")
+        case.temp = Mock()
+        with patch("test_windows_installer_survival.registered", return_value={"InstallLocation": str(case.app)}):
+            with self.assertRaisesRegex(AssertionError, "UI uninstall is not confirmed"):
+                Installer.cleanup_temp(case)
+        case.temp._finalizer.detach.assert_called_once_with()
+        case.temp.cleanup.assert_not_called()
+
+    def test_unreadable_uninstall_record_does_not_authorize_profile_removal(self):
+        from unittest.mock import Mock, patch
+        from test_windows_installer_survival import Installer
+        case = object.__new__(Installer)
+        case.backend_clean = True
+        case.root = case.app = Path("C:/Example/private-fixture")
+        case.temp = Mock()
+        with patch("test_windows_installer_survival.registered", side_effect=OSError("unavailable")):
+            with self.assertRaises(AssertionError):
+                Installer.cleanup_temp(case)
+        case.temp._finalizer.detach.assert_called_once_with()
+        case.temp.cleanup.assert_not_called()
+
+    def test_confirmed_backend_absence_allows_original_profile_cleanup(self):
+        from unittest.mock import Mock
+        from test_windows_installer_survival import Installer
+        with tempfile.TemporaryDirectory(prefix="installer-cleanup-") as folder:
+            case = Installer()
+            case.root = Path(folder)
+            case.backend_clean = True
+            case.temp = Mock()
+            Installer.cleanup_temp(case)
+            case.temp.cleanup.assert_called_once_with()
+            case.temp._finalizer.detach.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1033 @@
+//! U62: a project's test configuration, `.zerus/tests.toml` (owner,
+//! 2026-10-30: the mechanism is Zerus's, a repository's suites, commands and
+//! thresholds are its own configuration). The owner's overrides in the team
+//! settings apply over the file; without a file Zerus proposes what it detects,
+//! and a project with neither keeps today's flow.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+pub const FILE: &str = ".zerus/tests.toml";
+
+/// Where the configuration came from; only `File` turns the discipline on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// The project's own `.zerus/tests.toml`.
+    File,
+    /// No file: a proposal from the stacks Zerus found.
+    Detected,
+    /// Neither a file nor a known stack: today's flow.
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TestsConfig {
+    #[serde(default = "version")]
+    pub version: u32,
+    #[serde(default)]
+    pub map: MapSettings,
+    #[serde(default)]
+    pub full: FullRun,
+    #[serde(default)]
+    pub retries: Retries,
+    #[serde(default)]
+    pub budgets: Budgets,
+    #[serde(default)]
+    pub reuse: Reuse,
+    #[serde(default)]
+    pub isolation: Isolation,
+    #[serde(default)]
+    pub build_cache: BuildCache,
+    #[serde(default)]
+    pub merge_queue: MergeQueue,
+    /// U62 (#717): the night window in which long suites may run.
+    #[serde(default)]
+    pub schedule: Schedule,
+    /// Task #281: how a performance run checks the machine first.
+    #[serde(default)]
+    pub performance: Performance,
+    /// Resource classes by name: what a suite needs of the machine.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resources: std::collections::BTreeMap<String, Resources>,
+    #[serde(default, rename = "provider", skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<Provider>,
+    /// #742: further tools the project's tests or builds need (coverage, a
+    /// linter); Zerus offers a missing one to the owner.
+    #[serde(default, rename = "tool", skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolNeed>,
+    /// Task 190: where a tool lives on this project, for a template that must
+    /// find it itself: `[tools]` names a tool (`qt`) and its path.
+    #[serde(default, rename = "tools", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tool_paths: std::collections::BTreeMap<String, String>,
+    /// Task 377 (owner, 2026-11-08): the generated files a merge must refresh
+    /// (a catalog, a lockfile's checksum): shell commands run in the line's
+    /// folder after a merge, their changes folded into the merge commit.
+    #[serde(default, rename = "generate", skip_serializing_if = "Vec::is_empty")]
+    pub generated: Vec<String>,
+    /// Task 85: the project's own `hgs team run` templates, typed like the
+    /// built-ins; each runs only once the owner accepted its exact content.
+    #[serde(default, rename = "template", skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<ProjectTemplate>,
+    /// The build broker's table (`src/state/teams/broker.rs` reads it from the
+    /// same file). Task 84 found it refused here, which made a file with it
+    /// unreadable for `hgs test` and the merge queue; it is declared, not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_broker: Option<Value>,
+}
+
+/// Task 85: a `[[template]]` entry: a fixed program and argv with typed
+/// placeholders, as the built-in templates are.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplate {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<TemplateParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// The test report the run leaves, read into one result per test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<TemplateResults>,
+}
+
+impl ProjectTemplate {
+    /// The hash the owner's acceptance is bound to: any change waits again.
+    pub fn content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let text = serde_json::to_string(self).unwrap_or_default();
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
+}
+
+/// One typed placeholder of a project template.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateParam {
+    pub name: String,
+    /// identifier, identifiers, text, path or paths.
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Where a project template's run writes its test report, and its format.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateResults {
+    /// junit or trx.
+    pub format: String,
+    /// A path relative to the folder.
+    pub path: String,
+}
+
+/// A `[[tool]]` entry: a tool, why the project needs it and what it saves;
+/// `programs` and `install` (by manager: winget, brew, pacman, apt, cargo,
+/// pip) only for a tool Zerus's catalog does not know.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolNeed {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub saves: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub install: std::collections::BTreeMap<String, String>,
+}
+
+fn version() -> u32 {
+    1
+}
+
+/// U62 (#717): the night window, local hours; `night_start > night_end` wraps
+/// midnight. A suite longer than the configured budget runs only inside it, or
+/// the CI runs it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Schedule {
+    #[serde(default = "night_start")]
+    pub night_start: u32,
+    #[serde(default = "night_end")]
+    pub night_end: u32,
+}
+
+fn night_start() -> u32 {
+    22
+}
+
+fn night_end() -> u32 {
+    6
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self { night_start: night_start(), night_end: night_end() }
+    }
+}
+
+/// Task #281 (owner, 2026-11-08): a performance measurement looks at the
+/// machine first. Above a threshold a perf run waits for a quiet window,
+/// bounded; past the bound it runs marked `loaded` with the numbers.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Performance {
+    /// Busy CPU above this share of the machine (percent) means not quiet.
+    #[serde(default = "perf_cpu")]
+    pub cpu_percent: u32,
+    /// A disk fuller than this (percent used) means not quiet.
+    #[serde(default = "perf_disk")]
+    pub disk_percent: u32,
+    /// More Zerus builds running than this means not quiet.
+    #[serde(default = "perf_builds")]
+    pub builds: u32,
+    /// The longest wait for a quiet window, in seconds; past it the run runs
+    /// marked loaded.
+    #[serde(default = "perf_wait")]
+    pub wait_seconds: f64,
+}
+
+fn perf_cpu() -> u32 {
+    70
+}
+fn perf_disk() -> u32 {
+    90
+}
+fn perf_builds() -> u32 {
+    1
+}
+fn perf_wait() -> f64 {
+    600.0
+}
+
+impl Default for Performance {
+    fn default() -> Self {
+        Self { cpu_percent: perf_cpu(), disk_percent: perf_disk(), builds: perf_builds(), wait_seconds: perf_wait() }
+    }
+}
+
+/// Whether `hour` (local, 0-23) is inside the night window.
+pub fn is_night(hour: u32, schedule: &Schedule) -> bool {
+    let (start, end) = (schedule.night_start % 24, schedule.night_end % 24);
+    if start == end {
+        return false;
+    }
+    if start < end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+
+impl Default for TestsConfig {
+    fn default() -> Self {
+        Self {
+            version: version(),
+            map: MapSettings::default(),
+            full: FullRun::default(),
+            retries: Retries::default(),
+            budgets: Budgets::default(),
+            reuse: Reuse::default(),
+            isolation: Isolation::default(),
+            build_cache: BuildCache::default(),
+            merge_queue: MergeQueue::default(),
+            schedule: Schedule::default(),
+            performance: Performance::default(),
+            resources: std::collections::BTreeMap::new(),
+            providers: Vec::new(),
+            generated: Vec::new(),
+            tools: Vec::new(),
+            tool_paths: std::collections::BTreeMap::new(),
+            templates: Vec::new(),
+            build_broker: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MapSettings {
+    /// The committed test map, written by `hgs test map --write`.
+    #[serde(default = "map_file")]
+    pub file: String,
+    /// Recorded durations, written by `hgs test durations --record`.
+    #[serde(default = "durations_file")]
+    pub durations: String,
+    /// A changed file no provider's area holds: reported, or every test.
+    #[serde(default)]
+    pub unmapped: Unmapped,
+    /// Files no test covers by design (documentation, artwork).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+impl Default for MapSettings {
+    fn default() -> Self {
+        Self { file: map_file(), durations: durations_file(), unmapped: Unmapped::default(), ignore: Vec::new() }
+    }
+}
+
+fn map_file() -> String {
+    ".zerus/test-map.json".to_owned()
+}
+fn durations_file() -> String {
+    ".zerus/test-durations.json".to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Unmapped {
+    /// Named in the output; nothing runs for it.
+    #[default]
+    Report,
+    /// Every provider's whole set runs.
+    All,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FullRun {
+    /// Where the full run happens.
+    #[serde(default, rename = "where")]
+    pub place: Place,
+    /// Who may start it.
+    #[serde(default)]
+    pub policy: FullPolicy,
+    /// The CI workflow or runner that does it, when it is not here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    #[default]
+    Here,
+    Ci,
+    Runner,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FullPolicy {
+    /// Only on the owner's confirmation, told how long it takes (U62).
+    #[default]
+    Owner,
+    /// The owner gave a standing permission.
+    Standing,
+    /// Anyone may start it.
+    Anyone,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Retries {
+    /// Retries of a failed suite before it fails; a pass on a retry marks it
+    /// flaky. A crash is never retried.
+    #[serde(default = "one")]
+    pub flaky: u32,
+    /// Days a flaky quarantine lasts before the suite counts again.
+    #[serde(default = "quarantine_days")]
+    pub quarantine_days: u32,
+    /// #718: flaky episodes of one suite that become one lead item to file a
+    /// task; 0 is off.
+    #[serde(default = "three")]
+    pub episodes: u32,
+}
+
+fn three() -> u32 {
+    3
+}
+
+impl Default for Retries {
+    fn default() -> Self {
+        Self { flaky: one(), quarantine_days: quarantine_days(), episodes: three() }
+    }
+}
+
+fn one() -> u32 {
+    1
+}
+fn quarantine_days() -> u32 {
+    14
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Budgets {
+    /// A suite whose time grows by more than this share of its recorded time
+    /// is flagged; 0 is off.
+    #[serde(default)]
+    pub grow_percent: u32,
+    /// A suite's default time budget in minutes; 0 is none.
+    #[serde(default)]
+    pub suite_minutes: f64,
+    /// #718: a suite's default size budget in test lines; 0 is none.
+    #[serde(default)]
+    pub suite_lines: u32,
+}
+
+/// #718: `[reuse]`, when unchanged results are reused and when Zerus proposes
+/// a full run instead.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Reuse {
+    /// Reused results since the last full run that propose a new one; 0 is off.
+    #[serde(default)]
+    pub full_after: u32,
+    /// Days the oldest reused measurement may reach before a full run is
+    /// proposed; 0 is off.
+    #[serde(default)]
+    pub max_age_days: f64,
+}
+
+/// #718: what a provider's unchanged result is reused by.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReuseBy {
+    /// The kind's own: never for cargo (it runs in seconds when filtered),
+    /// the test binary and its data for ctest, the source hashes otherwise.
+    #[default]
+    Auto,
+    /// The hashes of the map's input files.
+    Inputs,
+    /// The test binary's hash and its data files.
+    Binary,
+    Never,
+}
+
+/// `[isolation]`: only its switch is read here; its other keys (templates,
+/// prefixes, env, logs and the platform tables) belong to
+/// `state::teams::isolation`, which checks them.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Isolation {
+    /// Each suite gets its own home, temp and settings folders.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+impl Default for Isolation {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BuildCache {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The tool, such as sccache or ccache.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool: String,
+    /// The shared cache folder, its size and the compilers it serves
+    /// ("rust", "cxx"); the team runner reads them (#721).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compilers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MergeQueue {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Resources {
+    #[serde(default)]
+    pub cpu: u32,
+    #[serde(default)]
+    pub ram_mb: u32,
+    #[serde(default)]
+    pub gpu: bool,
+    /// Needs a display, a device or anything else one at a time.
+    #[serde(default)]
+    pub exclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Cargo,
+    Ctest,
+    Pytest,
+    Unittest,
+    Gradle,
+    Npm,
+    Command,
+    /// Task 137: pytest over Cython extensions, rebuilt in place first.
+    Cython,
+    /// Task 137: Visual Studio C++ projects (.sln, .vcxproj), vstest for
+    /// their test projects.
+    Msbuild,
+    /// Task 137: an Unreal project's automation tests (ue-build, ue-test).
+    Unreal,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Cargo => "cargo",
+            Kind::Ctest => "ctest",
+            Kind::Pytest => "pytest",
+            Kind::Unittest => "unittest",
+            Kind::Gradle => "gradle",
+            Kind::Npm => "npm",
+            Kind::Command => "command",
+            Kind::Cython => "cython",
+            Kind::Msbuild => "msbuild",
+            Kind::Unreal => "unreal",
+        }
+    }
+}
+
+/// How a provider's affected set is found.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Rule {
+    /// From the build: Cargo's module graph, CMake's link lists, the files a
+    /// test names or imports.
+    Build,
+    /// Only the provider's path map.
+    Paths,
+    /// Any change in its area runs everything.
+    All,
+}
+
+/// How far a change in a shared Rust module reaches (cargo, `build`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Widen {
+    /// The changed module's own tests.
+    None,
+    /// And the tests of every module that uses it.
+    #[default]
+    Dependants,
+    /// And of every module that uses those, to the end.
+    Transitive,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    pub name: String,
+    pub kind: Kind,
+    /// Its working directory, relative to the project.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+    /// The area: globs of the files whose changes its tests answer for.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Globs of its test files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+    /// Test files never chosen automatically; they run only by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual: Vec<String>,
+    /// Test files another platform's build holds: this map cannot name them,
+    /// and a change in them runs there (the CI), not here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elsewhere: Vec<String>,
+    #[serde(default = "rule_build")]
+    pub affected: Rule,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathRule>,
+    /// The command; `{targets}` is replaced by what the map chose, and by the
+    /// whole set without it for a full run. Empty is the kind's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    /// Local merge-queue CTest preparation. Empty keeps the existing runner.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub configure: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub probe: String,
+    /// The manifest, relative to `root`: cargo's Cargo.toml, msbuild's .sln or
+    /// project file, unreal's .uproject.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manifest: String,
+    /// cargo: how far a change in a shared module reaches.
+    #[serde(default)]
+    pub widen: Widen,
+    /// ctest: the configured build folder holding CMake's file API reply.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build_dir: String,
+    /// Unreal: a module folder to its automation test prefix (default the module name).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prefixes: BTreeMap<String, String>,
+    /// A resource class from `[resources]`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resources: String,
+    /// The platforms it runs on; empty is every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+    /// Its own time budget in minutes, over `budgets.suite_minutes`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub budget_minutes: f64,
+    /// #718: its own size budget in test lines, over `budgets.suite_lines`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub budget_lines: u32,
+    /// #718: what an unchanged result is reused by.
+    #[serde(default, skip_serializing_if = "is_auto")]
+    pub reuse: ReuseBy,
+    /// Turned off, here or by the owner's override.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// Task 88: the report a suite's run leaves (junit, trx or unreal), read
+    /// into one result per test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<TemplateResults>,
+    /// Task #281: this provider's suites are performance measurements: a run
+    /// checks the machine's load first and records it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub performance: bool,
+}
+
+fn rule_build() -> Rule {
+    Rule::Build
+}
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+fn is_auto(value: &ReuseBy) -> bool {
+    *value == ReuseBy::Auto
+}
+
+impl Provider {
+    /// #732: the platform classes its suites run on (windows, linux, macos,
+    /// android): its `platforms`, and android for a Gradle provider that names
+    /// none. Empty runs anywhere, so here.
+    pub fn platform_classes(&self) -> Vec<String> {
+        if self.platforms.is_empty() && self.kind == Kind::Gradle {
+            return vec!["android".to_owned()];
+        }
+        self.platforms.iter().map(|platform| platform.to_ascii_lowercase()).collect()
+    }
+
+    /// #718: what this provider's unchanged result is reused by.
+    pub fn reuse_by(&self) -> ReuseBy {
+        match (self.reuse, self.kind) {
+            (ReuseBy::Auto, Kind::Cargo) => ReuseBy::Never,
+            (ReuseBy::Auto, Kind::Ctest) => ReuseBy::Binary,
+            (ReuseBy::Auto, _) => ReuseBy::Inputs,
+            (chosen, _) => chosen,
+        }
+    }
+}
+
+/// A path map entry: a change in `files` runs `targets` (map target ids or
+/// test files), or the tests whose text mentions `mentions`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PathRule {
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mentions: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Loaded {
+    pub source: Source,
+    /// The file read, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The owner's override from the team settings applied.
+    pub overridden: bool,
+    pub config: TestsConfig,
+    /// Machine values never become part of the exported project configuration.
+    #[serde(skip)]
+    pub local: std::collections::BTreeMap<String, LocalProvider>,
+}
+
+impl Loaded {
+    /// The discipline applies: a file says so, possibly through the owner.
+    pub fn active(&self) -> bool {
+        self.source == Source::File || self.overridden
+    }
+}
+
+/// Reads the project's configuration under `root`, the owner's `overrides`
+/// (the team settings' `tests` object) over it.
+pub fn load(root: &Path, overrides: Option<&Value>) -> anyhow::Result<Loaded> {
+    let mut loaded = load_project(root, overrides)?;
+    loaded.local = local_providers(root, &loaded.config)?;
+    Ok(loaded)
+}
+
+/// A bad machine-only file must not disable an enabled merge queue. Its
+/// validation still refuses selection/execution, once an accept is queued.
+pub(crate) fn load_project(root: &Path, overrides: Option<&Value>) -> anyhow::Result<Loaded> {
+    let path = root.join(FILE);
+    let (source, mut value, read) = match std::fs::read_to_string(&path) {
+        Ok(text) => (Source::File, parse_toml(&text).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?, Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let detected = super::detect::detect(root);
+            let source = if detected.providers.is_empty() { Source::None } else { Source::Detected };
+            (source, serde_json::to_value(detected)?, None)
+        }
+        Err(error) => anyhow::bail!("Cannot read {}: {error}", path.display()),
+    };
+    let overridden = overrides.is_some_and(|overrides| overrides.as_object().is_some_and(|fields| !fields.is_empty()));
+    if let Some(overrides) = overrides.filter(|_| overridden) {
+        merge(&mut value, overrides);
+    }
+    let config: TestsConfig = serde_json::from_value(value).map_err(|error| anyhow::anyhow!("Invalid test configuration: {error}"))?;
+    validate(&config)?;
+    Ok(Loaded { source, path: read, overridden, config, local: Default::default() })
+}
+
+pub const LOCAL_FILE: &str = ".zerus/tests.local.toml";
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalProvider {
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalFile {
+    #[serde(default)]
+    provider: std::collections::BTreeMap<String, LocalProvider>,
+}
+
+fn local_providers(root: &Path, config: &TestsConfig) -> anyhow::Result<std::collections::BTreeMap<String, LocalProvider>> {
+    let path = root.join(LOCAL_FILE);
+    use std::io::Read;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut text = String::new();
+    file.take(65537).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() <= 65536, "The local test configuration is at most 64 KiB");
+    let mut command = std::process::Command::new("git");
+    command.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"]).arg(root).args(["ls-files", "--error-unmatch", "--", LOCAL_FILE]);
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"] { command.env_remove(key); }
+    // Task #44 (team ede724c4): ten seconds here; under tests at least a
+    // minute, which a machine busy with parallel builds fits (a loaded run
+    // stopped it: "Cannot verify local test configuration is untracked:
+    // Stopped"), as task #32's read_window does for the worktree reads.
+    #[cfg(test)]
+    let window = std::time::Duration::from_secs(60);
+    #[cfg(not(test))]
+    let window = std::time::Duration::from_secs(10);
+    let (status, _, _) = crate::platform::run_bounded(&mut command, [4096, 4096],
+        std::time::Instant::now() + window, &|| false)
+        .map_err(|error| anyhow::anyhow!("Cannot verify local test configuration is untracked: {error:?}"))?;
+    anyhow::ensure!(!status.success(), "The local test configuration {LOCAL_FILE} must not be tracked");
+    anyhow::ensure!(status.code() == Some(1), "Cannot verify local test configuration is untracked");
+    let local: LocalFile = serde_json::from_value(parse_toml(&text)?)
+        .map_err(|error| anyhow::anyhow!("Invalid local test configuration: {error}"))?;
+    for (name, values) in &local.provider {
+        anyhow::ensure!(config.providers.iter().any(|provider| provider.name == *name), "Unknown local test provider {name}");
+        anyhow::ensure!(values.vars.len() <= 64 && values.env.len() <= 64, "A local provider has at most 64 vars and env entries");
+        for (key, value) in values.vars.iter().chain(values.env.iter()) {
+            anyhow::ensure!(!key.is_empty() && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !value.contains('\0') && value.len() <= 8192, "Invalid local test configuration key {key}");
+        }
+        anyhow::ensure!(!values.vars.contains_key("build_dir") && !values.vars.contains_key("targets"), "Local vars cannot replace build_dir or targets");
+    }
+    Ok(local.provider)
+}
+
+/// The owner's override over the file: tables merge field by field, providers
+/// by name (a new name is added), anything else is replaced.
+pub fn merge(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (Value::Object(base), Value::Object(over)) => {
+            for (key, value) in over {
+                if key == "provider" {
+                    merge_providers(base.entry(key.clone()).or_insert_with(|| Value::Array(Vec::new())), value);
+                } else {
+                    merge(base.entry(key.clone()).or_insert(Value::Null), value);
+                }
+            }
+        }
+        (base, over) => *base = over.clone(),
+    }
+}
+
+fn merge_providers(base: &mut Value, over: &Value) {
+    let Some(list) = base.as_array_mut() else {
+        *base = over.clone();
+        return;
+    };
+    for provider in over.as_array().into_iter().flatten() {
+        let name = provider.get("name");
+        match list.iter_mut().find(|known| name.is_some() && known.get("name") == name) {
+            Some(known) => merge(known, provider),
+            None => list.push(provider.clone()),
+        }
+    }
+}
+
+fn validate(config: &TestsConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(config.version == 1, "The test configuration's version is 1, not {}", config.version);
+    anyhow::ensure!(config.templates.len() <= 50, "A project declares at most 50 templates");
+    let mut ids = std::collections::BTreeSet::new();
+    for template in &config.templates {
+        anyhow::ensure!(ids.insert(template.id.as_str()), "Two templates are named {}", template.id);
+        crate::state::teams::templates::check_project_template(template)?;
+    }
+    for tool in &config.tools {
+        anyhow::ensure!(!tool.name.trim().is_empty(), "Every [[tool]] has a name");
+    }
+    for (tool, path) in &config.tool_paths {
+        anyhow::ensure!(!tool.trim().is_empty(), "Every [tools] entry names a tool");
+        anyhow::ensure!(!path.trim().is_empty(), "Every [tools] entry names a path: {tool}");
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for provider in &config.providers {
+        anyhow::ensure!(!provider.name.trim().is_empty(), "Every test provider has a name");
+        anyhow::ensure!(names.insert(provider.name.as_str()), "Two test providers are named {}", provider.name);
+        anyhow::ensure!(
+            provider.kind != Kind::Command || !provider.command.is_empty(),
+            "The command provider {} names its command",
+            provider.name
+        );
+        anyhow::ensure!(
+            !matches!(provider.kind, Kind::Msbuild | Kind::Unreal) || !provider.manifest.is_empty(),
+            "The {} provider {} names its manifest ({})",
+            provider.kind.name(),
+            provider.name,
+            if provider.kind == Kind::Msbuild { "the .sln or project file" } else { "the .uproject" }
+        );
+        anyhow::ensure!(
+            provider.kind != Kind::Ctest || !provider.build_dir.is_empty() || provider.affected != Rule::Build,
+            "The ctest provider {} names its build_dir to read the map from the build",
+            provider.name
+        );
+        anyhow::ensure!(
+            provider.resources.is_empty() || config.resources.contains_key(&provider.resources),
+            "The provider {} names an unknown resource class {}",
+            provider.name,
+            provider.resources
+        );
+        if !provider.configure.is_empty() || !provider.build.is_empty() || !provider.probe.is_empty() {
+            anyhow::ensure!(provider.kind == Kind::Ctest && !provider.configure.trim().is_empty() && !provider.build.trim().is_empty(),
+                "Preparation for {} requires a ctest provider with configure and build commands", provider.name);
+            anyhow::ensure!([&provider.configure, &provider.build, &provider.probe].iter().all(|command| command.len() <= 16384),
+                "Preparation commands for {} are at most 16 KiB", provider.name);
+        }
+        if let Some(results) = &provider.results {
+            anyhow::ensure!(
+                crate::state::teams::run_results::Format::parse(&results.format).is_some(),
+                "The provider {}'s results format is junit, trx or unreal (got {})",
+                provider.name,
+                results.format
+            );
+            let path = std::path::Path::new(&results.path);
+            anyhow::ensure!(
+                !results.path.trim().is_empty() && path.is_relative() && !results.path.contains(':') && !path.components().any(|part| part == std::path::Component::ParentDir),
+                "The provider {}'s results path is a path inside the project (got {})",
+                provider.name,
+                results.path
+            );
+        }
+        for rule in &provider.paths {
+            anyhow::ensure!(!rule.files.is_empty(), "A path rule of {} names its files", provider.name);
+            anyhow::ensure!(
+                !rule.targets.is_empty() || !rule.mentions.is_empty(),
+                "A path rule of {} names its targets or what its tests mention",
+                provider.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// TOML as JSON, so the owner's JSON override merges over it field by field.
+pub fn parse_toml(text: &str) -> anyhow::Result<Value> {
+    let document: toml_edit::DocumentMut = text.parse()?;
+    Ok(table(document.as_table()))
+}
+
+fn table(table: &toml_edit::Table) -> Value {
+    let mut out = Map::new();
+    for (key, item) in table.iter() {
+        if let Some(value) = item_value(item) {
+            out.insert(key.to_owned(), value);
+        }
+    }
+    Value::Object(out)
+}
+
+fn item_value(item: &toml_edit::Item) -> Option<Value> {
+    match item {
+        toml_edit::Item::None => None,
+        toml_edit::Item::Value(value) => Some(scalar(value)),
+        toml_edit::Item::Table(inner) => Some(table(inner)),
+        toml_edit::Item::ArrayOfTables(tables) => Some(Value::Array(tables.iter().map(table).collect())),
+    }
+}
+
+fn scalar(value: &toml_edit::Value) -> Value {
+    match value {
+        toml_edit::Value::String(text) => Value::String(text.value().clone()),
+        toml_edit::Value::Integer(number) => Value::from(*number.value()),
+        toml_edit::Value::Float(number) => Value::from(*number.value()),
+        toml_edit::Value::Boolean(flag) => Value::Bool(*flag.value()),
+        toml_edit::Value::Datetime(time) => Value::String(time.value().to_string()),
+        toml_edit::Value::Array(items) => Value::Array(items.iter().map(scalar).collect()),
+        toml_edit::Value::InlineTable(inner) => {
+            Value::Object(inner.iter().map(|(key, value)| (key.to_owned(), scalar(value))).collect())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    const FILE_TEXT: &str = r#"
+version = 1
+[map]
+ignore = ["docs/**"]
+[full]
+where = "ci"
+target = "nightly.yml"
+[retries]
+flaky = 2
+[resources.gui]
+cpu = 2
+exclusive = true
+[[provider]]
+name = "rust"
+kind = "cargo"
+sources = ["src/**"]
+widen = "transitive"
+[[provider]]
+name = "gui"
+kind = "ctest"
+build_dir = "build"
+resources = "gui"
+sources = ["gui/**"]
+[[provider.paths]]
+files = ["gui/fixtures/**"]
+targets = ["ctest:gui:views"]
+"#;
+
+    #[test]
+    fn the_project_file_is_read_with_its_providers_and_defaults() {
+        let dir = project(&[(FILE, FILE_TEXT)]);
+        let loaded = load(dir.path(), None).unwrap();
+        assert_eq!(loaded.source, Source::File);
+        assert!(loaded.active());
+        let config = &loaded.config;
+        assert_eq!(config.full.place, Place::Ci);
+        assert_eq!(config.full.policy, FullPolicy::Owner);
+        assert_eq!(config.retries.flaky, 2);
+        assert_eq!(config.retries.quarantine_days, 14);
+        assert_eq!(config.map.file, ".zerus/test-map.json");
+        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.providers[0].widen, Widen::Transitive);
+        assert_eq!(config.providers[1].affected, Rule::Build);
+        assert_eq!(config.providers[1].paths[0].targets, vec!["ctest:gui:views"]);
+        assert!(config.resources["gui"].exclusive);
+    }
+
+    #[test]
+    fn the_owner_overrides_fields_and_providers_by_name() {
+        let dir = project(&[(FILE, FILE_TEXT)]);
+        let overrides = json!({
+            "full": {"policy": "standing"},
+            "merge_queue": {"enabled": true},
+            "provider": [
+                {"name": "gui", "disabled": true},
+                {"name": "docs", "kind": "command", "command": "make check-docs", "sources": ["docs/**"], "affected": "all"}
+            ]
+        });
+        let loaded = load(dir.path(), Some(&overrides)).unwrap();
+        assert!(loaded.overridden);
+        let config = &loaded.config;
+        // The file's other fields stay.
+        assert_eq!((config.full.place, config.full.policy), (Place::Ci, FullPolicy::Standing));
+        assert!(config.merge_queue.enabled);
+        assert_eq!(config.providers.len(), 3);
+        assert!(config.providers[1].disabled && config.providers[1].build_dir == "build");
+        assert_eq!(config.providers[2].kind, Kind::Command);
+    }
+
+    #[test]
+    fn without_a_file_zerus_proposes_what_it_detects_and_stays_off() {
+        let dir = project(&[("Cargo.toml", "[package]\nname = \"x\"\n"), ("src/main.rs", "fn main() {}\n")]);
+        let loaded = load(dir.path(), None).unwrap();
+        assert_eq!(loaded.source, Source::Detected);
+        assert!(!loaded.active(), "a proposal changes nobody's flow");
+        assert_eq!(loaded.config.providers[0].kind, Kind::Cargo);
+        let empty = project(&[("README.md", "hello\n")]);
+        let loaded = load(empty.path(), None).unwrap();
+        assert_eq!(loaded.source, Source::None);
+        assert!(loaded.config.providers.is_empty() && !loaded.active());
+    }
+
+    #[test]
+    fn a_wrong_file_is_refused_with_its_reason() {
+        let unknown = project(&[(FILE, "[full]\nwhen = \"ci\"\n")]);
+        assert!(load(unknown.path(), None).unwrap_err().to_string().contains("unknown field `when`"));
+        let twice = project(&[(FILE, "[[provider]]\nname = \"a\"\nkind = \"npm\"\n[[provider]]\nname = \"a\"\nkind = \"npm\"\n")]);
+        assert!(load(twice.path(), None).unwrap_err().to_string().contains("Two test providers are named a"));
+        let class = project(&[(FILE, "[[provider]]\nname = \"a\"\nkind = \"npm\"\nresources = \"gpu\"\n")]);
+        assert!(load(class.path(), None).unwrap_err().to_string().contains("unknown resource class gpu"));
+        let command = project(&[(FILE, "[[provider]]\nname = \"a\"\nkind = \"command\"\n")]);
+        assert!(load(command.path(), None).unwrap_err().to_string().contains("names its command"));
+    }
+
+
+
+    /// Task 190: a project names where a tool lives in `[tools]`, beside its
+    /// `[[tool]]` needs; the file still parses and validates.
+    #[test]
+    fn a_project_names_a_tools_path_in_its_own_table() {
+        let dir = project(&[(FILE, "version = 1\n[tools]\nqt = 'D:/Tools/zerus-deps/Qt/6.10.3/msvc2022_64'\n")]);
+        let loaded = load(dir.path(), None).unwrap();
+        assert_eq!(loaded.config.tool_paths.get("qt").map(String::as_str), Some("D:/Tools/zerus-deps/Qt/6.10.3/msvc2022_64"));
+        // An empty path is refused rather than searched for.
+        let dir = project(&[(FILE, "version = 1\n[tools]\nqt = ' '\n")]);
+        assert!(load(dir.path(), None).unwrap_err().to_string().contains("[tools] entry names a path"));
+    }
+}

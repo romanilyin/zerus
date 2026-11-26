@@ -2,7 +2,7 @@
 //! Keep a launch message out of the resume recipe and use ordinary guarded
 //! input once, in the lifetime of the supervisor that created this run.
 use super::*;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 pub(super) struct Prompt {
@@ -160,7 +160,7 @@ fn pending(record: &Value, request: &str) -> bool {
 
 fn cancel(name: &str, run: &str, request: &str) -> Result<()> {
     let _guard = lock(None)?;
-    if let Some(mut record) = read_run(name, run)?.filter(|record| pending(record, request)) {
+    if let Some(mut record) = read_own_run(name, run)?.filter(|record| pending(record, request)) {
         record["launch_prompt"]["status"] = json!("cancelled");
         write(&mut record)?;
     }
@@ -171,7 +171,7 @@ fn cancel(name: &str, run: &str, request: &str) -> Result<()> {
 /// global state lock; input::submit repeats all guards for the one submission.
 fn reserve(name: &str, run: &str, request: &str, conversation: &str) -> Result<bool> {
     let _guard = lock(None)?;
-    let Some(mut record) = read_run(name, run)?.filter(|record| pending(record, request)) else {
+    let Some(mut record) = read_own_run(name, run)?.filter(|record| pending(record, request)) else {
         return Ok(false);
     };
     let valid =
@@ -192,8 +192,8 @@ fn poll_interval(elapsed: Duration) -> Duration {
 /// This loop never survives or restarts its supervisor, and it never retries a
 /// submit call, including definite refusals. Readiness polling sends no keys.
 /// Long manual trust/setup waits neither hold the state lock nor poll rapidly.
-pub(super) fn wait(
-    child: &mut Child,
+pub(super) fn wait<C: supervisor::ChildStatus>(
+    child: &mut C,
     name: &str,
     run: &str,
     prompt: Option<&mut Prompt>,
@@ -209,7 +209,7 @@ pub(super) fn wait(
     let conversation = &prompt.conversation;
     {
         let _guard = lock(None)?;
-        let mut record = read_run(&name, run)?.ok_or("Kimi launch identity changed")?;
+        let mut record = read_own_run(&name, run)?.ok_or("Kimi launch identity changed")?;
         name = string(&record, "name").to_owned();
         record["launch_prompt"] =
             json!({"request_id":request_id,"status":"pending","preview":clipped(text, 200)});
@@ -228,7 +228,7 @@ pub(super) fn wait(
             return supervisor::wait(child);
         }
         // Atomic record reads and terminal observation do not take lock(None).
-        let Some(record) = read_run(&name, run)?.filter(|record| pending(record, request_id))
+        let Some(record) = read_own_run(&name, run)?.filter(|record| pending(record, request_id))
         else {
             prompt.spent = true;
             return supervisor::wait(child);
@@ -250,7 +250,7 @@ pub(super) fn wait(
                     "expected_run_id":run,"expected_conversation_id":conversation});
                 let result = input::submit(&name, payload.to_string().as_bytes(), None);
                 let _guard = lock(None)?;
-                if let Some(mut record) = read_run(&name, run)? {
+                if let Some(mut record) = read_own_run(&name, run)? {
                     record["launch_prompt"]["status"] = json!(if result.is_ok() {
                         "submitted"
                     } else {

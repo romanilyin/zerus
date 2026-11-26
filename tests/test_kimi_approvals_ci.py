@@ -65,9 +65,9 @@ class ApprovalGateControls(unittest.TestCase):
                         self.assertEqual(events, ['oracle', 'stage'] if system == 'nt' else ['stage'])
                         plan = json.loads((evidence / 'plan.json').read_text())
                         self.assertEqual((plan['native_cases'], plan['mac_shim_compiles'], tuple(plan['methods'])),
-                                         (12, 12 if system == 'posix' else 0, selected))
+                                         (16, 16 if system == 'posix' else 0, selected))
                         reservation = json.loads((evidence / 'reservation.json').read_text())
-                        self.assertEqual((reservation['state'], reservation['versions'], reservation['native_cases']), ('SPENT', ['2.3.1'], 12))
+                        self.assertEqual((reservation['state'], reservation['versions'], reservation['native_cases']), ('SPENT', ['2.3.1'], 16))
                         self.assertEqual((version, methods), ('2.3.1', selected))
                         self.assertIn('HGS_KIMI_TEST_RECORD', env)
                         events.append('native')
@@ -97,7 +97,7 @@ class ApprovalGateControls(unittest.TestCase):
                         choose.assert_called_once()
                     self.assertEqual(events, (['oracle'] if system == 'nt' else []) + ['stage'] + ([] if failed else ['native']))
                     receipt = json.loads((output / 'evidence/receipt.json').read_text())
-                    self.assertEqual((receipt['outcome'], receipt['native_cases']), ('FAIL', None) if failed else ('PASS', 12))
+                    self.assertEqual((receipt['outcome'], receipt['native_cases']), ('FAIL', None) if failed else ('PASS', 16))
 
     def test_both_platforms_keep_the_exact_seven_semantic_names(self):
         for platform in ('darwin-arm64', 'win32-x64'):
@@ -108,7 +108,7 @@ class ApprovalGateControls(unittest.TestCase):
     def test_both_platforms_keep_the_exact_goal_names(self):
         for platform in ('darwin-arm64', 'win32-x64'):
             methods = gate.goal_methods(platform)
-            self.assertEqual(len(methods), 4)
+            self.assertEqual(len(methods), 8)
             self.assertEqual(tuple(item.rsplit('.', 1)[-1] for item in methods), gate.GOAL_NAMES)
 
     def test_a_missing_goal_method_fails_selection(self):
@@ -120,7 +120,7 @@ class ApprovalGateControls(unittest.TestCase):
             path = root / 'tests/test_kimi_approvals_native.py'
             path.parent.mkdir()
             path.write_text(source.replace(missing, '    def removed_goal(self):\n', 1), encoding='utf-8')
-            with mock.patch.object(gate, 'ROOT', root), self.assertRaisesRegex(ValueError, 'exact four goal'):
+            with mock.patch.object(gate, 'ROOT', root), self.assertRaisesRegex(ValueError, 'exact eight goal'):
                 gate.goal_methods('darwin-arm64')
 
     def test_both_platforms_keep_the_exact_plan_name(self):
@@ -143,12 +143,12 @@ class ApprovalGateControls(unittest.TestCase):
 
     def test_a_partial_or_skipped_result_never_qualifies(self):
         methods = gate.selected_methods('win32-x64')
-        good = dict(tests=12, started=list(methods), completed=list(methods), failures=0, errors=0, skipped=0,
+        good = dict(tests=16, started=list(methods), completed=list(methods), failures=0, errors=0, skipped=0,
                     expected_failures=0, unexpected_successes=0)
         self.assertTrue(gate.qualifies(good, methods))
         for key in ('failures', 'errors', 'skipped', 'expected_failures', 'unexpected_successes'):
             self.assertFalse(gate.qualifies(dict(good, **{key: 1}), methods), key)
-        for value in (11, True, '12'):
+        for value in (15, True, '16'):
             self.assertFalse(gate.qualifies(dict(good, tests=value), methods))
         self.assertFalse(gate.qualifies(dict(good, completed=list(methods[:-1])), methods))
         self.assertFalse(gate.qualifies(dict(good, started=list(reversed(methods))), methods))
@@ -234,19 +234,21 @@ class ApprovalGateControls(unittest.TestCase):
                     for label in ('Approve once', 'Approve for this session', 'Reject')])
         card = dict(can_answer=True, answer_unavailable_reason='', answer_transport='kimi_tui', questions=[item])
         case.card = lambda: card
-        for folder, display in ((PureWindowsPath('D:/fixture/project with spaces'), 'D:/fixture/project with spaces'),
+        for folder, display in ((PureWindowsPath('D:/fixture/project with spaces'), r'D:\fixture\project with spaces'),
                                 (PurePosixPath('/fixture/project with spaces'), '/fixture/project with spaces')):
             with self.subTest(folder=folder):
                 case.project.resolve.return_value = folder
-                self.assertEqual(folder.as_posix(), display)
+                self.assertEqual(str(folder), display)
                 if isinstance(folder, PurePosixPath):
-                    self.assertEqual(str(folder), display, 'Unix display bytes stay unchanged')
+                    self.assertEqual(folder.as_posix(), display, 'Unix display bytes stay unchanged')
                 for body in ('cwd: ' + display + '\n$ printf approved', '$ printf approved\ncwd: ' + display):
                     item['body'] = body
                     self.assertIs(case.answerable(), card)
-                wrong = ['different/project', display + '-sibling', display + ' child']
+                wrong = ['different/project', display + '-sibling', display + ' child', display[:16] + '...']
                 if display.startswith('D:'):
-                    wrong.append(display.lower())
+                    wrong.extend((display.lower(), 'E:' + display[2:], folder.as_posix()))
+                else:
+                    wrong.append(display.replace('/', '\\'))
                 for other in wrong:
                     item['body'] = 'cwd: ' + other + '\n$ printf approved'
                     with self.subTest(other=other), self.assertRaises(AssertionError):
@@ -262,7 +264,7 @@ class ApprovalGateControls(unittest.TestCase):
         for path in ('src/state/kimi_approval.rs', 'src/state/kimi_goal.rs', 'src/state/kimi_plan.rs',
                      'src/state/questions.rs', 'src/state/question_terminal.rs', 'src/state/mod.rs'):
             self.assertIn("- '" + path + "'", source)
-        self.assertEqual(source.count('seven Bash, four CreateGoal and one ExitPlanMode approval cases'), 2)
+        self.assertEqual(source.count('seven Bash, eight CreateGoal and one ExitPlanMode approval cases'), 2)
         self.assertNotIn('pull_request_target:', source)
         self.assertNotIn('self-hosted', source)
         self.assertIn('os: ["macos-15", "windows-2025"]', source)

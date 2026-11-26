@@ -45,6 +45,9 @@ fn native_job(record: &Value, call: &str, command: &str, at: f64) -> Value {
     let mut j = new_job(record, "main", call, command, at);
     j["source"] = json!("native_history");
     j["observed"] = json!(false);
+    // A command/completion identity alone carries no output evidence. Keep
+    // absence distinct from a native result that explicitly recorded "".
+    j.as_object_mut().unwrap().remove("output");
     j
 }
 pub(super) fn collect(record: &Value, jobs: &mut Jobs, live: bool) -> Result<()> {
@@ -62,6 +65,9 @@ pub(super) fn collect(record: &Value, jobs: &mut Jobs, live: bool) -> Result<()>
 pub(super) fn codex_result(value: &Value) -> Value {
     if value.is_object() {
         return value.clone();
+    }
+    if !value.is_string() && !value.is_array() {
+        return Value::Null;
     }
     let s = text(value);
     if let Ok(v) = serde_json::from_str::<Value>(&s) {
@@ -127,7 +133,7 @@ pub(super) fn codex(record: &Value, rows: &[Value], jobs: &mut Jobs) {
                 .cloned()
                 .unwrap_or_else(|| native_job(record, call, &command, started));
             if !command.is_empty() {
-                job["command"] = json!(journal::clipped(&json!(command), 16000));
+                set_command(&mut job, &command);
             }
             if item["cwd"].is_string() {
                 job["cwd"] = item["cwd"].clone();
@@ -437,7 +443,12 @@ fn kimi(record: &Value, jobs: &mut Jobs, live: bool) -> Result<()> {
                         .is_some_and(|birth| at > 0. && (birth - at).abs() < 5.)
                 );
                 if job["observed"] == true {
-                    job["os_pid"] = json!(pid);
+                    if let Some(identity) = crate::platform::process_identity(pid) {
+                        job["os_pid"] = json!(pid);
+                        job["process_birth"] = json!(identity.birth);
+                    } else {
+                        job["observed"] = json!(false);
+                    }
                 }
                 job["exit_code"] = task
                     .get("exitCode")
@@ -627,7 +638,9 @@ pub(super) fn dsh(record: &Value, inspected: &Value) -> Jobs {
         if !call.is_empty() {
             if let Some(previous) = jobs.remove(&id(record, owner, call)) {
                 job["output"] = previous["output"].clone();
-                job["command"] = previous["command"].clone();
+                for field in ["command", "command_digest", "command_truncated"] {
+                    job[field] = previous[field].clone();
+                }
                 job["cwd"] = previous["cwd"].clone();
             }
             job["call_id"] = json!(call);

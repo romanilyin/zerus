@@ -8,21 +8,26 @@
 //! `zerus_watch_protocol::decode`, and its stderr is drained. When the stream
 //! ends, fails, sends a fatal `error` or stays silent for 30 s, the computer is
 //! [`ComputerStatus::Reconnecting`] with its rows kept, and the next start
-//! follows after 5 s, 15 s, 60 s, then every 5 minutes (failures more than ten
-//! minutes apart start over). Followed sessions are subscribed again on every
+//! follows after the shared [`RestartDelays`] (by default 1 s, 2 s, 5 s, then
+//! every 10 s; failures more than ten minutes apart start over). Each wait is
+//! published as [`crate::Retry::Waiting`] with the deadline that ends it, before its
+//! status, and [`StreamHandle::reconnect`] ends it early. Followed sessions are
+//! subscribed again on every
 //! new stream, after their last cursor, and so are followed processes when the
 //! stream offers that topic. A followed organization comes from a stream that
 //! offers its topic; while none does, this computer's is polled with
 //! `hgs swarm get` every 5 s.
-use crate::{state::CatalogState, Change, ComputerId, ComputerStatus};
+use crate::{
+    state::CatalogState, Change, ComputerId, ComputerStatus, NextAttempt, Retry as Schedule,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zerus_watch_protocol::{
@@ -36,13 +41,112 @@ use zerus_watch_protocol::{
 const QUEUE_LINES: usize = 1024;
 /// The most help text a probe reads.
 const PROBE_BYTES: u64 = 1 << 20;
+const SOURCE_JOIN: Duration = Duration::from_secs(1);
+/// At most one restart a minute skips the delay for a replaced executable
+/// (zerus-5wmh.66.2.46): a new executable that reports itself replaced again
+/// (a broken install) restarts after the failure delays.
+const REPLACED_GAP: Duration = Duration::from_secs(60);
+
+/// A fatal `hgs_replaced` error: an update replaced the server's executable.
+fn replaced(frame: &Frame) -> bool {
+    matches!(&frame.body, Body::Error(error)
+        if error.fatal && error.code == zerus_watch_protocol::code::HGS_REPLACED)
+}
+
+pub(crate) mod helper;
+#[path = "stream_legacy_source.rs"]
+mod legacy_source;
+mod resources;
+
+/// The default restart delays, in seconds, before restart 1, 2, 3 and every
+/// later one: a computer that comes up later is found within seconds.
+pub const RESTART_DEFAULT_SECS: [u64; 4] = [1, 2, 5, 10];
+/// The bounds of one configured restart delay, in seconds.
+pub const RESTART_MIN_SECS: u64 = 1;
+pub const RESTART_MAX_SECS: u64 = 3600;
+const INVALID_DELAYS: &str = "invalid_retry_delays";
+
+/// The restart delays the supervisors of one fleet share. A change applies to
+/// the next wait each one schedules; a wait already scheduled keeps its
+/// published deadline.
+#[derive(Clone)]
+pub struct RestartDelays(Arc<Mutex<[Duration; 4]>>);
+
+impl RestartDelays {
+    pub fn new(delays: [Duration; 4]) -> Self {
+        Self(Arc::new(Mutex::new(delays)))
+    }
+    pub fn get(&self) -> [Duration; 4] {
+        *lock(&self.0)
+    }
+    /// Replaces the delays of every supervisor sharing this schedule.
+    pub fn set(&self, delays: [Duration; 4]) {
+        *lock(&self.0) = delays;
+    }
+}
+
+impl From<[Duration; 4]> for RestartDelays {
+    fn from(delays: [Duration; 4]) -> Self {
+        Self::new(delays)
+    }
+}
+
+impl PartialEq for RestartDelays {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl std::fmt::Debug for RestartDelays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+/// A restart schedule in whole seconds: exactly four delays, for the first,
+/// second, third and every later failure, each from 1 s to 1 h and never
+/// shorter than the one before.
+pub fn checked_restart_delays(seconds: &[u64]) -> Result<[Duration; 4], &'static str> {
+    let seconds = <[u64; 4]>::try_from(seconds).map_err(|_| INVALID_DELAYS)?;
+    if seconds
+        .iter()
+        .any(|delay| !(RESTART_MIN_SECS..=RESTART_MAX_SECS).contains(delay))
+        || seconds.windows(2).any(|pair| pair[1] < pair[0])
+    {
+        return Err(INVALID_DELAYS);
+    }
+    Ok(seconds.map(Duration::from_secs))
+}
+
+/// A saved or requested schedule: a JSON array of four whole seconds.
+pub fn restart_delays_from_value(value: &Value) -> Result<[Duration; 4], &'static str> {
+    let seconds = value
+        .as_array()
+        .ok_or(INVALID_DELAYS)?
+        .iter()
+        .map(|delay| delay.as_u64().ok_or(INVALID_DELAYS))
+        .collect::<Result<Vec<_>, _>>()?;
+    checked_restart_delays(&seconds)
+}
+
+/// The wait after `attempt` failures, scheduled at `now`. Its deadline both
+/// ends the supervisor's wait and is published. Pure, so tests pin the clock.
+pub(crate) fn schedule(delay: Duration, attempt: u32, serial: u64, now: Instant) -> NextAttempt {
+    NextAttempt {
+        serial,
+        attempt,
+        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        deadline: now + delay,
+    }
+}
 
 /// The delays and bounds of a stream. [`Timing::scaled`] shrinks the restart
 /// and re-probe delays for tests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Timing {
-    /// The delay before restart 1, 2, 3 and every later one.
-    pub restart: [Duration; 4],
+    /// The delay before restart 1, 2, 3 and every later one, shared by every
+    /// supervisor this timing (or a clone of it) starts.
+    pub restart: RestartDelays,
     /// A stream without any frame for this long restarts.
     pub silence: Duration,
     /// How often a computer without the marker is probed again.
@@ -63,7 +167,7 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            restart: [5, 15, 60, 300].map(Duration::from_secs),
+            restart: RestartDelays::new(RESTART_DEFAULT_SECS.map(Duration::from_secs)),
             silence: Duration::from_secs(30),
             reprobe: Duration::from_secs(600),
             probe_timeout: Duration::from_secs(5),
@@ -81,7 +185,7 @@ impl Timing {
     pub fn scaled(factor: f64) -> Self {
         let default = Self::default();
         Self {
-            restart: default.restart.map(|delay| delay.mul_f64(factor)),
+            restart: RestartDelays::new(default.restart.get().map(|delay| delay.mul_f64(factor))),
             reprobe: default.reprobe.mul_f64(factor),
             organization_poll: default.organization_poll.mul_f64(factor),
             legacy: crate::legacy::Intervals {
@@ -96,7 +200,7 @@ impl Timing {
     /// The delay before the restart after `attempt` failures.
     pub fn restart_delay(&self, attempt: u32) -> Duration {
         let index = attempt.saturating_sub(1).min(3) as usize;
-        self.restart[index]
+        self.restart.get()[index]
     }
 
     fn probe_timeout(&self, computer: &ComputerId) -> Duration {
@@ -167,50 +271,101 @@ pub enum Probe {
 /// `hgs [@alias] <args>` without an agent's attribution identity: the client
 /// acts for the person even when it was started from an agent's shell.
 pub(crate) fn hgs_command(hgs: &Path, computer: &ComputerId, args: &[&str]) -> Command {
-    let mut command = Command::new(hgs);
+    let mut command = crate::child_environment::command(hgs);
     if let Some(alias) = computer.alias() {
         command.arg(format!("@{alias}"));
     }
     command
         .args(args)
         .env_remove("HGS_SESSION")
+        .env_remove("HGS_SESSION_ID")
         .env_remove("HGS_RUN_ID");
     command
 }
 
 /// Runs `hgs [@host] -h` and looks for [`HELP_MARKER`].
 pub fn probe(hgs: &Path, computer: &ComputerId, timeout: Duration) -> Probe {
-    probe_until(hgs, computer, timeout, &AtomicBool::new(false))
+    probe_until(hgs, computer, timeout, &AtomicBool::new(false), None, None)
 }
 
-fn probe_until(hgs: &Path, computer: &ComputerId, timeout: Duration, stop: &AtomicBool) -> Probe {
+fn probe_until(
+    hgs: &Path,
+    computer: &ComputerId,
+    timeout: Duration,
+    stop: &AtomicBool,
+    source: Option<&crate::source::Endpoint>,
+    resources: Option<&resources::Scope>,
+) -> Probe {
+    let primary = match resources {
+        Some(scope) => match scope.primary() {
+            Some(held) => Some(held),
+            None => {
+                eprintln!("zerus-client: role=fleet operation=probe resources=pending");
+                return Probe::Failed("hgs -h is not ready".into());
+            }
+        },
+        None => None,
+    };
+    let reader_slot = if let Some(source) = source {
+        let Some(slot) = source.reader() else {
+            return Probe::Failed("previous source reader is still open".into());
+        };
+        Some(slot)
+    } else {
+        None
+    };
+    let child_charge = primary.clone().map(crate::run::ChildCharge::new);
     let mut command = hgs_command(hgs, computer, &["-h"]);
+    helper::prepare(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = match command.spawn() {
+    let mut child = match if let Some(source) = source {
+        source.spawn(&mut command)
+    } else {
+        crate::child_environment::spawn(&mut command)
+    } {
         Ok(child) => child,
-        Err(error) => return Probe::Failed(format!("cannot start hgs: {error}")),
+        Err(error) => {
+            if let Some(charge) = &child_charge {
+                charge.confirmed();
+            }
+            return Probe::Failed(format!("cannot start hgs: {error}"));
+        }
     };
     let (tx, rx) = mpsc::channel();
     if let Some(stdout) = child.stdout.take() {
+        let callback = resources.cloned();
         thread::spawn(move || {
+            let _callback = callback;
             let mut text = Vec::new();
             let _ = stdout.take(PROBE_BYTES).read_to_end(&mut text);
+            // Release before waking launch, which uses the same per-alias
+            // guard for its stdout/stderr readers.
+            drop(reader_slot);
+            drop(primary);
             let _ = tx.send(text);
         });
     }
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+        match helper::try_wait(&mut child) {
+            Ok(Some(status)) => {
+                if let Some(charge) = &child_charge {
+                    charge.confirmed();
+                }
+                break Some(status);
+            }
             Ok(None) if Instant::now() < deadline && !stop.load(Ordering::Relaxed) => {
                 thread::sleep(Duration::from_millis(10));
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if helper::terminate(&mut child).is_ok() {
+                    if let Some(charge) = &child_charge {
+                        charge.confirmed();
+                    }
+                }
                 break None;
             }
         }
@@ -222,10 +377,18 @@ fn probe_until(hgs: &Path, computer: &ComputerId, timeout: Duration, stop: &Atom
         return Probe::Failed(format!("hgs -h exited with {status}"));
     }
     let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
-    if String::from_utf8_lossy(&text).contains(HELP_MARKER) {
+    if help_marker(&String::from_utf8_lossy(&text), source.is_some()) {
         Probe::Supported
     } else {
         Probe::Unsupported
+    }
+}
+
+fn help_marker(text: &str, raw: bool) -> bool {
+    if raw {
+        text.lines().any(|line| line.trim() == HELP_MARKER)
+    } else {
+        text.contains(HELP_MARKER)
     }
 }
 
@@ -318,15 +481,27 @@ pub(crate) fn read_line(
 }
 
 enum Input {
+    GitRows(Vec<String>),
+    SourceResnapshot,
+    SourceControls(crate::source::ControlBatch),
+    Reconnect,
     Line {
         generation: u64,
         line: String,
+        received_at: Instant,
+        permit: Option<crate::source::Permit>,
     },
     Closed {
         generation: u64,
     },
     Subscribe {
         key: String,
+    },
+    /// One page of a followed session's rows before `before`.
+    Older {
+        key: String,
+        before: i64,
+        limit: u32,
     },
     Unsubscribe {
         key: String,
@@ -339,6 +514,9 @@ enum Input {
         key: String,
         session: SessionRef,
     },
+    RefreshProcesses {
+        key: String,
+    },
     SubscribeTasks {
         key: String,
     },
@@ -347,6 +525,8 @@ enum Input {
     },
     SubscribeOrganization,
     UnsubscribeOrganization,
+    /// Task #16 (P2.5): the team views' follow changed.
+    TeamViews,
     /// A `swarm get` of the organization poll.
     OrganizationPolled(Result<Value, crate::ReadError>),
     /// A read of the polling of a computer without the stream.
@@ -355,11 +535,62 @@ enum Input {
         result: Result<Value, String>,
     },
     Control(Control),
+    /// Preferences the host confirmed for a Mute or Unmute.
+    Notifications {
+        target: crate::actions::Target,
+        preferences: Value,
+    },
     Stop,
 }
 
 /// The organization edit snapshot the supervisor keeps current.
 type OrganizationShared = Arc<Mutex<Option<crate::OrganizationSnapshot>>>;
+
+/// One coalesced wake of the existing offline supervisor. A full input queue
+/// already wakes the receiver, which checks this state before waiting again.
+#[derive(Default)]
+struct Retry(AtomicU8);
+
+impl Retry {
+    const WAITING: u8 = 1;
+    const REQUESTED: u8 = 2;
+
+    fn request(&self, tx: &SyncSender<Input>) -> bool {
+        if self
+            .0
+            .compare_exchange(
+                Self::WAITING,
+                Self::REQUESTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        match tx.try_send(Input::Reconnect) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => {
+                self.begin();
+                false
+            }
+        }
+    }
+
+    fn waiting(&self) {
+        let _ = self
+            .0
+            .compare_exchange(0, Self::WAITING, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn begin(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::REQUESTED
+    }
+}
 
 /// Polls `hgs swarm get` on its own thread until dropped.
 struct Poller {
@@ -380,10 +611,19 @@ struct Follow {
 }
 
 type Follows = Arc<Mutex<BTreeMap<String, Follow>>>;
-/// Sessions whose processes are followed, by key.
-type ProcessFollows = Arc<Mutex<BTreeMap<String, SessionRef>>>;
+#[derive(Clone, Debug)]
+struct ProcessFollow {
+    session: SessionRef,
+    interval_ms: Option<u64>,
+}
+
+/// Sessions whose processes are followed, by key, with their requested cadence.
+type ProcessFollows = Arc<Mutex<BTreeMap<String, ProcessFollow>>>;
 /// Projects whose task lists are followed.
 type TaskFollows = Arc<Mutex<BTreeSet<String>>>;
+/// Task #16 of team c536f0e5 (P2.5): the team views followed, and the team
+/// whose status, inbox and feed they add; None while no Teams view is open.
+type TeamViewsFollow = Arc<Mutex<Option<Option<String>>>>;
 
 fn lock<T>(follows: &Mutex<T>) -> MutexGuard<'_, T> {
     follows
@@ -391,24 +631,72 @@ fn lock<T>(follows: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[derive(Clone)]
+pub(crate) struct SourceCancel {
+    stop: Weak<AtomicBool>,
+    wake: SyncSender<Input>,
+}
+impl SourceCancel {
+    pub fn cancel(&self) {
+        if let Some(stop) = self.stop.upgrade() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let _ = self.wake.try_send(Input::Stop);
+    }
+    pub fn cancelled(&self) -> bool {
+        self.stop
+            .upgrade()
+            .is_none_or(|stop| stop.load(Ordering::Relaxed))
+    }
+}
+
 /// Controls one computer's supervisor; dropping it stops the stream.
 pub struct StreamHandle {
     computer: ComputerId,
     tx: SyncSender<Input>,
     follows: Follows,
+    team_views: TeamViewsFollow,
     processes: ProcessFollows,
     /// The processes follows the latest stream accepts.
     processes_limit: Arc<AtomicUsize>,
     tasks: TaskFollows,
     /// The tasks follows the latest stream accepts.
     tasks_limit: Arc<AtomicUsize>,
+    /// The older-page size of the running greeted stream; 0 while none runs or
+    /// when it cannot page.
+    activity_older: Arc<AtomicUsize>,
     organization: Arc<AtomicBool>,
     organization_snapshot: OrganizationShared,
     stop: Arc<AtomicBool>,
+    retry: Arc<Retry>,
     thread: Option<JoinHandle<()>>,
+    raw_source: bool,
+    resources: Option<resources::Control>,
 }
 
 impl StreamHandle {
+    pub(crate) fn source_controls(&self, batch: crate::source::ControlBatch) -> bool {
+        self.raw_source && !self.stopped() && self.tx.try_send(Input::SourceControls(batch)).is_ok()
+    }
+    pub(crate) fn wake_source_resnapshot(&self) -> bool {
+        !self.stopped()
+            && match self.tx.try_send(Input::SourceResnapshot) {
+                Ok(()) | Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+    }
+    /// Requests one immediate offline retry without replacing this supervisor,
+    /// its catalog or subscriptions. False online, stopped or already pending.
+    pub fn reconnect(&self) -> bool {
+        !self.stopped() && self.retry.request(&self.tx)
+    }
+
+    pub fn git_rows(&self, keys: Vec<String>) -> bool {
+        keys.len() <= crate::git::VISIBLE_FOLDERS
+            && !self.stopped()
+            && self.tx.try_send(Input::GitRows(keys)).is_ok()
+    }
+
     pub fn computer(&self) -> &ComputerId {
         &self.computer
     }
@@ -417,6 +705,20 @@ impl StreamHandle {
     /// once the supervisor stopped. Activity goes through [`Self::follow`].
     pub fn send(&self, control: Control) -> bool {
         !self.stopped() && self.tx.send(Input::Control(control)).is_ok()
+    }
+
+    /// Applies the preferences the host confirmed for a Mute or Unmute to the
+    /// session's row at once (`FleetState::applyNotificationPreferences`);
+    /// the row goes out as a change. False once the supervisor stopped.
+    pub fn apply_notifications(&self, target: crate::actions::Target, preferences: Value) -> bool {
+        !self.stopped()
+            && self
+                .tx
+                .send(Input::Notifications {
+                    target,
+                    preferences,
+                })
+                .is_ok()
     }
 
     /// Follows a session's Activity on this computer, now and on every later
@@ -456,6 +758,26 @@ impl StreamHandle {
         Ok(key)
     }
 
+    /// Asks for one page of a followed session's rows before the journal
+    /// `seq` `before`, answered as `older` updates. Ok(false) when the key is
+    /// not followed or the running stream cannot page (the caller falls back
+    /// to re-following with `after`).
+    pub fn older(&self, key: &str, before: i64, limit: u32) -> Result<bool, FollowError> {
+        if self.stopped() {
+            return Err(FollowError::Stopped);
+        }
+        if !lock(&self.follows).contains_key(key) || self.activity_older.load(Ordering::Relaxed) == 0
+        {
+            return Ok(false);
+        }
+        let _ = self.tx.send(Input::Older {
+            key: key.to_owned(),
+            before,
+            limit,
+        });
+        Ok(true)
+    }
+
     /// Stops following; false when the key was not followed.
     pub fn unfollow(&self, key: &str) -> bool {
         let Some(follow) = lock(&self.follows).remove(key) else {
@@ -485,18 +807,59 @@ impl StreamHandle {
         {
             let mut follows = lock(&self.processes);
             if let Some(old) = follows.get(&key) {
-                if *old == session {
+                if old.session == session {
                     return Ok(key);
                 }
             } else if follows.len() >= self.processes_limit.load(Ordering::Relaxed) {
                 return Err(FollowError::TooMany);
             }
-            follows.insert(key.clone(), session);
+            let interval_ms = follows.get(&key).and_then(|follow| follow.interval_ms);
+            follows.insert(
+                key.clone(),
+                ProcessFollow {
+                    session,
+                    interval_ms,
+                },
+            );
         }
         self.tx
             .send(Input::SubscribeProcesses { key: key.clone() })
             .map_err(|_| FollowError::Stopped)?;
         Ok(key)
+    }
+
+    /// Changes a followed session's cadence without dropping its current state.
+    /// The request survives reconnects; older watch servers keep their default.
+    pub fn set_processes_interval(&self, key: &str, interval_ms: u64) -> Result<(), FollowError> {
+        if self.stopped() {
+            return Err(FollowError::Stopped);
+        }
+        {
+            let mut follows = lock(&self.processes);
+            let follow = follows.get_mut(key).ok_or(FollowError::KeyMismatch)?;
+            let interval = Some(interval_ms.clamp(1_000, 600_000));
+            if follow.interval_ms == interval {
+                return Ok(());
+            }
+            follow.interval_ms = interval;
+        }
+        self.tx
+            .send(Input::SubscribeProcesses { key: key.into() })
+            .map_err(|_| FollowError::Stopped)
+    }
+
+    /// Requests one fresh inventory for an existing subscription. Repeated
+    /// requests coalesce on the server and retain the current state meanwhile.
+    pub fn refresh_processes(&self, key: &str) -> Result<(), FollowError> {
+        if self.stopped() {
+            return Err(FollowError::Stopped);
+        }
+        if !lock(&self.processes).contains_key(key) {
+            return Err(FollowError::KeyMismatch);
+        }
+        self.tx
+            .send(Input::RefreshProcesses { key: key.into() })
+            .map_err(|_| FollowError::Stopped)
     }
 
     /// Stops following a session's processes and drops their state without an
@@ -507,7 +870,7 @@ impl StreamHandle {
         };
         let _ = self.tx.send(Input::UnsubscribeProcesses {
             key: key.to_owned(),
-            session,
+            session: session.session,
         });
         true
     }
@@ -558,6 +921,25 @@ impl StreamHandle {
         true
     }
 
+    /// Task #16 of team c536f0e5 (P2.5): follows the team views (`Some`),
+    /// with the team whose status, inbox and feed they add, or stops (`None`).
+    /// A stream that offers `team.views` then sends them as rows
+    /// ([`crate::Change::TeamViews`]); one without it changes nothing, and
+    /// the Teams poller reads them. Kept across reconnects.
+    pub fn follow_team_views(&self, follow: Option<Option<String>>) -> bool {
+        if self.stopped() {
+            return false;
+        }
+        {
+            let mut current = lock(&self.team_views);
+            if *current == follow {
+                return true;
+            }
+            *current = follow;
+        }
+        self.tx.send(Input::TeamViews).is_ok()
+    }
+
     /// The projects whose task lists are followed.
     pub fn followed_tasks(&self) -> Vec<String> {
         lock(&self.tasks).iter().cloned().collect()
@@ -605,8 +987,61 @@ impl StreamHandle {
         self.stop.load(Ordering::Relaxed)
     }
 
-    fn shutdown(&mut self) {
+    /// Close native admissions and wake the owned supervisor without joining.
+    /// This is cancellation only; resource completion needs the host's barrier.
+    pub fn request_stop(&self) {
+        self.close_admissions();
+        let _ = self.tx.try_send(Input::Stop);
+    }
+
+    /// Nonblocking source-owner barrier. No upstream I/O or joins of live work.
+    pub(crate) fn join_source_if_finished(&mut self) -> bool {
+        assert!(self.raw_source);
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return false;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        true
+    }
+
+    /// Cancel a source on an owner's early drop without blocking its actor.
+    /// Endpoint guards still count unfinished I/O; this is never a drain proof.
+    pub(crate) fn detach_source(mut self) {
+        assert!(self.raw_source);
+        self.request_stop();
+        self.thread.take();
+    }
+
+    fn close_admissions(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(resources) = &self.resources {
+            resources.close();
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.close_admissions();
+        if self.raw_source || self.resources.is_some() {
+            let _ = self.tx.try_send(Input::Stop);
+            if let Some(thread) = self.thread.take() {
+                let until = Instant::now() + SOURCE_JOIN;
+                while !thread.is_finished() && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if thread.is_finished() {
+                    let _ = thread.join();
+                }
+                // Pending I/O keeps its endpoint/reader guards after this
+                // bounded join; cancellation never proves writer drain.
+            }
+            return;
+        }
         let _ = self.tx.send(Input::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -627,39 +1062,113 @@ pub fn spawn(
     timing: Timing,
     sink: Sender<StreamEvent>,
 ) -> StreamHandle {
+    spawn_with(hgs, computer, timing, Some(sink), None, None).expect("start a stream supervisor")
+}
+
+/// Opt into actual helper/pipe/worker retention. The host supplies an already
+/// admitted, bounded source group and retains its consumer callbacks separately.
+/// A bounded stop is not drain: wait on that host's closed admission gate.
+/// Unknown child exit pins its group until host exit. No source or effect authority.
+pub fn spawn_accounted(
+    hgs: &Path,
+    computer: &ComputerId,
+    timing: Timing,
+    sink: Sender<StreamEvent>,
+    resources: Arc<dyn Send + Sync>,
+) -> io::Result<StreamHandle> {
+    if !computer.is_local() && !crate::fleet::valid_alias(&computer.0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid source alias",
+        ));
+    }
+    spawn_with(
+        hgs,
+        computer,
+        timing,
+        Some(sink),
+        None,
+        Some(resources::Scope::new(resources)),
+    )
+}
+
+pub(crate) fn spawn_source(
+    hgs: &Path,
+    computer: &ComputerId,
+    timing: Timing,
+    source: crate::source::Endpoint,
+) -> io::Result<StreamHandle> {
+    let resources = source.resources().map(resources::Scope::new);
+    spawn_with(hgs, computer, timing, None, Some(source), resources)
+}
+
+fn spawn_with(
+    hgs: &Path,
+    computer: &ComputerId,
+    timing: Timing,
+    sink: Option<Sender<StreamEvent>>,
+    mut source: Option<crate::source::Endpoint>,
+    resources: Option<resources::Scope>,
+) -> io::Result<StreamHandle> {
     let (tx, rx) = mpsc::sync_channel(QUEUE_LINES);
     let follows = Follows::default();
     let processes = ProcessFollows::default();
     let processes_limit = Arc::new(AtomicUsize::new(PROCESSES_SUBSCRIPTIONS));
     let tasks = TaskFollows::default();
+    let team_views = TeamViewsFollow::default();
     let tasks_limit = Arc::new(AtomicUsize::new(TASKS_SUBSCRIPTIONS));
+    let activity_older = Arc::new(AtomicUsize::new(0));
     let organization = Arc::new(AtomicBool::new(false));
     let organization_snapshot = OrganizationShared::default();
     let stop = Arc::new(AtomicBool::new(false));
+    let raw_source = source.is_some();
+    if let Some(source) = &mut source {
+        source.set_cancel(SourceCancel {
+            stop: Arc::downgrade(&stop),
+            wake: tx.clone(),
+        });
+    }
+    let retry = Arc::new(Retry::default());
+    let resource_control = resources.as_ref().map(resources::Scope::control);
     let supervisor = Supervisor {
         hgs: hgs.to_owned(),
         computer: computer.clone(),
         timing,
         sink,
+        source,
+        resources,
+        child_charge: None,
+        primary: None,
+        connection: None,
         rx,
         tx: tx.clone(),
         follows: follows.clone(),
         processes: processes.clone(),
         processes_limit: processes_limit.clone(),
         tasks: tasks.clone(),
+        team_views: team_views.clone(),
         tasks_limit: tasks_limit.clone(),
+        activity_older: activity_older.clone(),
         organization_snapshot: organization_snapshot.clone(),
         poller: None,
         worker_fixed: None,
         legacy: None,
         legacy_windows: BTreeSet::new(),
         stop: stop.clone(),
+        retry: retry.clone(),
         state: CatalogState::new(),
+        git: crate::git::subscriptions::Subscriptions::default(),
         generation: 0,
         child: None,
         stdin: None,
         greeted: false,
         last_frame: Instant::now(),
+        launched: Instant::now(),
+        source_seq: None,
+        replaced_restart: None,
+        reader_stop: None,
+        schedule: std::cell::Cell::new(Schedule::Idle),
+        schedule_serial: 0,
     };
     let name = match computer.alias() {
         Some(alias) => format!("hgs-watch-{alias}"),
@@ -667,9 +1176,8 @@ pub fn spawn(
     };
     let thread = thread::Builder::new()
         .name(name)
-        .spawn(move || supervisor.run())
-        .expect("start a stream supervisor");
-    StreamHandle {
+        .spawn(move || supervisor.run())?;
+    Ok(StreamHandle {
         computer: computer.clone(),
         tx,
         follows,
@@ -677,24 +1185,34 @@ pub fn spawn(
         processes_limit,
         tasks,
         tasks_limit,
+        team_views,
+        activity_older,
         organization,
         organization_snapshot,
         stop,
+        retry,
         thread: Some(thread),
-    }
+        raw_source,
+        resources: resource_control,
+    })
 }
 
 #[derive(PartialEq)]
 enum Outcome {
     Ended,
     Stopped,
+    Resnapshot,
+    /// The server's executable was replaced: start the new one now.
+    Replaced,
 }
 
 struct Supervisor {
     hgs: PathBuf,
     computer: ComputerId,
     timing: Timing,
-    sink: Sender<StreamEvent>,
+    sink: Option<Sender<StreamEvent>>,
+    source: Option<crate::source::Endpoint>,
+    connection: Option<crate::source::Connection>,
     rx: Receiver<Input>,
     tx: SyncSender<Input>,
     follows: Follows,
@@ -702,6 +1220,8 @@ struct Supervisor {
     processes_limit: Arc<AtomicUsize>,
     tasks: TaskFollows,
     tasks_limit: Arc<AtomicUsize>,
+    team_views: TeamViewsFollow,
+    activity_older: Arc<AtomicUsize>,
     organization_snapshot: OrganizationShared,
     /// Polls `swarm get` while no stream offers the organization.
     poller: Option<Poller>,
@@ -713,13 +1233,27 @@ struct Supervisor {
     /// Followed sessions whose first window the polling sent.
     legacy_windows: BTreeSet<String>,
     stop: Arc<AtomicBool>,
+    retry: Arc<Retry>,
     state: CatalogState,
+    git: crate::git::subscriptions::Subscriptions,
     generation: u64,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     /// The running stream sent its `hello`.
     greeted: bool,
     last_frame: Instant,
+    launched: Instant,
+    source_seq: Option<u64>,
+    /// The last restart for a replaced executable, which skipped the delay.
+    replaced_restart: Option<Instant>,
+    reader_stop: Option<Arc<AtomicBool>>,
+    resources: Option<resources::Scope>,
+    child_charge: Option<crate::run::ChildCharge>,
+    primary: Option<Arc<dyn Send + Sync>>,
+    /// The restart schedule last published; see [`crate::Retry`].
+    schedule: std::cell::Cell<Schedule>,
+    /// The serial of the last wait this supervisor scheduled.
+    schedule_serial: u64,
 }
 
 impl Supervisor {
@@ -729,12 +1263,47 @@ impl Supervisor {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
+            // No greeted stream runs until the next hello: no older pages.
+            self.activity_older.store(0, Ordering::Relaxed);
+            // A retry is in flight now; extra Refresh presses coalesce with it.
+            self.retry.begin();
             self.state.begin();
+            if let Some(source) = &self.source {
+                self.connection = source.connect(&self.stop);
+                if self.connection.is_none() {
+                    break;
+                }
+            }
             let timeout = self.timing.probe_timeout(&self.computer);
-            match probe_until(&self.hgs, &self.computer, timeout, &self.stop) {
+            match probe_until(
+                &self.hgs,
+                &self.computer,
+                timeout,
+                &self.stop,
+                self.source.as_ref(),
+                self.resources.as_ref(),
+            ) {
                 Probe::Supported => {
                     self.legacy = None;
                     self.legacy_windows.clear();
+                }
+                Probe::Unsupported if self.source.is_some() => {
+                    self.connection = None;
+                    self.status(ComputerStatus::Unsupported);
+                    let again = if self
+                        .source
+                        .as_ref()
+                        .and_then(|s| s.legacy_config())
+                        .is_some()
+                    {
+                        self.poll_source_legacy(self.timing.reprobe)
+                    } else {
+                        self.wait(self.timing.reprobe)
+                    };
+                    if again {
+                        continue;
+                    }
+                    break;
                 }
                 Probe::Unsupported => {
                     // Polled already: the status stays until a listing fails.
@@ -765,6 +1334,10 @@ impl Supervisor {
             }
             let outcome = self.pump();
             self.close();
+            if matches!(outcome, Outcome::Resnapshot | Outcome::Replaced) {
+                self.status(ComputerStatus::Probing);
+                continue;
+            }
             if outcome == Outcome::Stopped || !self.fail() {
                 break;
             }
@@ -782,8 +1355,65 @@ impl Supervisor {
         self.status(ComputerStatus::Ended);
     }
 
+    /// Applies confirmed notification preferences to the session's row and
+    /// sends the changed row on, as a frame's changes go.
+    fn notifications(&mut self, target: &crate::actions::Target, preferences: &Value) {
+        for change in self
+            .state
+            .apply_notification_preferences(&self.computer, target, preferences)
+        {
+            self.emit(change);
+        }
+    }
+
     fn emit(&self, change: Change) {
-        let _ = self.sink.send(StreamEvent::Change(change));
+        let left = match &change {
+            Change::Computer {
+                status: ComputerStatus::Reconnecting { .. },
+                ..
+            } => {
+                self.retry.waiting();
+                false
+            }
+            Change::Computer { .. } => {
+                self.retry.begin();
+                true
+            }
+            _ => false,
+        };
+        // A computer that is not reconnecting has no restart waiting or
+        // running; clearing it first leaves nothing behind an ended computer.
+        if left {
+            self.publish(Schedule::Idle);
+        }
+        self.forward(change);
+    }
+
+    fn forward(&self, change: Change) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.send(StreamEvent::Change(change));
+        } else if let Some(source) = &self.source {
+            let sent = match change {
+                Change::Computer { status, .. } => {
+                    source.status(self.generation, status, &self.stop)
+                }
+                Change::Retry { retry, .. } => source.retry(self.generation, retry, &self.stop),
+                _ => true,
+            };
+            if !sent {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Publishes a changed restart schedule; an unchanged one sends nothing.
+    fn publish(&self, schedule: Schedule) {
+        if self.schedule.replace(schedule) != schedule {
+            self.forward(Change::Retry {
+                computer: self.computer.clone(),
+                retry: schedule,
+            });
+        }
     }
 
     fn status(&self, status: ComputerStatus) {
@@ -794,37 +1424,83 @@ impl Supervisor {
     }
 
     /// Reports the failure of this attempt and waits out its delay; false
-    /// when the stream was stopped meanwhile.
+    /// when the stream was stopped meanwhile. The one deadline both ends the
+    /// wait and is published, before the status, as the next attempt; a
+    /// manual reconnect ends it early.
     fn fail(&mut self) -> bool {
-        for change in self.state.end(&self.computer, Instant::now()) {
+        self.connection = None;
+        let changes = self.state.end(&self.computer, Instant::now());
+        let attempt = self.state.attempt();
+        self.schedule_serial += 1;
+        let next = schedule(
+            self.timing.restart_delay(attempt),
+            attempt,
+            self.schedule_serial,
+            Instant::now(),
+        );
+        self.publish(Schedule::Waiting(next));
+        for change in changes {
             self.emit(change);
         }
-        self.wait(self.timing.restart_delay(self.state.attempt()))
+        let again = self.wait_until(next.deadline);
+        self.publish(if again {
+            Schedule::Attempting {
+                serial: next.serial,
+                attempt,
+            }
+        } else {
+            Schedule::Idle
+        });
+        again
     }
 
     /// Waits without a stream, keeping follows current; false on stop.
     fn wait(&mut self, time: Duration) -> bool {
+        self.wait_until(Instant::now() + time)
+    }
+
+    /// [`Self::wait`] until `deadline`; true at the deadline or on a
+    /// requested reconnect.
+    fn wait_until(&mut self, deadline: Instant) -> bool {
         // No stream: a followed organization is polled meanwhile.
         self.sync_poller();
-        let deadline = Instant::now() + time;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if self.retry.requested() {
+                return true;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return true;
             }
             match self.rx.recv_timeout(left) {
                 Ok(Input::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Ok(Input::GitRows(keys)) => self.git.wanted(keys),
                 Ok(Input::Subscribe { key }) => self.state.follow(&key),
                 Ok(Input::Unsubscribe { key, .. }) => self.state.unfollow(&key),
                 Ok(Input::SubscribeProcesses { key }) => self.state.processes_mut().follow(&key),
                 Ok(Input::UnsubscribeProcesses { key, .. }) => {
                     self.state.processes_mut().unfollow(&key)
                 }
-                Ok(Input::SubscribeTasks { key }) => self.state.tasks_mut().follow(&key),
+                Ok(Input::SubscribeTasks { key }) => {
+                    self.state.tasks_mut().follow(&key);
+                    self.tasks_unavailable(
+                        &key,
+                        "disconnected",
+                        "The task connection was interrupted. Reconnecting…",
+                    );
+                }
                 Ok(Input::UnsubscribeTasks { key }) => self.state.tasks_mut().unfollow(&key),
                 Ok(Input::SubscribeOrganization) => self.subscribe_organization(),
                 Ok(Input::UnsubscribeOrganization) => self.unsubscribe_organization(),
+                Ok(Input::TeamViews) => self.subscribe_team_views(),
                 Ok(Input::OrganizationPolled(result)) => self.organization_polled(result),
+                Ok(Input::Notifications {
+                    target,
+                    preferences,
+                }) => self.notifications(&target, &preferences),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => return true,
             }
@@ -837,9 +1513,18 @@ impl Supervisor {
         self.sync_poller();
         let deadline = Instant::now() + time;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
             let now = Instant::now();
             if now >= deadline {
                 return true;
+            }
+            if self.retry.requested() {
+                self.retry.begin();
+                if let Some(legacy) = &mut self.legacy {
+                    legacy.refresh_listing(now);
+                }
             }
             let activity: Vec<(String, String, Option<i64>)> = lock(&self.follows)
                 .iter()
@@ -855,7 +1540,7 @@ impl Supervisor {
             let processes: Vec<(String, String)> = lock(&self.processes)
                 .iter()
                 .filter(|(key, _)| self.state.processes().is_followed(key))
-                .map(|(key, session)| (key.clone(), session.name.clone()))
+                .map(|(key, follow)| (key.clone(), follow.session.name.clone()))
                 .collect();
             let follows = crate::legacy::Follows {
                 activity: &activity,
@@ -866,6 +1551,13 @@ impl Supervisor {
                 .legacy
                 .get_or_insert_with(|| crate::legacy::Schedule::new(every));
             let reads = legacy.due(now, &follows);
+            // A capability re-probe temporarily disabled Refresh. Restore it
+            // from the listing's outcome, unless a scheduled read owns it now.
+            if legacy.listing_retryable() {
+                self.retry.waiting();
+            } else {
+                self.retry.begin();
+            }
             for read in reads {
                 self.spawn_legacy(read);
             }
@@ -879,21 +1571,35 @@ impl Supervisor {
                 .max(Duration::from_millis(1));
             match self.rx.recv_timeout(left) {
                 Ok(Input::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Ok(Input::GitRows(keys)) => self.git.wanted(keys),
                 Ok(Input::Subscribe { key }) => self.state.follow(&key),
                 Ok(Input::Unsubscribe { key, .. }) => {
                     self.state.unfollow(&key);
                     self.legacy_windows.remove(&key);
                 }
                 Ok(Input::SubscribeProcesses { key }) => self.state.processes_mut().follow(&key),
+                Ok(Input::RefreshProcesses { key }) => {
+                    if let Some(schedule) = &mut self.legacy {
+                        schedule.refresh_processes(&key, Instant::now());
+                    }
+                }
                 Ok(Input::UnsubscribeProcesses { key, .. }) => {
                     self.state.processes_mut().unfollow(&key)
                 }
-                Ok(Input::SubscribeTasks { key }) => self.state.tasks_mut().follow(&key),
+                Ok(Input::SubscribeTasks { key }) => {
+                    self.state.tasks_mut().follow(&key);
+                    self.tasks_unavailable(&key, "unsupported_topic", "This computer's hgs does not support task subscriptions. Update hgs and reconnect.");
+                }
                 Ok(Input::UnsubscribeTasks { key }) => self.state.tasks_mut().unfollow(&key),
                 Ok(Input::SubscribeOrganization) => self.subscribe_organization(),
                 Ok(Input::UnsubscribeOrganization) => self.unsubscribe_organization(),
+                Ok(Input::TeamViews) => self.subscribe_team_views(),
                 Ok(Input::OrganizationPolled(result)) => self.organization_polled(result),
                 Ok(Input::Legacy { read, result }) => self.legacy_reply(read, result),
+                Ok(Input::Notifications {
+                    target,
+                    preferences,
+                }) => self.notifications(&target, &preferences),
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -904,11 +1610,30 @@ impl Supervisor {
     fn spawn_legacy(&mut self, read: crate::legacy::Read) {
         let (hgs, computer, tx) = (self.hgs.clone(), self.computer.clone(), self.tx.clone());
         let failed = read.clone();
+        let resources = match &self.resources {
+            Some(scope) => match scope.rpc() {
+                Some(held) => Some(held),
+                None => {
+                    if let Some(legacy) = &mut self.legacy {
+                        legacy.done(&read, Instant::now());
+                    }
+                    return;
+                }
+            },
+            None => None,
+        };
+        let stop = self.stop.clone();
         let spawned = thread::Builder::new()
             .name("hgs-legacy-poll".into())
             .spawn(move || {
-                let result = crate::legacy::run(&hgs, &computer, &read);
+                let result = match &resources {
+                    Some(held) => {
+                        crate::legacy::run_accounted(&hgs, &computer, &read, &stop, held.clone())
+                    }
+                    None => crate::legacy::run(&hgs, &computer, &read),
+                };
                 let _ = tx.send(Input::Legacy { read, result });
+                drop(resources);
             });
         if spawned.is_err() {
             if let Some(legacy) = self.legacy.as_mut() {
@@ -931,10 +1656,12 @@ impl Supervisor {
                 // This computer's listing names the peers, as its meta would.
                 if computer.is_local() {
                     if let Some(peers) = self.state.peers() {
-                        let _ = self.sink.send(StreamEvent::Peers {
-                            computer: computer.clone(),
-                            peers,
-                        });
+                        if let Some(sink) = &self.sink {
+                            let _ = sink.send(StreamEvent::Peers {
+                                computer: computer.clone(),
+                                peers,
+                            });
+                        }
                     }
                 }
                 if first {
@@ -1013,46 +1740,138 @@ impl Supervisor {
     }
 
     fn launch(&mut self) -> io::Result<()> {
+        let primary = self
+            .resources
+            .as_ref()
+            .map(|scope| {
+                scope.primary().ok_or_else(|| {
+                    eprintln!("zerus-client: role=fleet operation=watch resources=pending");
+                    io::Error::new(io::ErrorKind::WouldBlock, "hgs watch is not ready")
+                })
+            })
+            .transpose()?;
+        let reader_slot = if let Some(source) = &self.source {
+            let slot = source.reader().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "previous source reader is still open",
+                )
+            })?;
+            Some(Arc::new(slot))
+        } else {
+            None
+        };
+
+        let child_charge = primary.clone().map(crate::run::ChildCharge::new);
         let mut command = hgs_command(&self.hgs, &self.computer, &["watch", "--json"]);
+        helper::prepare(&mut command);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        let spawned = if let Some(source) = &self.source {
+            source.spawn(&mut command)
+        } else {
+            crate::child_environment::spawn(&mut command)
+        };
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(charge) = &child_charge {
+                    charge.confirmed();
+                }
+                return Err(error);
+            }
+        };
         self.generation += 1;
         let generation = self.generation;
         if let Some(stdout) = child.stdout.take() {
             let tx = self.tx.clone();
-            thread::spawn(move || read_stream(stdout, generation, tx));
+            let source = self.source.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            self.reader_stop = Some(stop.clone());
+            let slot = reader_slot.clone();
+            let retained = primary.clone();
+            thread::spawn(move || {
+                let _slot = slot;
+                let _resources = retained;
+                read_stream(stdout, generation, tx, source, stop);
+            });
         }
         if let Some(mut stderr) = child.stderr.take() {
+            let slot = reader_slot.clone();
+            let retained = primary.clone();
             thread::spawn(move || {
+                let _slot = slot;
+                let _resources = retained;
                 let _ = io::copy(&mut stderr, &mut io::sink());
             });
         }
         self.stdin = child.stdin.take();
         self.child = Some(child);
+        self.child_charge = child_charge;
+        self.primary = primary;
         self.greeted = false;
         self.last_frame = Instant::now();
+        self.launched = self.last_frame;
+        self.source_seq = None;
         Ok(())
     }
 
     /// Runs the stream until it ends or the handle stops it.
     fn pump(&mut self) -> Outcome {
         loop {
-            let left = self
+            if self.stop.load(Ordering::Relaxed) {
+                return Outcome::Stopped;
+            }
+            if self
+                .source
+                .as_ref()
+                .is_some_and(|source| source.resnapshot.take(self.generation))
+            {
+                return Outcome::Resnapshot;
+            }
+            let mut left = self
                 .timing
                 .silence
                 .saturating_sub(self.last_frame.elapsed());
+            if self.source.is_some() && !self.greeted {
+                left = left.min(self.timing.silence.saturating_sub(self.launched.elapsed()));
+            }
             if left.is_zero() {
                 return Outcome::Ended;
             }
             match self.rx.recv_timeout(left) {
-                Ok(Input::Line { generation, line }) if generation == self.generation => {
-                    self.last_frame = Instant::now();
+                Ok(Input::Line {
+                    generation,
+                    line,
+                    received_at,
+                    permit,
+                }) if generation == self.generation => {
+                    self.last_frame = if self.source.is_some() {
+                        received_at
+                    } else {
+                        Instant::now()
+                    };
                     match classify(&line) {
+                        // An update replaced the server's executable: the
+                        // new one starts at once, with the rows kept, but
+                        // only once a minute; a repeat waits like a failure.
+                        Line::Frame(frame)
+                            if replaced(&frame)
+                                && self
+                                    .replaced_restart
+                                    .is_none_or(|at| at.elapsed() >= REPLACED_GAP) =>
+                        {
+                            self.replaced_restart = Some(Instant::now());
+                            return Outcome::Replaced;
+                        }
                         Line::Frame(frame) => {
-                            self.handle(&frame);
+                            if self.source.is_some() {
+                                self.handle_source(frame, received_at, permit);
+                            } else {
+                                self.handle(&frame);
+                            }
                             if self.state.failed() {
                                 return Outcome::Ended;
                             }
@@ -1065,7 +1884,12 @@ impl Supervisor {
                     return Outcome::Ended;
                 }
                 Ok(Input::Line { .. } | Input::Closed { .. }) => {}
+                Ok(Input::GitRows(keys)) => {
+                    self.git.wanted(keys);
+                    self.reconcile_git();
+                }
                 Ok(Input::Subscribe { key }) => self.subscribe(&key),
+                Ok(Input::Older { key, before, limit }) => self.older(&key, before, limit),
                 Ok(Input::Unsubscribe { key, session }) => {
                     self.state.unfollow(&key);
                     if self.greeted {
@@ -1077,12 +1901,14 @@ impl Supervisor {
                     }
                 }
                 Ok(Input::SubscribeProcesses { key }) => self.subscribe_processes(&key),
+                Ok(Input::RefreshProcesses { key }) => self.send_processes_subscription(&key, true),
                 Ok(Input::UnsubscribeProcesses { key, session }) => {
                     self.state.processes_mut().unfollow(&key);
                     self.unsubscribe_processes(session);
                 }
                 Ok(Input::SubscribeOrganization) => self.subscribe_organization(),
                 Ok(Input::UnsubscribeOrganization) => self.unsubscribe_organization(),
+                Ok(Input::TeamViews) => self.subscribe_team_views(),
                 Ok(Input::OrganizationPolled(result)) => self.organization_polled(result),
                 // A polling read that finished after the stream started.
                 Ok(Input::Legacy { .. }) => {}
@@ -1091,15 +1917,125 @@ impl Supervisor {
                     self.state.tasks_mut().unfollow(&key);
                     self.unsubscribe_tasks(&key);
                 }
+                Ok(Input::SourceControls(batch)) => {
+                    if self
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.resnapshot.accepting(batch.generation))
+                        && self.greeted
+                        && batch.generation == self.generation
+                    {
+                        if let Some(stdin) = self.stdin.as_mut() {
+                            if stdin
+                                .write_all(&batch.bytes)
+                                .and_then(|()| stdin.flush())
+                                .is_err()
+                            {
+                                return Outcome::Ended;
+                            }
+                        }
+                    }
+                }
                 Ok(Input::Control(control)) => self.write(&control),
+                // A queued wake from an older attempt must never restart a
+                // source that is online now, or a later offline attempt.
+                Ok(Input::Reconnect | Input::SourceResnapshot) => {}
+                Ok(Input::Notifications {
+                    target,
+                    preferences,
+                }) => self.notifications(&target, &preferences),
                 Ok(Input::Stop) | Err(RecvTimeoutError::Disconnected) => return Outcome::Stopped,
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
     }
 
+    /// Forward catalog frames without ever applying them to CatalogState.
+    /// That empty state supplies only the existing lifecycle/backoff policy.
+    fn handle_source(
+        &mut self,
+        frame: Box<Frame>,
+        received_at: Instant,
+        permit: Option<crate::source::Permit>,
+    ) {
+        let hello = matches!(&frame.body, Body::Hello(_));
+        if hello == self.greeted || self.source_seq.is_some_and(|seq| frame.seq <= seq) {
+            self.state.end(&self.computer, Instant::now());
+            if let (Some(source), Some(permit)) = (&self.source, permit) {
+                if !source.status_reserved(
+                    self.generation,
+                    ComputerStatus::Reconnecting {
+                        attempt: self.state.attempt(),
+                    },
+                    permit,
+                ) {
+                    self.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        self.source_seq = Some(frame.seq);
+        let live = matches!(&frame.body, Body::Snapshot(snapshot) if snapshot.topic == topic::CATALOG && snapshot.last);
+        let changes = source_lifecycle(&mut self.state, &self.computer, &frame);
+        if hello {
+            self.greeted = true;
+            self.activity_older
+                .store(self.state.activity_older(), Ordering::Relaxed);
+            self.connection = None;
+            if let Some(source) = &self.source {
+                source.resnapshot.open(self.generation);
+            }
+        }
+        let Some(permit) = permit else {
+            self.stop.store(true, Ordering::Relaxed);
+            return;
+        };
+        let sent = self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.frame(self.generation, frame, received_at, permit));
+        if !sent {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        // The frame is now consumer-owned, so a full ingress cannot deadlock
+        // while an additional lifecycle status waits for space.
+        for change in changes {
+            self.emit(change);
+        }
+        if live {
+            self.status(ComputerStatus::Live);
+        }
+    }
+
+    fn reconcile_git(&mut self) {
+        let (controls, changes) =
+            self.git
+                .reconcile(&mut self.state, &self.computer, Instant::now());
+        for control in controls {
+            self.write(&control);
+        }
+        for change in changes {
+            self.emit(change);
+        }
+    }
     fn handle(&mut self, frame: &Frame) {
         let changes = self.state.apply(&self.computer, frame);
+        // Task #20 of team c536f0e5 (P2.6c): the peer's catalog or tasks
+        // changed: this computer's swarm worker syncs with it now.
+        if self.state.take_swarm_moved() {
+            if let (Some(alias), Some(configuration)) = (self.computer.alias(), crate::swarm_wake::hgs_configuration()) {
+                crate::swarm_wake::touch(&configuration, alias);
+            }
+        }
+        let (controls, git_changes) =
+            self.git
+                .frame(&mut self.state, &self.computer, frame, Instant::now());
+        for control in controls {
+            self.write(&control);
+        }
+        for change in git_changes {
+            self.emit(change);
+        }
         for change in changes {
             if matches!(change, Change::Organization { .. }) {
                 self.organization_changed();
@@ -1119,8 +2055,8 @@ impl Supervisor {
                 } => {
                     // The server may still follow a key the catalog dropped.
                     let removed = lock(&self.processes).remove(key);
-                    if let Some(session) = removed {
-                        self.unsubscribe_processes(session);
+                    if let Some(follow) = removed {
+                        self.unsubscribe_processes(follow.session);
                     }
                 }
                 Change::Tasks {
@@ -1137,6 +2073,8 @@ impl Supervisor {
         match &frame.body {
             Body::Hello(_) => {
                 self.greeted = true;
+                self.activity_older
+                    .store(self.state.activity_older(), Ordering::Relaxed);
                 let limit = self
                     .state
                     .processes_limit()
@@ -1164,6 +2102,24 @@ impl Supervisor {
                 if self.state.organization().is_followed() {
                     self.subscribe_organization();
                 }
+                // Task 8: the team heads, so the Teams poller reads a team
+                // when it changed; a peer without the topic keeps polling.
+                if self.state.team_offered() {
+                    self.write(&Control::Subscribe(Subscription {
+                        topic: topic::TEAM.into(),
+                        ..Subscription::default()
+                    }));
+                }
+                // Task #16 (P2.5): the followed team views, as rows.
+                self.subscribe_team_views();
+                // Task #20 (P2.6c): a peer's swarm head, which wakes this
+                // computer's swarm worker when it moves.
+                if !self.computer.is_local() && self.state.swarm_offered() {
+                    self.write(&Control::Subscribe(Subscription {
+                        topic: topic::SWARM.into(),
+                        ..Subscription::default()
+                    }));
+                }
             }
             Body::Snapshot(snapshot)
                 if snapshot.topic == topic::CATALOG_META
@@ -1171,10 +2127,12 @@ impl Supervisor {
                     && self.computer.is_local() =>
             {
                 if let Some(peers) = self.state.peers() {
-                    let _ = self.sink.send(StreamEvent::Peers {
-                        computer: self.computer.clone(),
-                        peers,
-                    });
+                    if let Some(sink) = &self.sink {
+                        let _ = sink.send(StreamEvent::Peers {
+                            computer: self.computer.clone(),
+                            peers,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1205,13 +2163,36 @@ impl Supervisor {
         }));
     }
 
+    /// Asks a greeted stream for one page of a followed session's rows before
+    /// `before`. The live subscription, its cursor and state stay as they are:
+    /// only the answer's `older` frames come back.
+    fn older(&mut self, key: &str, before: i64, limit: u32) {
+        if !self.greeted {
+            return;
+        }
+        let Some(follow) = lock(&self.follows).get(key).cloned() else {
+            return;
+        };
+        let server = u32::try_from(self.activity_older.load(Ordering::Relaxed)).unwrap_or(u32::MAX);
+        if server == 0 {
+            return;
+        }
+        self.write(&Control::Subscribe(Subscription {
+            topic: topic::ACTIVITY.into(),
+            session: Some(follow.session),
+            before: Some(before),
+            tail: Some(limit.min(server).max(1)),
+            ..Subscription::default()
+        }));
+    }
+
     /// Accepts the key's processes frames and, on a greeted stream that offers
     /// the topic, subscribes it. A key the live catalog lacks ends at once, and
     /// so does one beyond the stream's limit.
     fn subscribe_processes(&mut self, key: &str) {
-        let Some(session) = lock(&self.processes).get(key).cloned() else {
+        if !lock(&self.processes).contains_key(key) {
             return;
-        };
+        }
         self.state.processes_mut().follow(key);
         if !self.greeted {
             return;
@@ -1227,9 +2208,21 @@ impl Supervisor {
             }
             return;
         }
+        self.send_processes_subscription(key, false);
+    }
+
+    fn send_processes_subscription(&mut self, key: &str, refresh: bool) {
+        if !self.greeted || self.state.processes_limit().is_none() {
+            return;
+        }
+        let Some(follow) = lock(&self.processes).get(key).cloned() else {
+            return;
+        };
         self.write(&Control::Subscribe(Subscription {
             topic: topic::PROCESSES.into(),
-            session: Some(session),
+            session: Some(follow.session),
+            interval_ms: follow.interval_ms,
+            refresh: refresh.then_some(true),
             ..Subscription::default()
         }));
     }
@@ -1256,15 +2249,26 @@ impl Supervisor {
         let stop = Arc::new(AtomicBool::new(false));
         let (hgs, tx, flag) = (self.hgs.clone(), self.tx.clone(), stop.clone());
         let every = self.timing.organization_poll;
+        let scope = self.resources.clone();
         let spawned = thread::Builder::new()
             .name("hgs-swarm-poll".into())
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) {
-                    let reply = crate::reads::read(&hgs, &ComputerId::local(), &crate::Read::Swarm);
-                    if flag.load(Ordering::Relaxed)
-                        || tx.send(Input::OrganizationPolled(reply)).is_err()
-                    {
-                        return;
+                    let resources = scope.as_ref().map(resources::Scope::rpc);
+                    if !matches!(resources, Some(None)) {
+                        let held = resources.flatten();
+                        let reply = match &held {
+                            Some(held) => organization_accounted(&hgs, &flag, held.clone()),
+                            None => {
+                                crate::reads::read(&hgs, &ComputerId::local(), &crate::Read::Swarm)
+                            }
+                        };
+                        if flag.load(Ordering::Relaxed)
+                            || tx.send(Input::OrganizationPolled(reply)).is_err()
+                        {
+                            return;
+                        }
+                        drop(held);
                     }
                     let until = Instant::now() + every;
                     while Instant::now() < until && !flag.load(Ordering::Relaxed) {
@@ -1279,6 +2283,34 @@ impl Supervisor {
 
     /// Follows the organization from the running stream when it offers the
     /// topic, otherwise by polling.
+    /// Task #16 of team c536f0e5 (P2.5): subscribes the followed team views
+    /// (again, with another team) or unsubscribes them, on a greeted stream
+    /// that offers the topic.
+    fn subscribe_team_views(&mut self) {
+        if !self.greeted || !self.state.team_views_offered() {
+            return;
+        }
+        let follow = lock(&self.team_views).clone();
+        match follow {
+            Some(team) => self.write(&Control::Subscribe(Subscription {
+                topic: topic::TEAM_VIEWS.into(),
+                team,
+                ..Subscription::default()
+            })),
+            None => {
+                self.write(&Control::Unsubscribe(Subscription {
+                    topic: topic::TEAM_VIEWS.into(),
+                    ..Subscription::default()
+                }));
+                let mut changes = Vec::new();
+                self.state.lose_team_views(&self.computer, &mut changes);
+                for change in changes {
+                    self.emit(change);
+                }
+            }
+        }
+    }
+
     fn subscribe_organization(&mut self) {
         self.state.organization_mut().follow();
         if self.streams_organization() {
@@ -1333,12 +2365,24 @@ impl Supervisor {
             .worker_fixed
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
         if self.computer.is_local() && due && self.state.organization().worker_outdated() {
+            let resources = match &self.resources {
+                Some(scope) => match scope.rpc() {
+                    Some(held) => Some(held),
+                    None => return,
+                },
+                None => None,
+            };
             self.worker_fixed = Some(Instant::now());
             let hgs = self.hgs.clone();
+            let stop = self.stop.clone();
             let _ = thread::Builder::new()
                 .name("hgs-swarm-worker".into())
                 .spawn(move || {
-                    let _ = crate::reads::read(&hgs, &ComputerId::local(), &crate::Read::Swarm);
+                    let _held = resources.clone();
+                    let _ = match resources {
+                        Some(held) => organization_accounted(&hgs, &stop, held),
+                        None => crate::reads::read(&hgs, &ComputerId::local(), &crate::Read::Swarm),
+                    };
                 });
         }
     }
@@ -1354,6 +2398,7 @@ impl Supervisor {
             return;
         }
         let Some(limit) = self.state.tasks_limit() else {
+            self.tasks_unavailable(key, "unsupported_topic", "This computer's hgs does not support task subscriptions. Update hgs and reconnect.");
             return;
         };
         if self.state.tasks().keys().position(|known| known == key) >= Some(limit) {
@@ -1363,11 +2408,24 @@ impl Supervisor {
             }
             return;
         }
+        // A window of each stage; an older server ignores it and sends the
+        // whole list.
         self.write(&Control::Subscribe(Subscription {
             topic: topic::TASKS.into(),
             project: Some(key.to_owned()),
+            window: Some(crate::tasks::WINDOW),
             ..Subscription::default()
         }));
+    }
+
+    fn tasks_unavailable(&mut self, key: &str, code: &str, message: &str) {
+        if let Some(change) = self
+            .state
+            .tasks_mut()
+            .unavailable(&self.computer, key, code, message)
+        {
+            self.emit(change);
+        }
     }
 
     fn unsubscribe_tasks(&mut self, key: &str) {
@@ -1406,38 +2464,109 @@ impl Supervisor {
 
     /// Ends the running stream: EOF first, then a kill after the grace time.
     fn close(&mut self) {
+        for change in self.git.disconnected(&mut self.state, &self.computer) {
+            self.emit(change);
+        }
+
+        if let Some(source) = &self.source {
+            source.resnapshot.close();
+        }
         self.stdin = None;
         self.greeted = false;
+        self.activity_older.store(0, Ordering::Relaxed);
+        if let Some(stop) = self.reader_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         self.sync_poller();
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let deadline = Instant::now() + self.timing.stop_grace;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
+        if let Some(mut child) = self.child.take() {
+            let deadline = Instant::now() + self.timing.stop_grace;
+            loop {
+                match helper::try_wait(&mut child) {
+                    Ok(Some(_)) => {
+                        if let Some(charge) = &self.child_charge {
+                            charge.confirmed();
+                        }
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    _ => {
+                        if helper::terminate(&mut child).is_ok() {
+                            if let Some(charge) = &self.child_charge {
+                                charge.confirmed();
+                            }
+                        }
+                        break;
+                    }
                 }
             }
+        }
+        self.child_charge = None;
+        self.primary = None;
+        self.connection = None;
+        if self.source.is_some() {
+            // Release stale-generation ingress before reserving a reconnect
+            // status. Otherwise a full input queue could hold every permit.
+            while self.rx.try_recv().is_ok() {}
         }
     }
 }
 
-fn read_stream(stdout: impl io::Read, generation: u64, tx: SyncSender<Input>) {
+/// Raw output shares lifecycle policy, never the per-session projection path.
+pub(crate) fn source_lifecycle(
+    state: &mut CatalogState,
+    computer: &ComputerId,
+    frame: &Frame,
+) -> Vec<Change> {
+    match &frame.body {
+        Body::Hello(_) => state.apply(computer, frame),
+        Body::Error(error) if error.fatal => state.end(computer, Instant::now()),
+        _ => Vec::new(),
+    }
+}
+
+fn read_stream(
+    stdout: impl io::Read,
+    generation: u64,
+    tx: SyncSender<Input>,
+    source: Option<crate::source::Endpoint>,
+    stop: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::with_capacity(64 << 10, stdout);
     let mut line = Vec::new();
     loop {
+        if source.is_some() && stop.load(Ordering::Relaxed) {
+            return;
+        }
         match read_line(&mut reader, &mut line, MAX_FRAME_BYTES) {
             Ok(LineRead::Line) => {
-                let text = String::from_utf8_lossy(&line).into_owned();
+                let received_at = Instant::now();
+                let permit = if let Some(source) = &source {
+                    let Some(permit) = source.reserve(line.len() + 1 + 1024, &stop) else {
+                        return;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
+                let text = if source.is_some() {
+                    match std::str::from_utf8(&line) {
+                        Ok(text) => text.to_owned(),
+                        Err(_) => {
+                            let _ = tx.send(Input::Closed { generation });
+                            return;
+                        }
+                    }
+                } else {
+                    String::from_utf8_lossy(&line).into_owned()
+                };
                 if tx
                     .send(Input::Line {
                         generation,
                         line: text,
+                        received_at,
+                        permit,
                     })
                     .is_err()
                 {
@@ -1452,23 +2581,156 @@ fn read_stream(stdout: impl io::Read, generation: u64, tx: SyncSender<Input>) {
     }
 }
 
+fn organization_accounted(
+    hgs: &Path,
+    stop: &AtomicBool,
+    resources: Arc<dyn Send + Sync>,
+) -> Result<Value, crate::reads::ReadError> {
+    use crate::{
+        reads::{self, ReadError},
+        run::Stopped,
+    };
+    let read = crate::Read::Swarm;
+    let inv = reads::invocation(&ComputerId::local(), &read)?;
+    let exit = crate::run::run_accounted(hgs, &inv, &[], read.limit(), stop, resources.clone())
+        .map_err(|error| match error {
+            Stopped::Cancelled => ReadError::Superseded,
+            Stopped::TooLarge(error) => ReadError::TooLarge { limit: error.cap },
+        })?;
+    let outcome = reads::decode(&read, exit);
+    drop(resources);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn restart_delays_are_5_15_60_then_300_seconds() {
+    fn raw_help_admission_needs_a_whole_marker_line() {
+        assert!(help_marker(&format!("help\n  {HELP_MARKER}\n"), true));
+        assert!(!help_marker(&format!("unsupported: {HELP_MARKER}"), true));
+        assert!(help_marker(&format!("prefix {HELP_MARKER}"), false));
+        assert!(!help_marker("old CLI", true));
+    }
+
+    #[test]
+    fn a_reconnect_is_coalesced_and_still_pending_when_the_input_queue_is_full() {
+        let retry = Retry::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Input::Reconnect).unwrap();
+        retry.waiting();
+        assert!(retry.request(&tx));
+        for _ in 0..1000 {
+            assert!(!retry.request(&tx));
+        }
+        assert!(
+            retry.requested(),
+            "the existing queued input wakes the waiter"
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "no unbounded wake messages");
+        retry.begin();
+        assert!(
+            !retry.request(&tx),
+            "an in-flight/online source is unchanged"
+        );
+        retry.waiting();
+        assert!(
+            !retry.requested(),
+            "an old queued wake never retries a later failure"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_after_the_receiver_ends_is_not_left_pending() {
+        let retry = Retry::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        retry.waiting();
+        assert!(!retry.request(&tx));
+        assert!(!retry.requested());
+    }
+
+    #[test]
+    fn restart_delays_default_to_1_2_5_then_every_10_seconds() {
         let timing = Timing::default();
         let delays: Vec<u64> = (0..7)
             .map(|attempt| timing.restart_delay(attempt).as_secs())
             .collect();
-        assert_eq!(delays, vec![5, 5, 15, 60, 300, 300, 300]);
+        assert_eq!(delays, vec![1, 1, 2, 5, 10, 10, 10]);
         let scaled = Timing::scaled(0.001);
-        assert_eq!(scaled.restart_delay(1), Duration::from_millis(5));
-        assert_eq!(scaled.restart_delay(4), Duration::from_millis(300));
+        assert_eq!(scaled.restart_delay(1), Duration::from_millis(1));
+        assert_eq!(scaled.restart_delay(4), Duration::from_millis(10));
         assert_eq!(scaled.reprobe, Duration::from_millis(600));
         assert_eq!(scaled.organization_poll, Duration::from_millis(5));
         assert_eq!(scaled.silence, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_restart_schedule_is_four_bounded_non_decreasing_seconds() {
+        let ok = checked_restart_delays(&[1, 2, 5, 10]).unwrap();
+        assert_eq!(ok, [1, 2, 5, 10].map(Duration::from_secs));
+        assert!(checked_restart_delays(&[3, 3, 3, 3]).is_ok());
+        assert!(checked_restart_delays(&[1, 1, 1, 3600]).is_ok());
+        for bad in [
+            &[][..],
+            &[1, 2, 5][..],
+            &[1, 2, 5, 10, 20][..],
+            &[0, 2, 5, 10][..],
+            &[1, 2, 5, 3601][..],
+            &[5, 2, 5, 10][..],
+            &[1, 2, 10, 5][..],
+        ] {
+            assert_eq!(checked_restart_delays(bad), Err(INVALID_DELAYS), "{bad:?}");
+        }
+        assert_eq!(
+            restart_delays_from_value(&serde_json::json!([2, 4, 8, 16])).unwrap(),
+            [2, 4, 8, 16].map(Duration::from_secs)
+        );
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!("1,2,5,10"),
+            serde_json::json!([1, 2, 5, "10"]),
+            serde_json::json!([1, 2, 5, 10.5]),
+            serde_json::json!([1, 2, 5, -10]),
+        ] {
+            assert!(restart_delays_from_value(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn clones_of_one_timing_share_their_restart_delays() {
+        let timing = Timing::default();
+        let supervisor = timing.clone();
+        let other = Timing::default();
+        timing.restart.set([3, 6, 9, 12].map(Duration::from_secs));
+        assert_eq!(supervisor.restart_delay(4), Duration::from_secs(12));
+        assert_eq!(supervisor.restart_delay(1), Duration::from_secs(3));
+        // A separate fleet keeps its own schedule.
+        assert_eq!(other.restart_delay(4), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_scheduled_wait_publishes_the_deadline_that_ends_it() {
+        let now = Instant::now();
+        let next = schedule(Duration::from_secs(5), 3, 7, now);
+        assert_eq!(
+            next,
+            NextAttempt {
+                serial: 7,
+                attempt: 3,
+                delay_ms: 5000,
+                deadline: now + Duration::from_secs(5),
+            }
+        );
+        // The remaining time follows the monotonic deadline only: the same
+        // wait read later has less left, never a restarted delay.
+        assert_eq!(next.remaining_ms(now), 5000);
+        assert_eq!(next.remaining_ms(now + Duration::from_millis(1250)), 3750);
+        assert_eq!(next.remaining_ms(now + Duration::from_secs(9)), 0);
+        assert_eq!(schedule(Duration::from_secs(5), 3, 7, now), next);
+        assert_eq!(schedule(Duration::from_millis(2), 1, 8, now).delay_ms, 2);
     }
 
     #[test]
@@ -1563,7 +2825,7 @@ mod tests {
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(removed, vec!["HGS_RUN_ID", "HGS_SESSION"]);
+        assert_eq!(removed, vec!["HGS_RUN_ID", "HGS_SESSION", "HGS_SESSION_ID"]);
         let local = hgs_command(Path::new("hgs"), &ComputerId::local(), &["-h"]);
         assert_eq!(local.get_args().count(), 1);
     }

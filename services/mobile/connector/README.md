@@ -61,6 +61,39 @@ journal class within the shared read quota. Delivered terminal rows expire
 after one hour; existing persisted SQL predicates and mutation tombstones stay
 unchanged. The Python connector does not list or advertise this operation.
 
+The Rust-only `send_receipt` READ requires the exact `delivery-receipt-v1`
+native help line. It carries `{schema:1,request_id,intent,intent_sha256}`;
+`request_id` identifies this read, never a new send. The immutable intent is
+`{schema:1,computer_id,machine_id,session_id,session,provider,native_encoding,payload}`.
+`payload` is the original ordinary text-only send payload, with its original
+UUID, exact text and all original options. Text remains bounded to 64 KiB;
+attachments must be absent or empty. The original historical name is data,
+never a route to its current holder. The listed original run must still map
+unambiguously to the same durable session ID.
+A cold peer context refuses until its ordinary background snapshot is ready;
+receipt recovery never forces a listing, reconciliation or provider RPC.
+
+`intent_sha256` is SHA-256 of sorted-key compact ASCII-escaped canonical JSON,
+without Unicode normalization or trimming. `native_digest` is a different
+digest computed with the unchanged native producer encoding. `native_encoding`
+freezes `python_default` for direct native stdin or `compact` for the v1 mobile
+peer helper's reserialization. DeepSeek/OpenCode retain their existing compact
+`[original_name,payload]` digest. The shared exact-byte vectors live in
+`../vectors/send_receipt/intents.json`; CRLF is an encoding control, while the
+existing send admission still refuses carriage returns.
+
+The connector invokes the same reader through the stable closed
+`hgs __state delivery receipt ORIGINAL_NAME --json` entry, within five seconds
+and an 8 KiB result cap. A downgraded executable refuses that unknown operation
+instead of treating a cached capability as a session launch. The reader checks
+the physical machine directly without an older outer guard initializing state. It validates every returned identity and
+digest, then projects body-free `submitted` proof or `unknown`. An error is a
+failed read, never evidence that the original was Not sent. This read has its
+own journal UUID and the shared read quota; delivered results expire after one
+hour through indexed cleanup. The original uncertain mutation and native
+receipt remain unchanged. v2 authenticates the same READ operation and retains
+its permanent encrypted identity. Phone settlement ships separately.
+
 With the exact native help line
 `Mobile repository acquisition ABI: repository-acquisition-v1`, this Rust connector
 also advertises `repository_check`, `repository_clone` and `repository_status`.
@@ -116,6 +149,18 @@ forget revokes it. Without the marker, heartbeats keep the legacy listing with
 archives and report `mobile_archive.available=false`. The runtime vectors
 compare both heartbeats with Python: `heartbeat-legacy.json` and the paged
 `heartbeat-snapshot` of `projections.jsonl`.
+
+Encrypted computer packets keep the existing 1 MiB plaintext limit. After all
+scope and task advertisements are encoded, a validated paged-archive preview
+may retain a shorter prefix of recent archives to fit that packet. Its
+`mobile_archive.loaded` and `partial` describe the prefix actually sent;
+`available` and `total` stay unchanged. Archive browsing still uses the same
+checked `archive_list` pages, even when no preview row fits. Current session
+rows, their order and facts, and project/account/capability catalogs stay exact.
+An already fitting packet is byte-for-byte unchanged. Unknown preview metadata,
+ambiguous archive identities, legacy unpaged archives, or a packet whose current
+rows and required metadata alone exceed the limit still refuse as before.
+This preview budget is not a paged transport for an oversized current inventory.
 
 ## Build and test
 
@@ -243,7 +288,11 @@ One tokio `current_thread` runtime runs two loops, as Python's two tasks do:
   follows one `hgs watch --json` (`watch_listing.rs`) and takes the listing
   from its catalog rows and `catalog.meta`, composed as
   `ls --json --local --no-archives` prints them, while the stream is live
-  (a frame within 30 s). Before then, after the stream ends (restarted after
+  (a frame within 30 s). Presence durations age from the last metadata frame,
+  independently of stream heartbeats and session deltas. Presence is omitted
+  when missing or malformed, or when metadata is older than 120 s; the other
+  live listing fields remain available. This does not change the relay's historical last-activity
+  timer for `away_N`. Before then, after the stream ends (restarted after
   5, 15 and 60 s, then every 5 minutes), for peers and for requests routed to
   this computer, it runs `ls` as before. Windows hosts keep `ls`.
 - **Requests**: upload undelivered receipts, then long-poll
@@ -309,6 +358,22 @@ runs each identity once, hgs's JSON refusal before anything happened fails the
 receipt with its reason, and any other outcome once the call began (a prompt
 sent but not recorded, a crash, a timeout) is uncertain. `task_done` is a short
 read like the exchange (`TASK_READ_SQL`).
+
+The additional exact help line `Mobile task identity ABI: task-session-identity-v2`
+advertises `task_session_identity_v2` only when those native task operations are
+available. Action-request schema 2 adds the required nonempty opaque `session_id`
+to `task_send`; the CLI passes it unchanged to the existing `--session-id` guard.
+For `task_done`, schema 2 requires a session filter containing `machine`, the
+label hint `session`, and `session_id`. Labels may be stale; a missing immutable
+identity never falls back to a matching label. Results keep the schema-1 envelope.
+
+Phones select schema 2 only when the selected target computer advertises the
+feature and the relay accepts it; older routes retain their existing schema-1
+requests upfront. A schema-2 refusal or uncertain outcome never causes a
+schema-1 retry. The request UUID and the payload remain the original ones on
+recovery. `task_cancel`, project exchange, and replicated document schemas and
+write limits are unchanged. This is additive protocol support, not a deployment
+or upgrade of a live gateway.
 
 ## Divergences from the Python connector
 
@@ -393,6 +458,33 @@ as Rust does. None survives a rollback to Python.
 - Both implementations take an exclusive `flock(2)` on `connector.lock`, so
   they never run on one journal at once, and `hgs status` reports either one as
   running.
+- Only this connector selects a session by its durable ID (zerus-ucck
+  P1c-2b). An explicit mutation adds `--session-id ID` right after the name:
+  `send`, `send_now`, `answer`, `interrupt`, `settings`, `clear_context` and
+  `compact_context`, and the scoped actions `pause`, `resume`, `rename`,
+  `fork`, `archive`, `forget`, `terminate` and `remove_queued`. The ID is the
+  `session_id` of the latest listing's row for the request's
+  `expected_run_id`.
+  - Every CLI on the call's path must list the markers. The CLI itself needs
+    `session-id-selector-v1`. A call through a mobile peer entry point (a peer
+    context, or a request routed to this computer) also needs
+    `mobile-peer-session-id-v1` on that CLI, and a peer's call needs it on the
+    gateway's CLI too.
+  - Restore, archived conversations, `process_stop`, `recovery_action`,
+    `set_mobile_delivery` and every read keep the name.
+  - Only the CLI's refusal of that exact ID while it resolves the ID, before
+    the command runs, becomes the failed receipt "native session changed;
+    refresh before action". That refusal is the whole standard error, one
+    line, with its exact status: 1 for `hgs: Session ID ID is OTHER, not NAME`
+    and `hgs: No live or saved session has ID ID`; 5 for `hgs: Several
+    sessions carry ID ID: NAMES`.
+  - Every other failure after the write began stays uncertain. That includes
+    `Session ID ID no longer names NAME`, which a command's later read can
+    also report after its effect. A peer hop reports the ambiguity with
+    status 1, so there it stays uncertain too.
+  - Phones, the relay, API v1, request identities and the journal are
+    unchanged. The Python connector keeps the name form, so a rollback only
+    drops the selection.
 
 ## Dependencies
 
@@ -516,6 +608,13 @@ but cannot restore released Read caches.
 
 ### Explicit recovery after an unobserved failed Start
 
+After a managed Linux Start observes its worker, acknowledgement may wait for
+temporary private-Store contention within the same original 15-second deadline.
+It rechecks the record/config revisions and exact native process, service and
+generation before saving. Waiting submits no further Start job. Timeout or a
+changed binding keeps the existing reservation unacknowledged; it never grants
+permission to repeat an inactive unknown Start.
+
 Ordinary Start never repeats an unknown managed-service reservation. On Linux,
 an operator may pass `failed_start_revision` to `--workspace start`: it must be
 the SHA256 of the exact current private `legacy-service-handover.json` record,
@@ -537,3 +636,12 @@ definition when needed and establishes a new verified process/generation.
 Profiles, phone identity, native receipts, request IDs and the journal stay in
 place. Storage failure or incomplete recovery requires reconciliation; it never
 authorizes another automatic attempt.
+
+
+The negotiated `send_outcome` and `send_outcome_receipt` pair preserves the
+native terminal-negative ABI without changing ordinary `send`. Both the Rust
+and retained Python connectors verify the native help markers, exact original
+payload digest and full frozen identity. The Rust connector also requires its
+peer gateway to advertise the same capability. No negative is inferred from a
+native diagnostic or exit code. See the relay README and shared outcome vectors
+for the API-v1 wrappers, original-only proof read and journal retention.

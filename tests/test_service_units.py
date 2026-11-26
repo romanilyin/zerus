@@ -28,7 +28,7 @@ def service(text):
 
 class PackagedUnits(unittest.TestCase):
     def test_packaged_and_source_gui_units_kill_only_their_main_process(self):
-        units = sorted((ROOT / "packaging/linux").glob("*.service")) + [ROOT / "tray/packaging/hgs-tray.service"]
+        units = sorted((ROOT / "packaging/linux").glob("*.service")) + [ROOT / "packaging/desktop/hgs-tray.service"]
         self.assertIn(ROOT / "packaging/linux/hgs-recovery.service", units)
         self.assertIn(ROOT / "packaging/linux/hgs-swarm.service", units)
         for unit in units:
@@ -42,7 +42,6 @@ class PackagedUnits(unittest.TestCase):
         self.assertEqual(service(blocks[0]).get("KillMode"), ["process"])
         drop_in = "~/.config/systemd/user/zerus-mobile-connector.service.d/50-zerus-killmode.conf"
         self.assertIn(f"printf '[Service]\\nKillMode=process\\n' \\\n  > {drop_in}", guide)
-        self.assertIn(drop_in, (ROOT / "tray/src/RelaySettings.h").read_text(encoding="utf-8"))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "systemd user units are written on Linux")

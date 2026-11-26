@@ -1,0 +1,46 @@
+name: Test map coverage
+
+# U62: once a week, each test target of the map runs alone under coverage and
+# hgs test coverage compares what it executed with .zerus/test-map.json. A gap
+# (a file a target covers that the map does not give it) is reported in the job
+# summary and the artifact; it is a finding for the map, not a failure.
+on:
+  schedule:
+    - cron: '23 2 * * 0'
+    # #718: the monthly run's summary names tests without unique coverage.
+    - cron: '47 3 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust modules (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Linux test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev libncurses-dev bison pkg-config fish
+      - name: Pinned tmux with verified input-mode support
+        shell: bash
+        run: |
+          bash scripts/ci/install-tmux.sh "$RUNNER_TEMP/tmux"
+          echo "$RUNNER_TEMP/tmux/bin" >> "$GITHUB_PATH"
+      - run: rustup toolchain install stable --profile minimal --component llvm-tools-preview && rustup default stable
+      - run: cargo install cargo-llvm-cov --locked --version 0.6.16
+      - run: cargo build --locked
+      - name: Each module alone under llvm-cov
+        run: python3 scripts/ci/test-map-coverage.py rust --out artifacts/coverage
+      - name: Retain the comparison
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-map-coverage-rust
+          path: artifacts/coverage
+          retention-days: 14

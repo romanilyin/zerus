@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 const REPORTS_SHOWN: usize = 4;
 
 /// One team session's reason, and the budget its Background job runs under.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Task 117: kept as the last good answer for a read the store keeps busy.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Waiting {
     pub name: String,
     pub conversation_id: String,
@@ -24,6 +25,12 @@ pub(crate) struct Waiting {
     /// U30: the member's `hgs team run` still running in its folder: the
     /// session is Building.
     pub build: Option<Value>,
+    /// The phone's alert items for the lead's row (`mobile_attention`): task
+    /// 95's stalled lead, one per notification round, and task 113's raised
+    /// Terminal-only requests of the team's members.
+    pub alerts: Vec<Value>,
+    /// Task 97: the team, so the owner queue finds its lead's row.
+    pub team: String,
 }
 
 /// The reasons of every session of these teams, the lead's first.
@@ -44,6 +51,16 @@ pub(crate) fn reasons(teams: &[Team], now: f64) -> Vec<Waiting> {
                     "job":budget.job.as_ref().map(|job| json!({"command":job.command,"since":job.since}))})
             });
             let build = if lead { None } else { team_build(team, member, now) };
+            let mut alerts: Vec<Value> = team
+                .lead_stall
+                .as_ref()
+                .filter(|_| lead && team.status == TeamStatus::Running)
+                .map(|stall| super::lead_stall::mobile_item(team, stall))
+                .into_iter()
+                .collect();
+            if lead {
+                alerts.extend(team.members.iter().filter_map(|member| super::terminal_prompt::mobile_item(team, member)));
+            }
             out.push(Waiting {
                 name: session.name.clone(),
                 conversation_id: session.conversation_id.clone(),
@@ -51,6 +68,8 @@ pub(crate) fn reasons(teams: &[Team], now: f64) -> Vec<Waiting> {
                 reason,
                 budget,
                 build,
+                alerts,
+                team: team.id.clone(),
             });
         }
     }
@@ -61,12 +80,23 @@ pub(crate) fn reasons(teams: &[Team], now: f64) -> Vec<Waiting> {
 /// (the dispatcher settles it then, C1).
 const RUN_GRACE_SECONDS: f64 = 120.0;
 
-/// U30: the oldest template run still claimed in the member's own folder.
+/// U30: the oldest template run the member asked for that is still claimed in
+/// its folder. Members that may not have worktrees share one folder, where
+/// every member's claims lie: only the claim that names this member is its
+/// build (`dispatcher::claim_of`), or a run one member started would show all
+/// of them as Building.
 fn team_build(team: &Team, member: &Member, now: f64) -> Option<Value> {
     let folder = super::dispatcher::member_folder_path(team, member).ok()?;
+    let shared = team.members.iter().any(|other| {
+        other.id != member.id
+            && other.id != team.lead
+            && other.state != MemberState::Removed
+            && super::dispatcher::member_folder_path(team, other).is_ok_and(|other| super::dispatcher::same_path(&other, &folder))
+    });
     super::outbox::running_all(std::path::Path::new(&folder))
         .into_iter()
         .map(|(_, claim)| claim)
+        .filter(|claim| super::dispatcher::claim_of(claim, &member.id, shared))
         .filter(|claim| {
             let started = claim["started"].as_f64().unwrap_or(0.0);
             let bound = claim["timeout_secs"].as_f64().unwrap_or(1800.0);
@@ -78,6 +108,19 @@ fn team_build(team: &Team, member: &Member, now: f64) -> Option<Value> {
             json!({"source":"team_run","request_id":claim["request_id"],"label":label,
                 "command":claim["command"].as_str().unwrap_or(&label),"since":claim["started"]})
         })
+}
+
+/// Task 112: a paused team's sessions wait for the team, not for their own
+/// Resume: the reason says since when, by whom, and that members get no tasks.
+fn paused_reason(team: &Team) -> Option<Value> {
+    let words = super::inbox::paused_words(team);
+    let text = if words.is_empty() {
+        "Waiting for you to resume the team: members get no tasks".to_owned()
+    } else {
+        format!("Waiting for you to resume the team, paused {words}: members get no tasks")
+    };
+    let pause = team.paused.clone().unwrap_or_default();
+    reason(team, "team_paused", text, json!({"paused_at":pause.at,"paused_by":pause.by}))
 }
 
 fn reason(team: &Team, kind: &str, text: String, extra: Value) -> Option<Value> {
@@ -99,10 +142,15 @@ fn role_of(team: &Team, member: &str) -> String {
 }
 
 fn lead_reason(team: &Team) -> Option<Value> {
+    // Task 95: decisions wait for a lead that does not work on them: only the
+    // owner moves it now.
+    if let Some(stall) = team.lead_stall.as_ref().filter(|_| team.status == TeamStatus::Running) {
+        let items = if stall.items == 1 { "1 decision waits".to_owned() } else { format!("{} decisions wait", stall.items) };
+        return reason(team, "team_lead_stalled", format!("Waiting for you: the lead stalled, {items} for it"),
+            json!({"items":stall.items,"members":stall.members,"stall":stall.reason,"round":stall.round}));
+    }
     match team.status {
-        TeamStatus::Paused => {
-            return reason(team, "team_paused", "Waiting for you to resume the team".into(), json!({}));
-        }
+        TeamStatus::Paused => return paused_reason(team),
         TeamStatus::Planning if !team.tasks.is_empty() => {
             return reason(team, "team_plan", "Waiting for you to approve the plan".into(), json!({}));
         }
@@ -126,6 +174,14 @@ fn lead_reason(team: &Team) -> Option<Value> {
         let tasks: Vec<u32> = out.iter().map(|(_, id)| *id).collect();
         return reason(team, "team_reports", format!("Waiting for reports: {}", names.join(", ")), json!({"tasks":tasks}));
     }
+    // U63 (owner, 2026-10-31): a phase that waits for the owner's acceptance
+    // holds every later phase; the lead waits for the owner (no contract
+    // change: a "Waiting for you" reason, like a phase approval).
+    let awaiting = team.phases.iter().filter(|phase| plan::awaits_acceptance(team, phase)).min_by_key(|phase| phase.order());
+    if let Some(phase) = awaiting {
+        let title = if phase.title.is_empty() { String::new() } else { format!(" \u{b7} {}", phase.title) };
+        return reason(team, "team_phase_acceptance", format!("Waiting for you to accept phase {}{title}", phase.n), json!({"phase":phase.n}));
+    }
     let draft = team.phases.iter().filter(|phase| phase.state == PhaseState::Draft).min_by_key(|phase| phase.order());
     if let Some(phase) = draft {
         let title = if phase.title.is_empty() { String::new() } else { format!(" \u{b7} {}", phase.title) };
@@ -140,7 +196,7 @@ fn lead_reason(team: &Team) -> Option<Value> {
 
 fn member_reason(team: &Team, member: &Member) -> Option<Value> {
     if team.status == TeamStatus::Paused {
-        return reason(team, "team_paused", "Waiting for you to resume the team".into(), json!({}));
+        return paused_reason(team);
     }
     if team.status != TeamStatus::Running {
         return None;
@@ -154,7 +210,19 @@ fn member_reason(team: &Team, member: &Member) -> Option<Value> {
     if working {
         return None;
     }
+    // Task 160: a member whose task is parked waits for that condition, never
+    // for a build of its own: Zerus watches it.
+    if let Some((task, park)) = team.tasks.iter().find_map(|task| task.park.as_ref().filter(|park| park.member == member.id).map(|park| (task, park))) {
+        let text = super::park::summary(park, crate::state::now());
+        let text = format!("Waiting for #{}: {text}", task.id);
+        return reason(team, "team_parked", text, json!({"task":task.id,"eta":park.eta,"state":park.state}));
+    }
     let parent = if member.parent.is_empty() { team.lead.as_str() } else { member.parent.as_str() };
+    // U36: a report in a stage of its pipeline waits for that stage.
+    if let Some(task) = team.tasks.iter().filter(mine).filter(|task| task.status.in_stage()).max_by_key(|task| task.id) {
+        let kind = if task.status == TaskStatus::InTest { "test" } else { "review" };
+        return reason(team, "team_review", format!("Waiting for the {kind} of #{}", task.id), json!({"task":task.id,"stage":kind}));
+    }
     if let Some(task) = team.tasks.iter().filter(mine).filter(|task| task.status == TaskStatus::Submitted).max_by_key(|task| task.id) {
         return reason(team, "team_review", format!("Waiting for {} to review #{}", role_of(team, parent), task.id),
             json!({"task":task.id,"by":parent}));
@@ -166,14 +234,30 @@ fn member_reason(team: &Team, member: &Member) -> Option<Value> {
         .filter(mine)
         .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Draft))
         .min_by_key(|task| (!ready.contains(&task.id), task.status == TaskStatus::Draft, task.id))?;
+    // Task 159: a task an open card of the owner holds back waits for it.
+    if let Some(cards) = super::owner_steps::waiting_on_cards(team).get(&next.id) {
+        return reason(team, "team_owner_card", format!("Waiting for the owner's card {} for #{}", cards.join(", "), next.id),
+            json!({"task":next.id,"cards":cards}));
+    }
     let phase_of = |n: u32| team.phases.iter().find(|phase| phase.n == n);
     if next.status == TaskStatus::Draft || phase_of(next.phase).is_some_and(|phase| phase.state.is_draft()) {
         return reason(team, "team_draft_phase",
             format!("Waiting for Lead: phase {} is not accepted yet (#{})", next.phase, next.id),
             json!({"task":next.id,"phase":next.phase}));
     }
+    // U63: a paused phase, and one behind a phase awaiting the owner's
+    // acceptance, wait for that.
+    if let Some(pause) = plan::phase_pause(team, next.phase) {
+        let who = if pause.owner { "you" } else { "the lead" };
+        return reason(team, "team_phase_paused", format!("Waiting for {who} to remove the pause of phase {} (#{})", next.phase, next.id),
+            json!({"task":next.id,"phase":next.phase,"owner":pause.owner}));
+    }
+    if let Some(held) = plan::acceptance_block(team, next.phase) {
+        return reason(team, "team_phase_acceptance", format!("Waiting for the owner to accept phase {held} (#{})", next.id),
+            json!({"task":next.id,"phase":next.phase,"held_by":held}));
+    }
     let blockers = plan::barrier_blockers(team, next);
-    if !blockers.is_empty() || phase_of(next.phase).is_some_and(|phase| phase.state == PhaseState::Queued) {
+    if !blockers.is_empty() {
         let title = phase_of(next.phase).filter(|phase| !phase.title.is_empty())
             .map(|phase| format!(" \u{b7} {}", phase.title)).unwrap_or_default();
         return reason(team, "team_phase", format!("Waiting for phase {}{title} to start (#{})", next.phase, next.id),
@@ -187,6 +271,28 @@ fn member_reason(team: &Team, member: &Member) -> Option<Value> {
         let role = if role.is_empty() { String::new() } else { format!(" ({role})") };
         return reason(team, "team_dependency", format!("Waiting for #{}{title}{role}", dep.task),
             json!({"task":next.id,"dependency":dep.task}));
+    }
+    // Task 295: a ready task whose hand-out step was refused or never
+    // confirmed waits for that, named; one Zerus still prepares waits for it.
+    if let Some(wait) = next.waits.as_ref().filter(|_| next.hold.is_none()) {
+        let text = if wait.running() {
+            format!("Waiting for Zerus to prepare #{}", next.id)
+        } else {
+            let why: String = wait.reason.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+            format!("Waiting for {} to retry or reassign #{}: {why}", role_of(team, parent), next.id)
+        };
+        return reason(team, "team_task_waits", text, json!({"task":next.id,"for":wait.waits_for,"on":wait.on,"state":wait.state}));
+    }
+    // Task 295: a ready task whose files another open task writes waits for
+    // that task, never for the lead; it is handed out when that one ends.
+    if next.hold.is_none() && ready.contains(&next.id) {
+        let queue = plan::output_queue(team, next);
+        if let Some(first) = queue.first() {
+            let title = team.task(*first).map(|task| task.title.clone()).unwrap_or_default();
+            let title = if title.is_empty() { String::new() } else { format!(" {title}") };
+            return reason(team, "team_output", format!("Waiting for #{first}{title}: it writes the same files as #{}", next.id),
+                json!({"task":next.id,"holders":queue}));
+        }
     }
     // Ready, held or between hand-outs: the lead hands it out.
     reason(team, "team_hand_out", format!("Waiting for {} to hand out #{}", role_of(team, parent), next.id),
@@ -294,8 +400,15 @@ mod tests {
         let mut paused = team(vec![task(1, "dev", TaskStatus::Pending)]);
         paused.status = TeamStatus::Paused;
         let found = reasons(&[paused], 0.0);
-        assert_eq!(text(&found, "lead"), "Waiting for you to resume the team");
-        assert_eq!(text(&found, "dev"), "Waiting for you to resume the team");
+        // Task 112: members get no tasks; with a recorded pause, since when and by whom.
+        assert_eq!(text(&found, "lead"), "Waiting for you to resume the team: members get no tasks");
+        assert_eq!(text(&found, "dev"), "Waiting for you to resume the team: members get no tasks");
+        let mut recorded = team(vec![task(1, "dev", TaskStatus::Pending)]);
+        recorded.status = TeamStatus::Paused;
+        recorded.paused = Some(crate::state::teams::model::TeamPause { at: 1_800_000_000.0, by: "You".into(), reason: "paused".into() });
+        let found = reasons(&[recorded], 0.0);
+        let said = text(&found, "lead");
+        assert!(said.starts_with("Waiting for you to resume the team, paused since ") && said.ends_with(" by You: members get no tasks"), "{said}");
         let mut planning = team(vec![task(1, "dev", TaskStatus::Pending)]);
         planning.status = TeamStatus::Planning;
         let found = reasons(&[planning], 0.0);
@@ -305,6 +418,29 @@ mod tests {
         drafted.tasks[1].phase = 2;
         drafted.phases = vec![Phase { n: 2, title: "Next".into(), state: PhaseState::Draft, tasks: vec![2], ..Default::default() }];
         assert_eq!(text(&reasons(&[drafted], 0.0), "lead"), "Waiting for you to approve phase 2 \u{b7} Next");
+    }
+
+    /// U63 (owner, 2026-10-31): a phase awaiting the owner's acceptance makes
+    /// the lead wait for you (a Waiting for you reason, no new state); a
+    /// member behind it, or in a paused phase, waits for that.
+    #[test]
+    fn the_lead_waits_for_your_acceptance_and_members_for_the_pause() {
+        let mut held = team(vec![task(1, "dev", TaskStatus::Accepted), task(2, "qa", TaskStatus::Pending), task(3, "dev", TaskStatus::Pending)]);
+        held.tasks[0].phase = 2;
+        held.tasks[1].phase = 3;
+        held.tasks[2].phase = 4;
+        held.phases = vec![
+            Phase { n: 2, order: 2, title: "Checkout".into(), state: PhaseState::AwaitingAcceptance, acceptance: super::super::model::PhaseAcceptance::Owner, tasks: vec![1], ..Default::default() },
+            Phase { n: 3, order: 3, state: PhaseState::Approved, barrier: true, tasks: vec![2], ..Default::default() },
+            Phase { n: 4, order: 4, state: PhaseState::Approved, tasks: vec![3], ..Default::default() },
+        ];
+        let found = reasons(&[held.clone()], 0.0);
+        assert_eq!((kind(&found, "lead"), text(&found, "lead")), ("team_phase_acceptance".into(), "Waiting for you to accept phase 2 \u{b7} Checkout".into()));
+        assert_eq!(text(&found, "qa"), "Waiting for the owner to accept phase 2 (#2)");
+        held.phases[0].state = PhaseState::Done;
+        held.phases[1].pause = Some(super::super::model::PhasePause { by: "Lead".into(), owner: false, at: 1.0, reason: "API".into() });
+        let found = reasons(&[held], 0.0);
+        assert_eq!(text(&found, "qa"), "Waiting for the lead to remove the pause of phase 3 (#2)");
     }
 
     #[test]
@@ -345,5 +481,32 @@ mod tests {
         assert_eq!(of(&reasons(&[team.clone()], 900.0 + 600.0 + RUN_GRACE_SECONDS + 1.0), "dev").build, None);
         // The lead runs commands itself: it has no template runs.
         assert_eq!(of(&reasons(&[team], 1000.0), "lead").build, None);
+    }
+
+    /// Members that may not have worktrees work in one folder, where every
+    /// member's claims lie: a run is the build of the member that asked for it.
+    #[test]
+    fn a_run_in_a_shared_folder_is_the_build_of_the_member_that_asked() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut team = team(vec![]);
+        team.folder = folder.path().display().to_string();
+        let run = "22222222-2222-4222-8222-222222222222";
+        let claim = json!({"request_id":run,"started":900.0,"timeout_secs":600,"label":"ue-build","command":"ue build","member":"dev","attempt":"a"});
+        super::super::outbox::write_running(folder.path(), run, &claim).unwrap();
+        let found = reasons(&[team.clone()], 1000.0);
+        assert_eq!(of(&found, "dev").build.as_ref().unwrap()["request_id"], run);
+        assert_eq!(of(&found, "qa").build, None, "another member's run is not its build");
+        assert_eq!(of(&found, "lead").build, None);
+        // A claim that names nobody (written before claims named their member)
+        // is nobody's where several members work.
+        let unnamed = "33333333-3333-4333-8333-333333333333";
+        super::super::outbox::write_running(folder.path(), unnamed, &json!({"request_id":unnamed,"started":800.0,"timeout_secs":600,"label":"ue-test"})).unwrap();
+        let found = reasons(&[team.clone()], 1000.0);
+        assert_eq!(of(&found, "dev").build.as_ref().unwrap()["request_id"], run, "its own run, not the older unnamed one");
+        assert_eq!(of(&found, "qa").build, None);
+        // A member alone in the folder keeps such a claim as its build.
+        team.members[2].state = MemberState::Removed;
+        std::fs::remove_file(super::super::outbox::running_path(folder.path(), run)).unwrap();
+        assert_eq!(of(&reasons(&[team], 1000.0), "dev").build.as_ref().unwrap()["request_id"], unnamed);
     }
 }

@@ -170,6 +170,30 @@ fn a_damaged_inventory_is_refused() {
     ));
 }
 
+/// zerus-63rru.75: the FFI's add refuses each of the nine bidirectional
+/// characters in a title, as the replica writer refuses them.
+#[test]
+fn a_title_with_a_bidirectional_character_is_refused_through_the_api() {
+    for ch in [
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}',
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let api = store(&root);
+        let error = api
+            .add(
+                format!("Title{ch}name"),
+                TaskStage::Todo,
+                TaskTarget::AnySession,
+                TaskPosition::End,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no control or bidirectional"),
+            "{ch:?}: {error:?}"
+        );
+    }
+}
 #[test]
 fn a_held_project_answers_busy_instead_of_waiting() {
     let root = tempfile::tempdir().unwrap();
@@ -314,7 +338,58 @@ fn named_cards_have_a_visible_title_but_remain_read_only_in_mobile_abi() {
     let shown = api.get(uuid.clone()).unwrap();
     assert_eq!(shown.text, "Title only");
     assert!(!shown.writable);
-    assert!(api.edit_text(uuid.clone(), "Changed".into()).is_err());
-    assert!(api.set_stage(uuid.clone(), TaskStage::Backlog).is_err());
+    // Every refusal names the update path, as the apps' disabled actions do.
+    for refused in [
+        api.edit_text(uuid.clone(), "Changed".into()),
+        api.set_stage(uuid.clone(), TaskStage::Backlog),
+        api.comment(uuid.clone(), "From the phone".into()),
+    ] {
+        match refused {
+            Err(ReplicaError::Refused(message)) => {
+                assert_eq!(message, "Update Zerus to change this task.")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
     assert_eq!(api.get(uuid).unwrap().text, "Title only");
+}
+
+/// zerus-cg5h.4 S2b.2 C1: a task hgs cut over to the execution schema before
+/// its first attempt is read-only in the apps, which edit only schema <= 2.
+#[test]
+fn a_floored_task_is_read_only_in_the_apps() {
+    use zerus_replica::{ProjectStore, Stage};
+    let root = tempfile::tempdir().unwrap();
+    let apps = store(&root);
+    let task = apps
+        .add(
+            "Add rate limiting".into(),
+            TaskStage::Todo,
+            TaskTarget::AnySession,
+            TaskPosition::End,
+        )
+        .unwrap();
+    assert!(task.writable);
+    {
+        let hgs = ProjectStore::open(root.path(), "project-1").unwrap();
+        let mut native = hgs
+            .admit_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        let doc = native.write_first_floor(&task.uuid).unwrap();
+        assert_eq!(doc.stage().unwrap(), Stage::Todo);
+    }
+    let floored = apps.get(task.uuid.clone()).unwrap();
+    assert!(!floored.writable);
+    match apps.comment(task.uuid.clone(), "From the phone".into()) {
+        Err(ReplicaError::Refused(message)) => {
+            assert!(message.contains("Update Zerus"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    match apps.set_stage(task.uuid, TaskStage::Backlog) {
+        Err(ReplicaError::Refused(message)) => {
+            assert!(message.contains("Update Zerus"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }

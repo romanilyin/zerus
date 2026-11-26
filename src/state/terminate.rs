@@ -15,12 +15,19 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
     let original = {
         let _guard = lock(None)?;
         let record = read(name)?;
+        terminating::check_mutation(&record)?;
+        if supervisor::owned_pending(&record) {
+            return Err("Original descendant owner requires a cohort-aware controller; terminal kept".into());
+        }
         if let Some(scope)=scope {scope.check(&record)?;}
         if expected_run.is_some_and(|run| run != string(&record, "run_id")) {
             return Err("session changed before termination; refresh and try again".into());
         }
         let snapshot = live()?;
-        if let Some(panes) = snapshot.get(name) {
+        // The session's own terminal (P3b), never another under its label;
+        // a terminal another session's launch holds is not this session's.
+        let own = terminal_live(&snapshot, &record)?;
+        if let Some(panes) = panes_of(&snapshot, &record).filter(|_| own) {
             if panes.len() != 1
                 || panes[0].0 != string(&record, "pane")
                 || panes[0].2 != string(&record, "run_id")
@@ -82,7 +89,7 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
     // the exit, which takes the state lock, and ended (spec D11): wait for that
     // without the lock. tmux dropped it with kill-session already.
     #[cfg(windows)]
-    while listed(&live()?, name, string(&original, "run_id")) {
+    while listed(&live()?, terminal_name(&original), string(&original, "run_id")) {
         if Instant::now() >= deadline {
             return Err(
                 "terminal closed, but its supervisor has not ended; its saved binding was kept"
@@ -92,7 +99,7 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
         std::thread::sleep(Duration::from_millis(50));
     }
     let _guard = lock(None)?;
-    if let Some(archived) = archive::records()?.into_iter().find(|entry| {
+    if let Some(archived) = archive::complete_records()?.into_iter().find(|entry| {
         entry["name"] == original["name"]
             && entry["conversation_id"] == original["conversation_id"]
             && (entry["run_id"] == original["run_id"]
@@ -102,22 +109,41 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
         if forget {
             // Check every retained binding and recovery reference before the
             // first removal. A newly launched/awaiting restore owns its source.
-            let current = if record_path(name).exists() {Some(read(name)?)} else {None};
-            forget_archive_preflight(&archived,current.as_ref(),scope)?;
-            if live()?.contains_key(name) || current.as_ref().is_some_and(process_alive) {
+            let current = if record_path(name).exists() {
+                Some(read(name)?)
+            } else {
+                None
+            };
+            forget_archive_preflight(&archived, current.as_ref(), scope)?;
+            let snapshot = live()?;
+            let running = match current.as_ref() {
+                Some(record) => terminal_live(&snapshot, record)? || process_alive(record),
+                None => snapshot.contains_key(name),
+            };
+            if running {
                 return Err("Session is still running; no archive or binding was forgotten".into());
             }
-            if let Some(scope)=scope {scope.changing();}
-            archive::remove_synced(&archive::path(string(&archived,"archive_id"))?)?;
-            if let Some(record)=current {
-                rename::remove_legacy(&record)?;
-                archive::remove_synced(&record_path(name))?;
+            if let Some(scope) = scope {
+                scope.changing();
+            }
+            archive::remove_synced(&archive::path(string(&archived, "archive_id"))?)?;
+            if let Some(record) = &current {
+                storage::remove_record(record)?;
+            }
+            worktree_lock::left(&archived);
+            if let Some(record) =
+                current.filter(|record| record["session_id"] != archived["session_id"])
+            {
+                worktree_lock::left(&record);
             }
         } else {
             drop(_guard);
-            super::worktree_lifecycle::after_archive(&archived);
-            if let Some(scope)=scope {scope.result_record(&archived);}
-            else {println!("hgs: archived {name} ({})", string(&archived, "archive_id"));}
+            super::worktree_lifecycle::after_archive(&archived, string(&archived, "archive_id"));
+            if let Some(scope) = scope {
+                scope.result_record(&archived);
+            } else {
+                println!("hgs: archived {name} ({})", string(&archived, "archive_id"));
+            }
         }
         return Ok(0);
     }
@@ -128,14 +154,14 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
             "session binding changed while terminating; the replacement was left intact".into(),
         );
     }
-    // No live instance with the same name may be removed from the catalog.
-    if live()?.contains_key(name) || process_alive(&record) {
+    // No live instance of the session may be removed from the catalog.
+    if terminal_live(&live()?, &record)? || process_alive(&record) {
         return Err("session is still running; its saved binding was kept".into());
     }
     if let Some(scope)=scope {scope.changing();}
     if forget {
-        rename::remove_legacy(&record)?;
-        archive::remove_synced(&record_path(name))?;
+        storage::remove_record(&record)?;
+        worktree_lock::left(&record);
         return Ok(0);
     }
     record["completion_source"] = json!("manual_terminate");
@@ -143,16 +169,17 @@ pub(super) fn dispatch_scoped(args: &[String], dry: bool, scope: Option<&session
     let id = archive::save(&record)?;
     let archived = archive::read_archive(name,&id)?;
     drop(_guard);
-    super::worktree_lifecycle::after_archive(&record);
+    super::worktree_lifecycle::after_archive(&record, &id);
     if let Some(scope)=scope {scope.result_record(&archived);} else {println!("hgs: terminated and archived {name} ({id})");}
     Ok(0)
 }
 
-/// Whether `snapshot` still lists `name` with a pane of run `run_id`.
+/// Whether `snapshot` still lists the terminal `terminal` with a pane of run
+/// `run_id`.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn listed(snapshot: &Snapshot, name: &str, run_id: &str) -> bool {
+fn listed(snapshot: &Snapshot, terminal: &str, run_id: &str) -> bool {
     snapshot
-        .get(name)
+        .get(terminal)
         .is_some_and(|panes| panes.iter().any(|(_, _, run)| run == run_id))
 }
 

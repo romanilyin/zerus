@@ -24,7 +24,19 @@ const ROOT_FILES: [&str; 2] = ["read-marks.json", "notifications.json"];
 /// The folder that holds routed bindings next to the root's own.
 const BINDINGS: &str = "bindings";
 /// Folders whose every entry counts.
-const FOLDERS: [&str; 6] = [BINDINGS, "name_routes", "renames", "launches", "dsh/bindings", "opencode/bindings"];
+const FOLDERS: [&str; 10] = [
+    BINDINGS,
+    "name_routes",
+    "renames",
+    "launches",
+    "dsh/bindings",
+    "opencode/bindings",
+    // The ID layout and its label index (zerus-ucck P3a).
+    "sessions",
+    "dsh/sessions",
+    "opencode/sessions",
+    "labels",
+];
 /// Single files and folders whose own stamp counts. Archive files are added or
 /// removed, which changes the folder.
 const PATHS: [&str; 4] = ["coordination/waits.sqlite3", "coordination/waits.sqlite3-wal", "coordination/waits.sqlite3-journal", "archives"];
@@ -46,7 +58,7 @@ fn entry(path: &Path, metadata: &fs::Metadata) -> u64 {
 
 /// One hash of these files' stamps; a missing file counts as missing. The git
 /// topic stats a checkout's Git metadata with it on every pulse.
-pub(super) fn files(paths: &[PathBuf]) -> u64 {
+pub(crate) fn files(paths: &[PathBuf]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for path in paths {
         match fs::metadata(path) {
@@ -117,6 +129,34 @@ impl Scan {
     }
 }
 
+/// Task #11 (P2.1a): whether a change notified at `relative` (to the state
+/// folder) can move a pulse input: the stamped files and folders above, the
+/// journal, the team store and the question route ledger. Everything else
+/// (logs, team ticks, heartbeats, temporary files) never wakes the loop.
+pub(crate) fn relevant(relative: &Path) -> bool {
+    let Some(name) = relative.file_name().and_then(|name| name.to_str()) else { return false };
+    // SQLite's shared memory changes on reads, this loop's own included.
+    if name.ends_with("-shm") {
+        return false;
+    }
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    let store = |stem: &str, path: &Path| path.to_str().is_some_and(|path| path.replace('\\', "/").starts_with(stem));
+    if parent.as_os_str().is_empty() {
+        return binding(name)
+            || ROOT_FILES.contains(&name)
+            || FOLDERS.contains(&name)
+            || PATHS.contains(&name)
+            || ["coordination", "dsh", "opencode", "teams", "desktop"].contains(&name)
+            || store("events.sqlite3", relative);
+    }
+    if PATHS.iter().any(|path| store(path, relative)) || store("teams/teams.sqlite3", relative) || store("desktop/state.sqlite3", relative) {
+        return true;
+    }
+    // A stamped folder, or one of its entries (the archives folder counts
+    // as a whole: an entry added or removed changes it).
+    FOLDERS.iter().chain(["archives"].iter()).any(|folder| relative == Path::new(folder) || (parent == Path::new(folder) && ordinary(name)))
+}
+
 /// The stamps of a state folder.
 pub(super) fn scan(root: &Path) -> Scan {
     let mut scan = Scan::default();
@@ -130,12 +170,110 @@ pub(super) fn scan(root: &Path) -> Scan {
             scan.global.add(&path, &metadata);
         }
     }
+    // The service ledger is read once per scan, never once per session.
+    // Only a failure revision changes this stamp; ordinary desktop writes do not.
+    if let Some(revision) = crate::state::question_route_outcomes::Reader::at(root).and_then(|r| r.revision()) {
+        let mut hash = DefaultHasher::new();
+        ("question_route_outcome_revision", revision).hash(&mut hash);
+        scan.global.hash = scan.global.hash.wrapping_add(hash.finish());
+    }
     scan
+}
+
+/// Task #7 of team c536f0e5 (P1.6): the whole scan of `root` as one number,
+/// for the team worker's listing reuse: equal numbers, no listing input moved.
+pub(crate) fn digest(root: &Path) -> u64 {
+    let scan = scan(root);
+    let mut hasher = DefaultHasher::new();
+    (scan.global.hash, scan.global.entries).hash(&mut hasher);
+    scan.bindings.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_route_failure_revision_changes_the_watch_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let missing = scan(root);
+        assert!(!root.join("desktop").exists(), "a read never creates service state");
+        fs::create_dir(root.join("desktop")).unwrap();
+        let path = root.join("desktop/state.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o600)).unwrap();
+        db.execute_batch("CREATE TABLE desktop_question_route_outcome_revision(id INTEGER PRIMARY KEY,revision INTEGER);
+            INSERT INTO desktop_question_route_outcome_revision VALUES(1,0);
+            CREATE TABLE unrelated(value INTEGER); INSERT INTO unrelated VALUES(0);").unwrap();
+        let before = scan(root);
+        assert_ne!(before.global,missing.global);
+        db.execute("UPDATE unrelated SET value=1",[]).unwrap();
+        assert_eq!(scan(root),before,"ordinary Store writes never refresh the catalog");
+        db.execute("UPDATE desktop_question_route_outcome_revision SET revision=1",[]).unwrap();
+        assert_ne!(scan(root).global,before.global,"a settled failure refreshes the human request");
+    }
+
+    /// Task #11: notifications that can move an input wake the loop; logs,
+    /// team ticks, temporary files and SQLite shared memory never do.
+    #[test]
+    fn only_notified_inputs_are_relevant() {
+        let binding = format!("{}.json", "a".repeat(64));
+        for path in [
+            binding.as_str(),
+            "read-marks.json",
+            "events.sqlite3",
+            "events.sqlite3-wal",
+            "bindings/x.json",
+            r"bindings\x.json",
+            "dsh/bindings/x.json",
+            "launches",
+            "launches/1.json",
+            "labels/l.json",
+            "archives",
+            "archives/a.json",
+            "coordination/waits.sqlite3-wal",
+            "teams/teams.sqlite3",
+            "teams/teams.sqlite3-wal",
+            "desktop/state.sqlite3-wal",
+        ] {
+            assert!(relevant(Path::new(path)), "{path}");
+        }
+        for path in [
+            "logs/slow-calls.log",
+            "teams/abc/tick.json",
+            "teams/worker.heartbeat",
+            ".hgs-next",
+            "launches/.hgs-partial",
+            "bindings/.lock",
+            "events.sqlite3-shm",
+            "teams/teams.sqlite3-shm",
+            "notes.json",
+            "desktop-presence.json",
+            "catalog.meta",
+        ] {
+            assert!(!relevant(Path::new(path)), "{path}");
+        }
+    }
+
+    /// zerus-ucck P3a: a session in the ID layout, and the label index, are
+    /// inputs of `hgs watch` too.
+    #[test]
+    fn the_id_layout_changes_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::create_dir_all(root.join("labels")).unwrap();
+        let before = scan(root);
+        fs::write(root.join("sessions/3f2a9c1d-6b7e-4c2a-9d1f-0a1b2c3d4e5f.json"), "{}").unwrap();
+        let session = scan(root);
+        assert_ne!(session, before);
+        fs::write(root.join(format!("labels/{}.json", "b".repeat(64))), "{}").unwrap();
+        assert_ne!(scan(root), session);
+    }
 
     #[test]
     fn bindings_and_inputs_change_the_stamp_and_temporary_files_do_not() {

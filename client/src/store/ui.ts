@@ -1,42 +1,165 @@
-import { createMemo, createSignal } from "solid-js";
+import { batch, createMemo, createSignal, untrack } from "solid-js";
 import { createStore } from "solid-js/store";
-import { catalog, orderedRows } from "./catalog";
+import { catalog, computerFresh, orderedRows } from "./catalog";
 import { documentVisibility } from "./visibility";
+import { countedAttention, filterActive, filterAttention, isActive, isWorking, needsAttention } from "./attention";
+import { settings, settingsReady, setSetting, num } from "./settings";
+import { createRowDensity, ROW_DENSITY_KEY } from "./rowDensity";
+import { collapseTeams } from "./collapsed-teams";
 import type { Session, Status } from "../ui/sessions/types";
+import type { FolderScope } from "../ui/sessions/scope-filters";
+import { trNoop } from "../i18n";
+import { archiveReveal, forgetListReveal } from "./listReveal";
+export { isActive, needsAttention };
 
 // Interface state of the first screen: page, selection, filters, list layout,
 // menus and toasts. Data lives in store/catalog.ts and store/activity.ts.
 
 export type MenuEntry =
-  | { label: string; icon?: string; kbd?: string; danger?: boolean; disabled?: boolean; hint?: string; checked?: boolean; action?: () => void }
+  /** `note` is a visible line under the item (why it is closed); `hint` only its hover title. */
+  | { label: string; icon?: string; agent?: string; kbd?: string; danger?: boolean; disabled?: boolean; hint?: string; note?: string; checked?: boolean | "mixed"; action?: () => void }
   | { separator: true }
   | { heading: string };
 
-export type Page = "dashboard" | "sessions" | "projects" | "machines" | "accounts" | "settings";
+export type Page = "dashboard" | "sessions" | "projects" | "machines" | "accounts" | "settings" | "waiting" | "newteam" | "catalog" | "designer" | "modelservers";
 export type StateFilter = "all" | "attention" | "active" | "paused" | "archived";
 /** The Zerus mark's motion; the owner chose the two-turn spin-up (2026-10-27). */
 export type LogoMotion = "spin";
 
-const params = new URLSearchParams(location.search);
+// A unit test in the node environment has no location: no query then.
+const params = new URLSearchParams(typeof location === "undefined" ? "" : location.search);
 
-const PAGES: Page[] = ["dashboard", "sessions", "projects", "machines", "accounts", "settings"];
+const PAGES: Page[] = ["dashboard", "sessions", "projects", "machines", "accounts", "settings", "waiting"];
 // `?page=settings` opens a screen (headless screenshots), as in the mockup.
 export const [page, setPage] = createSignal<Page>(PAGES.find((p) => p === params.get("page")) ?? "sessions");
-export const [selectedKey, setSelectedKey] = createSignal<string | undefined>();
-export const [stateFilter, setStateFilter] = createSignal<StateFilter>("all");
+const [selectedKey, setSelectedKeyRaw] = createSignal<string | undefined>();
+export { selectedKey };
+/** Task View belongs to an explicit task navigation, not the next session. */
+export function setSelectedKey(value?: string | ((previous: string | undefined) => string | undefined)) {
+  return batch(() => {
+    const previous = untrack(selectedKey);
+    const next = setSelectedKeyRaw((current) => typeof value === "function" ? value(current) : value);
+    if (next !== previous) forgetListReveal();
+    if (next !== previous && untrack(detailTab) === "taskview") setDetailTab("activity");
+    return next;
+  });
+}
+export const [stateFilter, setStateFilterRaw] = createSignal<StateFilter>("all");
+/** Qt clears an exact-folder scope when All sessions is chosen. */
+export function setStateFilter(filter: StateFilter) { if (filter === "all") setFolderFilter(undefined); return setStateFilterRaw(filter); }
 export const [machineFilter, setMachineFilter] = createSignal<string[]>([]);
 export const [projectFilter, setProjectFilter] = createSignal<string[]>([]);
+/** Machine-local binding keys, not display account ids. */
+export const [accountFilter, setAccountFilter] = createSignal<string[]>([]);
+export const accountFilterSet = createMemo(() => new Set(accountFilter()));
+export const [folderFilter, setFolderFilter] = createSignal<FolderScope>();
 export const [multi, setMulti] = createStore<Record<string, boolean>>({});
 export const [peek, setPeek] = createSignal(false);
+export type DetailTab = "activity" | "terminal" | "native" | "processes" | "taskview" | "team" | "newteam";
+export const [detailTab, setDetailTab] = createSignal<DetailTab>("activity");
+const [latestRequests, setLatestRequests] = createSignal(0);
+/**
+ * Enter on a session row (Qt's jumpToLatestActivity): the Activity tab at its
+ * latest message. The mounted Activity takes the request, or the next to mount
+ * (ui/sessions/Activity.tsx), so the list never loads the transcript itself.
+ */
+export function showLatestActivity() { setDetailTab("activity"); setLatestRequests((n) => n + 1); }
+export { latestRequests };
+let latestTaken = 0;
+/** Activity's side, read in an effect: true once per request (several pending ones jump once). */
+export function takeLatestRequest(): boolean {
+  const n = latestRequests();
+  if (n <= latestTaken) return false;
+  latestTaken = n;
+  return true;
+}
 export const [subagentOpen, setSubagentOpen] = createSignal<string | undefined>();
 export const [search, setSearch] = createSignal(params.get("q") ?? "");
-export const [collapsed, setCollapsed] = createStore<Record<string, boolean>>({});
 export const [expandedChildren, setExpandedChildren] = createStore<Record<string, boolean>>({});
-export const [compactRows, setCompactRows] = createStore<Record<string, boolean>>({});
+
+/** Qt's workspace/collapsedTeams: a lead's members stay folded after a restart and on the other UI. */
+const COLLAPSED_TEAMS_KEY = "workspace/collapsedTeams";
+export const collapsedTeams = createMemo(() => {
+  const stored = settings[COLLAPSED_TEAMS_KEY];
+  return new Set(Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : []);
+});
+export const teamsCollapsed = (id: string) => collapsedTeams().has(id);
+export function setTeamCollapsed(id: string, collapsed: boolean) {
+  void setSetting(COLLAPSED_TEAMS_KEY, collapseTeams([...collapsedTeams()], id, collapsed));
+}
+const rowDensity = createRowDensity({
+  stored: () => settings[ROW_DENSITY_KEY], ready: settingsReady,
+  save: (keys) => setSetting(ROW_DENSITY_KEY, keys),
+  keys: (key) => (catalog.rows[key] ?? archivedRow(key))?.compactKeys,
+});
+export const compactRows = new Proxy<Record<string, boolean>>({}, {
+  get: (_target, key) => typeof key === "string" ? rowDensity.get(key) : undefined,
+});
+export const setCompactRows = rowDensity.set;
+export const expandCompactRows = rowDensity.expandAll;
+export const hasCompactRows = rowDensity.any;
 export const [stripMode, setStripMode] = createSignal(params.get("strip") === "1");
-export const [menu, setMenu] = createSignal<{ x: number; y: number; items: MenuEntry[] } | undefined>();
+/** Task 243: the title bar's sessions toggle asks the list (which owns the slide) to collapse or show again. */
+const [sessionsToggleTick, setSessionsToggleTick] = createSignal(0);
+export { sessionsToggleTick };
+export const toggleSessionsList = () => setSessionsToggleTick((tick) => tick + 1);
+/** Task 243: the skin draws one title bar (`chrome: unified`); App says so, the sessions list hides completely then. */
+export const [unifiedChrome, setUnifiedChrome] = createSignal(false);
+// sessionKey is a transient highlight, independent of conversation selection.
+type Menu = { x: number; y: number; items: MenuEntry[]; sessionKey?: string };
+// Keep the logical snapshot synchronous for guarded asynchronous menu reads.
+// Only its painted layer waits for the native child to acknowledge hiding.
+export const [menu, rememberMenu] = createSignal<Menu | undefined>();
+export const [visibleMenu, publishMenu] = createSignal<Menu | undefined>();
+let menuBarrier: ((scope: string, opening: boolean) => Promise<void> | undefined) | undefined;
+let menuRevision = 0;
+let menuPreparationTimer: ReturnType<typeof setTimeout> | undefined;
+export const MENU_PREPARATION_MS = 180;
+/** A native child must acknowledge hiding before an app menu can cover it. */
+export function bindMenuBarrier(barrier: typeof menuBarrier) { menuBarrier = barrier; }
+export const nativeOverlayBarrier = (scope: string, opening: boolean) => menuBarrier?.(scope, opening);
+/** Open after preparation or its budget, retaining the native hide barrier.
+ * The returned updater accepts partial replies only for this exact opening. */
+export function setMenu(value: Menu | undefined, ready?: Promise<MenuEntry[]>) {
+  clearTimeout(menuPreparationTimer);
+  menuPreparationTimer = undefined;
+  const revision = ++menuRevision;
+  rememberMenu(value);
+  const wait = nativeOverlayBarrier("menu", !!value);
+  if (!value) { publishMenu(undefined); return; }
+  let current = value, shown = false;
+  // Late reads belong to this opening, even after the preparation budget.
+  const update = (items: MenuEntry[]) => {
+    if (revision !== menuRevision) return;
+    current = { ...current, items };
+    rememberMenu(current);
+    if (shown) publishMenu(current);
+  };
+  const show = () => {
+    if (revision !== menuRevision) return;
+    shown = true;
+    publishMenu(current);
+  };
+  if (!wait && !ready) { show(); return update; }
+  // Bound only data preparation. Native-child hiding still requires its
+  // actual acknowledgement before any menu can be painted over the child.
+  if (ready) publishMenu(undefined);
+  const preparation = ready && new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, MENU_PREPARATION_MS);
+    menuPreparationTimer = timer;
+    void ready.then(update).catch(() => {}).finally(() => {
+      clearTimeout(timer);
+      if (menuPreparationTimer === timer) menuPreparationTimer = undefined;
+      resolve();
+    });
+  });
+  void Promise.all([wait, preparation]).then(show).catch(() => {});
+  return update;
+}
 export const [contentScale, setContentScale] = createSignal(1);
-export const [toasts, setToasts] = createStore<{ items: { id: number; title: string; text: string }[] }>({ items: [] });
+/** A row the session list scrolls to once it lists it (Qt's `revealRow`); a new selection drops it. */
+export const [revealing, setRevealing] = createSignal<string | undefined>();
+export const revealRow = (id: string) => setRevealing(id);
 export const logoMotion = (): LogoMotion => "spin";
 
 /**
@@ -54,69 +177,81 @@ const syncClock = () => {
 syncClock();
 documentVisibility.onChange(syncClock);
 
-/** Project order set by dragging headers; projects not in it follow in arrival order. */
-const [projectMoves, setProjectMoves] = createSignal<string[]>([]);
-export const projectOrder = createMemo<string[]>(() => {
-  const seen = new Set<string>();
-  const order: string[] = [];
-  for (const p of projectMoves()) if (!seen.has(p)) { seen.add(p); order.push(p); }
-  for (const s of orderedRows()) if (!seen.has(s.project)) { seen.add(s.project); order.push(s.project); }
-  return order;
-});
-export const setProjectOrder = (order: string[]) => setProjectMoves(order);
-
-// Docked session list width (QSplitter default 310, minimum 270), remembered per viewer.
-const SESSIONS_WIDTH_KEY = "zerus-client-sessions-width";
-const savedWidth = (() => { try { return Number(localStorage.getItem(SESSIONS_WIDTH_KEY)) || 0; } catch { return 0; } })();
-export const [sessionsWidth, setSessionsWidthRaw] = createSignal(savedWidth >= 270 ? savedWidth : 310);
-export function setSessionsWidth(width: number) {
-  setSessionsWidthRaw(width);
-  try { localStorage.setItem(SESSIONS_WIDTH_KEY, String(width)); } catch { /* storage may be unavailable */ }
+// Qt's docked splitter and Next's former localStorage choice now share Settings.
+const [dragSessionsWidth, setDragSessionsWidth] = createSignal<number>();
+export const sessionsWidth = () => dragSessionsWidth() ?? num("workspace/sessionsWidth");
+export const setSessionsWidth = setDragSessionsWidth;
+export function commitSessionsWidth() {
+  const width = dragSessionsWidth();
+  setDragSessionsWidth(undefined);
+  if (width !== undefined) void setSetting("workspace/sessionsWidth", width);
 }
 
-let toastId = 0;
-export function toast(title: string, text: string) {
-  const id = ++toastId;
-  setToasts("items", (items) => [...items, { id, title, text }]);
-  setTimeout(() => setToasts("items", (items) => items.filter((t) => t.id !== id)), 4200);
-}
+/** Toasts go to the window's one notice bus (store/notices.ts). */
+export { toast } from "./notices";
+
+let archivedRow: (key: string) => Session | undefined = () => undefined;
+let searchRow: (key: string) => Session | undefined = () => undefined;
+/** The search keeps at most its one selected archived row, independently of archive pages. */
+export function bindSearchRow(lookup: (key: string) => Session | undefined) { searchRow = lookup; }
+/** Hands the selection the loaded archived rows (store/archive.ts), which this module cannot import: archive.ts reads the filters here. */
+export function bindArchivedRows(lookup: (key: string) => Session | undefined) { archivedRow = lookup; }
 
 export const selected = createMemo<Session | undefined>(() => {
   const key = selectedKey();
-  return key ? catalog.rows[key] : undefined;
+  return key ? catalog.rows[key] ?? archivedRow(key) ?? searchRow(key)
+    ?? (archiveReveal()?.session.key === key ? archiveReveal()!.session : undefined) : undefined;
 });
 
-/** Needs attention: actionable, unread reply or review later (muted rows are listed, not counted). */
-export const needsAttention = (s: Session) => s.status === "attention" || (s.unread && s.status !== "offline") || !!s.reviewLater;
+/** The window's online state of a row: its computer's rows are current (Qt's `entry.online`). */
+const online = (s: Session) => computerFresh(s.computer);
 
-/** Active = current work OR Scheduled OR Needs attention OR a local draft. */
-export const isActive = (s: Session) =>
-  s.status === "working" || s.status === "background" || s.status === "scheduled" || s.status === "waiting" || needsAttention(s) || s.draft;
-
+/**
+ * A state filter's membership (zerus-sa9qn.18). A quiet supervised child's unread
+ * reply, retry or limit waits for its parent, so Needs attention and Active
+ * neither count nor list it, while its Review later mark, or a child's request
+ * only the person can answer, is both (filterAttention). The list and the tab
+ * counts read it through listedByFilter.
+ */
 export function matchesFilter(s: Session, f: StateFilter): boolean {
   switch (f) {
     case "all": return true;
-    case "attention": return needsAttention(s);
-    case "active": return isActive(s);
+    case "attention": return filterAttention(s, online(s));
+    case "active": return filterActive(s, online(s));
     case "paused": return s.status === "paused";
-    case "archived": return false;
+    case "archived": return s.state === "archived";
   }
+}
+
+/**
+ * The selected row whose reply was just read (Qt's m_readSelectionKey): it
+ * stays listed under Needs attention and Active until another row is selected,
+ * so reading it never replaces the open conversation. session.ts clears it on
+ * every selection change.
+ */
+export const [readSelectionKey, setReadSelectionKey] = createSignal<string | undefined>();
+
+/** The state filter with the open row kept after its read (SessionsWindowRows.cpp:272-275). */
+export function listedByFilter(s: Session, f: StateFilter): boolean {
+  if (matchesFilter(s, f)) return true;
+  return (f === "attention" || f === "active") && s.state !== "archived" && s.key === selectedKey() && s.key === readSelectionKey();
 }
 
 export const counts = createMemo(() => {
   let all = 0, active = 0, attention = 0, working = 0, paused = 0;
   for (const s of orderedRows()) {
     all++;
-    if (isActive(s)) active++;
-    if (needsAttention(s) && !s.muted) attention++;
-    if (s.status === "working" || s.status === "background") working++;
+    const up = online(s);
+    if (isActive(s, up)) active++;
+    if (countedAttention(s, up)) attention++;
+    if (isWorking(s, up)) working++;
     if (s.status === "paused") paused++;
   }
   return { all, active, attention, working, paused };
 });
 
 export const STATUS_LABEL: Record<Status, string> = {
-  attention: "Needs attention",
+  attention: trNoop("Needs attention"),
   working: "Working",
   background: "Background",
   scheduled: "Scheduled",
@@ -124,7 +259,7 @@ export const STATUS_LABEL: Record<Status, string> = {
   error: "Error",
   offline: "Offline",
   paused: "Paused",
-  waiting: "Waiting for result",
+  waiting: trNoop("Waiting for result"),
   starting: "Starting",
   ended: "Archived",
 };

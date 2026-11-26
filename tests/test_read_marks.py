@@ -7,9 +7,11 @@ import re
 import sqlite3
 import subprocess
 import time
+import threading
 import unittest
 import uuid
 
+import receipt_locator
 import test_input as fixtures
 
 HGS = fixtures.HGS
@@ -50,6 +52,145 @@ class ReadMarks(unittest.TestCase):
         self.assertIsNone(row['read'])
         self.assertIsNone(row['attention_signature'])
         self.assertEqual(row['optional_questions'], {'count': 0})
+
+    def test_exact_inspection_observes_raw_host_mark_without_presentation_replacement(self):
+        self.record_path.chmod(0o600)
+        first = self.reply(100.5)
+        self.waiting()
+        signature = self.listing()['attention_signature']
+        written = self.mark(reply_id=first, attention_signature=signature)['read']
+        self.reply(200.5)
+        uri_result = subprocess.run([str(HGS), 'reference', self.name, '--json'], env=self.env,
+                                    text=True, capture_output=True, timeout=10)
+        self.assertEqual(uri_result.returncode, 0, uri_result.stderr)
+        uri = json.loads(uri_result.stdout)['uri']
+        path = self.state / 'read-marks.json'
+        original = path.read_bytes()
+        for target in ([self.name, '--read-observation'],
+                       [self.name, '--after', '0', '--skip-processes', '--read-observation'], [uri]):
+            result = subprocess.run([str(HGS), 'inspect', *target], env=self.env,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(result.stdout)
+            self.assertEqual(row['read'], written)
+            self.assertNotEqual(row['reply_id'], first)
+            observation = row['read_observation']
+            self.assertTrue(observation['complete'])
+            self.assertEqual(observation['freshness'], 'observed')
+            self.assertEqual(observation['generation'], 'sha256:' + hashlib.sha256(original).hexdigest())
+            self.assertEqual(observation['target'], dict(name=self.name, run_id=self.run_id,
+                                                        conversation_id=self.conversation_id))
+            self.assertGreater(observation['observed_at'], 0)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_inspection_distinguishes_absent_from_invalid_raw_mark_source(self):
+        self.record_path.chmod(0o600)
+        def inspect():
+            result = subprocess.run([str(HGS), 'inspect', self.name, '--read-observation'], env=self.env,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+        row = inspect()
+        self.assertIsNone(row['read'])
+        self.assertEqual(row['read_observation']['source_state'], 'absent')
+        self.assertTrue(row['read_observation']['complete'])
+        path = self.state / 'read-marks.json'
+        path.write_text('{broken source')
+        path.chmod(0o600)
+        row = inspect()
+        self.assertIsNone(row['read'])
+        self.assertFalse(row['read_observation']['complete'])
+        self.assertEqual(row['read_observation']['freshness'], 'unknown')
+        self.assertEqual(path.read_text(), '{broken source')
+
+    def test_activity_and_process_poll_shapes_never_include_read_observation(self):
+        self.record_path.chmod(0o600)
+        reply = self.reply(100.5)
+        self.mark(reply_id=reply)
+        path = self.state / 'read-marks.json'
+        marks = json.loads(path.read_text())
+        # A shared store sized like a real fleet must not enter a detail poll.
+        marks['sessions'].update({f'unrelated-{i}': {self.conversation_id: {
+            'conversation_id': self.conversation_id, 'reply_id': 'unrelated-reply',
+            'attention_signature': None, 'at': 1.0}} for i in range(20000)})
+        path.write_text(json.dumps(marks))
+        original = path.read_bytes()
+        for args in ([], ['--after', '0', '--skip-processes'],
+                     ['--after', '1', '--skip-processes'],
+                     ['--after', str(2**63 - 1)]):
+            with self.subTest(args=args):
+                result = subprocess.run([str(HGS), 'inspect', self.name, *args], env=self.env,
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                row = json.loads(result.stdout)
+                self.assertNotIn('read', row)
+                self.assertNotIn('read_observation', row)
+        self.assertEqual(path.read_bytes(), original)
+
+    def inspect(self, *args):
+        result = subprocess.run([str(HGS), 'inspect', self.name, *args], env=self.env,
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_current_read_names_exactly_what_read_accepts_now(self):
+        first = self.reply(100.5)
+        self.waiting()
+        row = self.listing()
+        self.assertEqual(row['reply_id'], first)
+        self.assertRegex(row['attention_signature'], HEX)
+        expected = dict(schema=1, run_id=self.run_id, conversation_id=self.conversation_id, reply_id=first,
+                        attention_signature=row['attention_signature'], attention_complete=True)
+        for args in ([], ['--after', '0', '--skip-processes']):
+            with self.subTest(args=args):
+                self.assertEqual(self.inspect(*args, '--current-read')['current_read'], expected)
+        for args in ([], ['--after', '0', '--skip-processes'], ['--read-observation']):
+            with self.subTest(args=args):
+                self.assertNotIn('current_read', self.inspect(*args))
+        self.assertFalse((self.state / 'read-marks.json').exists())  # Inspecting acknowledges nothing.
+        current = self.inspect('--current-read')['current_read']
+        self.assertEqual(self.mark(reply_id=current['reply_id'], attention_signature=current['attention_signature'])['applied'],
+                         {'reply_id': True, 'attention_signature': True})
+        # A newer reply and request make the earlier values stale; they are never applied.
+        self.reply(200.5)
+        self.waiting('call-2')
+        self.assertEqual(self.mark(reply_id=current['reply_id'], attention_signature=current['attention_signature'])['applied'],
+                         {'reply_id': False, 'attention_signature': False})
+        newer = self.inspect('--current-read')['current_read']
+        self.assertNotEqual((newer['reply_id'], newer['attention_signature']),
+                            (current['reply_id'], current['attention_signature']))
+        self.assertEqual(self.mark(reply_id=newer['reply_id'], attention_signature=newer['attention_signature'])['applied'],
+                         {'reply_id': True, 'attention_signature': True})
+
+    def test_current_read_never_signs_unindexed_questions(self):
+        self.codex_question()
+        known = self.listing()['attention_signature']
+        self.assertRegex(known, HEX)
+        self.assertEqual(self.inspect('--current-read')['current_read']['attention_signature'], known)
+        digest = hashlib.sha256(json.dumps([None, self.conversation_id], separators=(',', ':')).encode()).hexdigest()
+        path = self.state / 'codex_questions' / f'{digest}.lock'
+        # Hold the question index longer than the one-second budget, then let the
+        # inspection's own (unbudgeted) question listing finish. A slow start can
+        # reach the signed read after the release: then it must be complete and
+        # equal to the known signature, and a longer hold is tried.
+        for hold in (2.5, 5.0, 10.0):
+            with self.subTest(hold=hold), path.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                child = subprocess.Popen([str(HGS), 'inspect', self.name, '--current-read'], env=self.env,
+                                         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                time.sleep(hold)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                out, err = child.communicate(timeout=60)
+                self.assertEqual(child.returncode, 0, err)
+                current = json.loads(out)['current_read']
+                if current['attention_complete']:
+                    self.assertEqual(current['attention_signature'], known)
+                    continue
+                self.assertNotIn(current['attention_signature'], (known, None))
+                self.assertFalse(self.mark(attention_signature=current['attention_signature'])['applied']['attention_signature'])
+                break
+        else:
+            self.fail('the signed question read never ran while the index was held')
 
     def test_signature_ignores_status_updates_and_changes_for_a_new_request(self):
         self.waiting()
@@ -269,8 +410,10 @@ class ReadMarks(unittest.TestCase):
 
     def hook(self, kind, session_id=None, **fields):
         event = dict(session_id=session_id or self.conversation_id, hook_event_name=kind, **fields)
-        result = subprocess.run([str(HGS), '__state', 'hook'], input=json.dumps(event), text=True, capture_output=True,
-                                env=dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id), timeout=10)
+        import hook_caller_fixtures
+        env=dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id)
+        result = hook_caller_fixtures.run(self,event,env) if self.record['agent']=='claude' else subprocess.run(
+            [str(HGS),'__state','hook'],input=json.dumps(event),text=True,capture_output=True,env=env,timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def acknowledged(self):
@@ -332,6 +475,10 @@ class ReadMarks(unittest.TestCase):
         rollout.write_text(''.join(json.dumps(line) + '\n' for line in lines))
         self.record.update(transcript=str(rollout), phase='working', activity='busy')
         self.write_record()
+        # Question recovery reads the receipt locator (zerus-a4mub.8); a fresh
+        # state lists the questions as unknown until it exists, which these
+        # read-mark tests do not measure.
+        receipt_locator.settle(HGS, self.env)
 
     def test_unindexed_questions_are_never_acknowledged(self):
         self.codex_question()
@@ -372,6 +519,24 @@ class ReadMarks(unittest.TestCase):
         self.assertIsNone(row['optional_questions'])
         self.assertIsNone(row['attention_signature'])
         self.assertEqual(row['phase'], 'working')
+
+    def test_current_read_reports_an_unreadable_question_index_as_incomplete(self):
+        self.codex_question()
+        self.assertTrue(self.inspect('--current-read')['current_read']['attention_complete'])
+        # zerus-a4mub.28: an index that cannot be read leaves the questions unknown.
+        # The listing and `hgs read` keep counting it as none.
+        rollout = Path(self.record['transcript'])
+        lines = rollout.read_text().splitlines(keepends=True)
+        rollout.write_text(json.dumps(dict(type='session_meta', payload=dict(id=str(uuid.uuid4())))) + '\n'
+                           + ''.join(lines[1:]))
+        self.assertIsNone(self.listing()['attention_signature'])
+        row = self.inspect('--current-read')
+        self.assertIn('pending_questions_error', row)
+        current = row['current_read']
+        self.assertFalse(current['attention_complete'])
+        self.assertRegex(current['attention_signature'], HEX)
+        self.assertFalse(self.mark(attention_signature=current['attention_signature'])['applied']['attention_signature'])
+        self.assertFalse((self.state / 'read-marks.json').exists())
 
     def test_saved_session_lists_no_optional_questions(self):
         self.codex_question()
@@ -438,6 +603,55 @@ os.execv('/bin/sh', ['sh', '-c', sys.argv[-1]])
         missing = self.read(remote=True, name='codex/missing-session', reply_id=reply)
         self.assertEqual(missing.returncode, 1)
         self.assertEqual(json.loads(missing.stdout), {'ok': False, 'error': 'not_found'})
+
+    def test_ordinary_local_and_peer_reads_close_both_output_pipes_after_exit(self):
+        # Actual hgs dispatch and remote argv. The isolated SSH shim execs the
+        # selected command; it neither starts nor emulates a persistent master.
+        self.script('ssh', """#!/usr/bin/env python3
+import json, os, pathlib, sys
+pathlib.Path(os.environ['INPUT_FIXTURE'], 'ssh-args').write_text(json.dumps(sys.argv[1:]))
+os.execv('/bin/sh', ['sh', '-c', sys.argv[-1]])
+""")
+        reply = self.reply(100.5)
+        payload = json.dumps(dict(run_id=self.run_id, conversation_id=self.conversation_id,
+                                  reply_id=reply, attention_signature=None)).encode()
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                process = subprocess.Popen([str(HGS), *(['@remote'] if remote else []),
+                    'read', self.name, '--json'], env=self.env, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                output = [None, None]
+                eof = [threading.Event(), threading.Event()]
+                def reader(index, pipe):
+                    try:
+                        output[index] = pipe.read()
+                    finally:
+                        eof[index].set()
+                readers = [threading.Thread(target=reader, args=(i, pipe), daemon=True)
+                           for i, pipe in enumerate((process.stdout, process.stderr))]
+                for thread in readers:
+                    thread.start()
+                process.stdin.write(payload)
+                process.stdin.close()
+                try:
+                    self.assertEqual(process.wait(timeout=10), 0)
+                    deadline = time.monotonic() + 2
+                    for ended in eof:
+                        self.assertTrue(ended.wait(max(0, deadline - time.monotonic())),
+                                        'ordinary read retained an output pipe after owned exit')
+                    self.assertTrue(json.loads(output[0])['applied']['reply_id'])
+                    self.assertEqual(output[1], b'')
+                finally:
+                    if process.poll() is None:
+                        process.terminate()  # Only this test's owned helper.
+                        process.wait(timeout=5)
+                    for i, thread in enumerate(readers):
+                        thread.join(timeout=.1)
+                        if not thread.is_alive():
+                            (process.stdout, process.stderr)[i].close()
+                if remote:
+                    args = json.loads((self.root / 'ssh-args').read_text())
+                    self.assertFalse(any('ControlPersist' in arg for arg in args), args)
 
 
 if __name__ == '__main__':

@@ -64,6 +64,19 @@ class Accounts(unittest.TestCase):
         self.ls()
         self.assertIn('--version',self.opencode_calls.read_text().splitlines())
         self.assertFalse((self.root/'xdg-state/opencode').exists(),'a service registration appeared')
+    def test_kimi_compact_on_expiry_default_and_revision_guard(self):
+        def catalog():return json.loads(self.run_hgs('account','ls','--json').stdout)
+        def kimi(c):return next(p for p in c['profiles'] if p['id']=='native-kimi')
+        original=catalog();self.assertTrue(kimi(original)['compact_on_expiry_supported']);self.assertTrue(kimi(original)['compact_on_expiry'])
+        changed=json.loads(self.run_hgs('account','compact-on-expiry','native-kimi','--revision',original['revision'],'--enabled','false').stdout)
+        self.assertFalse(kimi(changed)['compact_on_expiry'])
+        self.run_hgs('account','compact-on-expiry','native-kimi','--revision',original['revision'],'--enabled','true',ok=False)
+        self.assertFalse(kimi(catalog())['compact_on_expiry'])
+        for account,value in [('native-codex','true'),('native-kimi','invalid')]:
+            self.run_hgs('account','compact-on-expiry',account,'--revision',changed['revision'],'--enabled',value,ok=False)
+        self.assertFalse(kimi(catalog())['compact_on_expiry'])
+        self.assertFalse((self.home/'.kimi-code/tui.toml').exists())
+
     def test_opencode_full_catalog_never_starts_and_checks_its_folder(self):
         catalog=json.loads(self.run_hgs('account','models','native-opencode','--json').stdout)
         self.assertEqual((catalog['catalog_state'],catalog['models'],catalog['model_options']),('not_running',[],[]))
@@ -128,6 +141,43 @@ class Accounts(unittest.TestCase):
         self.run_hgs('account','model-defaults','code','--model','')
         self.assertEqual(json.loads(self.run_hgs('account','model-settings','code').stdout)['defaults'],dict(model='',effort=''))
         self.assertEqual((home/'config.toml').read_bytes(),original)
+
+    def test_model_defaults_reads_ignore_newer_entries_and_writes_preserve_them_verbatim(self):
+        self.add('code','codex')
+        home=self.config/'accounts/code'
+        (home/'models_cache.json').write_text(json.dumps({'models':[{'slug':'fixture-smart','visibility':'list',
+            'supported_reasoning_levels':[{'effort':'high'},{'effort':'xhigh'}]}]}))
+        path=self.config/'accounts.json'
+        catalog=json.loads(path.read_text())
+        future='{ "route": ["future",1.00,1e+02], "options": {"new":true} }'
+        newer='{ "model": "fixture-claude", "effort": "future-effort" }'
+        extra='{ "model": "fixture", "new_field": [1, 2] }'
+        path.write_text(json.dumps(catalog)[:-1]+',"model_defaults":{"native-future":'+future+
+            ',"native-claude":'+newer+',"native-kimi":'+extra+
+            ',"code":{"model":"fixture-smart","effort":"high"}}}')
+        rows={p['id']:p for p in self.ls()['profiles']}
+        self.assertEqual(rows['code']['model_defaults_status'],'saved')
+        for who in ('native-claude','native-kimi'):
+            self.assertEqual(rows[who]['model_defaults_status'],'ignored')
+            self.assertTrue(rows[who]['model_defaults_reason'])
+            self.assertEqual(rows[who]['model_defaults'],dict(model='',effort=''))
+        settings=json.loads(self.run_hgs('account','model-settings','native-claude').stdout)
+        self.assertEqual(settings['model_defaults_status'],'ignored')
+        self.assertEqual(settings['defaults'],dict(model='',effort=''))
+        # Ignored values do not reach launch arguments.
+        launch=self.run_hgs('--dry-run','claude',str(self.root),'-n','ignored','-d').stdout
+        self.assertNotIn(b'fixture-claude',launch)
+        self.assertNotIn(b'future-effort',launch)
+        before=path.read_bytes()
+        self.run_hgs('account','model-defaults','code','--model','fixture-smart','--effort','future-effort',ok=False)
+        self.assertEqual(path.read_bytes(),before)
+        self.run_hgs('account','model-defaults','code','--model','fixture-smart','--effort','xhigh')
+        for value in (future,newer,extra):
+            self.assertIn(value,path.read_text())
+        self.run_hgs('account','model-defaults','native-claude','--model','')
+        self.assertNotIn('native-claude',json.loads(path.read_text())['model_defaults'])
+        for value in (future,extra):
+            self.assertIn(value,path.read_text())
 
     def test_native_opencode_login_dry_run_never_invokes_auth(self):
         fake=self.bin
@@ -230,6 +280,150 @@ class Accounts(unittest.TestCase):
         self.add(); self.assertEqual((self.config/'accounts.json').stat().st_mode & 0o777,0o600)
         self.assertEqual((self.config/'accounts/work').stat().st_mode & 0o777,0o700)
         self.assertNotIn('auth',json.loads((self.config/'accounts.json').read_text())['profiles']['work'])
+    def test_terminal_setup_refuses_stale_catalog_before_any_provider_effect(self):
+        self.assertTrue(self.ls()['setup_revision'])
+        before=self.ls()['revision']; self.add()
+        for op,account in [('login','work'),('install','codex'),('start','native-opencode')]:
+            result=self.run_hgs('account',op,account,'--revision',before,'--dry-run',ok=False)
+            self.assertIn(b'Accounts changed on this machine',result.stderr)
+        current=self.ls()['revision']
+        login=json.loads(self.run_hgs('account','login','work','--revision',current,'--dry-run').stdout)
+        self.assertEqual(login['provider'],'codex')
+        install=json.loads(self.run_hgs('account','install','codex','--revision',current,'--dry-run').stdout)
+        self.assertTrue(install['dry_run'])
+        self.assert_opencode_only_asked_its_version()
+
+    def test_a_remote_sign_in_forwards_the_browser_callback_port(self):
+        # T-tknwyr: Codex finishes a browser sign-in on the signing computer's
+        # localhost:1455; a sign-in on a peer forwards this computer's port there.
+        self.env['HGS_PEERS']='peer'
+        calls=self.root/'ssh-calls.log'
+        ssh=self.bin/'ssh'
+        # A POSIX peer answers the platform probe; every other call is logged.
+        ssh.write_text('#!/bin/sh\ncase "$*" in *hgs-remote-v2*) echo "hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"; exit 0;; esac\n'
+                       'printf "%s\\n" "$*" >> "'+str(calls)+'"\nexit 7\n'); ssh.chmod(0o755)
+        forward='-o ExitOnForwardFailure=no -o ControlPath=none -L 1455:localhost:1455'
+        machine='11111111-1111-4111-8111-111111111111'
+        def ssh_line(*args, sign_in):
+            calls.write_text('')
+            result=self.run_hgs(*args,ok=False)
+            line=calls.read_text().splitlines()[-1]
+            self.assertEqual(forward in line, sign_in, line)
+            self.assertEqual(b'localhost:1455 is forwarded to peer' in result.stderr, sign_in, result.stderr)
+            return line
+        # The desktop's guarded, interactive sign-in and the plain CLI one.
+        self.assertIn('-t',ssh_line('@peer','--expect-machine',machine,'account','login','work','--revision','r1',sign_in=True).split())
+        ssh_line('@peer','account','login','work',sign_in=True)
+        ssh_line('@peer','account','ls',sign_in=False)
+        ssh_line('@peer','--expect-machine',machine,'account','ls',sign_in=False)
+        ssh_line('@peer','--expect-machine',machine,'account','install','codex','--revision','r1',sign_in=False)
+
+    def test_permission_scope_is_shared_by_default_and_kept_beside_the_catalog(self):
+        # zerus-f0uz8: an account's permission mode is shared by all its
+        # computers unless the person keeps it per computer.
+        self.add()
+        listed=self.ls()
+        self.assertTrue(listed['permission_scope_supported'])
+        rows={r['id']:r for r in listed['profiles']}
+        self.assertEqual(rows['work']['permission_scope'],'account')
+        catalog=(self.config/'accounts.json').read_bytes()
+        changed=json.loads(self.run_hgs('account','permission-scope','work','--scope','computer','--revision',listed['revision']).stdout)
+        self.assertEqual({r['id']:r for r in changed['profiles']}['work']['permission_scope'],'computer')
+        # accounts.json is unchanged, so older hgs builds keep reading it.
+        self.assertEqual((self.config/'accounts.json').read_bytes(),catalog)
+        self.assertEqual(changed['revision'],listed['revision'])
+        self.assertEqual(json.loads((self.config/'account-scopes.json').read_text()),{'permission_scopes':{'work':'computer'}})
+        self.assertEqual(oct((self.config/'account-scopes.json').stat().st_mode & 0o777),'0o600')
+        # A shared change names the scope it saw; a computer that keeps its
+        # permissions per computer since then refuses it, under the lock.
+        stale=self.run_hgs('account','permissions','work','--mode','bypass','--expect-scope','account',ok=False)
+        self.assertIn(b'changed between shared and per computer',stale.stderr)
+        self.assertNotIn('work',json.loads((self.config/'accounts.json').read_text()).get('permission_modes',{}))
+        self.run_hgs('account','permissions','work','--mode','bypass','--expect-scope','computer')
+        self.run_hgs('account','permissions','work','--mode','provider')
+        back=json.loads(self.run_hgs('account','permission-scope','work','--scope','account').stdout)
+        self.assertEqual({r['id']:r for r in back['profiles']}['work']['permission_scope'],'account')
+        self.assertEqual(json.loads((self.config/'account-scopes.json').read_text()),{})
+        for args in (['work','--scope','everywhere'],['missing','--scope','computer'],['work','--scope','computer','--revision','stale'],
+                     ['native-opencode','--scope','computer']):
+            with self.subTest(args=args):
+                self.run_hgs('account','permission-scope',*args,ok=False)
+        # A malformed record fails closed: every row reads per computer, and
+        # writes refuse instead of dropping other accounts' choices.
+        (self.config/'account-scopes.json').write_text('{"permission_scopes":{"work":"maybe"}}')
+        self.assertEqual({r['id']:r['permission_scope'] for r in self.ls()['profiles']}['work'],'computer')
+        self.assertIn(b'repair or remove',self.run_hgs('account','permission-scope','work','--scope','account',ok=False).stderr)
+
+    def test_marks_are_kept_beside_the_catalog_and_migration_never_replaces_them(self):
+        # zerus-sa9qn.6: an account's color and emoji live with the account on
+        # its computer, outside accounts.json, which older hgs parses strictly.
+        self.add()
+        listed=self.ls()
+        self.assertTrue(listed['marks_supported'])
+        self.assertEqual({r['id']:r['mark'] for r in listed['profiles']}['work'],{'color':None,'emoji':None})
+        catalog=(self.config/'accounts.json').read_bytes()
+        def mark(*args,ok=True): return self.run_hgs('account','mark',*args,ok=ok)
+        changed=json.loads(mark('work','--color','#2B97FF','--emoji','🦊','--revision',listed['revision']).stdout)
+        self.assertEqual({r['id']:r['mark'] for r in changed['profiles']}['work'],{'color':'#2b97ff','emoji':'🦊'})
+        self.assertEqual((self.config/'accounts.json').read_bytes(),catalog)
+        self.assertEqual(changed['revision'],listed['revision'])
+        self.assertEqual(json.loads((self.config/'account-marks.json').read_text()),{'marks':{'work':{'color':'#2b97ff','emoji':'🦊'}}})
+        self.assertEqual(oct((self.config/'account-marks.json').stat().st_mode & 0o777),'0o600')
+        # A desktop moving its own choice here never replaces this computer's;
+        # it fills only what is unset.
+        mark('work','--emoji','none')
+        migrated=json.loads(mark('work','--color','#00aa7f','--emoji','🐙','--if-unset').stdout)
+        self.assertEqual({r['id']:r['mark'] for r in migrated['profiles']}['work'],{'color':'#2b97ff','emoji':'🐙'})
+        # Clearing both removes the entry; a native account has a mark too.
+        mark('work','--color','none','--emoji','')
+        self.assertEqual(json.loads((self.config/'account-marks.json').read_text()),{})
+        self.assertEqual({r['id']:r['mark'] for r in json.loads(mark('native-codex','--color','#8796aa').stdout)['profiles']}['native-codex']['color'],'#8796aa')
+        for args in (['work'],['work','--color','red'],['work','--color','#2b97f'],['work','--emoji','A'],['work','--emoji','🦊 🦊'],
+                     ['missing','--color','#2b97ff'],['work','--color','#2b97ff','--revision','stale']):
+            with self.subTest(args=args):
+                mark(*args,ok=False)
+        # A deleted profile's mark is forgotten on the next write; unknown
+        # fields from a newer hgs are kept.
+        marks=json.loads((self.config/'account-marks.json').read_text())
+        marks['marks']['gone']={'color':'#2b97ff'}; marks['marks']['native-codex']['later']=1; marks['version']=2
+        (self.config/'account-marks.json').write_text(json.dumps(marks))
+        mark('native-codex','--color','#a6cc38')
+        self.assertEqual(json.loads((self.config/'account-marks.json').read_text()),{'marks':{'native-codex':{'color':'#a6cc38','later':1}},'version':2})
+        # A write never leaves a file the reader refuses: a record at the
+        # 64 KiB cap with a newer hgs's field keeps it, and the edit refuses
+        # (zerus-etuiw).
+        full='{"padding":"'+'x'*(64*1024-len('{"padding":""}'))+'"}'
+        (self.config/'account-marks.json').write_text(full)
+        self.assertEqual(len((self.config/'account-marks.json').read_bytes()),64*1024)
+        self.assertEqual({r['id']:r['mark'] for r in self.ls()['profiles']}['native-codex'],{'color':None,'emoji':None})
+        self.assertIn(b'would exceed 64 KiB',mark('native-codex','--color','#2b97ff',ok=False).stderr)
+        self.assertEqual((self.config/'account-marks.json').read_text(),full)
+        # A malformed record shows no marks and refuses writes instead of
+        # dropping other accounts' choices.
+        (self.config/'account-marks.json').write_text('{"marks":')
+        self.assertEqual({r['id']:r['mark'] for r in self.ls()['profiles']}['native-codex'],{'color':None,'emoji':None})
+        self.assertIn(b'repair or remove',mark('native-codex','--color','#2b97ff',ok=False).stderr)
+
+    def test_connected_accounts_default_to_bypass_and_keep_an_explicit_choice(self):
+        # Owner, 2026-11-07 (T-6hcfnu): without an explicit choice Claude, Codex
+        # and Kimi accounts bypass permissions; an explicit choice always wins.
+        self.add()
+        rows={r['id']:r for r in self.ls()['profiles']}
+        self.assertEqual((rows['work']['permission_mode'],rows['work']['permission_mode_source'],rows['work']['permission_detail']),
+                         ('bypass','default','Zerus default'))
+        self.run_hgs('account','permissions','work','--mode','provider')
+        row={r['id']:r for r in self.ls()['profiles']}['work']
+        self.assertEqual((row['permission_mode'],row['permission_mode_source']),('provider','zerus'))
+        self.assertEqual(json.loads((self.config/'accounts.json').read_text())['permission_modes'],{'work':'provider'})
+        self.run_hgs('account','permissions','work','--mode','default')
+        row={r['id']:r for r in self.ls()['profiles']}['work']
+        self.assertEqual((row['permission_mode'],row['permission_mode_source']),('bypass','default'))
+        self.run_hgs('account','permissions','work','--mode','everything',ok=False)
+        # OpenCode keeps its native configuration.
+        native={r['id']:r for r in self.ls()['profiles']}
+        if 'native-opencode' in native:
+            self.assertEqual(native['native-opencode']['permission_mode'],'provider')
+
     def test_stale_revision_and_duplicate_rejected(self):
         before=self.ls()['revision']; self.add()
         self.run_hgs('account','add','other','--provider','kimi','--revision',before,ok=False)
@@ -301,6 +495,19 @@ class Accounts(unittest.TestCase):
         data = inspect()
         self.assertEqual((data['status'], data['identity']['email']), ('ok', 'kimi@example.invalid'))
         self.assertEqual(data['windows'][0]['used_percent'], 25.0)
+        self.assertEqual(data['auth_status'], 'signed_in')
+        # A plan without a quota report still proves the sign-in, and the grant stays
+        # unavailable rather than expired: the native server answered with a live token.
+        routes.pop('/api/v1/oauth/usage')
+        data = inspect()
+        self.assertEqual((data['status'], data['auth_status']), ('unavailable', 'signed_in'))
+        self.assertEqual((data['identity']['email'], data['windows']), ('kimi@example.invalid', []))
+        # A failed identity read is never reported as a sign-in, even with a quota.
+        routes['/api/v1/oauth/usage'] = {'data': {'kind': 'ok', 'quota': {'usages': {'limit5h': {'usedRatio': 0.25, 'resetAt': None}}}}}
+        routes.pop('/api/v1/oauth/userinfo')
+        data = inspect()
+        self.assertNotIn('auth_status', data)
+        self.assertEqual(data['status'], 'ok')
 
     def test_ollama_account_runs_claude_code_on_a_local_model(self):
         import http.server, threading
@@ -430,7 +637,7 @@ for line in sys.stdin:
     def test_explicit_agent_install_is_allowlisted_and_failed_download_never_runs(self):
         # Unix runs npm or the vendors' install.sh; Windows gets install.ps1 (src/accounts/install.rs).
         for provider,package,url in (('codex','@openai/codex',''),('claude','','https://claude.ai/install.sh'),
-                                     ('kimi','','https://code.kimi.com/kimi-code/install.sh'),('dsh','@deepseek-ai/dsh@0.2.1-rc.2','')):
+                                     ('kimi','','https://code.kimi.com/kimi-code/install.sh'),('dsh','@deepseek-ai/dsh@0.2.2-rc.1','')):
             result=json.loads(self.run_hgs('account','install',provider,'--dry-run').stdout)
             self.assertEqual(result,{'provider':provider,'package':package,'installer_url':url,'dry_run':True})
         self.run_hgs('account','install','arbitrary-command',ok=False)
@@ -505,7 +712,7 @@ if sys.argv[1:3]==['auth','login']:
  assert sys.argv[3:]==['--claudeai']
  sys.exit(1 if (home/'fail-login').exists() else 0)
 assert sys.argv[1:]==['auth','status','--json']
-print(json.dumps({'loggedIn':not (home/'signed-out').exists(),'authMethod':'claude.ai'}))
+print(json.dumps({'loggedIn':not (home/'signed-out').exists(),'email':'work@example.test','authMethod':'claude.ai'}))
 ''')
         return home,settings
 
@@ -600,6 +807,153 @@ sys.exit(0 if signed_in else 1)
         self.assertEqual(result['auth_status'],'signed_out')
         self.assertEqual(result['status'],'signed_out')
 
+    def test_claude_rate_limit_is_shared_by_refreshes_and_preserves_last_limits(self):
+        home,_=self.claude_login_fixture()
+        credentials=home/'.credentials.json'
+        credentials.write_text(json.dumps({'claudeAiOauth':{'accessToken':'SYNTHETIC-USAGE-TOKEN'}}))
+        before=credentials.read_bytes()
+        calls=self.root/'usage-calls'
+        curl=self.bin/'curl'
+        curl.write_text('''#!/usr/bin/env python3
+import json,sys,pathlib
+config=sys.stdin.read()
+assert 'https://api.anthropic.com/api/oauth/usage' in config
+assert 'SYNTHETIC-USAGE-TOKEN' in config
+assert 'SYNTHETIC-USAGE-TOKEN' not in sys.argv
+calls=pathlib.Path('''+repr(str(calls))+''')
+count=int(calls.read_text())+1 if calls.exists() else 1
+calls.write_text(str(count))
+headers=pathlib.Path(sys.argv[sys.argv.index('--dump-header')+1])
+if count==1:
+ headers.write_text('HTTP/1.1 200 OK\\r\\n\\r\\n')
+ print(json.dumps({'five_hour':{'utilization':42,'resets_at':'2030-01-01T00:00:00Z'}}))
+ print('200',end='')
+elif count==2:
+ headers.write_text('HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 100\\r\\n\\r\\n')
+ print('{}')
+ print('429',end='')
+else:
+ raise AssertionError('usage endpoint requested during cooldown')
+''');curl.chmod(0o755)
+        commands=[[HGS,'account','inspect','claude-work','--refresh'] for _ in range(4)]
+        children=[subprocess.Popen(cmd,env=self.env,cwd=self.root,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for cmd in commands]
+        for child in children:
+            stdout,stderr=child.communicate(timeout=15)
+            self.assertEqual(child.returncode,0,stderr.decode())
+            self.assertEqual(json.loads(stdout)['windows'][0]['used_percent'],42)
+        self.assertEqual(calls.read_text(),'1')
+        # Age the synthetic sample/attempt instead of sleeping a real minute.
+        cache=self.config/'account-status/claude-usage.json'
+        saved=json.loads(cache.read_text())
+        for entry in saved.values():
+            entry['attempted_at']-=360
+            entry['checked_at']-=360
+        checked=next(iter(saved.values()))['checked_at']
+        cache.write_text(json.dumps(saved))
+        limited=json.loads(self.run_hgs('account','inspect','claude-work','--refresh').stdout)
+        self.assertEqual((limited['status'],limited['auth_status']),('rate_limited','signed_in'))
+        self.assertEqual(limited['checked_at'],checked)
+        self.assertEqual(limited['windows'][0]['used_percent'],42)
+        self.assertGreater(limited['retry_at'],time.time()+95)
+        for _ in range(2):
+            cached=json.loads(self.run_hgs('account','inspect','claude-work','--refresh').stdout)
+            self.assertEqual(cached['retry_at'],limited['retry_at'])
+            self.assertEqual(cached['checked_at'],checked)
+        self.assertEqual(calls.read_text(),'2')
+        row=next(p for p in self.ls()['profiles'] if p['id']=='claude-work')
+        self.assertEqual(row['account_status']['retry_at'],limited['retry_at'])
+        self.assertEqual(row['account_status']['status'],'rate_limited')
+        self.assertEqual(credentials.read_bytes(),before)
+        self.assertNotIn('SYNTHETIC-USAGE-TOKEN',json.dumps(saved)+json.dumps(limited)+cache.read_text())
+
+    def test_claude_usage_cache_rejects_nonregular_paths_before_request(self):
+        import stat
+        home,_=self.claude_login_fixture()
+        (home/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'SYNTHETIC-USAGE-TOKEN'}}))
+        marker=self.root/'unexpected-curl'
+        curl=self.bin/'curl';curl.write_text('#!/bin/sh\nprintf unexpected > '+str(marker)+'\nexit 99\n');curl.chmod(0o755)
+        folder=self.config/'account-status';folder.mkdir(mode=0o700,exist_ok=True)
+        target=self.root/'original';target.write_text('synthetic original');target.chmod(0o600)
+        before=(target.read_bytes(),target.stat().st_mode)
+        profile_cache=hashlib.sha256((str(home)+':claude-work').encode()).hexdigest()+'.json'
+        for leaf in ('claude-usage.json','claude-usage.lock',profile_cache):
+            for kind in ('fifo','symlink','directory','hardlink','oversize'):
+                if kind=='oversize' and leaf=='claude-usage.lock':continue
+                with self.subTest(leaf=leaf,kind=kind):
+                    path=folder/leaf
+                    if path.exists() or path.is_symlink():path.unlink()
+                    if kind=='fifo':os.mkfifo(path,0o600)
+                    elif kind=='symlink':path.symlink_to(target)
+                    elif kind=='hardlink':os.link(target,path)
+                    elif kind=='oversize':path.write_bytes(b' '*(1024*1024+1));path.chmod(0o600)
+                    else:path.mkdir(mode=0o700)
+                    child=subprocess.Popen([HGS,'account','inspect','claude-work','--refresh'],env=self.env,cwd=self.root,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                    try:
+                        _,stderr=child.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        child.kill();child.communicate(timeout=3)
+                        self.fail('cache file open blocked before admission: '+leaf+'/'+kind)
+                    self.assertNotEqual(child.returncode,0,stderr.decode())
+                    self.assertFalse(marker.exists())
+                    self.assertEqual((target.read_bytes(),target.stat().st_mode),before)
+                    if kind=='fifo':self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+                    if kind=='directory':path.rmdir()
+                    else:path.unlink()
+
+    def test_claude_account_switch_cannot_reuse_quota_or_cooldown_without_uuid(self):
+        home,_=self.claude_login_fixture()
+        selected=home/'selected.json'
+        (self.bin/'claude').write_text('''#!/usr/bin/env python3
+import json,os,pathlib,sys
+home=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
+assert sys.argv[1:]==['auth','status','--json']
+print(json.dumps(dict(loggedIn=True,authMethod='claude.ai',**json.loads((home/'selected.json').read_text()))))
+''')
+        calls=self.root/'usage-calls'
+        curl=self.bin/'curl';curl.write_text('''#!/usr/bin/env python3
+import json,sys,pathlib
+config=sys.stdin.read();alpha='SYNTHETIC-ALPHA' in config
+calls=pathlib.Path('''+repr(str(calls))+''')
+old=calls.read_text().splitlines() if calls.exists() else []
+with calls.open('a') as file:file.write(('alpha' if alpha else 'beta')+'\\n')
+limited=alpha and 'alpha' in old
+headers=pathlib.Path(sys.argv[sys.argv.index('--dump-header')+1])
+headers.write_text('HTTP/1.1 429 Too Many Requests\\r\\nRetry-After: 1000\\r\\n\\r\\n' if limited else 'HTTP/1.1 200 OK\\r\\n\\r\\n')
+print('{}' if limited else json.dumps({'five_hour':{'utilization':20 if alpha else 80,'resets_at':'2030-01-01T00:00:00Z'}}))
+print('429' if limited else '200',end='')
+''');curl.chmod(0o755)
+        def choose(name,token=None):
+            selected.write_text(json.dumps({'email':name+'@example.test','orgName':'Fixture','subscriptionType':'Max'}))
+            (home/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':token or 'SYNTHETIC-'+name.upper()}}))
+        def inspect(*flags):return json.loads(self.run_hgs('account','inspect','claude-work',*flags).stdout)
+        choose('alpha');first=inspect('--refresh');self.assertEqual(first['windows'][0]['used_percent'],20)
+        cache=self.config/'account-status/claude-usage.json';saved=json.loads(cache.read_text())
+        for row in saved.values():row['attempted_at']-=360;row['checked_at']-=360
+        cache.write_text(json.dumps(saved))
+        limited=inspect('--refresh');self.assertEqual(limited['status'],'rate_limited')
+        choose('beta');before=(home/'.credentials.json').read_bytes()
+        beta=inspect() # Even an unforced inspect must observe the changed account.
+        self.assertEqual((beta['identity']['email'],beta['windows'][0]['used_percent'],beta['status']),('beta@example.test',80,'ok'))
+        self.assertIsNone(beta['retry_at'])
+        self.assertEqual(inspect('--refresh')['windows'][0]['used_percent'],80)
+        self.assertEqual(calls.read_text().splitlines(),['alpha','alpha','beta'])
+        self.assertEqual((home/'.credentials.json').read_bytes(),before)
+        choose('alpha','SYNTHETIC-ALPHA-ROTATED')
+        changed=json.loads((home/'.credentials.json').read_text())
+        changed['claudeAiOauth'].update(scopes=['profile','usage'],rateLimitTier='updated',expiresAt=9999999999999)
+        (home/'.credentials.json').write_text(json.dumps(changed))
+        rotated=inspect('--refresh')
+        self.assertEqual((rotated['identity']['email'],rotated['status'],rotated['retry_at']),('alpha@example.test','rate_limited',limited['retry_at']))
+        self.assertEqual(rotated['windows'][0]['used_percent'],20)
+        self.assertEqual(calls.read_text().splitlines(),['alpha','alpha','beta'])
+        # A failed identity observation cannot adopt Alpha while credentials
+        # now select Beta. No credential refresh or usage request is attempted.
+        choose('beta');(self.bin/'claude').write_text('#!/bin/sh\nexit 99\n')
+        unknown=inspect('--refresh')
+        self.assertEqual(unknown['windows'],[])
+        self.assertNotIn('alpha@example.test',json.dumps(unknown))
+        self.assertEqual(calls.read_text().splitlines(),['alpha','alpha','beta'])
+
     @unittest.skipUnless(os.uname().sysname=='Darwin', 'macOS Keychain diagnostic')
     def test_claude_inaccessible_saved_sign_in_preserves_profile_identity(self):
         import hashlib
@@ -621,6 +975,68 @@ sys.exit(0 if signed_in else 1)
         self.assertNotIn('notify',(copied/'config.toml').read_text())
         self.assertEqual((copied/'auth.json').stat().st_mode & 0o777,0o600)
         self.run_hgs('account','copy','native-codex','--to','@local','--as','copied',ok=False)
+    def test_guarded_copy_pins_both_catalogs_machines_and_source_sign_in(self):
+        self.fake_auth()
+        listing=self.ls(); self.assertTrue(listing['copy_revision'])
+        machine=json.loads(self.run_hgs('swarm','get').stdout)['node_id']
+        source=next(p for p in listing['profiles'] if p['id']=='native-codex')
+        def guards(revision,auth=None,source_machine=None):
+            return ['--source-machine',source_machine or machine,'--destination-machine',machine,
+                    '--source-revision',revision,'--destination-revision',revision,
+                    '--source-auth-revision',auth or source['auth_revision']]
+        before=listing['revision']
+        self.run_hgs('account','copy','native-codex','--to','@local','--as','wrong-machine',*guards(before,source_machine='11111111-1111-4111-8111-111111111111'),ok=False)
+        self.run_hgs('account','copy','native-codex','--to','@local','--as','wrong-auth',*guards(before,auth='changed'),ok=False)
+        receipt=self.run_hgs('account','copy','native-codex','--to','@local','--as','guarded',*guards(before))
+        self.assertTrue(json.loads(receipt.stdout)['ok'])
+        self.assertNotIn(b'TEMPORARY-TEST-KEY',receipt.stdout+receipt.stderr)
+        self.run_hgs('account','copy','native-codex','--to','@local','--as','stale',*guards(before),ok=False)
+        for name in ('wrong-machine','wrong-auth','stale'):
+            self.assertFalse((self.config/'accounts'/name).exists())
+        self.assertEqual((self.config/'accounts/guarded/auth.json').read_bytes(),(self.home/'.codex/auth.json').read_bytes())
+        self.assertIn(b'Account transfer ABI: revision-copy-v1',self.run_hgs('--help').stdout)
+
+    def test_guarded_remote_copy_sends_no_credential_bytes_before_destination_admission(self):
+        self.fake_auth(); self.env['HGS_PEERS']='remote'
+        peer=self.root/'peer'; home=peer/'home'; home.mkdir(parents=True)
+        config=home/'.config/hgs'; config.mkdir(parents=True)
+        env={'PATH':self.env['PATH'],'LANG':'C.UTF-8','HOME':str(home),'HGS_CONFIG_DIR':str(config),
+             'HGS_STATE_DIR':str(peer/'state'),'HGS_SELF':'peer','HGS_PEERS':'','HGS_TAB':'0'}
+        for key in ('STATE','CONFIG','DATA','CACHE'):
+            folder=peer/('xdg-'+key.lower()); folder.mkdir(); env['XDG_'+key+'_HOME']=str(folder)
+        auth=home/'.codex'; auth.mkdir(); (auth/'auth.json').write_text('{"OPENAI_API_KEY":"TEMPORARY-PEER-KEY"}')
+        def call_peer(*args):
+            result=subprocess.run([HGS,*args],env=env,cwd=self.root,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr); return json.loads(result.stdout)
+        peer_catalog=call_peer('account','ls'); peer_id=call_peer('swarm','get')['node_id']
+        local_catalog=self.ls(); local_id=json.loads(self.run_hgs('swarm','get').stdout)['node_id']
+        source=next(p for p in peer_catalog['profiles'] if p['id']=='native-codex')
+        observer=self.root/'observe-import'; count=self.root/'import-bytes.json'
+        script=self.bin/'ssh'
+        script.write_text('#!/usr/bin/env python3\nimport json,os,shlex,subprocess,sys\nimport sys\nif sys.argv[-1].startswith("echo "+chr(34)+"hgs-remote-v2|"): print("hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"); sys.exit(0)\n'
+            +'from pathlib import Path\nargs=shlex.split(sys.argv[-1]); assert args[0]=="~/.local/bin/hgs"\n'
+            +'program='+repr(HGS)+'; env='+repr(env)+'\n'
+            +'if "_import" in args and Path('+repr(str(observer))+').exists():\n'
+            +' child=subprocess.run([program,*args[1:]],env=env,stdin=sys.stdin.buffer,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)\n'
+            +' os.close(1)\n data=sys.stdin.buffer.read()\n'
+            +' Path('+repr(str(count))+').write_text(json.dumps({"bytes":len(data)}))\n sys.exit(child.returncode)\n'
+            +'os.execve(program,[program,*args[1:]],env)\n')
+        script.chmod(0o755)
+        args=['--source-machine',peer_id,'--destination-machine',local_id,
+              '--source-revision',peer_catalog['revision'],'--destination-revision',local_catalog['revision'],
+              '--source-auth-revision',source['auth_revision']]
+        result=self.run_hgs('account','copy','native-codex','--from','remote','--to','@local','--as','remote-copy',*args)
+        self.assertNotIn(b'TEMPORARY-PEER-KEY',result.stdout+result.stderr)
+        self.assertEqual((self.config/'accounts/remote-copy/auth.json').read_bytes(),(auth/'auth.json').read_bytes())
+        observer.touch(); local_catalog=self.ls()
+        source=next(p for p in local_catalog['profiles'] if p['id']=='native-codex')
+        args=['--source-machine',local_id,'--destination-machine','11111111-1111-4111-8111-111111111111',
+              '--source-revision',local_catalog['revision'],'--destination-revision',peer_catalog['revision'],
+              '--source-auth-revision',source['auth_revision']]
+        self.run_hgs('account','copy','native-codex','--from','@local','--to','remote','--as','wrong-destination',*args,ok=False)
+        self.assertEqual(json.loads(count.read_text())['bytes'],0)
+        self.assertFalse((config/'accounts/wrong-destination').exists())
+
     def test_kimi_only_auth_and_provider_config_copied(self):
         d=self.home/'.kimi-code'; (d/'credentials').mkdir(parents=True)
         (d/'config.toml').write_text('default_model="test"\nnotify=["evil"]\n[[hooks]]\ncommand="evil"\n[providers.test]\ntype="openai"\napi_key="TEMPORARY"\n[models.test]\nprovider="test"\nmodel="test"\n')
@@ -645,7 +1061,7 @@ sys.exit(0 if signed_in else 1)
             'auth.json':base64.b64encode(b'{"OPENAI_API_KEY":"TEMPORARY-TEST-KEY"}').decode(),
             'config.toml':base64.b64encode(b'cli_auth_credentials_store="file"\n').decode()}})
         script=self.bin/'ssh'
-        script.write_text('#!/usr/bin/env python3\nimport subprocess,sys\nsubprocess.Popen(["sleep","30"])\nprint('+repr(payload)+',flush=True)\n')
+        script.write_text('#!/usr/bin/env python3\nimport subprocess,sys\nimport sys\nif sys.argv[-1].startswith("echo "+chr(34)+"hgs-remote-v2|"): print("hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"); sys.exit(0)\nsubprocess.Popen(["sleep","30"])\nprint('+repr(payload)+',flush=True)\n')
         script.chmod(0o755)
         start=time.monotonic()
         result=self.run_hgs('account','copy','native-codex','--from','remote','--to','@local','--as','copied')
@@ -656,7 +1072,7 @@ sys.exit(0 if signed_in else 1)
         self.env['HGS_PEERS']='remote'
         pid_file=self.root/'escaped-helper.pid'
         script=self.bin/'ssh'
-        script.write_text('#!/usr/bin/env python3\nimport pathlib,subprocess\np=subprocess.Popen(["sleep","60"],start_new_session=True)\npathlib.Path('+repr(str(pid_file))+').write_text(str(p.pid))\nprint("{}",flush=True)\n')
+        script.write_text('#!/usr/bin/env python3\nimport pathlib,subprocess\nimport sys\nif sys.argv[-1].startswith("echo "+chr(34)+"hgs-remote-v2|"): print("hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"); sys.exit(0)\np=subprocess.Popen(["sleep","60"],start_new_session=True)\npathlib.Path('+repr(str(pid_file))+').write_text(str(p.pid))\nprint("{}",flush=True)\n')
         script.chmod(0o755)
         start=time.monotonic()
         try:

@@ -12,6 +12,15 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
+/// Consumers must require this exact capability before offering a running Stop.
+pub const STOP_PREFLIGHT_ABI: &str = "service-preflight-v1";
+/// The closed result of a Stop refused by its preflight: no marker was offered, so
+/// nothing changed. Nothing else may be read as that, least of all an error's text.
+pub const STOP_REFUSED_BEFORE_EFFECT: &str = "stop-refused-before-effect";
+/// A closed refusal is a reply, and still not a success.
+pub fn reply_exit(reply: &Value) -> u8 {
+    u8::from(reply["ok"] == false)
+}
 const CONTROL: &str = "workspace-control.json";
 const STOP: &str = "workspace-stop.json";
 fn fail() -> ConnectorError {
@@ -35,20 +44,38 @@ fn generation(value: &Value) -> Result<&str> {
     Ok(generation)
 }
 fn replace(store: &Store, name: &str, value: &Value) -> Result<()> {
-    let expected = Store::revision(store.read(name).map_err(|_| fail())?.as_deref());
-    let bytes = serde_json::to_vec(value).map_err(|_| fail())?;
-    store.replace(name, &expected, &bytes).map_err(|_| fail())?;
+    replace_raw(store, name, value).map_err(|_| fail())
+}
+fn replace_raw(store: &Store, name: &str, value: &Value) -> std::io::Result<()> {
+    let expected = Store::revision(store.read(name)?.as_deref());
+    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    store.replace(name, &expected, &bytes)?;
     Ok(())
 }
 /// Call only after the connector owns the exact receipt directory journal lock.
 pub fn publish(state_dir: &Path) -> Result<String> {
-    let store = Store::lock(state_dir, false).map_err(|_| fail())?;
-    let generation = crate::private_state::random_id().map_err(|_| fail())?;
-    replace(
-        &store,
-        CONTROL,
-        &json!({"version":1,"generation":generation,"pid":std::process::id()}),
-    )?;
+    crate::startup::enter(crate::startup::Stage::GenerationLock);
+    let store = Store::lock(state_dir, false).map_err(|error| {
+        crate::startup::io(crate::startup::Stage::GenerationLock, &error);
+        fail()
+    })?;
+    let generation = crate::private_state::random_id().map_err(|error| {
+        crate::startup::io(crate::startup::Stage::GenerationRandom, &error);
+        fail()
+    })?;
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut control = json!({"version":1,"generation":generation,"pid":std::process::id()});
+    // A Windows Stop needs this to name the instance. Without it the connector
+    // still runs, and its Stop is refused.
+    #[cfg(windows)]
+    if let Ok(birth) = zerus_windows_private::current_process_birth() {
+        control["birth"] = json!(birth);
+    }
+    crate::startup::enter(crate::startup::Stage::GenerationPublish);
+    replace_raw(&store, CONTROL, &control).map_err(|error| {
+        crate::startup::io(crate::startup::Stage::GenerationPublish, &error);
+        fail()
+    })?;
     Ok(generation)
 }
 /// Reads only the marker for this process generation. An old stop record cannot
@@ -127,10 +154,24 @@ fn configured(config_path: &Path, input: &Value) -> Result<(workspace::Profile, 
     }
     Ok((profile, revision, private_dir))
 }
+#[cfg(windows)]
+fn stop_target<'a>(
+    config_path: &'a Path,
+    revision: &'a str,
+    profile: &'a workspace::Profile,
+) -> crate::workspace_provenance::Target<'a> {
+    crate::workspace_provenance::Target {
+        revision,
+        config: config_path,
+        state_dir: &profile.state_dir,
+        node_id: &profile.identity.device.device_id,
+    }
+}
 pub async fn manage_start(config_path: &Path, input: &Value) -> Result<Value> {
     let (profile, revision, private_dir) = configured(config_path, input)?;
     profile.validate()?;
-    let _guard = Store::lock(&private_dir.join("lifecycle"), true).map_err(|_| fail())?;
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let lifecycle = Store::lock(&private_dir.join("lifecycle"), true).map_err(|_| fail())?;
     if workspace_cli::read_config(config_path)?.1 != revision {
         return Err(fail());
     }
@@ -157,6 +198,8 @@ pub async fn manage_start(config_path: &Path, input: &Value) -> Result<Value> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(feature = "test-hooks")]
+    crate::hooks::capture_child_stderr(&mut command)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -168,6 +211,26 @@ pub async fn manage_start(config_path: &Path, input: &Value) -> Result<Value> {
         command.creation_flags(0x08000000);
     }
     let mut child = command.spawn().map_err(|_| fail())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        let recorded = zerus_windows_private::identity_of(child.id(), child.as_handle())
+            .map_err(|_| fail())
+            .and_then(|identity| {
+                crate::workspace_provenance::record_start(
+                    &lifecycle,
+                    &stop_target(config_path, &revision, &profile),
+                    &identity,
+                )
+            });
+        // A child that already ended is reported by the wait below. One still running
+        // has no receipt, so its Stop stays refused, and this Start isn't confirmed.
+        if let Err(error) = recorded {
+            if child.try_wait().map_err(|_| fail())?.is_none() {
+                return Err(error);
+            }
+        }
+    }
     for _ in 0..100 {
         if child.try_wait().map_err(|_| fail())?.is_some() {
             return Err(ConnectorError::new(
@@ -191,7 +254,7 @@ pub async fn manage_start(config_path: &Path, input: &Value) -> Result<Value> {
     ))
 }
 pub async fn manage_stop(config_path: &Path, input: &Value) -> Result<Value> {
-    let (profile, revision, _private_dir) = configured(config_path, input)?;
+    let (profile, revision, private_dir) = configured(config_path, input)?;
     let current = status(&profile.state_dir)?;
     if current["running"] != true {
         return Ok(current);
@@ -207,10 +270,55 @@ pub async fn manage_stop(config_path: &Path, input: &Value) -> Result<Value> {
         let store = Store::lock(&profile.state_dir, false).map_err(|_| fail())?;
         let control = record(&profile.state_dir, CONTROL)?.ok_or_else(fail)?;
         if generation(&control)? != expected
+            || control["pid"].as_u64() == Some(std::process::id() as u64)
             || workspace_cli::read_config(config_path)?.1 != revision
         {
             return Err(fail());
         }
+        #[cfg(windows)]
+        let admission = crate::workspace_provenance::admit(
+            &private_dir.join("lifecycle"),
+            &stop_target(config_path, &revision, &profile),
+            &control,
+        );
+        #[cfg(not(windows))]
+        let admission = crate::workspace_service::stop_preflight(
+            config_path,
+            &private_dir,
+            &revision,
+            &profile,
+            &control,
+        )
+        .await;
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let Ok(original) = admission
+        else {
+            // An earlier call's marker for this generation is a Stop in effect,
+            // whatever this admission says now, so it is not this refusal.
+            if record(&profile.state_dir, STOP)?
+                .as_ref()
+                .is_some_and(|stop| generation(stop).ok() == Some(expected))
+            {
+                return Err(fail());
+            }
+            return Ok(json!({
+                "ok": false,
+                "refusal": STOP_REFUSED_BEFORE_EFFECT,
+                "error": "Stop was refused before anything changed",
+                "generation": expected,
+                "expected_revision": revision,
+            }));
+        };
+        // The admission awaited bounded manager reads. Do not publish against a
+        // replaced generation, lock owner or configuration after that await.
+        if record(&profile.state_dir, CONTROL)?.as_ref() != Some(&control)
+            || workspace_cli::read_config(config_path)?.1 != revision
+            || status(&profile.state_dir)?["generation"].as_str() != Some(expected)
+        {
+            return Err(fail());
+        }
+        #[cfg(windows)]
+        original.verify().map_err(|_| fail())?;
         replace(&store, STOP, &json!({"version":1,"generation":expected}))?;
     }
     for _ in 0..200 {
@@ -229,6 +337,16 @@ pub async fn manage_stop(config_path: &Path, input: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_reply_that_says_not_ok_exits_with_failure() {
+        assert_eq!(
+            reply_exit(&json!({"ok":false,"refusal":STOP_REFUSED_BEFORE_EFFECT})),
+            1
+        );
+        for reply in [json!({"ok":true}), json!({"state":"running"}), json!({})] {
+            assert_eq!(reply_exit(&reply), 0, "{reply}");
+        }
+    }
     #[tokio::test]
     async fn stale_stop_generation_does_not_stop_replacement() {
         let directory = tempfile::tempdir().unwrap();

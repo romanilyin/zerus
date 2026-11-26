@@ -36,6 +36,10 @@ pub(crate) struct Role {
     pub effort: String,
     #[serde(default)]
     pub permissions: String,
+    /// Task 154: the rights profile a member of this role launches with;
+    /// empty: the role's default (rights::role_profile).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permissions_profile: String,
     #[serde(default)]
     pub computer: String,
     /// worktree, shared or read_only.
@@ -77,6 +81,18 @@ pub(crate) struct Role {
     pub prompt_off: Vec<String>,
     #[serde(default)]
     pub notes: BTreeMap<String, String>,
+    /// U36: the pipeline this role's tasks use unless the plan names one; a
+    /// docs role uses Docs. Empty falls back to the template's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pipeline: String,
+    /// U45: the models a member of this role may switch between before a
+    /// task; copied into the member when it joins. Empty: its launch model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<super::model::ModelChoice>,
+    /// U46: what Zerus does to this role's context before each hand-out:
+    /// empty or "none", "compact" or "clear". Copied onto a member that joins.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_before_task: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -139,7 +155,59 @@ pub(crate) struct Template {
     /// U25: same, owner or lead (new phases).
     #[serde(default)]
     pub phases: String,
+    /// U36: the pipeline a team from this template gives its tasks by default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pipeline: String,
 }
+
+/// U36: one stage of a pipeline preset: what it checks and who does it, a
+/// role (its first free member) or a pinned member.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct Stage {
+    /// review, test, command (U47) or land (U48).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub member: String,
+    /// U47/U48: the command Zerus runs for a command or land stage, its
+    /// expected exit code and time limit. Only the owner's catalog has it: a
+    /// plan chooses the preset, never the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<super::model::Check>,
+    /// U48: a land stage's exit codes and outcomes, `{"0":"accepted",
+    /// "2":"returned","3":"held"}`; empty is 0 accepted and any other held.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exits: BTreeMap<String, String>,
+}
+
+/// U36: a named pipeline preset ("Code: review, test, lead"): its stages after
+/// the implementer's report, the review rounds before the lead decides, the
+/// folder rule of a test stage and who gives the final acceptance.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct Pipeline {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub stages: Vec<Stage>,
+    /// Returned rounds before the task goes to the lead; 0 reads as 3.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_rounds: u32,
+    /// hold (the test holds the task's folder) or checkout (a detached
+    /// checkout of the attempt's commits); empty reads as hold.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder: String,
+    /// lead, sub_lead or auto; empty reads as lead.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accept: String,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// U36: the rounds a preset allows when it names none.
+pub(crate) const DEFAULT_ROUNDS: u32 = 3;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub(crate) struct Rule {
@@ -168,6 +236,9 @@ pub(crate) struct Catalog {
     /// U28: the lead's planning rules, versioned with the catalog.
     #[serde(default = "default_planning_rules")]
     pub planning_rules: String,
+    /// U36: the pipeline presets; an old catalog has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipelines: Vec<Pipeline>,
 }
 
 pub(crate) fn default_planning_rules() -> String {
@@ -196,6 +267,7 @@ pub(crate) fn default_planning_rules() -> String {
         "(22) Offer a phase split above 25 tasks.",
         "(23) No starved notices before a phase is approved; idleness only when the lead can act.",
         "(24) The roster and member limit change only on the owner's explicit word (U26); otherwise the lead proposes.",
+        "(25) Above about 8 members or 20 open tasks keep two reviewers and two mergers and a sub-lead whose members report to it, and give tasks a review pipeline (\"docs\": review, auto; \"code\": review, test, lead) so the lead decides only returned work.",
     ]
     .join("\n")
 }
@@ -232,7 +304,7 @@ pub(crate) struct Proposal {
     /// Given by hgs when the proposal is made.
     #[serde(default)]
     pub id: String,
-    /// role, template or rule.
+    /// role, template, rule, pipeline or planning_rules.
     pub kind: String,
     /// add, change or remove.
     pub action: String,
@@ -284,8 +356,8 @@ pub(crate) fn builtin() -> Catalog {
         role("architect", "Architect", "#8e9bff", "claude", "", "read_only", &format!("You are the Architect: design interfaces and boundaries; change code only when a task asks. {finish}")),
         role("backend", "Backend", "#6fa8ff", "codex", "", "worktree", &format!("You are the Backend engineer of this team. Work only inside your folder. Keep APIs backward compatible unless the task says otherwise. {finish}")),
         role("frontend", "Frontend", "#f08bb4", "codex", "", "worktree", &format!("You are the Frontend engineer of this team. Work only inside your folder. {finish}")),
-        role("tester", "Tester", "#56c8e0", "claude", "", "worktree", &format!("You are the Tester of this team. Write and run tests; report what passed and what failed. {finish}")),
-        role("reviewer", "Reviewer", "#d9b38c", "claude", "", "read_only", &format!("You are the Reviewer: read the changes, report findings by severity, change nothing. {finish}")),
+        role("tester", "Tester", "#56c8e0", "claude", "", "worktree", &format!("You are the Tester of this team: write and run tests and report what passed and what failed. In a task's test stage, run only the suites of the files its change touched, take the criteria's shots, edit none of the task's files, and answer with a verdict (pass, or return with the command and its failure). Never delete, skip or narrow a test to make it pass. {finish}")),
+        role("reviewer", "Reviewer", "#d9b38c", "claude", "", "read_only", &format!("You are the Reviewer: read a change against the task's criteria and report findings by severity; change nothing. In a task's review stage, read the attempt's change in the task's folder, edit none of its files, and answer with a verdict: pass, or return with findings that name the file and the line. Judge each criterion with your own evidence, treat the implementer's report as claims, judge an off-by-default setting as if it were on, and return a change that weakens a test or a criterion the task did not ask to change or breaks a project rule. Never pass a change you could not read. {finish}")),
         role("security", "Security", "#e48de0", "claude", "", "read_only", &format!("You are the Security reviewer: look for secrets, injection, authorization and data exposure. {finish}")),
         role("integrator", "Integrator", "#a3b1c6", "codex", "", "shared", &format!("You are the Integrator: merge the members' branches, resolve conflicts, run the full checks. {finish}")),
         role("researcher", "Researcher", "#b9d36b", "claude", "", "read_only", &format!("You are the Researcher: find facts and options with sources; change no code. {finish}")),
@@ -322,15 +394,44 @@ pub(crate) fn builtin() -> Catalog {
         },
     ];
     let routing = vec![Rule { id: "bug".into(), when: "bug fix".into(), template: "bugfix".into(), approval: "review".into(), use_: String::new() }];
-    Catalog { version: 1, roles, templates, routing, planning_rules: default_planning_rules() }
+    Catalog { version: 1, roles, templates, routing, planning_rules: default_planning_rules(), pipelines: builtin_pipelines() }
+}
+
+/// U36: the built-in presets. No template names one yet, so a team keeps
+/// today's flow until the owner picks a default.
+pub(crate) fn builtin_pipelines() -> Vec<Pipeline> {
+    let stage = |kind: &str, role: &str| Stage { kind: kind.into(), role: role.into(), ..Default::default() };
+    let preset = |id: &str, name: &str, stages: Vec<Stage>, accept: &str| Pipeline {
+        id: id.into(),
+        name: name.into(),
+        stages,
+        max_rounds: DEFAULT_ROUNDS,
+        folder: "hold".into(),
+        accept: accept.into(),
+    };
+    vec![
+        preset("code", "Code: review, test, lead", vec![stage("review", "reviewer"), stage("test", "tester")], "lead"),
+        preset("docs", "Docs: review, auto", vec![stage("review", "reviewer")], "auto"),
+        preset("check", "Check: lead", Vec::new(), "lead"),
+    ]
 }
 
 pub(crate) fn load() -> anyhow::Result<Catalog> {
     match fs::read_to_string(path()) {
-        Ok(text) => serde_json::from_str(&text).context("Invalid team catalog"),
+        Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(builtin()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Task #404: a catalog saved before the presets existed has no pipelines; the
+/// built-in presets are its default, so a plan or extend naming 'docs' works.
+fn parse(text: &str) -> anyhow::Result<Catalog> {
+    let mut catalog: Catalog = serde_json::from_str(text).context("Invalid team catalog")?;
+    if catalog.pipelines.is_empty() {
+        catalog.pipelines = builtin_pipelines();
+    }
+    Ok(catalog)
 }
 
 fn load_draft() -> anyhow::Result<Draft> {
@@ -361,11 +462,34 @@ pub(crate) fn snapshot_for(role_name: &str) -> Option<super::model::PromptSnapsh
         protocol_extra: role.protocol_extra.clone(),
         task_template: role.task_template.clone(),
         notes: role.notes.clone(),
+        context_before_task: role.context_before_task.clone(),
     })
 }
 
+/// Task 154 (4): the rights profile a member of this role launches with when
+/// it names none: the role's own, else what the role's job needs (QA
+/// operates sessions and workers, a merger commits, a tester builds).
+pub(crate) fn profile_for(role_name: &str) -> String {
+    let catalog = load().unwrap_or_else(|_| builtin());
+    let role = catalog.roles.iter().find(|role| role.id == role_name || role.name == role_name);
+    if let Some(profile) = role.map(|role| role.permissions_profile.clone()).filter(|profile| !profile.is_empty()) {
+        return profile;
+    }
+    let (id, name) = role.map(|role| (role.id.as_str(), role.name.as_str())).unwrap_or(("", role_name));
+    super::rights::role_profile(id, name).unwrap_or_default().to_owned()
+}
+
+/// U45: the model list of a catalog role, copied into a member when it joins
+/// so a later catalog edit changes no running team.
+pub(crate) fn models_for(role_name: &str) -> Vec<super::model::ModelChoice> {
+    let catalog = load().unwrap_or_else(|_| builtin());
+    catalog.roles.iter().find(|role| role.id == role_name || role.name == role_name).map(|role| role.models.clone()).unwrap_or_default()
+}
+
 /// Renders the member's snapshot in the role's order.
-pub(crate) fn prompt_order_text_snapshot(snapshot: &super::model::PromptSnapshot, member_prompt: &str, task: Option<&Task>) -> Option<String> {
+pub(crate) fn prompt_order_text_snapshot(snapshot: &super::model::PromptSnapshot, member_prompt: &str, task: Option<&Task>,
+    rules: &str,
+) -> Option<String> {
     let role = Role {
         prompt_order: snapshot.prompt_order.clone(),
         prompt_off: snapshot.prompt_off.clone(),
@@ -374,7 +498,7 @@ pub(crate) fn prompt_order_text_snapshot(snapshot: &super::model::PromptSnapshot
         notes: snapshot.notes.clone(),
         ..Default::default()
     };
-    prompt_order_text(&role, member_prompt, task, "")
+    prompt_order_text(&role, member_prompt, task, rules)
 }
 
 /// C1: the role's own task block replaces the standard "Task #N" block only
@@ -392,12 +516,17 @@ pub(crate) fn prompt_order_text(role: &Role, member_prompt: &str, task: Option<&
         return None;
     }
     let mut text = String::new();
-    for key in &role.prompt_order {
-        if role.prompt_off.contains(key) {
+    let mut order = role.prompt_order.clone();
+    if !project_rules.trim().is_empty() && !order.iter().any(|key| key == "rules") {
+        order.insert(0, "rules".into());
+    }
+    for key in &order {
+        if role.prompt_off.contains(key) && key != "rules" {
             continue;
         }
         let block = match key.as_str() {
-            "rules" => (!project_rules.trim().is_empty()).then(|| format!("Project rules:\n{}\n", project_rules.trim())),
+            "rules" => {
+                (!project_rules.trim().is_empty()).then(|| format!("{}\n", project_rules.trim()))}
             "role" => (!member_prompt.trim().is_empty()).then(|| format!("Role: {}\n", member_prompt.trim())),
             "protocol" => (!role.protocol_extra.trim().is_empty()).then(|| format!("Team protocol extra:\n{}\n", role.protocol_extra.trim())),
             "task" => task.filter(|_| !role.task_template.trim().is_empty()).map(|task| {
@@ -440,6 +569,34 @@ fn clean_id(id: &str) -> anyhow::Result<String> {
     Ok(id.to_owned())
 }
 
+/// A team member id as `hgs team` takes it: letters, digits, - and _.
+fn member_id_shape(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 40 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// U47/U48: a stage Zerus runs itself: a command of 1 to 2000 characters, no
+/// member or role; a land stage is the preset's last and maps exit codes to
+/// accepted, returned or held.
+fn validate_command_stage(pipeline: &Pipeline, i: usize, stage: &Stage) -> anyhow::Result<()> {
+    let (id, n) = (&pipeline.id, i + 1);
+    ensure!(stage.role.is_empty() && stage.member.is_empty(), "Pipeline {id} stage {n}: Zerus runs a {} stage, with no role or member", stage.kind);
+    let command = stage.command.as_ref().with_context(|| format!("Pipeline {id} stage {n}: a {} stage needs its command", stage.kind))?;
+    let length = command.command.trim().chars().count();
+    ensure!((1..=2000).contains(&length), "Pipeline {id} stage {n}: the command has 1 to 2000 characters");
+    ensure!(!command.command.chars().any(|ch| ch == char::from(0)), "Pipeline {id} stage {n}: the command has no NUL");
+    ensure!((1..=240).contains(&command.timeout_minutes), "Pipeline {id} stage {n}: the time limit is 1 to 240 minutes");
+    if stage.kind == "land" {
+        ensure!(n == pipeline.stages.len(), "Pipeline {id}: a land stage is the last stage");
+        for (code, outcome) in &stage.exits {
+            ensure!(code.parse::<i32>().is_ok(), "Pipeline {id} stage {n}: exit {code} is not a number");
+            ensure!(matches!(outcome.as_str(), "accepted" | "returned" | "held"), "Pipeline {id} stage {n}: exit {code} is accepted, returned or held");
+        }
+    } else {
+        ensure!(stage.exits.is_empty(), "Pipeline {id} stage {n}: only a land stage maps exit codes");
+    }
+    Ok(())
+}
+
 /// Checks a whole catalog: unique ids, known roles and templates.
 pub(crate) fn validate(catalog: &Catalog) -> anyhow::Result<()> {
     let mut roles = BTreeMap::new();
@@ -448,10 +605,17 @@ pub(crate) fn validate(catalog: &Catalog) -> anyhow::Result<()> {
         ensure!(!role.name.trim().is_empty(), "Role {} needs a name", role.id);
         ensure!(roles.insert(role.id.clone(), ()).is_none(), "Role {} is listed twice", role.id);
         ensure!(role.prompt.len() <= 8000, "The prompt of role {} is too long", role.id);
+        // U46: opt-in; an old catalog keeps the default none.
+        ensure!(
+            matches!(role.context_before_task.as_str(), "" | "none" | "compact" | "clear"),
+            "Role {}: context before a task is none, compact or clear",
+            role.id
+        );
         // U25: the role's editable prompt order and notes.
         ensure!(role.about.chars().count() <= 500, "The about of role {} is too long", role.id);
         ensure!(role.skills.len() <= 20, "Role {} has at most 20 skills", role.id);
         ensure!(matches!(role.message.as_str(), "" | "lead" | "some" | "team"), "Role {}: message is lead, some or team", role.id);
+        super::models::check_choices(&role.models).with_context(|| format!("Role {}", role.id))?;
         for key in &role.prompt_off {
             ensure!(role.prompt_order.contains(key) || role.notes.contains_key(key), "Role {} turns off unknown block {key}", role.id);
         }
@@ -483,6 +647,48 @@ pub(crate) fn validate(catalog: &Catalog) -> anyhow::Result<()> {
         for task in &template.tasks {
             ensure!(task.phase >= 1, "Template {}: a task phase starts at 1", template.id);
         }
+    }
+    // U36: presets with known stage kinds and roles; "none" is reserved for
+    // a task without a pipeline.
+    ensure!(catalog.pipelines.len() <= 20, "The catalog has at most 20 pipelines");
+    let mut pipelines = BTreeMap::new();
+    for pipeline in &catalog.pipelines {
+        clean_id(&pipeline.id)?;
+        ensure!(pipeline.id != "none", "Pipeline id none is reserved for no pipeline");
+        ensure!(!pipeline.name.trim().is_empty() && pipeline.name.chars().count() <= 80, "Pipeline {} needs a name of at most 80 characters", pipeline.id);
+        ensure!(pipelines.insert(pipeline.id.clone(), ()).is_none(), "Pipeline {} is listed twice", pipeline.id);
+        ensure!(pipeline.stages.len() <= 8, "Pipeline {} has at most 8 stages", pipeline.id);
+        ensure!(pipeline.max_rounds <= 10, "Pipeline {}: at most 10 rounds", pipeline.id);
+        ensure!(matches!(pipeline.folder.as_str(), "" | "hold" | "checkout"), "Pipeline {}: folder is hold or checkout", pipeline.id);
+        ensure!(matches!(pipeline.accept.as_str(), "" | "lead" | "sub_lead" | "auto"), "Pipeline {}: accept is lead, sub_lead or auto", pipeline.id);
+        for (i, stage) in pipeline.stages.iter().enumerate() {
+            ensure!(
+                matches!(stage.kind.as_str(), "review" | "test" | "command" | "land"),
+                "Pipeline {} stage {}: kind is review or test, or a command or land stage that Zerus runs",
+                pipeline.id,
+                i + 1
+            );
+            if matches!(stage.kind.as_str(), "command" | "land") {
+                validate_command_stage(pipeline, i, stage)?;
+                continue;
+            }
+            ensure!(
+                stage.command.is_none() && stage.exits.is_empty(),
+                "Pipeline {} stage {}: only a command or land stage runs a command",
+                pipeline.id,
+                i + 1
+            );
+            ensure!(stage.role.is_empty() != stage.member.is_empty(), "Pipeline {} stage {}: name a role or a member", pipeline.id, i + 1);
+            ensure!(stage.role.is_empty() || roles.contains_key(&stage.role), "Pipeline {} stage {} names unknown role {}", pipeline.id, i + 1, stage.role);
+            ensure!(stage.member.is_empty() || member_id_shape(&stage.member), "Pipeline {} stage {}: invalid member {}", pipeline.id, i + 1, stage.member);
+        }
+    }
+    let known_pipeline = |id: &str| id.is_empty() || id == "none" || pipelines.contains_key(id);
+    for role in &catalog.roles {
+        ensure!(known_pipeline(&role.pipeline), "Role {} names unknown pipeline {}", role.id, role.pipeline);
+    }
+    for template in &catalog.templates {
+        ensure!(known_pipeline(&template.pipeline), "Template {} names unknown pipeline {}", template.id, template.pipeline);
     }
     for rule in &catalog.routing {
         clean_id(&rule.id)?;
@@ -552,6 +758,11 @@ fn apply_one(catalog: &mut Catalog, proposal: &Proposal) -> anyhow::Result<()> {
             let value: Option<Rule> = if remove { None } else { Some(serde_json::from_value(proposal.value.clone()).context("Invalid rule")?) };
             upsert(&mut catalog.routing, &proposal.target, value, |r| r.id.as_str());
         }
+        // U36: the Pipelines tab's presets, kept or rejected like the others.
+        "pipeline" => {
+            let value: Option<Pipeline> = if remove { None } else { Some(serde_json::from_value(proposal.value.clone()).context("Invalid pipeline")?) };
+            upsert(&mut catalog.pipelines, &proposal.target, value, |p| p.id.as_str());
+        }
         // U28: the planning rules are designer-editable text like roles.
         "planning_rules" => {
             ensure!(!remove, "The planning rules cannot be removed");
@@ -613,21 +824,26 @@ fn locked<T>(f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
 }
 
 /// The Team designer's first prompt: what it may do and how it proposes.
-pub(crate) fn designer_brief(catalog: &Catalog, goal: &str, project: &str) -> String {
+pub(crate) fn designer_brief(catalog: &Catalog, goal: &str, project: &str, project_name: &str) -> String {
     let mut text = format!(
-        "You are the Zerus Team designer. You configure the team catalog: roles, templates (which roles a kind of work \
-         needs, with a task skeleton) and routing rules. Read `hgs guide designer` first. You may read the owner's \
+        "You are the Zerus Team designer, a conversational assistant for building agent teams. You configure the team catalog: \
+         roles, templates (which roles a kind of work needs, with a task skeleton) and routing rules. Read `hgs guide designer` \
+         first. Read the selected project and the existing catalog before designing. Discuss the owner's goals and ask focused \
+         questions when the tasks, constraints or acceptance criteria are unclear. Reuse suitable existing roles and templates, \
+         explain which ones fit, and propose new or changed ones only for needs they do not cover. You may read the owner's \
          projects to learn how they work, but change no file: your only output is proposals with `hgs team catalog propose --json`. \
          The owner keeps or rejects each proposal and applies them; running teams keep their roster. The catalog is v{}: \
-         read it with `hgs team catalog get --json <<< '{{}}'`. Run `hgs` directly and send JSON on stdin in a \
-         heredoc. Ask the owner what they need, then propose.",
+         read it with `hgs team catalog get --json <<< '{{}}'`. Run `hgs` directly and send JSON on stdin in a heredoc.",
         catalog.version
     );
     // Section 9.8: the designer explains sub-leads: a role may lead one, and a
     // seat may delegate to another template.
     text += "\n\nA role with can_lead_subteam may lead a sub-team; a roster seat may name subteam: <template> so that member delegates that template. Unknown templates and template cycles are refused, so keep the catalog acyclic.";
+    if !project_name.trim().is_empty() {
+        text += &format!("\n\nThe selected project is {}.", project_name.trim());
+    }
     if !project.trim().is_empty() {
-        text += &format!("\n\nThe owner works in the project folder {}.", project.trim());
+        text += &format!("\n\nRead the selected project in the folder {}.", project.trim());
     }
     if !goal.trim().is_empty() {
         text += &format!("\n\nThe owner asks: {}", goal.trim());
@@ -703,7 +919,7 @@ fn designer(input: &Value) -> anyhow::Result<Value> {
     std::fs::create_dir_all(&home).context("Could not create the Team designer's folder")?;
     let folder = home.to_string_lossy().into_owned();
     let agent = input["agent"].as_str().filter(|a| !a.is_empty()).unwrap_or("claude");
-    ensure!(["claude", "codex", "kimi", "dsh", "opencode"].contains(&agent), "Unknown agent {agent}");
+    ensure!(["claude", "codex", "kimi", "qwen", "dsh", "opencode"].contains(&agent), "Unknown agent {agent}");
     // A model or effort is one word, as a provider's command line takes it.
     let word = |key: &str| -> anyhow::Result<String> {
         let value = input[key].as_str().unwrap_or_default().trim().to_owned();
@@ -717,7 +933,7 @@ fn designer(input: &Value) -> anyhow::Result<Value> {
         let config = crate::config::Config::load()?;
         trust_designer(agent, &folder, &crate::accounts::claude_launch_config(&config)?)?;
     }
-    let brief = designer_brief(&load()?, input["goal"].as_str().unwrap_or_default(), project);
+    let brief = designer_brief(&load()?, input["goal"].as_str().unwrap_or_default(), project, input["project"].as_str().unwrap_or_default());
     let args = designer_commands(agent, &folder, &model, &effort, &brief, &launch_id);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = super::dispatcher::hgs("", &args, None, std::time::Duration::from_secs(120))?;
@@ -857,7 +1073,10 @@ mod tests {
         // An old catalog without the field loads the built-in rules.
         let old: Catalog = serde_json::from_value(json!({"version":3,"roles":[],"templates":[],"routing":[]})).unwrap();
         assert_eq!(old.planning_rules, default_planning_rules());
-        assert!(designer_brief(&builtin, "goal", "").contains("Planning rules") || designer_brief(&builtin, "goal", "").contains("(24)"));
+        let brief = designer_brief(&builtin, "goal", "/work/orbit", "Orbit platform");
+        assert!(brief.contains("Planning rules") || brief.contains("(24)"));
+        assert!(brief.contains("Orbit platform") && brief.contains("/work/orbit"));
+        assert!(brief.contains("ask focused questions") && brief.contains("Reuse suitable existing roles and templates"));
         // The rules are versioned with the catalog like any other text.
         let mut edited = builtin.clone();
         edited.version = 4;
@@ -938,7 +1157,7 @@ mod tests {
         assert_eq!(args[at + 1 + DESIGNER_CLAUDE_RULES.len()], "--", "{args:?}");
         let agent_at = args.iter().position(|arg| arg == "--").unwrap() + 1;
         let mut argv: Vec<String> = std::iter::once("claude".to_owned()).chain(args[agent_at..].iter().cloned()).collect();
-        crate::accounts::apply_permissions("claude", "bypass", &mut argv);
+        crate::accounts::apply_permissions("claude", "bypass", &mut argv).unwrap();
         let delimiter = argv.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(&argv[delimiter..], ["--", "brief"], "{argv:?}");
         assert!(argv[..delimiter].iter().any(|arg| arg == "--permission-mode"), "{argv:?}");
@@ -964,6 +1183,23 @@ mod tests {
             assert!(!trust_designer(agent, "C:\\designer", &config).unwrap(), "{agent}");
         }
         assert!(!config.exists(), "nothing writes a Claude account config for another agent");
+    }
+
+    /// Task #404: a catalog file saved before the presets existed (no
+    /// "pipelines") still offers the built-in presets, so an extend naming
+    /// 'docs' or 'code' is accepted; a catalog with its own keeps them.
+    #[test]
+    fn a_catalog_without_pipelines_gets_the_builtin_presets() {
+        let catalog = parse(r#"{"version":1,"roles":[{"id":"lead","name":"Lead"}]}"#).unwrap();
+        let ids: Vec<&str> = catalog.pipelines.iter().map(|pipeline| pipeline.id.as_str()).collect();
+        assert_eq!(ids, ["code", "docs", "check"], "{ids:?}");
+        // The extend path's check takes them: this is the 'Unknown pipeline
+        // docs' refusal the task named.
+        crate::state::teams::pipeline::check_choice("docs", &catalog).unwrap();
+        crate::state::teams::pipeline::check_choice("code", &catalog).unwrap();
+        let own = parse(r#"{"version":1,"pipelines":[{"id":"mine","name":"Mine"}]}"#).unwrap();
+        assert_eq!(own.pipelines.len(), 1, "{:?}", own.pipelines);
+        assert_eq!(own.pipelines[0].id, "mine");
     }
 
     #[test]
@@ -995,7 +1231,7 @@ mod tests {
 
     #[test]
     fn export_import_and_revert_move_versions() {
-        let _guard = crate::state::ENV_LOCK.lock().unwrap();
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let old = std::env::var("HGS_STATE_DIR").ok();
         std::env::set_var("HGS_STATE_DIR", dir.path());
@@ -1039,7 +1275,7 @@ mod tests {
         };
         role.notes.insert("note1".into(), "Read the docs first".into());
         let task = Task { id: 7, title: "API".into(), description: "The endpoint".into(), criteria: vec!["Fast".into(), "Safe".into()], ..Default::default() };
-        let text = prompt_order_text(&role, &role.prompt, Some(&task), "Use tabs").unwrap();
+        let text = prompt_order_text(&role, &role.prompt, Some(&task), "Project rules:\nUse tabs").unwrap();
         assert!(text.starts_with("Project rules:\nUse tabs\nRole: Write the code\n"), "{text}");
         assert!(text.contains("Team protocol extra:\nReport each step"), "{text}");
         assert!(text.contains("Do #7 API: The endpoint. Criteria: Fast; Safe"), "{text}");

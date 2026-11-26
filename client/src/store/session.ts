@@ -1,34 +1,199 @@
-import { createEffect, createRoot, on } from "solid-js";
-import { activityPort } from "../bridge";
-import { applyBatch, onReplaced, orderedRows } from "./catalog";
-import { bindActivity, bindSelection, observeBatch } from "./actions";
-import { createActivity } from "./activity";
-import { compactRows, selected, selectedKey, setCompactRows, setSelectedKey, subagentOpen } from "./ui";
-import type { Batch } from "../types";
+import { desktopService } from "./desktopService";
+import { batch, createEffect, createRoot, createSignal, on, untrack } from "solid-js";
+import { activityPort, composerTab, inspectSubagentActivity, processesFollow, processesShown, windowVisibility } from "../bridge";
+import { applyBatch, catalog, computerFresh, computerOffline, onReplaced, orderedRows, rowId, setDraftKeys } from "./catalog";
+import { composer, draftKey } from "./composer";
+import { sessionModels, bindModelNotice } from "./sessionModels";
+import { bindForkSession } from "./sessionForks";
+import { tasks } from "./tasks";
+import { terminal } from "./terminal";
+import { flag, num } from "./settings";
+import { bindActivity, bindSelection, followedFor, notify, updating } from "./actions";
+import { observeMarks } from "./marks";
+import { createActivity, type ActivityPort } from "./activity";
+import { teams } from "./teams";
+import { createSubagentActivity } from "./subagentActivity";
+import { archive } from "./archive";
+import { applyGrouping } from "./organization";
+import { activityReadOnly, shellSession } from "./activitySource";
+import { compactRows, detailTab, page, selected, selectedKey, setCompactRows, setDetailTab, setReadSelectionKey, setSelectedKey, subagentOpen } from "./ui";
+import { startScreens } from "./screens";
+import { documentVisibility, pageHidden } from "./visibility";
+import { processes, trackFollow, trackShown } from "./processes";
+import type { Batch, ComposerEvent, ProcessTarget } from "../types";
+import { trText } from "../text";
 
-// Wires the stores together: batches go to the catalog and the followed
-// Activity, the selected session is the followed one, and a `replaced` run
-// hands its selection and row layout to the new run of the same name.
+// Wires the stores together: batches go to the catalog, the grouping, the
+// followed Activity and the open composer, the selected session is the
+// followed one and has the open composer, and a
+// `replaced` run hands its selection and row layout to the new run of the
+// same name. An archived row is never followed (Qt streams only rows
+// without an archive id); store/archiveActivity.ts reads its recorded
+// Activity.
 
-export const activity = createActivity(activityPort);
+/**
+ * The Activity port of the two live follows: the selected session's and the
+ * Team tab's coordinator (task 9). Both may show one session in turn, and the
+ * desktop runs follow and unfollow as they come, possibly out of order: an
+ * unfollow waits while the other follow still shows that session, and a
+ * follow waits for that session's unfollow in flight.
+ */
+const unfollowing = new Map<string, Promise<void>>();
+function sharedPort(others: () => readonly (string | undefined)[]): ActivityPort {
+  return {
+    follow: (request) => {
+      const pending = unfollowing.get(rowId(request.computer, request.key));
+      return pending ? pending.then(() => activityPort.follow(request)) : activityPort.follow(request);
+    },
+    unfollow: (computer, key) => {
+      const id = rowId(computer, key);
+      if (others().includes(id)) return Promise.resolve();
+      const done: Promise<void> = activityPort.unfollow(computer, key).catch(() => {}).finally(() => { if (unfollowing.get(id) === done) unfollowing.delete(id); });
+      unfollowing.set(id, done);
+      return done;
+    },
+    older: (computer, key, before, limit) => activityPort.older?.(computer, key, before, limit) ?? Promise.resolve(false),
+  };
+}
+
+export const activity = createActivity(sharedPort(() => [coordinatorActivity.target()?.id, designerActivity.target()?.id]));
+/** The Team tab's coordinator conversation, when the coordinator is not the selected session. */
+export const coordinatorActivity = createActivity(sharedPort(() => [activity.target()?.id, designerActivity.target()?.id]));
+/** Task #44: the Team designer's conversation on its page, when it is not the selected session. */
+export const designerActivity = createActivity(sharedPort(() => [activity.target()?.id, coordinatorActivity.target()?.id]));
 bindActivity(activity);
+bindModelNotice((message) => notify("error", message, true));
 bindSelection(() => ({ key: selectedKey(), subagent: subagentOpen() }));
+bindForkSession({
+  busy: (row) => sessionModels.changing() || (composer.view()?.key === draftKey({ computer: row.computer, key: "", name: row.name, archive_id: null, session_id: row.archiveId ? null : row.sessionId ?? null })
+    && (!!composer.view()?.sending || !!composer.view()?.waiting)),
+});
 
-/** Applies one batch from the bridge. */
+/** The selected child's own bounded, read-only inspection page. */
+export const subagentActivity = createRoot(() => {
+  const store = createSubagentActivity({
+    read: (target) => inspectSubagentActivity(
+      { computer: target.computer, name: target.name, run_id: target.runId, conversation_id: target.conversationId },
+      target.archiveId,
+      target.agentId,
+    ),
+    showing: () => page() === "sessions" && !pageHidden(),
+    online: (computer) => !computerOffline(computer),
+  });
+  createEffect(() => {
+    const row = selected(), agentId = subagentOpen();
+    // Without an identity the core refuses the read, so the child says it is unavailable.
+    const target = row && agentId ? {
+      id: row.key, computer: row.computer, name: row.name, runId: row.runId ?? "", conversationId: row.conversationId ?? "",
+      archiveId: row.archiveId ?? null, agentId,
+    } : undefined;
+    untrack(() => store.follow(target));
+  });
+  return store;
+});
+
+/** Applies one batch from the bridge: its rows and their grouping are one reactive update. */
 export function receive(b: Batch) {
-  applyBatch(b);
-  observeBatch(b);
-  if (b.activity.length) activity.applyActivity(b.activity);
+  batch(() => {
+    if (b.desktop_service) desktopService.apply(b.desktop_service);
+    applyBatch(b);
+    applyGrouping(b);
+    archive.applyGroups(b.groups ?? []);
+  });
+  observeMarks(b);
+  if (b.activity.length) { activity.applyActivity(b.activity); coordinatorActivity.applyActivity(b.activity); designerActivity.applyActivity(b.activity); }
+  if (b.teams?.length) teams.apply(b.teams);
+  if (b.tasks?.length) tasks.apply(b.tasks);
+  if (b.processes_view) processes.apply(b.processes_view);
+  if (b.composer) composer.receive(b.composer);
+  if (b.draft_keys) setDraftKeys(b.draft_keys);
+  for (const e of b.composer_events ?? []) composerEvent(e);
+}
+
+/** What Rust says after a call ended: Qt's showNotice, or the Terminal tab its receipt asks for. */
+function composerEvent(e: ComposerEvent) {
+  // An error stays until dismissed unless it is transient (showNotice, SessionsWindow.cpp:5210).
+  if (e.kind === "notice") notify(e.error ? "error" : "info", e.text, e.error && !e.transient);
+  // Held messages, the Terminal draft and a Send that did nothing (src-tauri composer/held.rs).
+  else if (e.kind === "said") notify(e.error ? "error" : "info", trText(e.text), e.sticky);
+  // Codex's hooks review and Update now continue in Terminal (1157-1178); showing the tab connects it.
+  else if (composer.view()?.key === e.key) { terminal.opened(); setDetailTab("terminal"); }
 }
 
 createRoot(() => {
+  // Another selection lets the row whose reply was just read leave the
+  // filtered list (Qt's selectSession and selectCreation clear m_readSelectionKey).
+  createEffect(on(selectedKey, () => { setReadSelectionKey(undefined); }, { defer: true }));
+  // The selected session's composer. A rename keeps the catalog key, so Rust
+  // moves its draft to the new name. An archived row opens its own editable
+  // draft too; only its recorded Activity stays read-only (Qt selectSession).
   createEffect(on(() => {
     const s = selected();
-    return s ? `${s.key}\n${s.name}` : undefined;
-  }, () => {
-    const s = selected();
-    activity.follow(s ? { id: s.key, computer: s.computer, key: s.catalogKey, name: s.name, runId: s.runId, conversationId: s.conversationId } : undefined);
+    return s ? JSON.stringify([s.computer, s.catalogKey, s.name, s.state === "archived" ? s.archiveId ?? "" : "", subagentOpen(), s.conversationId ?? "", s.sessionId ?? ""]) : undefined;
+  }, (identity) => {
+    const s = selected(), child = subagentOpen();
+    const opened = composer.open(identity && s ? {
+      computer: s.computer, key: s.catalogKey, name: s.name, archive_id: s.state === "archived" ? s.archiveId ?? null : null,
+      subagent: child ? { agent_id: child, parent_conversation_id: s.conversationId ?? "" } : undefined, session_id: s.sessionId ?? null,
+    } : undefined);
+    // The first new-run frame may be its only state. Rust must bind the
+    // composer's followed key before that frame can reach its observer.
+    // Display/routing moves immediately; only the original subscribe waits.
+    // A shell session records no activity: nothing to read (zerus-bz54l).
+    activity.follow(s && !activityReadOnly(s.key) && !shellSession(s) ? { id: s.key, computer: s.computer, key: s.catalogKey, name: s.name, runId: s.runId, conversationId: s.conversationId } : undefined, opened);
   }));
+  // The detail tab that shows: behind Terminal a failed read waits Qt's
+  // background interval (Settings > Processes), which Rust reads when told.
+  createEffect(on(() => [detailTab(), num("processes/backgroundSeconds"), num("processes/activeSeconds")] as const, ([tab]) => {
+    // The Team tab shows the coordinator's conversation (and, for the lead, its composer).
+    void composerTab(tab === "taskview" ? "native" : tab === "team" || tab === "newteam" ? "activity" : tab).catch(() => {});
+  }));
+});
+
+// Model settings reuse the selected session's existing Activity inspection and
+// bounded pending keys. There is no model-settings poller or catalog-wide scan.
+createRoot(() => {
+  createEffect(() => {
+    const row = selected(), v = composer.view();
+    const followed = row ? followedFor(row.key) : undefined;
+    const context = row && !subagentOpen() ? { row, details: followed?.value, online: !computerOffline(row.computer),
+      busy: updating(row.computer, row.name) || !!v?.sending || !!v?.waiting,
+      answering: !!v?.question?.answering, inspectError: !!activity.error() || !!v?.inspect_error } : undefined;
+    untrack(() => sessionModels.setContext(context));
+  });
+  createEffect(() => {
+    sessionModels.view();
+    const rows = sessionModels.queuedKeys().map((key) => {
+      const row = catalog.rows[key];
+      return { key, row, online: !!row && !computerOffline(row.computer), busy: !!row && updating(row.computer, row.name) };
+    });
+    untrack(() => sessionModels.observe(rows));
+  });
+});
+
+// The Processes tab follows the selected session while Settings > Processes
+// is on (Qt polls nothing while it is off); output reads and the busy
+/** The session the Processes tab follows, as last sent to the hub; null while it follows none. */
+const [processesTarget, setProcessesTarget] = createSignal<ProcessTarget | null>(null);
+export { processesTarget };
+// indicator run only while the tab shows in a shown window.
+const [windowHidden, setWindowHidden] = createSignal(windowVisibility.hidden());
+windowVisibility.onChange(() => setWindowHidden(windowVisibility.hidden()));
+createRoot(() => {
+  const enabled = () => flag("processes/enabled");
+  trackFollow({
+    enabled, selected,
+    facts: (s) => {
+      const host = followedFor(s.key).value?.host_generation;
+      return {
+        online: computerFresh(s.computer),
+        generation: typeof host === "string" && host ? host : null,
+        inspectFailed: activity.target()?.id === s.key && !!activity.error(),
+      };
+    },
+    follow: (target) => { setProcessesTarget(target); processesFollow(target); },
+  });
+  trackShown({ enabled, selected: () => !!selected(), page, tab: detailTab, hidden: windowHidden, shown: processesShown });
 });
 
 // `?select=<session name>` opens that session once it is listed (screenshots, scripted measurements).
@@ -48,3 +213,6 @@ onReplaced((from, to) => {
   if (compactRows[from]) setCompactRows(to, true);
   if (selectedKey() === from) setSelectedKey(to);
 });
+
+// The Overview, Projects, Machines and Accounts reads run while their page shows.
+startScreens(page, documentVisibility);

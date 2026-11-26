@@ -45,7 +45,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 fn config_file(directory: &Path, provider: &str) -> Result<PathBuf> {
     Ok(directory.join(match provider {
-        "claude" => "settings.json",
+        "claude" | "qwen" => "settings.json",
         "codex" => "hooks.json",
         "kimi" => "config.toml",
         _ => return Err("This provider uses a native API, not tracking hook configuration".into()),
@@ -102,7 +102,7 @@ fn snapshot(directory: &Path, provider: &str, program: &str) -> Result<Snapshot>
     let known = hooks::health_version(&path, program);
     let bytes = read_bounded(&path, CONFIG_MAX)?;
     let mut report = match std::str::from_utf8(bytes.as_deref().unwrap_or_default()) {
-        Ok(text) => hooks::health_document(text, provider, known),
+        Ok(text) => hooks::health_document(text, &path, provider, known),
         Err(_) => Err("Invalid hook configuration".into()),
     }
     .unwrap_or_else(|_| json!({"state":"invalid","compatibility":{"state":"unknown"}}));
@@ -233,7 +233,7 @@ fn request_id(input: &Value) -> Result<&str> {
     }
     Ok(id)
 }
-fn session_report(name: &str, input: &Value) -> Result<Value> {
+pub(super) fn session_report(name: &str, input: &Value) -> Result<Value> {
     exact_keys(
         input,
         &["request_id", "expected_run_id", "expected_conversation_id"],
@@ -241,6 +241,9 @@ fn session_report(name: &str, input: &Value) -> Result<Value> {
     let id = request_id(input)?;
     bounded(input, "expected_run_id", 128, false)?;
     bounded(input, "expected_conversation_id", 256, false)?;
+    // zerus-ucck P3c: not resolved at dispatch; the request's identities
+    // select among sessions that share the label.
+    select_by(name, string(input, "expected_run_id"), string(input, "expected_conversation_id"))?;
     // Read a single immutable-target record; never use inspection/reconciliation
     // helpers that can contact a provider or scan native history.
     let path = if opencode::exists(name) {
@@ -257,6 +260,8 @@ fn session_report(name: &str, input: &Value) -> Result<Value> {
     let bytes = read_bounded(&path, CONFIG_MAX)?.ok_or("No saved hook health binding")?;
     let record: Value =
         serde_json::from_slice(&bytes).map_err(|_| "Invalid hook health binding")?;
+    // A `--session-id` selection must still be this record's (#1355 review).
+    session_id::verify(&record)?;
     if record["name"] != name
         || record["run_id"] != input["expected_run_id"]
         || record["conversation_id"] != input["expected_conversation_id"]
@@ -296,6 +301,11 @@ fn session_report(name: &str, input: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or("");
     let mut value = report(provider, &account, &directory, program, Some(&record));
+    // hooks-health-v1 keeps its configuration keys: phone connectors reject
+    // any other. The account report alone carries this flag (zerus-b64dl).
+    if let Some(configuration) = value["configuration"].as_object_mut() {
+        configuration.remove("unrecognised_tracking");
+    }
     value["request_id"] = json!(id);
     value["name"] = json!(name);
     value["run_id"] = record["run_id"].clone();
@@ -395,6 +405,12 @@ fn repair(config: &Config, account: &str, input: &Value) -> Result<Value> {
         }
         atomic(&path, content)?;
     }
+    // Still under the settings lock: record the program hgs wrote or kept.
+    hooks::record_written(
+        &current.path,
+        &provider,
+        merged.as_deref().unwrap_or(original),
+    );
     let mut result = report(&provider, account, &directory, &provider, None);
     result["request_id"] = json!(id);
     result["status"] = json!(if merged.is_some() {

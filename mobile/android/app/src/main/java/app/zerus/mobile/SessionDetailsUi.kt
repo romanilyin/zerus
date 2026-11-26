@@ -2,6 +2,7 @@ package app.zerus.mobile
 
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.QuestionAnswer
 
 import android.widget.Toast
 import androidx.compose.foundation.clickable
@@ -45,7 +46,8 @@ import org.json.JSONObject
 @Composable internal fun SessionHeaderTitle(model: ZerusViewModel,session: Session,onDetails: () -> Unit) {
     val target = session.target
     val status = if (model.activity == null && !model.demo) "Checking…" else SelectedSessionPresentation.status(session,model.activity)
-    val freshness = if (model.demo) " / Preview" else if (model.activityVerified || model.activity == null) "" else " / Last known"
+    // Freshness is the conversation status strip's (zerus-a4mub.10); the header keeps the session state.
+    val freshness = if (model.demo) " / Preview" else ""
     val kind = if (model.activity == null && !model.demo) DesktopBadgeKind.Neutral
         else DesktopSessionPalette.badge(SelectedSessionPresentation.session(session,model.activity),true).kind
     val colors = DesktopSessionPalette.colors(kind,MaterialTheme.colorScheme.background.luminance() < .5f)
@@ -150,6 +152,18 @@ import org.json.JSONObject
                     leadingIcon = { Icon(if(notificationPreference?.muted == true) Icons.Default.NotificationsActive else Icons.Default.NotificationsOff,null) },
                     enabled = notificationReason.isBlank(),
                     onClick = { menu = false;request = SessionNotificationPreferences.operation })
+                // The person's per-child question route switch (zerus-sa9qn.33).
+                val routingRaw = model.activity ?: session.raw
+                if(SessionQuestionRouting.applies(target,routingRaw)) {
+                    val routingReason = model.actionReason(target,SessionQuestionRouting.operation)
+                    DropdownMenuItem(text = { Column {
+                        Text(SessionQuestionRouting.label(routingRaw))
+                        if(routingReason.isNotBlank()) Text(routingReason,style=MaterialTheme.typography.bodySmall)
+                    } },
+                        leadingIcon = { Icon(Icons.Default.QuestionAnswer,null) },
+                        enabled = routingReason.isBlank(),
+                        onClick = { menu = false;request = SessionQuestionRouting.operation })
+                }
                 readEvidence?.let { evidence ->
                     val emptyReminder = model.reviewLater(target) && !evidence.authoritative && evidence.loadedIds.isEmpty()
                     DropdownMenuItem(text = { Text(if(emptyReminder) "Clear review reminder" else if(evidence.authoritative) "Mark read on this phone" else "Mark loaded replies read") },
@@ -218,6 +232,7 @@ import org.json.JSONObject
     val target = session.target
     val raw = model.activity
     val verified = model.activityVerified
+    val currentAgents = SessionFilters.currentActivity(session, SessionFilters.online(session, model.machines))
     // Polls replace the activity record; keep showing this target's previous view
     // while the next one is parsed so the sheet never collapses to a placeholder.
     var parsed by remember(target.key) { mutableStateOf<SessionDetailsView?>(null) }
@@ -269,9 +284,9 @@ import org.json.JSONObject
                         if (details.agents.isEmpty()) Text("No subagent activity reported.")
                         details.agents.forEach { agent ->
                             Text(agent.label, fontWeight = FontWeight.SemiBold)
-                            Text(SessionDetailsPresentation.agentStatus(agent.state) + if (agent.recorded) " / Last recorded" else "",
+                            Text(SessionDetailsPresentation.agentStatus(agent.state, agent.recorded || !currentAgents),
                                 style = MaterialTheme.typography.labelMedium)
-                            if (agent.group && agent.active != null && agent.total != null) Text("${agent.active} active / ${agent.total} total", style = MaterialTheme.typography.bodySmall)
+                            if (agent.group && agent.active != null && agent.total != null) Text("${SessionDetailsPresentation.agentActive(agent, currentAgents)} active / ${agent.total} total", style = MaterialTheme.typography.bodySmall)
                             SelectionContainer { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 if (agent.task.isNotBlank()) Text(agent.task)
                                 if (agent.preview.isNotBlank()) Text(agent.preview, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -387,10 +402,17 @@ import org.json.JSONObject
     LaunchedEffect(model.activity,model.activityVerified,target,operation) {
         if(notificationPreference == null && model.activityVerified) notificationPreference = SessionNotificationPreferences.parse(model.activity,target)
     }
-    val label = if(operation == SessionNotificationPreferences.operation) SessionNotificationPreferences.label(notificationPreference) else actionLabel(operation,target)
+    var questionRouting by remember(target,operation) { mutableStateOf<QuestionRouting?>(null) }
+    var routingRaw by remember(target,operation) { mutableStateOf<JSONObject?>(null) }
+    LaunchedEffect(model.activity,model.activityVerified,target,operation) {
+        if(questionRouting == null && model.activityVerified) { questionRouting = SessionQuestionRouting.parse(model.activity);routingRaw = model.activity }
+    }
+    val label = if(operation == SessionNotificationPreferences.operation) SessionNotificationPreferences.label(notificationPreference)
+        else if(operation == SessionQuestionRouting.operation) SessionQuestionRouting.label(routingRaw ?: session.raw) else actionLabel(operation,target)
     val computer = remember(target) { model.machines.find { it.connectionId == target.connectionId && it.id == target.computerId }?.name ?: "selected machine" }
     val args = when(operation) {
         SessionNotificationPreferences.operation -> JSONObject().put("muted",notificationPreference?.muted != true).put("expected_revision",notificationPreference?.revision ?: -1)
+        SessionQuestionRouting.operation -> SessionQuestionRouting.toggle(questionRouting)
         "rename" -> JSONObject().put("new_name",target.session.split('/').take(2).joinToString("/") + "/" + tag)
         "fork" -> JSONObject().put("tag",tag)
         else -> JSONObject()
@@ -398,11 +420,12 @@ import org.json.JSONObject
     val reason = model.actionReason(target,operation).ifBlank { SessionControlPresentation.reason(target,operation,model.activity) }.ifBlank {
         runCatching { SessionActionPolicies.arguments(operation,args); SessionActionPolicies.inspectReason(target,operation,args,model.activity ?: JSONObject()) }.getOrElse { it.message ?: "Enter a valid name." }
     }
-    ZerusAlertDialog(onDismissRequest = onDismiss, title = { Text(if(operation == SessionNotificationPreferences.operation) label + " / " + session.title else label + " " + session.title + "?") },
+    ZerusAlertDialog(onDismissRequest = onDismiss, title = { Text(if(operation == SessionNotificationPreferences.operation || operation == SessionQuestionRouting.operation) label + " / " + session.title else label + " " + session.title + "?") },
         text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("${target.session} on $computer")
             when(operation) {
                 SessionNotificationPreferences.operation -> Text("Applies to this conversation on all devices. Unread replies and pending requests stay unchanged. Unmuting does not replay earlier notifications.")
+                SessionQuestionRouting.operation -> Text("Applies to this child session on all devices. A blocking question is sent once to its parent session, which can answer it or ask you. Turning this off never cancels or resends a question already sent.")
                 "pause" -> Text("Pause keeps the exact native conversation for Resume. Open network connections, child processes and unsent terminal input are not kept.")
                 "resume" -> Text("Start the agent again with its saved native conversation.")
                 "archive" -> Text("Move this saved session to Archive. Your private drafts stay on this phone.")
@@ -413,7 +436,7 @@ import org.json.JSONObject
                 "rename" -> OutlinedTextField(tag,{ tag = it },label = { Text("Session tag") },singleLine = true)
                 "fork" -> { Text("Create a separate native conversation. Your current draft is kept without sending."); OutlinedTextField(tag,{ tag = it },label = { Text("New session tag") },singleLine = true) }
             }
-            if(reason.isNotBlank()) Text(reason, style = MaterialTheme.typography.bodySmall)
+            if(reason.isNotBlank()) Text(localizedSessionNameError(reason), style = MaterialTheme.typography.bodySmall)
         } },
         confirmButton = { TextButton(onClick = { model.flushDrafts(); model.sessionAction(target,operation,args); onDismiss() }, enabled = reason.isBlank()) { Text(label) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })

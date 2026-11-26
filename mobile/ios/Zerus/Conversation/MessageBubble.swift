@@ -68,6 +68,8 @@ struct MessageBubble: View {
     let onReviewOutgoing: (OutgoingMessage) -> Void
 
     private var own: Bool { QuestionReplyPresentation.isOwnRole(event.role) }
+    /// A fork's inherited row is its source's history: dimmed, and never acting on this session.
+    private var inherited: Bool { !(event.inheritedFrom ?? "").isEmpty }
 
     var body: some View {
         if event.role == ActivityNotices.role {
@@ -104,8 +106,9 @@ struct MessageBubble: View {
             .frame(maxWidth: own ? nil : .infinity, alignment: .leading)
             .background(own ? Color(hex: 0x203733) : Theme.surface, in: RoundedRectangle(cornerRadius: 17))
             .accessibilityElement(children: .contain)
-            .accessibilityLabel(own ? "You" : (agent.isEmpty ? "Agent" : agent))
+            .accessibilityLabel((inherited ? "Inherited, " : "") + (own ? "You" : (agent.isEmpty ? "Agent" : agent)))
         }
+        .opacity(inherited ? 0.72 : 1)
     }
 
     @ViewBuilder
@@ -127,7 +130,7 @@ struct MessageBubble: View {
             if event.role == "You (answer)" {
                 Text("You (answer)").font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
             }
-            if own {
+            if own || event.source == QuestionRouteActivity.source {
                 Text(verbatim: event.text).textSelection(.enabled)
             } else {
                 MarkdownContent(source: event.text)
@@ -138,7 +141,12 @@ struct MessageBubble: View {
     private var attachments: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(event.attachments.enumerated()), id: \.offset) { _, file in
-                AttachmentRow(target: target, file: file)
+                // An inherited file belongs to the source session: named, never opened here.
+                if inherited {
+                    Text("Attachment: \(file.name)").font(.caption2).foregroundStyle(Theme.muted)
+                } else {
+                    AttachmentRow(target: target, file: file)
+                }
             }
         }
     }
@@ -166,12 +174,20 @@ struct MessageBubble: View {
     private func recovery(_ message: OutgoingMessage) -> some View {
         let flight = app.conversation.receiptFlights.contains("outgoing:\(message.requestId)")
         return VStack(alignment: .leading, spacing: 4) {
-            if !message.error.isEmpty { Text(message.error).font(.footnote).foregroundStyle(Theme.amber) }
+            if !message.error.isEmpty && !message.deliveryDismissed { Text(message.error).font(.footnote).foregroundStyle(Theme.amber) }
+            if message.status == "uncertain" {
+                Text(message.deliveryDismissed ? OutgoingRecoveryPolicies.dismissedExplanation : OutgoingRecoveryPolicies.explanation)
+                    .font(.caption).foregroundStyle(Theme.muted)
+            }
             HStack {
                 if message.status == "uncertain" {
                     Button("Check delivery") { Task { await app.conversation.checkOutgoing(message) } }.disabled(flight)
                 }
                 Button("Review") { onReviewOutgoing(message) }.disabled(flight)
+                if message.status == "uncertain" && !message.deliveryDismissed {
+                    Button("Dismiss warning") { Task { await app.conversation.dismissOutgoing(message) } }
+                        .accessibilityHint(OutgoingRecoveryPolicies.explanation)
+                }
             }
             .buttonStyle(.borderless)
             .font(.footnote.weight(.semibold))

@@ -1,13 +1,42 @@
 //! Runs one [`Invocation`] and reports how it ended as an [`Exit`].
+#[cfg(any(windows, test))]
+mod hidden;
+#[cfg(all(test, unix))]
+mod input_tests;
+mod stdin;
+// Internal cross-crate bridge for the root desktop original_child runner only.
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod original_input;
+use stdin::InputOwner;
+pub use stdin::InputSpawn;
+#[cfg(unix)]
+pub mod rendezvous;
+pub(crate) mod startup;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod worktree_custody;
+#[cfg(windows)]
+pub use hidden::{HiddenError, ProcessIdentity};
+
 use crate::actions::{Exit, Invocation};
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod custody;
+// Original helper I/O custody; it supplies no native-operation authority.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod joined;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod writer_custody;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use joined::{run_owned_joined_observed, GuardedChild, JoinedSpawn};
 
 /// A noisy child keeps no more than this much of its standard error.
 const STDERR_CAP: usize = 64 * 1024;
@@ -23,7 +52,7 @@ pub fn run(hgs: &Path, inv: &Invocation) -> Exit {
 }
 
 /// [`run`] with extra environment variables for the child. The agent's
-/// attribution (`HGS_SESSION`, `HGS_RUN_ID`) is never passed on: the client
+/// attribution (`HGS_SESSION`, `HGS_SESSION_ID`, `HGS_RUN_ID`) is never passed on: the client
 /// acts for the person even when it was started from an agent's shell.
 ///
 /// A failed stdin write is a failure to deliver only while the child keeps
@@ -56,48 +85,951 @@ pub fn run_limited(
     parent_env: &[(&str, &str)],
     stdout_cap: usize,
 ) -> Result<Exit, TooLarge> {
+    limited(hgs, inv, parent_env, stdout_cap, Pipes::default())
+}
+
+/// Console-free Windows helper with bounded termination cleanup. A pending
+/// original child remains retained and prevents another helper in this process;
+/// an error never proves physical exit or authorizes replay. Only the supplied
+/// environment is passed to this fixed helper; the parent's profile is omitted.
+#[cfg(windows)]
+pub fn run_hidden_limited(
+    program: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+) -> Result<Exit, HiddenError> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    let stop = hidden::State::admit()?;
+    let result = limited(
+        program,
+        inv,
+        parent_env,
+        stdout_cap,
+        Pipes {
+            spawn: Some(Box::new(|command, input| {
+                command.creation_flags(CREATE_NO_WINDOW);
+                input.spawn(command)
+            })),
+            hidden_stop: Some(stop.clone()),
+            clear_environment: true,
+            ..Pipes::default()
+        },
+    );
+    stop.finish(result)
+}
+
+fn limited(
+    program: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+    pipes: Pipes,
+) -> Result<Exit, TooLarge> {
+    match run_inner(program, inv, parent_env, &[], stdout_cap, None, pipes) {
+        Ok(exit) => Ok(exit),
+        Err(Stopped::TooLarge(too_large)) => Err(too_large),
+        // Nothing sets a flag when there is none.
+        Err(Stopped::Cancelled) => Ok(Exit::Abnormal {
+            stderr: "cancelled".into(),
+        }),
+    }
+}
+
+/// Why a [`run_cancellable`] call gave no exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stopped {
+    TooLarge(TooLarge),
+    /// The cancel flag was set: the child was killed and waited for.
+    Cancelled,
+}
+
+/// [`run_limited`] that ends the child, within one poll (20 ms), once
+/// `cancel` is set, and reports [`Stopped::Cancelled`].
+pub fn run_cancellable(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+) -> Result<Exit, Stopped> {
+    run_inner(
+        hgs,
+        inv,
+        parent_env,
+        &[],
+        stdout_cap,
+        Some(cancel),
+        Pipes::default(),
+    )
+}
+
+/// Opt-in lifetime accounting around the existing cancellable runner. Exit,
+/// input-error, output and deadline semantics remain those of run_cancellable;
+/// completion of this call does not claim real pipe completion. Copies of the
+/// supplied charge live with the child, input writer and both output readers.
+/// A retained pipe keeps its copy after this bounded call returns. Unverified
+/// child exit pins a copy until host exit; the host must cap admissions.
+/// No journal, execution authorization or effect retry is provided here.
+/// [`run_accounted`] with the child as the leader of a private process group
+/// this call creates (`helper_group::prepare`), used only for the desktop's
+/// three fixed adoption invocations (adoption-preview, adopt, adoption-status).
+///
+/// The leader's exit is observed with waitid(WNOWAIT), so its unreaped PID pins
+/// the group. Only then, or when the call must stop (timeout or cancel), is
+/// that exact group signalled (killpg SIGKILL) and the leader reaped; nothing
+/// is signalled after reaping. A shared group, a process scan or a name/path
+/// match is never an authority to signal, and setsid-detached children stay
+/// outside. The original adoption ssh and its in-group descendants are thus
+/// stopped and reaped even when something else SIGKILLed the CLI, before the
+/// resources settle: the leader must be reaped and both pipes reach EOF.
+/// Windows keeps its per-child kill-on-close jobs; `prepare` is a no-op there.
+/// This never retries or replays a call.
+pub fn run_accounted_group(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+    resources: Arc<dyn Send + Sync>,
+) -> Result<Exit, Stopped> {
+    accounted(
+        hgs,
+        inv,
+        parent_env,
+        stdout_cap,
+        cancel,
+        resources,
+        Pipes {
+            group: true,
+            ..Pipes::default()
+        },
+    )
+}
+
+pub fn run_accounted(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+    resources: Arc<dyn Send + Sync>,
+) -> Result<Exit, Stopped> {
+    accounted(
+        hgs,
+        inv,
+        parent_env,
+        stdout_cap,
+        cancel,
+        resources,
+        Pipes::default(),
+    )
+}
+
+/// Routing data only. This neither selects a program nor authorizes a call.
+/// Preserve non-Unicode values and the original working directory; never log it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FrozenEnvironment {
+    values: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    directory: std::path::PathBuf,
+}
+impl FrozenEnvironment {
+    pub fn capture() -> std::io::Result<Self> {
+        let mut values = Vec::new();
+        let mut bytes = 0usize;
+        for (key, value) in std::env::vars_os() {
+            let size = key
+                .as_encoded_bytes()
+                .len()
+                .saturating_add(value.as_encoded_bytes().len());
+            bytes = bytes.saturating_add(size);
+            if values.len() == 1024 || size > 65536 || bytes > 1 << 20 {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            values.push((key, value));
+        }
+        let mut values = crate::child_environment::restored(values);
+        values.retain(|(key, _)| key != "HGS_SESSION" && key != "HGS_RUN_ID");
+        values.sort();
+        Ok(Self {
+            values,
+            directory: std::env::current_dir()?,
+        })
+    }
+    pub fn current(&self) -> bool {
+        Self::capture().is_ok_and(|now| &now == self)
+    }
+    pub fn apply(&self, command: &mut Command) {
+        command
+            .env_clear()
+            .envs(self.values.iter().cloned())
+            .current_dir(&self.directory)
+            .env_remove("HGS_SESSION")
+            .env_remove("HGS_RUN_ID");
+    }
+}
+
+/// The existing accounted runner with fixed routing environment and the
+/// caller's original-image spawn hook. Timeouts are unchanged (no 30s cap).
+/// Resources remain charged through actual child and pipe lifetime, including
+/// a bounded error return. Neither this API nor its environment grants consent.
+pub fn run_accounted_frozen(
+    hgs: &Path,
+    inv: &Invocation,
+    environment: &FrozenEnvironment,
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+    resources: Arc<dyn Send + Sync>,
+    spawn: impl FnOnce(&mut Command, InputSpawn) -> std::io::Result<Child> + Send + 'static,
+) -> Result<Exit, Stopped> {
+    run_accounted_frozen_with_completion(
+        hgs,
+        inv,
+        environment,
+        stdout_cap,
+        cancel,
+        (resources, None),
+        spawn,
+    )
+}
+
+pub fn run_accounted_frozen_with_completion(
+    hgs: &Path,
+    inv: &Invocation,
+    environment: &FrozenEnvironment,
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+    custody: (Arc<dyn Send + Sync>, Option<Arc<Completion>>),
+    spawn: impl FnOnce(&mut Command, InputSpawn) -> std::io::Result<Child> + Send + 'static,
+) -> Result<Exit, Stopped> {
+    let (resources, completion) = custody;
+    let environment = environment.clone();
+    accounted(
+        hgs,
+        inv,
+        &[],
+        stdout_cap,
+        cancel,
+        resources,
+        Pipes {
+            clear_environment: true,
+            completion,
+            spawn: Some(Box::new(move |command, input| {
+                environment.apply(command);
+                spawn(command, input)
+            })),
+            ..Pipes::default()
+        },
+    )
+}
+fn accounted(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    stdout_cap: usize,
+    cancel: &AtomicBool,
+    resources: Arc<dyn Send + Sync>,
+    mut pipes: Pipes,
+) -> Result<Exit, Stopped> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(Stopped::Cancelled);
+    }
+    let child_exited = pipes
+        .completion
+        .as_ref()
+        .map(|completion| completion.child())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let _child = ChildCharge {
+        resources: Some(resources.clone()),
+        exited: child_exited.clone(),
+    };
+    let result = run_inner(hgs, inv, parent_env, &[], stdout_cap, Some(cancel), {
+        pipes.readers = Some(resources);
+        pipes.retain_all = true;
+        pipes.child_exited = Some(child_exited.clone());
+        pipes
+    });
+    if matches!(result, Ok(Exit::StartFailed(_))) {
+        child_exited.store(true, Ordering::Release);
+    }
+    result
+}
+
+/// [`run_limited`] of another program (a connector) that also leaves out
+/// the variables in `remove`, such as the terminal's, even when
+/// `parent_env` sets them.
+pub fn run_without(
+    program: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    remove: &[&str],
+    stdout_cap: usize,
+) -> Result<Exit, TooLarge> {
+    match run_inner(
+        program,
+        inv,
+        parent_env,
+        remove,
+        stdout_cap,
+        None,
+        Pipes::default(),
+    ) {
+        Ok(exit) => Ok(exit),
+        Err(Stopped::TooLarge(too_large)) => Err(too_large),
+        Err(Stopped::Cancelled) => Ok(Exit::Abnormal {
+            stderr: "cancelled".into(),
+        }),
+    }
+}
+
+type StreamInput = Box<dyn FnOnce(ChildStdin) -> bool + Send>;
+type StreamOutput = Box<dyn FnOnce(ChildStdout) -> bool + Send>;
+type Spawn = fn(&mut Command) -> std::io::Result<Child>;
+type GuardedSpawn = Box<dyn FnOnce(&mut Command, InputSpawn) -> std::io::Result<Child> + Send>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retirement {
+    Retired,
+    Pending,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoState {
+    Running,
+    Closed,
+    Eof,
+    Failed,
+}
+
+struct IoWorker {
+    handle: thread::JoinHandle<()>,
+    status: Arc<Mutex<IoState>>,
+}
+
+#[derive(Default)]
+pub struct Completion {
+    workers: Mutex<Vec<IoWorker>>,
+    children: Mutex<Vec<Arc<AtomicBool>>>,
+    outcome: Mutex<Option<Retirement>>,
+}
+
+impl Completion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn child(&self) -> Arc<AtomicBool> {
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        if children.len() >= 2 {
+            *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(Retirement::Failed);
+        }
+        let child = Arc::new(AtomicBool::new(false));
+        children.push(child.clone());
+        child
+    }
+
+    pub fn track(&self, child: Arc<AtomicBool>) {
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        if !children.iter().any(|current| Arc::ptr_eq(current, &child)) {
+            if children.len() >= 2 {
+                *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Retirement::Failed);
+            }
+            children.push(child);
+        }
+    }
+
+    fn register(&self, handle: thread::JoinHandle<()>, status: Arc<Mutex<IoState>>) {
+        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        if workers.len() >= 6 {
+            *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(Retirement::Failed);
+            return;
+        }
+        workers.push(IoWorker { handle, status });
+    }
+
+    fn finish(&self, result: Retirement) -> Retirement {
+        let mut outcome = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
+        if outcome.is_none() {
+            *outcome = Some(result);
+        }
+        outcome.expect("terminal completion recorded")
+    }
+
+    pub fn join(&self) -> Retirement {
+        if let Some(result) = *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) {
+            return result;
+        }
+        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        if workers.iter().any(|worker| !worker.handle.is_finished()) {
+            return Retirement::Pending;
+        }
+        for worker in workers.drain(..) {
+            if worker.handle.join().is_err() {
+                return self.finish(Retirement::Failed);
+            }
+            let status = *worker.status.lock().unwrap_or_else(PoisonError::into_inner);
+            match status {
+                IoState::Closed | IoState::Eof => {}
+                IoState::Failed => return self.finish(Retirement::Failed),
+                IoState::Running => return self.finish(Retirement::Failed),
+            }
+        }
+        drop(workers);
+        let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        if children.is_empty() || children.iter().any(|child| !child.load(Ordering::Acquire)) {
+            return self.finish(Retirement::Failed);
+        }
+        drop(children);
+        self.finish(Retirement::Retired)
+    }
+}
+
+#[derive(Default)]
+struct Pipes {
+    input: Option<StreamInput>,
+    output: Option<StreamOutput>,
+    spawn: Option<GuardedSpawn>,
+    readers: Option<Arc<dyn Send + Sync>>,
+    stop: Option<Arc<AtomicBool>>,
+    require_complete: bool,
+    retain_all: bool,
+    stderr_cap: Option<usize>,
+    child_exited: Option<Arc<AtomicBool>>,
+    clear_environment: bool,
+    completion: Option<Arc<Completion>>,
+    /// The child leads a private group this call created ([`run_accounted_group`]).
+    group: bool,
+    #[cfg(any(windows, test))]
+    hidden_stop: Option<Arc<hidden::State>>,
+    /// Runs in the writer thread right after it signals completion.
+    #[cfg(test)]
+    after_written: Option<Box<dyn FnOnce() + Send>>,
+}
+
+struct StopContext {
+    exited: Option<Arc<AtomicBool>>,
+    group: bool,
+    #[cfg(any(windows, test))]
+    hidden: Option<Arc<hidden::State>>,
+}
+
+pub(crate) struct ChildCharge {
+    resources: Option<Arc<dyn Send + Sync>>,
+    exited: Arc<AtomicBool>,
+}
+impl ChildCharge {
+    pub(crate) fn new(resources: Arc<dyn Send + Sync>) -> Self {
+        Self {
+            resources: Some(resources),
+            exited: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub(crate) fn confirmed(&self) {
+        self.exited.store(true, Ordering::Release);
+    }
+
+    fn unverified(&mut self) -> Option<Arc<dyn Send + Sync>> {
+        if self.exited.load(Ordering::Acquire) {
+            None
+        } else {
+            self.resources.take()
+        }
+    }
+}
+impl Drop for ChildCharge {
+    fn drop(&mut self) {
+        if let Some(resources) = self.unverified() {
+            // kill/wait errors do not prove child exit. Keep this admission
+            // pinned rather than reporting a false last-resource completion.
+            // The host must bound admissions and recover from verified durable
+            // process/boot identities before allowing another operation.
+            std::mem::forget(resources);
+        }
+    }
+}
+
+/// Body-free failures of an owned exchange. The caller retains its original
+/// operation identity; none of these errors authorizes delivery or a retry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OwnedError {
+    InvalidInput,
+    Cancelled,
+    TimedOut,
+    StartFailed,
+    WriteFailed,
+    ChildFailed,
+    OutputTooLarge,
+    Incomplete,
+    ExitUnverified,
+}
+
+/// One bounded exchange through the existing runner, with actual lifetime
+/// accounting for the owned child, input writer and both output readers.
+/// This supplies no authorization, executable selection or operation policy.
+/// The host must reserve first and fence the supplied spawn hook itself.
+///
+/// Input/stdout are capped at 1 MiB, stderr at 16 KiB and the child deadline
+/// at 30 seconds. Success requires exit zero, successful complete input and
+/// real EOF on both pipes. A bounded stop/incomplete exchange may return while
+/// a descendant retains a pipe; the shared resources guard then stays alive.
+/// Only the owned child is stopped. No descendant or process group is killed.
+/// An unverified wait failure conservatively pins one guard until this host
+/// exits. The caller must cap admissions and supply durable recovery/remediation.
+pub fn run_owned(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    cancel: &AtomicBool,
+    spawn: impl FnOnce(&mut Command, InputSpawn) -> std::io::Result<Child> + Send + 'static,
+    resources: Arc<dyn Send + Sync>,
+) -> Result<Vec<u8>, OwnedError> {
+    run_owned_observed(hgs, inv, parent_env, cancel, spawn, resources, |_, _| {})
+}
+
+/// The same owned exchange, with a failure-only diagnostic observer. Standard
+/// error is bounded to 16 KiB and remains untrusted: callers must select fixed
+/// codes rather than persist child text. Observation changes no result, custody
+/// or permission and never makes an uncertain exchange safe to replay.
+pub fn run_owned_observed(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    cancel: &AtomicBool,
+    spawn: impl FnOnce(&mut Command, InputSpawn) -> std::io::Result<Child> + Send + 'static,
+    resources: Arc<dyn Send + Sync>,
+    observe: impl FnOnce(&OwnedError, Option<&str>),
+) -> Result<Vec<u8>, OwnedError> {
+    if cancel.load(Ordering::Acquire) {
+        observe(&OwnedError::Cancelled, None);
+        return Err(OwnedError::Cancelled);
+    }
+    if inv.stdin.as_ref().is_none_or(|bytes| bytes.len() > 1 << 20)
+        || inv.timeout.is_zero()
+        || inv.timeout > Duration::from_secs(30)
+    {
+        observe(&OwnedError::InvalidInput, None);
+        return Err(OwnedError::InvalidInput);
+    }
+    let child_exited = Arc::new(AtomicBool::new(false));
+    // Each pipe also owns a copy, even after the bounded runner returns.
+    let _child = ChildCharge {
+        resources: Some(resources.clone()),
+        exited: child_exited.clone(),
+    };
+    let until = Instant::now() + inv.timeout;
+    let exit = run_inner(
+        hgs,
+        inv,
+        parent_env,
+        &[],
+        1 << 20,
+        Some(cancel),
+        Pipes {
+            spawn: Some(Box::new(spawn)),
+            readers: Some(resources),
+            require_complete: true,
+            stderr_cap: Some(16 << 10),
+            child_exited: Some(child_exited.clone()),
+            ..Pipes::default()
+        },
+    );
+    if matches!(exit, Ok(Exit::StartFailed(_))) {
+        // The guarded spawn hook returned no owned child.
+        child_exited.store(true, Ordering::Release);
+    }
+    if !child_exited.load(Ordering::Acquire) {
+        observe(&OwnedError::ExitUnverified, None);
+        return Err(OwnedError::ExitUnverified);
+    }
+    // A cancellation/deadline racing completion cannot grant success.
+    if cancel.load(Ordering::Acquire) {
+        observe(&OwnedError::Cancelled, None);
+        return Err(OwnedError::Cancelled);
+    }
+    if Instant::now() >= until {
+        observe(&OwnedError::TimedOut, None);
+        return Err(OwnedError::TimedOut);
+    }
+    match exit {
+        Ok(Exit::Code {
+            code: 0, stdout, ..
+        }) => Ok(stdout),
+        other => {
+            let (error, stderr) = match other {
+                Ok(Exit::Code { stderr, .. }) => (OwnedError::ChildFailed, Some(stderr)),
+                Ok(Exit::TimedOut) => (OwnedError::TimedOut, None),
+                Ok(Exit::StartFailed(_)) => (OwnedError::StartFailed, None),
+                Ok(Exit::WriteFailed) => (OwnedError::WriteFailed, None),
+                Ok(Exit::Abnormal { stderr }) => (OwnedError::Incomplete, Some(stderr)),
+                Err(Stopped::Cancelled) => (OwnedError::Cancelled, None),
+                Err(Stopped::TooLarge(_)) => (OwnedError::OutputTooLarge, None),
+            };
+            observe(&error, stderr.as_deref());
+            Err(error)
+        }
+    }
+}
+
+// Also cancels a decoder that is still blocked in an OS read when the runner
+// returns. Its reader guard remains held until that read actually ends.
+struct CancelOutput(Option<Arc<AtomicBool>>);
+impl Drop for CancelOutput {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A streamed decoder never grants completion on a partial/failed child.
+/// Process and pipe errors are static categories, without child output.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DecodeError<E> {
+    Decode(E),
+    Cancelled,
+    TimedOut,
+    StartFailed,
+    ChildFailed,
+    TooLarge,
+    Incomplete,
+}
+
+/// Decode stdout on the existing runner's reader thread instead of collecting
+/// it. The callback must bound input, memory and sink work, require real EOF,
+/// and poll its stop flag/deadline. Its output/pages remain provisional until
+/// this function succeeds: both pipes must end and the owned child must exit 0.
+/// Stderr is capped at 64 KiB. `inv.stdin` must be absent.
+///
+/// The host supplies its guarded spawn function and an admitted reader-group
+/// guard shared by both pipes. Admission must bound global jobs and exclude a
+/// second reader group for the same source while an old group remains alive.
+/// A descendant retaining a pipe keeps the guard after cancellation/deadline;
+/// only the owned child is killed. No callback or unrelated process is killed.
+/// Unverified owned-child exit also retains the supplied group until host exit;
+/// a returned error and EOF alone cannot release that admission.
+pub fn run_decoded<T: Send + 'static, E: Send + 'static>(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    cancel: &AtomicBool,
+    spawn: Spawn,
+    readers: Arc<dyn Send + Sync>,
+    decode: impl FnOnce(ChildStdout, &AtomicBool, Instant) -> Result<T, E> + Send + 'static,
+) -> Result<T, DecodeError<E>> {
+    assert!(inv.stdin.is_none(), "a decoded read cannot have stdin");
+    // Refuse before spawn if the caller has already cancelled.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DecodeError::Cancelled);
+    }
+    let child = ChildCharge::new(readers.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    let decoder_stop = stop.clone();
+    let deadline = Instant::now() + inv.timeout;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let pipes = Pipes {
+        output: Some(Box::new(move |pipe| {
+            let result = decode(pipe, &decoder_stop, deadline);
+            let ok = result.is_ok();
+            tx.send(result).is_ok() && ok
+        })),
+        spawn: Some(Box::new(move |command, input| {
+            input.spawn_with(command, spawn)
+        })),
+        readers: Some(readers),
+        child_exited: Some(child.exited.clone()),
+        stop: Some(stop),
+        ..Pipes::default()
+    };
+    let exit = run_inner(hgs, inv, parent_env, &[], STDERR_CAP, Some(cancel), pipes);
+    if matches!(exit, Ok(Exit::StartFailed(_))) {
+        child.confirmed();
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DecodeError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(DecodeError::TimedOut);
+    }
+    match exit {
+        Err(Stopped::Cancelled) => return Err(DecodeError::Cancelled),
+        Err(Stopped::TooLarge(_)) => return Err(DecodeError::TooLarge),
+        Ok(Exit::TimedOut) => return Err(DecodeError::TimedOut),
+        Ok(Exit::StartFailed(_)) => return Err(DecodeError::StartFailed),
+        _ => {}
+    }
+    match rx.try_recv() {
+        Ok(Err(error)) => Err(DecodeError::Decode(error)),
+        Ok(Ok(value)) if matches!(exit, Ok(Exit::Code { code: 0, .. })) => Ok(value),
+        Ok(Ok(_)) => Err(DecodeError::ChildFailed),
+        Err(_) => Err(DecodeError::Incomplete),
+    }
+}
+
+/// Streams bounded input on the existing runner's writer thread. Both output
+/// pipes have a hard byte limit; exceeding either ends only this owned child.
+/// The callback must bound its own work and returns false on encoding/write
+/// failure. `inv.stdin` must be absent. A successful process exit alone does
+/// not establish that the callback completed; the caller validates its result.
+pub(crate) fn run_streamed(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    output_cap: usize,
+    input: impl FnOnce(ChildStdin) -> bool + Send + 'static,
+) -> Result<Exit, TooLarge> {
+    streamed(hgs, inv, parent_env, output_cap, None, None, input)
+}
+
+fn streamed(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    output_cap: usize,
+    cancel: Option<&AtomicBool>,
+    resources: Option<Arc<dyn Send + Sync>>,
+    input: impl FnOnce(ChildStdin) -> bool + Send + 'static,
+) -> Result<Exit, TooLarge> {
+    assert!(
+        inv.stdin.is_none(),
+        "streamed input cannot have a second body"
+    );
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+        return Ok(Exit::TimedOut);
+    }
+    let child_exited = resources.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
+    let _child = resources.as_ref().map(|resources| ChildCharge {
+        resources: Some(resources.clone()),
+        exited: child_exited.as_ref().unwrap().clone(),
+    });
+    let result = run_inner(
+        hgs,
+        inv,
+        parent_env,
+        &[],
+        output_cap,
+        cancel,
+        Pipes {
+            input: Some(Box::new(input)),
+            require_complete: resources.is_some(),
+            readers: resources,
+            child_exited: child_exited.clone(),
+            ..Pipes::default()
+        },
+    );
+    if matches!(result, Ok(Exit::StartFailed(_))) {
+        if let Some(child_exited) = &child_exited {
+            child_exited.store(true, Ordering::Release);
+        }
+    }
+    match result {
+        Ok(exit) => Ok(exit),
+        Err(Stopped::TooLarge(error)) => Err(error),
+        Err(Stopped::Cancelled) => Ok(Exit::TimedOut),
+    }
+}
+
+fn run_inner(
+    hgs: &Path,
+    inv: &Invocation,
+    parent_env: &[(&str, &str)],
+    remove: &[&str],
+    stdout_cap: usize,
+    cancel: Option<&AtomicBool>,
+    pipes: Pipes,
+) -> Result<Exit, Stopped> {
+    let stop_context = StopContext {
+        exited: pipes.child_exited.clone(),
+        group: pipes.group,
+        #[cfg(any(windows, test))]
+        hidden: pipes.hidden_stop.clone(),
+    };
+    let consumed = pipes.output.is_some();
+    let retain_all = pipes.require_complete || pipes.retain_all;
+    let strict_outputs = pipes.input.is_some() || consumed || pipes.require_complete;
+    let stderr_cap = pipes.stderr_cap.unwrap_or(if strict_outputs {
+        stdout_cap
+    } else {
+        STDERR_CAP
+    });
+    let _cancel_output = CancelOutput(pipes.stop);
     let mut command = Command::new(hgs);
     command.args(&inv.args);
+    if pipes.clear_environment {
+        command.env_clear();
+    }
     for (key, value) in parent_env {
         command.env(key, value);
     }
+    for key in remove {
+        command.env_remove(key);
+    }
+    if !pipes.clear_environment {
+        crate::child_environment::restore(&mut command);
+    }
     command
         .env_remove("HGS_SESSION")
+        .env_remove("HGS_SESSION_ID")
         .env_remove("HGS_RUN_ID")
-        .stdin(Stdio::piped())
+        .stdin(
+            if consumed && pipes.input.is_none() && inv.stdin.is_none() {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    if pipes.group {
+        crate::stream::helper::prepare(&mut command);
+    }
+    let group = pipes.group;
+    let has_input =
+        pipes.input.is_some() || inv.stdin.as_ref().is_some_and(|bytes| !bytes.is_empty());
+    let input_spawn = match InputSpawn::new(has_input) {
+        Ok(input) => input,
         Err(error) => return Ok(Exit::StartFailed(error.to_string())),
     };
+    let mut child =
+        match pipes.spawn.unwrap_or_else(|| Box::new(spawn_helper))(&mut command, input_spawn) {
+            Ok(child) => child,
+            Err(error) => return Ok(Exit::StartFailed(error.to_string())),
+        };
+    if pipes.require_complete
+        && (child.stdin.is_none() || child.stdout.is_none() || child.stderr.is_none())
+    {
+        if let Some(completion) = &pipes.completion {
+            completion.finish(Retirement::Failed);
+        }
+        return Ok(stop(
+            child,
+            Exit::Abnormal {
+                stderr: "owned exchange requires all three pipes".into(),
+            },
+            &stop_context,
+        ));
+    }
     let deadline = Instant::now() + inv.timeout;
 
+    let completion = pipes.completion.clone();
     let stdin = child.stdin.take();
+    let input_owner = stdin
+        .as_ref()
+        .map(|writer| InputOwner::acquire(writer, has_input))
+        .transpose();
     let input = inv.stdin.clone();
     let (write_tx, write_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let ok = match (stdin, input) {
-            (Some(mut pipe), Some(bytes)) => {
-                pipe.write_all(&bytes).and_then(|_| pipe.flush()).is_ok()
+    let input_guard = if retain_all {
+        pipes.readers.clone()
+    } else {
+        None
+    };
+    let writer_state = completion
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(IoState::Running)));
+    let writer_state_for_thread = writer_state.clone();
+    #[cfg(test)]
+    let after_written = pipes.after_written;
+    let writer = thread::spawn(move || {
+        let ok = if input_owner.is_ok() {
+            match (stdin, pipes.input, input) {
+                (Some(pipe), Some(write), _) => write(pipe),
+                (Some(mut pipe), None, Some(bytes)) => {
+                    pipe.write_all(&bytes).and_then(|_| pipe.flush()).is_ok()
+                }
+                _ => !has_input,
             }
-            _ => true,
+        } else {
+            drop(stdin);
+            false
         };
+        // Always finish the actual input, including a partial/failed write.
+        // A shutdown error is a failure, never evidence of successful delivery.
+        let ok = match input_owner {
+            Ok(Some(owner)) => owner.finish().is_ok() && ok,
+            Ok(None) => ok,
+            Err(_) => false,
+        };
+        // The input is closed: release the group before signalling, as the
+        // readers do, so a completed exchange holds no hidden admission.
+        drop(input_guard);
+        if let Some(state) = &writer_state_for_thread {
+            // Physical closure is distinct from the input success sent below.
+            *state.lock().unwrap_or_else(PoisonError::into_inner) = IoState::Closed;
+        }
         let _ = write_tx.send(ok);
+        #[cfg(test)]
+        if let Some(hook) = after_written {
+            hook();
+        }
     });
+    if let Some(completion) = &completion {
+        completion.register(writer, writer_state.expect("completion state"));
+    }
     let (done_tx, done_rx) = mpsc::channel();
     let over = Arc::new(AtomicBool::new(false));
     let limit = (stdout_cap < usize::MAX).then(|| (stdout_cap, Arc::clone(&over)));
-    let out = reader(
-        child.stdout.take(),
-        stdout_cap.saturating_add(1),
-        done_tx.clone(),
-        limit,
+    let decoded = Arc::new(AtomicU8::new(0));
+    let out = if let Some(consume) = pipes.output {
+        let stdout = child.stdout.take();
+        let done = done_tx.clone();
+        let completed = decoded.clone();
+        let guard = pipes.readers.clone();
+        let state = completion
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(IoState::Running)));
+        let output_state = state.clone();
+        let worker = thread::spawn(move || {
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stdout.is_some_and(consume)
+            }))
+            .unwrap_or(false);
+            // Release the pipe group before waking a possible replacement.
+            drop(guard);
+            if let Some(state) = &output_state {
+                *state.lock().unwrap_or_else(PoisonError::into_inner) =
+                    if ok { IoState::Eof } else { IoState::Failed };
+            }
+            completed.store(if ok { 1 } else { 2 }, Ordering::Release);
+            let _ = done.send(ok);
+        });
+        if let Some(completion) = &completion {
+            completion.register(worker, state.expect("completion state"));
+        }
+        Arc::default()
+    } else {
+        reader(
+            child.stdout.take(),
+            if strict_outputs {
+                stdout_cap
+            } else {
+                stdout_cap.saturating_add(1)
+            },
+            done_tx.clone(),
+            limit,
+            if retain_all {
+                pipes.readers.clone()
+            } else {
+                None
+            },
+            completion.clone(),
+        )
+    };
+    let err = reader(
+        child.stderr.take(),
+        stderr_cap,
+        done_tx,
+        strict_outputs.then(|| (stderr_cap, Arc::clone(&over))),
+        pipes.readers,
+        completion,
     );
-    let err = reader(child.stderr.take(), STDERR_CAP, done_tx, None);
-    let too_large = |err: &Shared| TooLarge {
-        cap: stdout_cap,
-        stderr: String::from_utf8_lossy(&take(err)).into_owned(),
+    let too_large = |err: &Shared| {
+        Stopped::TooLarge(TooLarge {
+            cap: stdout_cap,
+            stderr: String::from_utf8_lossy(&take(err)).into_owned(),
+        })
     };
 
     let mut written = false;
@@ -106,22 +1038,53 @@ pub fn run_limited(
     let status = loop {
         if !written {
             match write_rx.try_recv() {
-                Ok(true) | Err(TryRecvError::Disconnected) => written = true,
-                Ok(false) => {
+                Ok(true) => written = true,
+                Err(TryRecvError::Disconnected) if !pipes.require_complete && !has_input => {
+                    written = true
+                }
+                Ok(false) | Err(TryRecvError::Disconnected) => {
                     written = true;
                     write_failed_until = Some((Instant::now() + WRITE_GRACE).min(deadline));
                 }
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = stop(child, Exit::TimedOut, &stop_context);
+            drain(&done_rx);
+            return Err(Stopped::Cancelled);
+        }
         if over.load(Ordering::Relaxed) {
             // Ended for its output: the exit that gives is not reported.
-            let _ = stop(child, Exit::TimedOut);
+            let _ = stop(child, Exit::TimedOut, &stop_context);
             drain(&done_rx);
             return Err(too_large(&err));
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+        if consumed && decoded.load(Ordering::Acquire) == 2 {
+            let exit = stop(
+                child,
+                Exit::Abnormal {
+                    stderr: "stdout decoder failed".into(),
+                },
+                &stop_context,
+            );
+            drain(&done_rx);
+            return Ok(exit);
+        }
+        // A group leader's exit is seen unreaped; its pinned group is then
+        // signalled and the leader reaped before the status is returned.
+        let waited = if group {
+            crate::stream::helper::try_wait(&mut child)
+        } else {
+            child.try_wait()
+        };
+        match waited {
+            Ok(Some(status)) => {
+                if let Some(exited) = &pipes.child_exited {
+                    exited.store(true, Ordering::Release);
+                }
+                break status;
+            }
             Ok(None) => {}
             Err(error) => {
                 return Ok(stop(
@@ -129,22 +1092,103 @@ pub fn run_limited(
                     Exit::Abnormal {
                         stderr: error.to_string(),
                     },
+                    &stop_context,
                 ))
             }
         }
         let now = Instant::now();
         if write_failed_until.is_some_and(|until| now >= until) {
-            return Ok(stop(child, Exit::WriteFailed));
+            return Ok(stop(child, Exit::WriteFailed, &stop_context));
         }
         if now >= deadline {
-            return Ok(stop(child, Exit::TimedOut));
+            let exit = stop(child, Exit::TimedOut, &stop_context);
+            if consumed {
+                drain(&done_rx);
+            }
+            return Ok(exit);
         }
         thread::sleep(POLL);
     };
-    drain(&done_rx);
+    if consumed || pipes.require_complete {
+        let until = deadline.min(Instant::now() + DRAIN);
+        let mut ended = 0;
+        while ended < 2 || (pipes.require_complete && !written) {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(Stopped::Cancelled);
+            }
+            if over.load(Ordering::Relaxed) {
+                return Err(too_large(&err));
+            }
+            if pipes.require_complete && !written {
+                match write_rx.try_recv() {
+                    Ok(true) => written = true,
+                    Ok(false) | Err(TryRecvError::Disconnected) => return Ok(Exit::WriteFailed),
+                    Err(TryRecvError::Empty) => (),
+                }
+            }
+            if pipes.require_complete && write_failed_until.is_some() {
+                return Ok(Exit::WriteFailed);
+            }
+            if ended == 2 && written {
+                break;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(if Instant::now() >= deadline {
+                    Exit::TimedOut
+                } else {
+                    Exit::Abnormal {
+                        stderr: "stdout decoder or pipe incomplete".into(),
+                    }
+                });
+            }
+            if ended == 2 {
+                // Both readers ended; only the owned input writer is pending.
+                // Its counterpart may be a descendant. Do not spin on the now
+                // disconnected reader-completion channel.
+                thread::sleep(left.min(POLL));
+                continue;
+            }
+            match done_rx.recv_timeout(left.min(POLL)) {
+                Ok(false) if pipes.require_complete => {
+                    return Ok(Exit::Abnormal {
+                        stderr: "owned pipe did not reach EOF".into(),
+                    })
+                }
+                Ok(_) => ended += 1,
+                Err(mpsc::RecvTimeoutError::Disconnected) if pipes.require_complete => {
+                    return Ok(Exit::Abnormal {
+                        stderr: "owned reader did not complete".into(),
+                    });
+                }
+                Err(_) => (),
+            }
+        }
+        if consumed && decoded.load(Ordering::Acquire) != 1 {
+            return Ok(Exit::Abnormal {
+                stderr: "stdout decoder failed".into(),
+            });
+        }
+    } else {
+        drain(&done_rx);
+    }
+    // Preserve the ordinary runner's raw exit when its charged writer is
+    // still pending. A known write/shutdown failure cannot become success;
+    // the owned runner above additionally requires complete input and joins.
+    if status.success() && has_input && !pipes.require_complete {
+        let failed = write_failed_until.is_some()
+            || (!written
+                && matches!(
+                    write_rx.try_recv(),
+                    Ok(false) | Err(TryRecvError::Disconnected)
+                ));
+        if failed {
+            return Ok(Exit::WriteFailed);
+        }
+    }
     let stdout = take(&out);
     // A child can exit before the loop sees its output pass the cap.
-    if stdout.len() > stdout_cap {
+    if stdout.len() > stdout_cap || over.load(Ordering::Relaxed) {
         return Err(too_large(&err));
     }
     let stderr = String::from_utf8_lossy(&take(&err)).into_owned();
@@ -158,10 +1202,22 @@ pub fn run_limited(
     })
 }
 
+/// Helpers have private pipes, never an interactive console. Keep custom
+/// spawn/observation hooks in charge of their own original child.
+fn spawn_helper(command: &mut Command, input: InputSpawn) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    input.spawn(command)
+}
+
 /// Waits for both pipe readers to finish. One budget for both pipes: a
 /// grandchild that keeps them open must not hold the call, and what was read
 /// by then is still returned.
-fn drain(done: &Receiver<()>) {
+fn drain(done: &Receiver<bool>) {
     let until = Instant::now() + DRAIN;
     for _ in 0..2 {
         let left = until.saturating_duration_since(Instant::now());
@@ -171,9 +1227,27 @@ fn drain(done: &Receiver<()>) {
     }
 }
 
-fn stop(mut child: Child, exit: Exit) -> Exit {
+fn stop(mut child: Child, exit: Exit, context: &StopContext) -> Exit {
+    #[cfg(any(windows, test))]
+    if let Some(state) = &context.hidden {
+        return state.stop(child, exit, context.exited.clone());
+    }
+    if context.group {
+        // killpg on the still-pinned private group, then reap; an unverified
+        // wait leaves the exit unconfirmed (the resources stay pinned).
+        if crate::stream::helper::terminate(&mut child).is_ok() {
+            if let Some(exited) = &context.exited {
+                exited.store(true, Ordering::Release);
+            }
+        }
+        return exit;
+    }
     let _ = child.kill();
-    let _ = child.wait();
+    if child.wait().is_ok() {
+        if let Some(exited) = &context.exited {
+            exited.store(true, Ordering::Release);
+        }
+    }
     exit
 }
 
@@ -191,23 +1265,35 @@ fn take(buffer: &Shared) -> Vec<u8> {
 fn reader(
     pipe: Option<impl Read + Send + 'static>,
     cap: usize,
-    done: Sender<()>,
+    done: Sender<bool>,
     limit: Option<(usize, Arc<AtomicBool>)>,
+    guard: Option<Arc<dyn Send + Sync>>,
+    completion: Option<Arc<Completion>>,
 ) -> Shared {
     let buffer: Shared = Arc::default();
     let shared = Arc::clone(&buffer);
-    thread::spawn(move || {
+    let state = completion
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(IoState::Running)));
+    let reader_state = state.clone();
+    let worker = thread::spawn(move || {
+        let mut eof = false;
         if let Some(mut pipe) = pipe {
             let mut chunk = [0u8; 8192];
+            let mut received = 0usize;
             loop {
                 match pipe.read(&mut chunk) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
                     Ok(n) => {
+                        received = received.saturating_add(n);
                         let mut kept = shared.lock().unwrap_or_else(|e| e.into_inner());
                         let room = cap.saturating_sub(kept.len()).min(n);
                         kept.extend_from_slice(&chunk[..room]);
                         if let Some((bytes, over)) = &limit {
-                            if kept.len() > *bytes {
+                            if received > *bytes {
                                 over.store(true, Ordering::Relaxed);
                             }
                         }
@@ -217,7 +1303,882 @@ fn reader(
                 }
             }
         }
-        let _ = done.send(());
+        drop(guard);
+        if let Some(state) = &reader_state {
+            *state.lock().unwrap_or_else(PoisonError::into_inner) =
+                if eof { IoState::Eof } else { IoState::Failed };
+        }
+        let _ = done.send(eof);
     });
+    if let Some(completion) = completion {
+        completion.register(worker, state.expect("completion state"));
+    }
     buffer
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn settle(completion: &Completion) -> Retirement {
+        let until = Instant::now() + Duration::from_secs(1);
+        loop {
+            let result = completion.join();
+            if result != Retirement::Pending || Instant::now() >= until {
+                return result;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn unknown_child_exit_is_sticky_failed() {
+        let completion = Completion::new();
+        completion.child();
+        let worker = thread::spawn(|| {});
+        completion.register(worker, Arc::new(Mutex::new(IoState::Eof)));
+        assert_eq!(settle(&completion), Retirement::Failed);
+        assert_eq!(completion.join(), Retirement::Failed);
+    }
+
+    #[test]
+    fn a_read_error_is_not_eof() {
+        let completion = Completion::new();
+        completion.child().store(true, Ordering::Release);
+        let worker = thread::spawn(|| {});
+        completion.register(worker, Arc::new(Mutex::new(IoState::Failed)));
+        assert_eq!(settle(&completion), Retirement::Failed);
+    }
+
+    #[test]
+    fn an_empty_completion_is_not_a_physical_witness() {
+        assert_eq!(Completion::new().join(), Retirement::Failed);
+    }
+
+    #[test]
+    fn a_panicked_worker_is_not_eof() {
+        let completion = Completion::new();
+        completion.child().store(true, Ordering::Release);
+        let worker = thread::spawn(|| panic!("synthetic worker panic"));
+        completion.register(worker, Arc::new(Mutex::new(IoState::Eof)));
+        assert_eq!(settle(&completion), Retirement::Failed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_required_pipe_is_sticky_failed() {
+        let completion = Arc::new(Completion::new());
+        let child_exited = completion.child();
+        let invocation = Invocation {
+            args: Vec::new(),
+            stdin: None,
+            timeout: Duration::from_secs(1),
+            request_id: None,
+        };
+        let result = run_inner(
+            Path::new("/bin/true"),
+            &invocation,
+            &[],
+            &[],
+            1024,
+            None,
+            Pipes {
+                require_complete: true,
+                child_exited: Some(child_exited),
+                completion: Some(completion.clone()),
+                spawn: Some(Box::new(|command, _input| {
+                    command.stdin(Stdio::null()).spawn()
+                })),
+                ..Pipes::default()
+            },
+        );
+        assert!(matches!(result, Ok(Exit::Abnormal { .. })));
+        assert_eq!(completion.join(), Retirement::Failed);
+    }
+
+    #[test]
+    fn pending_completion_becomes_retired_without_a_second_join() {
+        let completion = Completion::new();
+        completion.child().store(true, Ordering::Release);
+        let state = Arc::new(Mutex::new(IoState::Running));
+        let worker_state = state.clone();
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            *worker_state.lock().unwrap_or_else(PoisonError::into_inner) = IoState::Eof;
+        });
+        completion.register(worker, state);
+        assert_eq!(completion.join(), Retirement::Pending);
+        release_tx.send(()).unwrap();
+        assert_eq!(settle(&completion), Retirement::Retired);
+        assert_eq!(completion.join(), Retirement::Retired);
+    }
+}
+
+#[cfg(test)]
+mod frozen_tests {
+    use super::*;
+    const MARKER: &str = "ZERUS_FROZEN_RUN_CHILD";
+    #[test]
+    fn child() {
+        let Some(mode) = std::env::var(MARKER).ok() else {
+            return;
+        };
+        if mode == "wait" {
+            thread::sleep(Duration::from_secs(31));
+            println!("original invocation timeout preserved");
+            return;
+        }
+        assert_eq!(mode, "environment");
+        for key in ["PATH", "Path", "path"] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "fixture PATH alias remains"
+            );
+        }
+        assert_eq!(std::env::var_os("ZERUS_FROZEN_EMPTY"), Some("".into()));
+        assert_eq!(std::env::var_os("HGS_SESSION"), None);
+        assert_eq!(std::env::var_os("HGS_RUN_ID"), None);
+        let raw = std::env::var_os("ZERUS_FROZEN_RAW").unwrap();
+        assert!(raw.to_str().is_none());
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            std::path::PathBuf::from(std::env::var_os("ZERUS_FROZEN_DIR").unwrap())
+                .canonicalize()
+                .unwrap()
+        );
+        println!("frozen native environment preserved");
+    }
+    fn call(environment: &FrozenEnvironment) -> Exit {
+        let invocation = Invocation {
+            args: [
+                "--exact",
+                "run::frozen_tests::child",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .map(String::from)
+            .to_vec(),
+            stdin: None,
+            timeout: Duration::from_secs(45),
+            request_id: None,
+        };
+        run_accounted_frozen(
+            &std::env::current_exe().unwrap(),
+            &invocation,
+            environment,
+            4096,
+            &AtomicBool::new(false),
+            Arc::new(()),
+            |command, input| input.spawn(command),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn a_real_child_receives_exact_frozen_native_values_and_absence() {
+        let mut environment = FrozenEnvironment::capture().unwrap();
+        assert!(environment.current());
+        // Windows environment keys are case insensitive. Exercise its usual
+        // mixed-case spelling on Unix too; the fixture must remove every alias.
+        environment
+            .values
+            .push(("Path".into(), "fixed fixture sentinel".into()));
+        environment
+            .values
+            .push(("path".into(), "fixed fixture sentinel".into()));
+        environment
+            .values
+            .retain(|(key, _)| !key.as_encoded_bytes().eq_ignore_ascii_case(b"PATH"));
+        environment
+            .values
+            .push((MARKER.into(), "environment".into()));
+        environment
+            .values
+            .push(("ZERUS_FROZEN_EMPTY".into(), "".into()));
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let raw = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0xd800])
+        };
+        environment.values.push(("ZERUS_FROZEN_RAW".into(), raw));
+        environment.directory = std::env::temp_dir().canonicalize().unwrap();
+        #[cfg(unix)]
+        let _alias = {
+            use std::os::unix::fs::DirBuilderExt;
+            struct Remove(std::path::PathBuf);
+            impl Drop for Remove {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let root =
+                std::env::temp_dir().join(format!("zerus-frozen-cwd-{}", uuid::Uuid::new_v4()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let owned = Remove(root);
+            let alias = owned.0.join("working-directory");
+            std::os::unix::fs::symlink(&environment.directory, &alias).unwrap();
+            environment.directory = alias;
+            owned
+        };
+        environment.values.push((
+            "ZERUS_FROZEN_DIR".into(),
+            environment.directory.as_os_str().to_owned(),
+        ));
+        let exit = call(&environment);
+        assert!(
+            matches!(&exit, Exit::Code {code:0, stdout, ..}
+            if String::from_utf8_lossy(stdout).contains("frozen native environment preserved")),
+            "bounded fixed-fixture child result: {exit:?}"
+        );
+    }
+    #[test]
+    fn the_native_runner_still_allows_an_original_over_thirty_seconds() {
+        let mut environment = FrozenEnvironment::capture().unwrap();
+        environment.values.push((MARKER.into(), "wait".into()));
+        assert!(matches!(call(&environment), Exit::Code {code:0, stdout, ..}
+            if String::from_utf8_lossy(&stdout).contains("original invocation timeout preserved")));
+    }
+}
+
+#[cfg(test)]
+mod owned_charge_tests {
+    use super::*;
+
+    #[test]
+    fn an_unverified_child_keeps_its_resource_charge() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let mut charge = ChildCharge {
+            resources: Some(resource),
+            exited: Arc::new(AtomicBool::new(false)),
+        };
+        // Exercise the exact unverified branch without leaking a test guard.
+        // Drop retains this guard indefinitely; only external verified recovery
+        // may settle the host's durable charge after this process is gone.
+        let pinned = charge.unverified().unwrap();
+        drop(charge);
+        assert!(weak.upgrade().is_some());
+        drop(pinned);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn verified_child_exit_releases_only_its_own_guard_copy() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let charge = ChildCharge {
+            resources: Some(resource.clone()),
+            exited: Arc::new(AtomicBool::new(true)),
+        };
+        drop(charge);
+        assert!(weak.upgrade().is_some());
+        drop(resource);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stream_tests {
+    use super::*;
+
+    fn python(code: &str, timeout: Duration) -> Invocation {
+        Invocation {
+            args: vec!["-c".into(), code.into()],
+            stdin: None,
+            timeout,
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_helper_environment_omits_every_parent_variable() {
+        let call = Invocation {
+            args: vec![],
+            stdin: None,
+            timeout: Duration::from_secs(5),
+            request_id: None,
+        };
+        let result = run_inner(
+            Path::new("/usr/bin/env"),
+            &call,
+            &[("ZERUS_TEST_ONLY", "explicit")],
+            &[],
+            1024,
+            None,
+            Pipes {
+                clear_environment: true,
+                ..Pipes::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(result, Exit::Code { code: 0, stdout, .. } if stdout == b"ZERUS_TEST_ONLY=explicit\n")
+        );
+    }
+
+    #[test]
+    fn streamed_eof_and_both_exact_output_limits_are_preserved() {
+        let code = "import sys,os; assert sys.stdin.buffer.read() == b'bounded input'; assert not {'HGS_SESSION', 'HGS_SESSION_ID', 'HGS_RUN_ID'} & set(os.environ); sys.stdout.write('x'*16384); sys.stderr.write('y'*16384)";
+        let exit = run_streamed(
+            Path::new("python3"),
+            &python(code, Duration::from_secs(5)),
+            &[
+                ("HGS_SESSION", "discard"),
+                ("HGS_SESSION_ID", "discard"),
+                ("HGS_RUN_ID", "discard"),
+            ],
+            16384,
+            |mut pipe| pipe.write_all(b"bounded input").is_ok(),
+        )
+        .unwrap();
+        match exit {
+            Exit::Code {
+                code: 0,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(stdout.len(), 16384);
+                assert_eq!(stderr.len(), 16384);
+            }
+            other => panic!("{other:?}"),
+        }
+        for noisy in ["stdout", "stderr"] {
+            let began = Instant::now();
+            let code = format!("import sys,time; sys.{noisy}.write('x'*16385); sys.{noisy}.flush(); time.sleep(10)");
+            let error = run_streamed(
+                Path::new("python3"),
+                &python(&code, Duration::from_secs(5)),
+                &[],
+                16384,
+                |_| true,
+            )
+            .unwrap_err();
+            assert_eq!(error.cap, 16384);
+            assert!(error.stderr.len() <= 16384);
+            assert!(began.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn deadline_ends_owned_child_and_releases_its_blocked_pipe_writer() {
+        let (done, completed) = mpsc::channel();
+        let began = Instant::now();
+        let exit = run_streamed(
+            Path::new("python3"),
+            &python("import time; time.sleep(10)", Duration::from_millis(250)),
+            &[],
+            16384,
+            move |mut pipe| {
+                let chunk = [0; 8192];
+                let result = (0..16384).try_for_each(|_| pipe.write_all(&chunk));
+                let _ = done.send(result.is_err());
+                result.is_ok()
+            },
+        )
+        .unwrap();
+        assert_eq!(exit, Exit::TimedOut);
+        assert!(began.elapsed() < Duration::from_secs(3));
+        assert!(completed.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+
+    // A completed exchange returns only after every pipe thread signalled; a
+    // writer that still held the group then kept the caller's admission
+    // charged, and the next admission was refused with Capacity.
+    #[test]
+    fn a_completed_retained_exchange_leaves_no_admission_held_by_its_writer() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let (resume, held) = mpsc::channel::<()>();
+        let exit = run_inner(
+            Path::new("python3"),
+            &python("import sys; sys.stdin.read()", Duration::from_secs(5)),
+            &[],
+            &[],
+            1024,
+            None,
+            Pipes {
+                input: Some(Box::new(|mut pipe| pipe.write_all(b"input").is_ok())),
+                require_complete: true,
+                readers: Some(resource),
+                child_exited: Some(Arc::new(AtomicBool::new(false))),
+                // Keep the writer thread alive past its signal.
+                after_written: Some(Box::new(move || {
+                    let _ = held.recv_timeout(Duration::from_secs(5));
+                })),
+                ..Pipes::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(exit, Exit::Code { code: 0, .. }), "{exit:?}");
+        assert!(
+            weak.upgrade().is_none(),
+            "the writer still held the admission after the exchange completed"
+        );
+        resume.send(()).unwrap();
+    }
+
+}
+
+#[cfg(all(test, windows))]
+mod hidden_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    const CASE: &str = "run::hidden_tests::hidden_helper_child";
+    const MARKER: &str = "ZERUS_TEST_HIDDEN_HELPER_CASE";
+
+    #[test]
+    #[ignore = "exact-filter hidden-helper child, launched only by its parent test"]
+    fn hidden_helper_child() {
+        // Fail before I/O or spawning if the marker was lost. This child has
+        // a different name from its parent and can never re-enter that test.
+        assert_eq!(
+            std::env::var(MARKER).as_deref(),
+            Ok(CASE),
+            "hidden-helper child requires its explicit marker"
+        );
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        // No PowerShell startup or C# compilation runs inside this deadline.
+        // SAFETY: GetConsoleWindow has no preconditions.
+        assert!(unsafe { GetConsoleWindow() }.is_null());
+        let mut input = Vec::new();
+        std::io::stdin().take(1025).read_to_end(&mut input).unwrap();
+        assert_eq!(input, b"exact helper input");
+        println!("\n0:exact helper input");
+    }
+
+    #[test]
+    fn ordinary_mobile_probe_and_action_helpers_have_no_console() {
+        let call = Invocation {
+            args: vec![
+                "--exact".into(),
+                CASE.into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            stdin: Some(b"exact helper input".to_vec()),
+            timeout: Duration::from_secs(15),
+            request_id: None,
+        };
+        for remove in [false, true] {
+            let env = [(MARKER, CASE)];
+            let result = if remove {
+                run_without(
+                    &std::env::current_exe().unwrap(),
+                    &call,
+                    &env,
+                    &crate::mobile::CONNECTOR_UNSET,
+                    4096,
+                )
+            } else {
+                run_limited(&std::env::current_exe().unwrap(), &call, &env, 4096)
+            }
+            .unwrap();
+            match result {
+                Exit::Code {
+                    code: 0, stdout, ..
+                } => {
+                    let output = String::from_utf8(stdout).unwrap();
+                    assert!(output.lines().any(|line| line == "0:exact helper input"));
+                    assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+                }
+                other => panic!("default helper: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_hidden_helper_has_no_console_and_receives_exact_input_through_eof() {
+        const FIXTURE_WAIT: Duration = Duration::from_secs(15);
+        let system_root = std::env::var("SystemRoot").expect("Windows has Unicode SystemRoot");
+        let program = std::path::PathBuf::from(&system_root)
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let modules = program
+            .parent()
+            .unwrap()
+            .join("Modules")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let temp = std::env::temp_dir().to_str().unwrap().to_owned();
+        let environment = [
+            ("SystemRoot", system_root.as_str()),
+            ("WINDIR", system_root.as_str()),
+            ("PSModulePath", modules.as_str()),
+            ("TEMP", temp.as_str()),
+            ("TMP", temp.as_str()),
+        ];
+        let mut native_environment = environment.to_vec();
+        native_environment.push((MARKER, CASE));
+        let call = Invocation {
+            args: vec![
+                "--exact".into(),
+                CASE.into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            stdin: Some(b"exact helper input".to_vec()),
+            timeout: FIXTURE_WAIT,
+            request_id: None,
+        };
+        let result = run_hidden_limited(
+            &std::env::current_exe().unwrap(),
+            &call,
+            &native_environment,
+            1024,
+        )
+        .unwrap();
+        match result {
+            Exit::Code {
+                code: 0, stdout, ..
+            } => {
+                let output = String::from_utf8(stdout).unwrap();
+                assert!(output.lines().any(|line| line == "0:exact helper input"));
+                assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Exercise the original env-loss hazard through the same hidden
+        // launch path. The child must fail its guard, never invoke a parent.
+        let missing_marker =
+            run_hidden_limited(&std::env::current_exe().unwrap(), &call, &environment, 4096)
+                .unwrap();
+        match missing_marker {
+            Exit::Code {
+                code: 101,
+                stdout,
+                stderr,
+            } => {
+                let output = String::from_utf8(stdout).unwrap();
+                assert!(output.contains("test result: FAILED. 0 passed; 1 failed;"));
+                assert!(format!("{output}{stderr}")
+                    .contains("hidden-helper child requires its explicit marker"));
+            }
+            other => panic!("missing marker: {other:?}"),
+        }
+
+        let body = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::WriteLine($env:PSModulePath);[Console]::WriteLine($env:ZERUS_TEST_PARENT_PROFILE);[Console]::WriteLine([string]$PSModuleAutoLoadingPreference)";
+        let probe = |source: &str| Invocation {
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-EncodedCommand".into(),
+                STANDARD.encode(
+                    source
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+            ],
+            stdin: Some(Vec::new()),
+            timeout: FIXTURE_WAIT,
+            request_id: None,
+        };
+        let inherited = run_limited(
+            &program,
+            &probe(&format!("$PSModuleAutoLoadingPreference='All';{body}")),
+            &[
+                ("PSModulePath", r"C:\Example\UserModules"),
+                ("ZERUS_TEST_PARENT_PROFILE", "inherited"),
+            ],
+            4096,
+        )
+        .unwrap();
+        let minimal = run_hidden_limited(&program, &probe(&format!(
+            "$PSModuleAutoLoadingPreference='None';$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');{body}"
+        )), &environment, 4096).unwrap();
+        let Exit::Code {
+            code: 0,
+            stdout: before,
+            ..
+        } = inherited
+        else {
+            panic!("inherited probe: {inherited:?}")
+        };
+        let Exit::Code {
+            code: 0,
+            stdout: after,
+            ..
+        } = minimal
+        else {
+            panic!("minimal probe: {minimal:?}")
+        };
+        let before = String::from_utf8(before).unwrap();
+        let after = String::from_utf8(after).unwrap();
+        assert!(before.contains(r"C:\Example\UserModules"));
+        assert!(before.contains("inherited"));
+        assert!(before.trim_end().ends_with("All"));
+        let after: Vec<_> = after.lines().collect();
+        assert_eq!(after.len(), 3);
+        // PathBuf retains literal '/' separators, while $PSHOME prints '\\'.
+        // Compare these known fixture paths with Windows path spelling rules.
+        assert_eq!(
+            after[0].replace('/', "\\").to_lowercase(),
+            modules.replace('/', "\\").to_lowercase()
+        );
+        assert_eq!(&after[1..], ["", "None"]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod group_tests {
+    use super::*;
+
+    /// A python3 leader that starts an in-group stand-in for its ssh child
+    /// (private streams, same process group), records its PID, then `rest`.
+    fn leader(pid_file: &Path, rest: &str, timeout: Duration) -> Invocation {
+        let code = format!(
+            "import os, subprocess, sys, time\n\
+             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n\
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n\
+             open({path:?}, 'w').write(str(child.pid))\n\
+             {rest}\n",
+            path = pid_file.display().to_string(),
+        );
+        Invocation {
+            args: vec!["-c".into(), code],
+            stdin: None,
+            timeout,
+            request_id: None,
+        }
+    }
+
+    /// A private scratch folder, removed when dropped.
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "zerus-run-group-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn stand_in(pid_file: &Path) -> libc::pid_t {
+        fs_pid(pid_file).expect("the leader recorded its child")
+    }
+
+    fn fs_pid(path: &Path) -> Option<libc::pid_t> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// The kernel's state for `pid` is zombie (or dead), from /proc/PID/stat.
+    /// A container whose PID 1 never reaps (CI's `tail -f /dev/null`) keeps
+    /// such zombies: they run no code and hold no pipes.
+    #[cfg(target_os = "linux")]
+    fn zombie(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| matches!(state, 'Z' | 'X'))
+        })
+    }
+
+    /// macOS hands orphans to launchd, which reaps them.
+    #[cfg(not(target_os = "linux"))]
+    fn zombie(_pid: libc::pid_t) -> bool {
+        false
+    }
+
+    /// Running: present and not a zombie.
+    fn running(pid: libc::pid_t) -> bool {
+        let present = unsafe { libc::kill(pid, 0) } == 0;
+        present && !zombie(pid)
+    }
+
+    /// Gone: stopped, whether already reaped or left as a zombie.
+    fn gone(pid: libc::pid_t) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !running(pid) {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run(inv: &Invocation, resources: Arc<dyn Send + Sync>) -> Exit {
+        run_accounted_group(
+            Path::new("python3"),
+            inv,
+            &[],
+            1 << 20,
+            &AtomicBool::new(false),
+            resources,
+        )
+        .unwrap()
+    }
+
+    /// The boundary: processes that left the private group (setsid or a
+    /// group of their own) are never signalled by it.
+    fn escaped_leader(directory: &Path, rest: &str, timeout: Duration) -> Invocation {
+        let code = format!(
+            "import os, subprocess, sys, time\n\
+             def start(path, **escape):\n\
+             \x20   child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n\
+             \x20       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **escape)\n\
+             \x20   open(path, 'w').write(str(child.pid))\n\
+             start({inside:?})\n\
+             start({session:?}, start_new_session=True)\n\
+             start({group:?}, preexec_fn=os.setpgrp)\n\
+             {rest}\n",
+            inside = directory.join("inside").display().to_string(),
+            session = directory.join("session").display().to_string(),
+            group = directory.join("group").display().to_string(),
+        );
+        Invocation {
+            args: vec!["-c".into(), code],
+            stdin: None,
+            timeout,
+            request_id: None,
+        }
+    }
+
+    /// Kills an escaped fixture process this test started (by its exact
+    /// recorded PID, while it is still alive), so nothing outlives the test.
+    fn clean_up(pid: libc::pid_t) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn processes_outside_the_private_group_survive_its_signal() {
+        for (name, rest, timeout) in [
+            ("normal exit", "print('done')", Duration::from_secs(20)),
+            (
+                "external kill",
+                "import signal\nos.kill(os.getpid(), signal.SIGKILL)",
+                Duration::from_secs(20),
+            ),
+            ("timeout", "time.sleep(30)", Duration::from_millis(1500)),
+        ] {
+            let temp = Scratch::new();
+            let exit = run(&escaped_leader(&temp.0, rest, timeout), Arc::new(()));
+            let inside = stand_in(&temp.0.join("inside"));
+            let session = stand_in(&temp.0.join("session"));
+            let group = stand_in(&temp.0.join("group"));
+            assert!(
+                gone(inside),
+                "{name}: the in-group stand-in survived ({exit:?})"
+            );
+            let session_alive = running(session);
+            let group_alive = running(group);
+            clean_up(session);
+            clean_up(group);
+            assert!(session_alive, "{name}: a setsid process was signalled");
+            assert!(group_alive, "{name}: an own-group process was signalled");
+        }
+    }
+
+    #[test]
+    fn a_leader_that_exits_leaves_no_group_member_running() {
+        let temp = Scratch::new();
+        let pid_file = temp.0.join("child");
+        let inv = leader(&pid_file, "print('done')", Duration::from_secs(20));
+        let exit = run(&inv, Arc::new(()));
+        assert!(matches!(exit, Exit::Code { code: 0, .. }), "{exit:?}");
+        assert!(
+            gone(stand_in(&pid_file)),
+            "an in-group member outlived the call"
+        );
+    }
+
+    #[test]
+    fn an_externally_killed_leader_has_its_group_stopped_and_is_reaped() {
+        let temp = Scratch::new();
+        let pid_file = temp.0.join("child");
+        let inv = leader(
+            &pid_file,
+            "import signal\nos.kill(os.getpid(), signal.SIGKILL)",
+            Duration::from_secs(20),
+        );
+        let resources: Arc<dyn Send + Sync> = Arc::new(());
+        let weak = Arc::downgrade(&resources);
+        let exit = run(&inv, resources);
+        assert!(matches!(exit, Exit::Abnormal { .. }), "{exit:?}");
+        assert!(
+            gone(stand_in(&pid_file)),
+            "the killed leader's group survived"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the confirmed reap releases the accounted resources"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_leader_has_its_whole_group_stopped() {
+        let temp = Scratch::new();
+        let pid_file = temp.0.join("child");
+        let inv = leader(&pid_file, "time.sleep(30)", Duration::from_millis(1500));
+        let started = Instant::now();
+        let exit = run(&inv, Arc::new(()));
+        assert_eq!(exit, Exit::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(
+            gone(stand_in(&pid_file)),
+            "the timed-out leader's group survived"
+        );
+    }
+
+    #[test]
+    fn a_member_holding_the_leader_pipes_is_stopped_with_the_group() {
+        let temp = Scratch::new();
+        let pid_file = temp.0.join("child");
+        // This member inherits the leader's own stdout and stderr.
+        let code = format!(
+            "import os, subprocess, sys\n\
+             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n\
+                 stdin=subprocess.DEVNULL)\n\
+             open({path:?}, 'w').write(str(child.pid))\n\
+             print('done')\n",
+            path = pid_file.display().to_string(),
+        );
+        let inv = Invocation {
+            args: vec!["-c".into(), code],
+            stdin: None,
+            timeout: Duration::from_secs(20),
+            request_id: None,
+        };
+        let resources: Arc<dyn Send + Sync> = Arc::new(());
+        let weak = Arc::downgrade(&resources);
+        let started = Instant::now();
+        let exit = run(&inv, resources);
+        assert!(matches!(exit, Exit::Code { code: 0, .. }), "{exit:?}");
+        assert!(gone(stand_in(&pid_file)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "both pipes reach EOF once the group is stopped"
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
 }

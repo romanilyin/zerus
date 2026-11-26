@@ -65,6 +65,18 @@ class SessionFiltersTest {
         return Session(Target("same", name, data.string("run_id").ifBlank {"run"}, data.string("conversation_id").ifBlank {"conversation"}, connection, archive),
             "Long title", "codex", "MISLEADING UI STATUS", "Project", "Preview", pending ?: QuestionPolicies.blockingRequests(data), data)
     }
+    @Test fun aKeepWarmPingIsReadyAndHoldsNoReplyLikeTheDesktop() {
+        val ping = session("""{"activity":"busy","phase":"working","keep_warm":{"enabled":true,"turn_active":true}}""")
+        assertEquals("Warming cache", SessionFilters.status(ping, true))
+        assertFalse(SessionFilters.working(ping, true))
+        assertFalse(SessionFilters.replyInProgress(ping, true))
+        assertFalse(SessionFilters.active(ping, true))
+        val person = session("""{"activity":"busy","phase":"working","keep_warm":{"enabled":true,"turn_active":false}}""")
+        assertEquals("Working", SessionFilters.status(person, true))
+        assertTrue(SessionFilters.working(person, true))
+        val asking = session("""{"activity":"busy","phase":"approval","keep_warm":{"enabled":true,"turn_active":true}}""")
+        assertEquals("Needs approval", SessionFilters.status(asking, true))
+    }
     @Test fun filtersFollowSharedDesktopContract() {
         val contract = JSONObject(checkNotNull(javaClass.getResourceAsStream("/session-filter-contract.json")).bufferedReader().use { it.readText() })
         assertEquals(contract.getJSONArray("filters").let { array -> (0 until array.length()).map(array::getString) }, SessionFilter.entries.map { it.id })
@@ -73,6 +85,9 @@ class SessionFiltersTest {
             val matches = SessionFilter.entries.filter { SessionFilters.matches(item, it, example.getBoolean("online"), example.getBoolean("draft")) }.map { it.id }
             val expected = example.getJSONArray("matches").let { array -> (0 until array.length()).map(array::getString) }
             assertEquals(example.getString("name"), expected, matches)
+            // The quiet-child and mute rules read the same classification as the desktop core (zerus-sa9qn.19).
+            if (example.has("quiet")) assertEquals(example.getString("name") + " quiet", example.getBoolean("quiet"), ChildSessions.quiet(item.raw))
+            if (example.has("muted")) assertEquals(example.getString("name") + " muted", example.getBoolean("muted"), SessionNotificationPreferences.muted(item))
         }
     }
     @Test fun machineChooserCountsKeepWorkspaceIdentityStateProjectAndZeroMachines() {

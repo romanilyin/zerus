@@ -509,7 +509,7 @@ fn read_registration() -> RegistrationRead {
 }
 
 /// Read with the same bound the parser enforces.
-fn read_registration_at(path: &Path) -> RegistrationRead {
+pub(super) fn read_registration_at(path: &Path) -> RegistrationRead {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RegistrationRead::Missing,
@@ -530,6 +530,16 @@ pub(super) fn connect() -> std::result::Result<Service, Unavailable> {
 }
 
 fn connect_from(read: RegistrationRead) -> std::result::Result<Service, Unavailable> {
+    connect_from_until(read, Instant::now() + Duration::from_secs(2), false)
+}
+pub(super) fn connect_within(deadline: Instant) -> std::result::Result<Service, Unavailable> {
+    connect_from_until(read_registration(), deadline, true)
+}
+fn connect_from_until(
+    read: RegistrationRead,
+    deadline: Instant,
+    listing: bool,
+) -> std::result::Result<Service, Unavailable> {
     let reg = match read {
         RegistrationRead::Missing => {
             return Err(if service_disabled() {
@@ -544,14 +554,8 @@ fn connect_from(read: RegistrationRead) -> std::result::Result<Service, Unavaila
     if !crate::platform::process_alive(reg.pid) {
         return Err(Unavailable::NotRunning);
     }
-    let info = request(
-        &reg,
-        "GET",
-        "/api/info",
-        None,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .map_err(|_| Unavailable::Unreachable(NOT_RESPONDING.into()))?;
+    let info = request(&reg, "GET", "/api/info", None, deadline)
+        .map_err(|_| Unavailable::Unreachable(NOT_RESPONDING.into()))?;
     if info.status != 200 {
         return Err(Unavailable::Unreachable(
             "OpenCode is not responding correctly".into(),
@@ -566,7 +570,23 @@ fn connect_from(read: RegistrationRead) -> std::result::Result<Service, Unavaila
         )));
     }
     let service = Service { reg };
-    let missing = compatibility(&service).map_err(Unavailable::Unreachable)?;
+    let missing = if listing {
+        compatibility_in(
+            &root().join("opencode/compat"),
+            &service.reg,
+            &requirement_digest(),
+            || {
+                let reply = request(&service.reg, "GET", "/openapi.json", None, deadline)?;
+                if !(200..300).contains(&reply.status) {
+                    return Err("OpenCode API description unavailable".into());
+                }
+                Ok(reply.body)
+            },
+        )
+    } else {
+        compatibility(&service)
+    }
+    .map_err(Unavailable::Unreachable)?;
     if let Some(first) = missing.first() {
         return Err(Unavailable::Incompatible(format!(
             "OpenCode {version} lacks {first}; update OpenCode or Zerus"
@@ -623,7 +643,7 @@ pub(super) fn compatibility_in(
         )
     );
     let cache = dir.join(format!("{key}.json"));
-    if let Ok(bytes) = fs::read(&cache) {
+    if let Ok(Some(bytes)) = labels::read_file(&cache, 4 << 20) {
         if let Ok(value) = serde_json::from_slice::<Vec<String>>(&bytes) {
             return Ok(value);
         }
@@ -711,10 +731,12 @@ fn may_start(
 /// the user's own configuration and state locations, the user's own
 /// `opencode` CLI would pass them too, and the service must register its
 /// `service.json` where `registration_path()` looks.
+/// Only HGS_STATE_DIR/HGS_CONFIG_DIR survive from HGS_*: they let a native
+/// tool shell address its Zerus catalog, and never assert a session identity.
 pub(super) fn start_environment(vars: Vec<(String, String)>) -> Vec<(String, String)> {
     vars.into_iter()
         .filter(|(k, _)| {
-            !(k.starts_with("HGS_")
+            !((k.starts_with("HGS_") && !["HGS_STATE_DIR", "HGS_CONFIG_DIR"].contains(&k.as_str()))
                 || k.starts_with("SSH_")
                 || k.starts_with("OPENCODE_SERVER_")
                 || k.starts_with("ZERUS_MOBILE_")
@@ -770,6 +792,9 @@ pub(super) fn ensure_started() -> Result<Service> {
     )? {
         return Ok(service);
     }
+    // Optional launch-only overlay: never edit the user's config or add a
+    // plugin to a service already running. Inline caller overrides stay dropped.
+    let overlay = super::context_hint::overlay().filter(super::context_hint::starting);
     let mut command = Command::new("opencode");
     #[cfg(target_os = "linux")]
     let mut runtime_dir = None;
@@ -800,16 +825,26 @@ pub(super) fn ensure_started() -> Result<Service> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(overlay) = &overlay {
+        command.env("OPENCODE_CONFIG_CONTENT", &overlay.content);
+    }
     #[cfg(target_os = "linux")]
     if let Some(runtime) = runtime_dir {
         command.env("XDG_RUNTIME_DIR", runtime);
     }
-    let mut child = crate::platform::spawn_detached(&mut command)
-        .map_err(|_| "OpenCode could not be started; install OpenCode 2".to_owned())?;
+    let mut child = crate::platform::spawn_detached(&mut command).map_err(|_| {
+        if let Some(overlay) = &overlay {
+            super::context_hint::spawn_failed(overlay);
+        }
+        "OpenCode could not be started; install OpenCode 2".to_owned()
+    })?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut failed = false;
     while Instant::now() < deadline {
         if let Ok(service) = connect() {
+            if let Some(overlay) = &overlay {
+                super::context_hint::started(&service, overlay);
+            }
             reap(child);
             return Ok(service);
         }
@@ -820,6 +855,9 @@ pub(super) fn ensure_started() -> Result<Service> {
             }
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Some(overlay) = &overlay {
+        super::context_hint::observe(overlay);
     }
     reap(child);
     if failed {
@@ -1349,6 +1387,11 @@ mod tests {
         let kept = start_environment(vec![
             ("PATH".into(), "/usr/bin".into()),
             ("HGS_SESSION".into(), "x".into()),
+            ("HGS_RUN_ID".into(), "run".into()),
+            ("HGS_SESSION_ID".into(), "session".into()),
+            ("HGS_CONVERSATION_ID".into(), "conversation".into()),
+            ("HGS_STATE_DIR".into(), "/tmp/example-state".into()),
+            ("HGS_CONFIG_DIR".into(), "/tmp/example-config".into()),
             ("SSH_AUTH_SOCK".into(), "/s".into()),
             ("SSH_CONNECTION".into(), "1".into()),
             ("OPENCODE_SERVER_PASSWORD".into(), "p".into()),
@@ -1365,6 +1408,8 @@ mod tests {
             names,
             vec![
                 "PATH",
+                "HGS_STATE_DIR",
+                "HGS_CONFIG_DIR",
                 "OPENCODE_CONFIG",
                 "OPENCODE_CONFIG_DIR",
                 "XDG_STATE_HOME",

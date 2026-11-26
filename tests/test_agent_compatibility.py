@@ -1,4 +1,5 @@
 """Distribution integrity, isolated contracts and upstream capability reporting."""
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -18,6 +19,138 @@ spec.loader.exec_module(compat)
 
 
 class AgentCompatibility(unittest.TestCase):
+    def setUp(self):
+        # Existing package/discovery controls substitute only the new compiler
+        # input admission. Its real source/hash/refusal controls are separate.
+        self.seed_admission=patch.object(compat,'seed_inputs',return_value=None)
+        self.seed_admission.start()
+        self.addCleanup(self.seed_admission.stop)
+
+    def memory_runner(self, cases):
+        """The actual runner with a supplied pure suite, never native discovery."""
+        import os
+        import threading
+
+        class Captured(io.StringIO):
+            visible = ''
+
+            def flush(self):
+                self.visible = self.getvalue()
+                super().flush()
+
+        output, error, namespace = Captured(), Captured(), {}
+        suite = unittest.TestSuite(cases(error))
+        with patch.object(os, 'environ', {}), patch('sys.argv', ['memory-runner']), \
+                patch.object(unittest.defaultTestLoader, 'loadTestsFromNames', return_value=suite), \
+                patch.object(compat.subprocess, 'Popen', side_effect=AssertionError('no child process')) as spawn, \
+                patch.object(threading, 'Timer') as timer, patch('sys.stdout', output), patch('sys.stderr', error), \
+                self.assertRaises(SystemExit) as exited:
+            exec(compile(compat.NATIVE_RUNNER, '<native-runner-control>', 'exec'), namespace)
+        spawn.assert_not_called()
+        timer.assert_not_called()
+        return namespace['result'], exited.exception.code, output.getvalue(), error
+
+    @staticmethod
+    def diagnostics(text):
+        return [json.loads(line.removeprefix('ZERUS_NATIVE_DIAGNOSTIC=')) for line in text.splitlines()
+                if line.startswith('ZERUS_NATIVE_DIAGNOSTIC=')]
+
+    def test_native_runner_retains_failure_and_error_before_cleanup(self):
+        observed = []
+
+        def cases(error):
+            class Failure(unittest.TestCase):
+                def runTest(case):
+                    case.addCleanup(lambda: observed.append(('failure', case.id(), error.visible)))
+                    case.fail('original readiness assertion')
+
+            class Error(unittest.TestCase):
+                def runTest(case):
+                    case.addCleanup(lambda: observed.append(('error', case.id(), error.visible)))
+                    raise RuntimeError('original readiness exception')
+
+            return [Failure(), Error()]
+
+        result, status, output, error = self.memory_runner(cases)
+        self.assertEqual((result.testsRun, len(result.failures), len(result.errors), len(result.skipped)), (2, 1, 1, 0))
+        self.assertEqual(status, 1)
+        self.assertEqual(output, 'ZERUS_NATIVE_RESULT={"tests": 2, "skipped": 0}\n')
+        self.assertEqual(len(observed), 2)
+        for kind, identity, before_cleanup in observed:
+            with self.subTest(kind=kind):
+                rows = [row for row in self.diagnostics(before_cleanup) if row['id'] == identity]
+                self.assertEqual([row['event'] for row in rows], ['start', kind])
+                record, = result.failures if kind == 'failure' else result.errors
+                self.assertEqual(record[0].id(), identity)
+                self.assertEqual(rows[1]['traceback'], record[1])
+                self.assertFalse(rows[1]['truncated'])
+                self.assertIn('original readiness', rows[1]['traceback'])
+        self.assertEqual([row['event'] for row in self.diagnostics(error.getvalue())],
+                         ['start', 'failure', 'end', 'start', 'error', 'end'])
+
+    def test_native_runner_bounds_long_unicode_details_and_keeps_the_full_result(self):
+        head, tail = 'start-漢字🙂-', '-end-Привет'
+        message = head + '界' * 20000 + tail
+
+        def cases(error):
+            class Failure(unittest.TestCase):
+                def runTest(case):
+                    case.fail(message)
+            return [Failure()]
+
+        result, status, output, error = self.memory_runner(cases)
+        row, = [row for row in self.diagnostics(error.getvalue()) if row['event'] == 'failure']
+        full = result.failures[0][1]
+        self.assertEqual(status, 1)
+        self.assertTrue(row['truncated'])
+        self.assertEqual(len(row['traceback']), 8192)
+        self.assertTrue(row['traceback'].startswith(full[:3000]))
+        self.assertTrue(row['traceback'].endswith(full[-3000:]))
+        self.assertIn(head, row['traceback'])
+        self.assertIn(tail, row['traceback'])
+        self.assertIn('traceback truncated', row['traceback'])
+        self.assertIn(message, full)
+        self.assertIn(message, error.getvalue(), 'standard unittest output keeps the complete failure')
+        fields = result.addFailure.__globals__['traceback_fields']
+        for length in (8191, 8192, 8193):
+            with self.subTest(length=length):
+                text = '頭' + '界' * (length - 2) + '尾'
+                bounded = fields(text)
+                self.assertEqual(len(bounded['traceback']), min(length, 8192))
+                self.assertEqual(bounded['truncated'], length > 8192)
+                self.assertTrue(bounded['traceback'].startswith('頭'))
+                self.assertTrue(bounded['traceback'].endswith('尾'))
+                if length <= 8192:
+                    self.assertEqual(bounded['traceback'], text)
+
+    def test_native_runner_keeps_success_skip_and_unexpected_success_classification(self):
+        def case(outcome):
+            class Probe(unittest.TestCase):
+                def runTest(probe):
+                    if outcome == 'skip':
+                        probe.skipTest('pure skipped fixture')
+            if outcome in ('expected failure', 'unexpected success'):
+                Probe.runTest = unittest.expectedFailure(Probe.runTest)
+            if outcome == 'expected failure':
+                def failed(probe):
+                    probe.fail('expected pure failure')
+                Probe.runTest = unittest.expectedFailure(failed)
+            return Probe()
+
+        for outcome, expected in [('success', (1, 0, 0, 0, 0)), ('skip', (1, 1, 0, 0, 1)),
+                                  ('unexpected success', (1, 0, 1, 0, 1)), ('expected failure', (1, 0, 0, 1, 0))]:
+            with self.subTest(outcome=outcome):
+                result, status, output, error = self.memory_runner(lambda error: [case(outcome)])
+                self.assertEqual((result.testsRun, len(result.skipped), len(result.unexpectedSuccesses),
+                                  len(result.expectedFailures), int(bool(status))), expected)
+                self.assertEqual((len(result.failures), len(result.errors)), (0, 0))
+                self.assertEqual([row['event'] for row in self.diagnostics(error.getvalue())], ['start', 'end'])
+                self.assertEqual(json.loads(output.removeprefix('ZERUS_NATIVE_RESULT=')),
+                                 dict(tests=1, skipped=len(result.skipped)))
+        result, status, output, error = self.memory_runner(lambda error: [])
+        self.assertEqual((result.testsRun, status), (0, 1))
+        self.assertEqual(output, 'ZERUS_NATIVE_RESULT={"tests": 0, "skipped": 0}\n')
+
     def registry(self, version='9.8.7'):
         manifest = json.loads(compat.MANIFEST.read_text())
         responses = {}
@@ -128,6 +261,13 @@ class AgentCompatibility(unittest.TestCase):
         policies = {row['name']: row.get('policy') for row in manifest['upstream']}
         self.assertEqual(policies['OpenCode'], 'minimum')
         self.assertEqual({name for name, policy in policies.items() if policy}, {'OpenCode'})
+        # DeepSeek's separate latest-only fixture does not execute this history.
+        self.assertEqual([row['version'] for row in manifest['dsh']], reviewed['DeepSeek Harness'])
+        for package in manifest['dsh']:
+            self.assertEqual(package['target'], 'npm')
+            self.assertEqual(package['url'], 'https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-'
+                             + package['version'] + '.tgz')
+            self.assertEqual(len(base64.b64decode(package['integrity'].removeprefix('sha512-'))), 64)
 
     def test_only_an_older_retained_version_may_skip_a_target(self):
         def pin(version, target, **extra):
@@ -434,20 +574,88 @@ class AgentCompatibility(unittest.TestCase):
             for target in ('linux-x64', 'darwin-arm64', 'win32-x64'):
                 self.assertEqual(compat.agent_target(agent, target), target)
 
-    def test_windows_runs_only_the_session_host_suites(self):
+    def test_windows_runs_only_the_session_host_and_portable_parser_suites(self):
         classes = {'claude': 'NativeWindowsClaude', 'codex': 'NativeWindowsCodex'}
         self.assertEqual({agent for agent, spec in compat.AGENTS.items() if 'win32-x64' in spec['members']}, set(classes))
         for agent in classes:
             spec = compat.AGENTS[agent]
             windows = compat.target_spec(agent, 'win32-x64')
-            self.assertEqual(windows['suites'], ['test_windows_native_agents.' + classes[agent]])
+            expected = ['test_windows_native_agents.' + classes[agent]]
+            if agent == 'claude':
+                expected.append('test_claude_session_start_native.NativeClaudeSessionStartJSON')
+                self.assertIn(expected[-1], compat.AGENTS[agent]['suites'])
+            self.assertEqual(windows['suites'], expected)
             self.assertEqual(windows['variable'], spec['variable'])
             self.assertFalse([name for name in spec['suites'] if 'windows' in name])
             for target in set(spec['members']) - {'win32-x64'}:
                 with self.subTest(agent=agent, target=target):
                     self.assertIs(compat.target_spec(agent, target), spec)
 
-    def qualify_fixture(self, agent, target):
+    def test_windows_claude_manual_mode_reaches_every_native_launch(self):
+        # Read the maintained fixture without importing its native host/process setup.
+        tree = ast.parse((ROOT / 'tests/test_windows_native_agents.py').read_text(encoding='utf-8'))
+        classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+        claude, native = classes['NativeWindowsClaude'], classes['NativeAgent']
+        args, = [node.value for node in claude.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == 'ARGS' for target in node.targets)]
+        self.assertEqual(ast.literal_eval(args),
+                         ('--model', 'claude-sonnet-4-6', '--permission-mode', 'manual'),
+                         'Claude approval fixtures must not inherit the account bypass default')
+        self.assertEqual([ast.unparse(base) for base in claude.bases], ['NativeAgent', 'host.HostCase'])
+        methods = {node.name: node for node in claude.body if isinstance(node, ast.FunctionDef)}
+        self.assertNotIn('launch', methods, 'all Claude launches must use the maintained common path')
+
+        def self_call(node, name):
+            return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == 'self'
+                    and node.func.attr == name)
+
+        launch, = [node for node in native.body if isinstance(node, ast.FunctionDef) and node.name == 'launch']
+        forwarded, = [node.value for node in launch.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == 'args' for target in node.targets)]
+        self.assertEqual(ast.dump(forwarded), ast.dump(ast.parse('[*self.ARGS, *extra]', mode='eval').body))
+        command, = [node for node in ast.walk(launch) if self_call(node, 'hgs')]
+        self.assertEqual(ast.unparse(command.args[0]), 'self.AGENT')
+        # The hgs delimiter precedes the native args; an extra native delimiter
+        # can only follow ARGS, so explicit manual mode retains launch precedence.
+        self.assertEqual(ast.dump(command.args[-1]),
+                         ast.dump(ast.parse("f(*(['--', *args] if args else []))").body[0].value.args[0]))
+
+        launches = {}
+        for name, method in methods.items():
+            calls = [node for node in ast.walk(method) if self_call(node, 'launch')]
+            if calls:
+                self.assertTrue(all(len(call.args) == 1 and not call.keywords for call in calls))
+                launches[name] = [ast.literal_eval(call.args[0]) for call in calls]
+        self.assertEqual(launches, {
+            'test_project_powershell_wrapper_keeps_existing_tracking_and_exact_messages': ['prime-hooks', 'wrapper'],
+            'test_a_tracked_launch_reports_its_hooks_and_send_delivers_exact_messages': ['messages'],
+            'test_hgs_answers_ask_user_question': ['question'],
+            'test_hgs_answers_a_question_taller_than_its_unviewed_pane': ['tall'],
+            'test_hgs_approves_a_write_once': ['approval'],
+            'test_the_answer_channel_answers_bash_approvals': ['channel'],
+            'test_a_bash_panel_taller_than_80x24_is_answered_through_the_hook': ['clipped'],
+            'test_terminal_answers_end_the_hook': ['terminal'],
+            'test_a_killed_hook_leaves_the_approval_to_the_verified_screen': ['killed'],
+            'test_clear_context_starts_a_new_conversation_in_the_same_agent': ['clear'],
+            'test_pause_resume_and_terminate': ['lifecycle'],
+            'test_a_team_swap_moves_the_lead_through_u53': ['swap'],
+            'test_input_keys_reach_claude_through_the_host': ['keys'],
+        })
+        wrapper = methods['test_project_powershell_wrapper_keeps_existing_tracking_and_exact_messages']
+        writes = [node for node in ast.walk(wrapper) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute) and node.func.attr == 'write_text']
+        script, = writes
+        self.assertEqual(ast.dump(script.args[0]),
+                         ast.dump(ast.parse('f"& \'{program}\' @args; exit $LASTEXITCODE\\n"', mode='eval').body))
+        settings, = [node.args[0] for node in ast.walk(methods['configure'])
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and ast.unparse(node.func) == 'json.dumps' and isinstance(node.args[0], ast.Dict)
+                     and any(isinstance(key, ast.Constant) and key.value == 'permissions'
+                             for key in node.args[0].keys)]
+        self.assertEqual(ast.literal_eval(settings), {'permissions': {'defaultMode': 'default'}})
+
+    def qualify_fixture(self, agent, target, effort_seed=None, teams=False):
         """Run qualify() with stand-ins for the package, the executable and the suite
         interpreter; returns the report row, the suite runs, the results folder and the
         profile each probe of the executable saw."""
@@ -481,13 +689,45 @@ class AgentCompatibility(unittest.TestCase):
         with patch.object(compat, 'install_native', return_value=work / agent / '1.2.3' / 'native'), \
                 patch.object(compat, 'probe', side_effect=probe), \
                 patch.object(compat.subprocess, 'run', side_effect=run), \
+                patch.object(compat, 'run_partitioned_suites',
+                             side_effect=lambda *args, **kwargs: compat.run_suites(*args)), \
                 patch.dict(compat.os.environ, {'HGS_TEST_CONPTY_DIR': 'C:\\fixture\\conpty',
                                                'HGS_SESSION': 'fixture-live-session',
                                                'XDG_STATE_HOME': '/fixture-live-state',
                                                'USERPROFILE': 'C:\\Users\\fixture-runner'}), \
                 patch('sys.stdout', io.StringIO()):
-            row = compat.qualify(agent, package, work, results, Path('hgs-under-test'))
+            row = compat.qualify(agent, package, work, results, Path('hgs-under-test'),effort_seed=effort_seed,
+                                 teams=teams)
         return row, runs, results / agent / '1.2.3', profiles
+
+    def test_private_seed_is_bound_and_forwarded_to_all_original_codex_cases(self):
+        value=dict(receipt='/fixture/receipt',value=dict(image=dict(path='/fixture/private-seed',sha256='a'*64),source=dict(commit='b'*40)))
+        with patch.object(compat,'seed_inputs',return_value=value):
+            row,runs,_,_=self.qualify_fixture('codex','linux-x64',effort_seed=value)
+        self.assertEqual(row['status'],'passed',row.get('error'))
+        self.assertEqual(len(runs),4)
+        self.assertEqual(row['effort_seed'],value['value'])
+        self.assertEqual({(env['HGS_CODEX_TEST_SIZE'],env['HGS_CODEX_TEST_ANIMATIONS']) for _,env,_ in runs},
+                         {(size,mode) for size in ('95x47','110x35') for mode in ('true','false')})
+        for _,env,_ in runs:
+            self.assertEqual(env['ZERUS_PICKER_EFFORT_SEED_IMAGE'],'/fixture/private-seed')
+            self.assertEqual(env['ZERUS_PICKER_EFFORT_SEED_SHA256'],'a'*64)
+
+    def test_missing_standard_unix_seed_refuses_before_upstream_or_native_install(self):
+        with tempfile.TemporaryDirectory() as root,patch.object(compat,'seed_inputs',side_effect=ValueError('missing private seed')), \
+             patch.object(compat,'discover_upstream') as discover,patch.object(compat,'install_native') as install, \
+             patch.object(compat,'host_target',return_value='linux-x64'),patch('sys.stderr',io.StringIO()), \
+             patch.object(compat.sys,'argv',['agent-compatibility.py','--agent','claude','--results',root]):
+            with self.assertRaises(SystemExit) as refusal:compat.main()
+            self.assertEqual(refusal.exception.code,2)
+            discover.assert_not_called();install.assert_not_called()
+
+    def test_ambient_private_seed_overrides_are_not_inherited(self):
+        with tempfile.TemporaryDirectory() as root,patch.dict(compat.os.environ,
+                ZERUS_PICKER_EFFORT_SEED_IMAGE='/unreviewed/image',ZERUS_PICKER_EFFORT_SEED_SHA256='f'*64):
+            env=compat.fixture_environment(Path(root)/'home')
+        self.assertNotIn('ZERUS_PICKER_EFFORT_SEED_IMAGE',env)
+        self.assertNotIn('ZERUS_PICKER_EFFORT_SEED_SHA256',env)
 
     def test_windows_qualifies_each_agent_once_through_the_session_host(self):
         for agent, spec in compat.AGENTS.items():
@@ -529,7 +769,7 @@ class AgentCompatibility(unittest.TestCase):
                 row, runs, directory, profiles = self.qualify_fixture('opencode', target)
                 self.assertEqual(row['status'], 'passed', row.get('error'))
                 [(suites, env, timeout)] = runs
-                self.assertEqual((suites, timeout), (['test_opencode_native'], compat.AGENTS['opencode']['timeout']))
+                self.assertEqual((suites, timeout), (['test_opencode_native', 'test_opencode_hint_native'], compat.AGENTS['opencode']['timeout']))
                 self.assertEqual(env['ZERUS_TEST_OPENCODE_NATIVE'], '1')
                 self.assertEqual(Path(env['ZERUS_TEST_OPENCODE_BIN']).name, 'native')
                 # The suite builds its own private folders; the runner's version and help
@@ -597,11 +837,15 @@ class AgentCompatibility(unittest.TestCase):
             stack.assert_called_once_with(file=error, all_threads=True)
             rows = [json.loads(line.removeprefix('ZERUS_NATIVE_DIAGNOSTIC=')) for line in error.getvalue().splitlines()
                     if line.startswith('ZERUS_NATIVE_DIAGNOSTIC=')]
-            self.assertEqual([row['event'] for row in rows], ['start', 'before-aggregate-timeout', 'end'])
+            self.assertEqual([row['event'] for row in rows],
+                             ['start', 'before-aggregate-timeout'] + ([] if passing else ['failure']) + ['end'])
             self.assertEqual(rows[0], dict(event='start', id=case.id(), started_monotonic=101))
             self.assertEqual(rows[1], dict(event='before-aggregate-timeout', monotonic=105,
                                           current=dict(id=case.id(), started_monotonic=101), case_elapsed=4))
-            self.assertEqual(rows[2], dict(event='end', id=case.id(), ended_monotonic=106, elapsed=5))
+            self.assertEqual(rows[-1], dict(event='end', id=case.id(), ended_monotonic=106, elapsed=5))
+            if not passing:
+                self.assertEqual(rows[2], dict(event='failure', id=case.id(),
+                                              traceback=namespace['result'].failures[0][1], truncated=False))
             self.assertIsNone(namespace['current'])
             self.assertEqual(output.getvalue(), 'ZERUS_NATIVE_RESULT={"tests": 1, "skipped": 0}\n')
 
@@ -628,7 +872,13 @@ class AgentCompatibility(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 marker = next(line for line in result.stdout.splitlines() if line.startswith('ZERUS_NATIVE_RESULT='))
                 counts = json.loads(marker.removeprefix('ZERUS_NATIVE_RESULT='))
-                self.assertEqual(counts['skipped'], counts['tests'])
+                if suites:
+                    # Native modules may also contain ordinary policy controls.
+                    # Even a mixed passing/skipped suite must fail this gate.
+                    self.assertGreater(counts['skipped'], 0)
+                    self.assertLessEqual(counts['skipped'], counts['tests'])
+                else:
+                    self.assertEqual(counts, {'tests': 0, 'skipped': 0})
 
     def test_fixture_environment_does_not_inherit_live_accounts_or_session_selection(self):
         import os
@@ -755,6 +1005,59 @@ class AgentCompatibility(unittest.TestCase):
         self.assertNotRegex(workflow, r'actions/cache[@/]')
         self.assertIn('persist-credentials: false', workflow)
         self.assertIn('retention-days: 3', workflow)
+
+
+    def test_teams_contract_runs_one_case_of_its_own_class_and_bound(self):
+        for agent in ('claude', 'codex'):
+            with self.subTest(agent=agent):
+                row, runs, results, _ = self.qualify_fixture(agent, 'linux-x64', teams=True)
+                self.assertEqual(row['status'], 'passed', row.get('error'))
+                self.assertEqual(row['contract'], 'teams')
+                self.assertEqual(list(row['cases']), ['teams'])
+                self.assertEqual(len(runs), 1, 'Teams adds no terminal-geometry cases')
+                suites, env, timeout = runs[0]
+                self.assertEqual(suites, compat.TEAMS_CLASSES[agent])
+                self.assertEqual(timeout, compat.TEAMS_TIMEOUT)
+                self.assertEqual(env['ZERUS_TEAMS_EVIDENCE'], str(results / 'teams-evidence'))
+                self.assertNotIn('HGS_CODEX_TEST_SIZE', env)
+                self.assertNotIn('ZERUS_PICKER_EFFORT_SEED_IMAGE', env)
+                self.assertNotIn('HGS_SESSION', env)
+
+    def test_teams_contract_selects_claude_and_codex_and_takes_no_seed(self):
+        qualified = []
+
+        def qualify(agent, package, work, results, hgs, teams=False):
+            qualified.append((agent, teams))
+            return {'agent': agent, 'version': package['version'], 'target': package['target'], 'status': 'passed'}
+
+        for target, arguments, expected in [
+                ('linux-x64', [], [('codex', True), ('claude', True)]),
+                ('linux-x64', ['--agent', 'claude'], [('claude', True)]),
+                ('linux-x64', ['--agent', 'opencode'], SystemExit),
+                ('linux-x64', ['--agent', 'kimi'], SystemExit),
+                ('linux-x64', ['--effort-seed-receipt', '/fixture/receipt'], SystemExit),
+                ('darwin-arm64', [], [('claude', True)]),
+                ('win32-x64', [], SystemExit)]:
+            qualified.clear()
+            responses = self.registry()
+            with self.subTest(target=target, arguments=arguments), tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(compat, 'fetch_json', side_effect=lambda url: responses[url]), \
+                    patch.object(compat, 'qualify', side_effect=qualify), \
+                    patch.object(compat, 'seed_inputs', side_effect=AssertionError('no Effort seed')), \
+                    patch.object(compat, 'host_target', return_value=target), \
+                    patch.object(compat.sys, 'argv', ['agent-compatibility.py', '--contract', 'teams',
+                                                      '--results', temporary, *arguments]), \
+                    patch('sys.stderr', io.StringIO()):
+                if expected is SystemExit:
+                    with self.assertRaises(SystemExit):
+                        compat.main()
+                    self.assertEqual(qualified, [])
+                else:
+                    self.assertFalse(compat.main())
+                    self.assertEqual(qualified, expected)
+                    report = json.loads((Path(temporary) / 'report.json').read_text())
+                    self.assertEqual(report['contract'], 'teams')
+                    self.assertEqual(report['selection_policy'], 'latest-only')
 
 
 if __name__ == '__main__':

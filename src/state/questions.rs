@@ -8,6 +8,8 @@ use std::fs::{self, File};
 use std::io::{Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
+mod kimi_blocking;
+
 const MAX_WIRE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: u64 = 128 * 1024;
 
@@ -23,7 +25,7 @@ fn text(value: &Value, max: usize) -> Result<String> {
     Ok(value.into())
 }
 
-fn token(value: &str) -> bool {
+pub(super) fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
         && value
@@ -110,9 +112,17 @@ fn card(
     Ok(card)
 }
 
+/// The tool through which `agent` asks the user: Claude Code's
+/// AskUserQuestion, or Qwen Code's ask_user_question, which takes the same
+/// `questions` (question, header, options with label and description,
+/// multiSelect; Qwen Code 0.27.4).
+pub(super) fn asks(record: &Value, tool: &str) -> bool {
+    tool == "AskUserQuestion" || (string(record, "agent") == "qwen" && tool == "ask_user_question")
+}
+
 pub(super) fn from_hook(record: &Value, event: &Value) -> Option<Value> {
     if string(event, "hook_event_name") != "PreToolUse"
-        || string(event, "tool_name") != "AskUserQuestion"
+        || !asks(record, string(event, "tool_name"))
         || !string(event, "agent_id").is_empty()
     {
         return None;
@@ -159,7 +169,7 @@ pub(super) fn observe(record: &mut Value, event: &Value) {
         let tool = tool_id(event);
         if !tool.is_empty() {
             pending.remove(tool);
-        } else if string(event, "tool_name") == "AskUserQuestion" {
+        } else if asks(record, string(event, "tool_name")) {
             pending.clear();
         }
     }
@@ -229,12 +239,18 @@ fn wire_events(record: &Value) -> Result<Vec<Value>> {
             {
                 continue;
             }
-            if !line.windows(12).any(|part| part == b"interaction.") {
+            if !line.windows(12).any(|part| part == b"interaction.")
+                && !line
+                    .windows(25)
+                    .any(|part| part == b"context.append_loop_event")
+            {
                 continue;
             }
             if let Ok(event) = serde_json::from_slice::<Value>(line) {
                 if string(&event, "agentId") == "main"
-                    && string(&event, "type").starts_with("interaction.")
+                    && (string(&event, "type").starts_with("interaction.")
+                        || (event["type"] == "context.append_loop_event"
+                            && event["event"]["type"] == "tool.call"))
                 {
                     events.push(event);
                 }
@@ -246,7 +262,9 @@ fn wire_events(record: &Value) -> Result<Vec<Value>> {
 
 fn recover_wire(record: &Value, events: &[Value]) -> BTreeMap<String, Value> {
     let mut pending = BTreeMap::new();
+    let mut calls = kimi_blocking::Calls::default();
     for event in events {
+        calls.observe(event);
         let id = string(event, "id");
         if id.is_empty() {
             continue;
@@ -260,7 +278,7 @@ fn recover_wire(record: &Value, events: &[Value]) -> BTreeMap<String, Value> {
                 if !active {
                     continue;
                 }
-                if let Ok(card) = card(
+                if let Ok(mut card) = card(
                     record,
                     id,
                     tool,
@@ -268,7 +286,8 @@ fn recover_wire(record: &Value, events: &[Value]) -> BTreeMap<String, Value> {
                     "kimi_wire",
                     event["time"].as_f64().unwrap_or(0.0) / 1000.0,
                 ) {
-                    pending.insert(id.into(), card);
+                    card["blocking"] = json!(calls.blocking(event, &card["questions"]));
+                    pending.insert(id.into(), (card, event));
                 }
             }
             "interaction.resolved" | "interaction.cancelled" | "interaction.dismissed" => {
@@ -278,20 +297,40 @@ fn recover_wire(record: &Value, events: &[Value]) -> BTreeMap<String, Value> {
         }
     }
     pending
+        .into_iter()
+        .map(|(id, (mut card, request))| {
+            // A later tool-ID reuse must retire an older question's proof.
+            // Rechecking only revokes authority; a future call cannot add it.
+            card["blocking"] =
+                json!(card["blocking"] == true && calls.blocking(request, &card["questions"]));
+            (id, card)
+        })
+        .collect()
 }
 
 /// Current normalized identities without availability checks (adapter guard API).
 pub(super) fn current(record: &Value) -> Result<Vec<Value>> {
-    Ok(collect(record, None)?.unwrap_or_default())
+    Ok(collect(record, None, false, true)?.unwrap_or_default().0)
 }
 
 /// Like `current`, but None when the Codex question index cannot be brought up
 /// to date by `deadline`; its progress is kept for the next call.
 pub(super) fn current_until(record: &Value, deadline: std::time::Instant) -> Result<Option<Vec<Value>>> {
-    collect(record, Some(deadline))
+    Ok(collect(record, Some(deadline), false, false)?.map(|(cards, _)| cards))
 }
 
-fn collect(record: &Value, deadline: Option<std::time::Instant>) -> Result<Option<Vec<Value>>> {
+/// The cards, and whether the Codex question index was complete by
+/// `deadline`. An incomplete index is None, unless `partial` keeps the other
+/// cards: then it adds no Codex question and nothing inferred from their
+/// absence (zerus-a4mub.8). `listing` marks a question listing (`current`
+/// and `inspection`): only a listing may fit a clipped Claude approval into
+/// its unviewed pane. A deadline alone never decides that.
+fn collect(
+    record: &Value,
+    deadline: Option<std::time::Instant>,
+    partial: bool,
+    listing: bool,
+) -> Result<Option<(Vec<Value>, bool)>> {
     let mut by_tool = BTreeMap::new();
     if let Some(pending) = record["pending_questions"].as_object() {
         for card in pending.values() {
@@ -300,7 +339,7 @@ fn collect(record: &Value, deadline: Option<std::time::Instant>) -> Result<Optio
                 && card["conversation_id"] == record["conversation_id"]
                 && record["active_tools"]
                     .get(tool)
-                    .is_some_and(|tool| string(tool, "name") == "AskUserQuestion")
+                    .is_some_and(|tool| asks(record, string(tool, "name")))
             {
                 by_tool.insert(tool.to_owned(), card.clone());
             }
@@ -320,42 +359,78 @@ fn collect(record: &Value, deadline: Option<std::time::Instant>) -> Result<Optio
     let mut cards: Vec<_> = by_tool.into_values().collect();
     cards.extend(kimi_plan::recover(record, &events));
     cards.extend(kimi_approval::recover(record, &events));
+    let mut complete = true;
     match deadline {
         None => cards.extend(codex_questions::current(record)?),
         Some(deadline) => match codex_questions::current_until(record, deadline)? {
             Some(codex) => cards.extend(codex),
+            None if partial => complete = false,
             None => return Ok(None),
         },
     }
-    // Only a listing may fit a clipped approval into its unviewed pane.
-    let approval=if deadline.is_none() {claude_approval::listed(record)} else {claude_approval::current(record)};
-    if let Some(approval)=approval{cards.push(approval);}
-    if let Some(mode) = claude_permission::current(record) {
-        cards.push(mode);
-    }
-    if let Some(resume) = claude_resume::current(record) { cards.push(resume); }
-    if let Some(limit) = claude_usage_limit::current(record) { cards.push(limit); }
-    if let Some(trust) = claude_trust::current(record) {
-        cards.push(trust);
-    }
-    if let Some(trust) = codex_trust::current(record) {cards.push(trust);}
-    if let Some(trust) = codex_hooks_trust::current(record) {cards.push(trust);}
-    if let Some(update) = codex_update::current(record) {cards.push(update);}
-    if let Some(goal) = codex_goal_resume::current(record) {cards.push(goal);}
-    if let Some(trust) = kimi_trust::current(record) {
-        cards.push(trust);
-    }
-    if let Some(hint) = kimi_cache_hint::current(record) {
-        cards.push(hint);
-    }
-    if let Some(terminal) = claude_approval::terminal_card(record, &cards) {
-        cards.push(terminal);
-    }
-    if cards.is_empty() {
-        cards.extend(claude_approval::idle_choice(record));
-    }
-    if cards.is_empty() {
-        cards.extend(startup_choice::current(record));
+    if !storage::listing_scope::public(record) {
+        // Only a listing may fit a clipped approval into its unviewed pane.
+        let approval = if listing {
+            claude_approval::listed(record)
+        } else {
+            claude_approval::current(record)
+        };
+        if let Some(approval) = approval {
+            cards.push(approval);
+        }
+        if let Some(mode) = claude_permission::current(record) {
+            cards.push(mode);
+        }
+        if let Some(resume) = claude_resume::current(record) {
+            cards.push(resume);
+        }
+        if let Some(limit) = claude_usage_limit::current(record) {
+            cards.push(limit);
+        }
+        if let Some(trust) = claude_trust::current(record) {
+            cards.push(trust);
+        }
+        // Task #466: Claude's bypass-permissions startup warning is the owner's card,
+        // never the generic read-only startup fallback.
+        if let Some(bypass) = claude_bypass::current(record) {
+            cards.push(bypass);
+        }
+        if let Some(trust) = codex_trust::current(record) {
+            cards.push(trust);
+        }
+        if let Some(approval) = codex_approval::current(record) {
+            cards.push(approval);
+        }
+        if let Some(setup) = codex_sandbox::current(record) {
+            cards.push(setup);
+        }
+        if let Some(trust) = codex_hooks_trust::current(record) {
+            cards.push(trust);
+        }
+        if let Some(update) = codex_update::current(record) {
+            cards.push(update);
+        }
+        if let Some(goal) = codex_goal_resume::current(record) {
+            cards.push(goal);
+        }
+        if let Some(limit) = codex_rate_limit::current(record) {
+            cards.push(limit);
+        }
+        if let Some(trust) = kimi_trust::current(record) {
+            cards.push(trust);
+        }
+        if let Some(hint) = kimi_cache_hint::current(record) {
+            cards.push(hint);
+        }
+        if let Some(terminal) = claude_approval::terminal_card(record, &cards) {
+            cards.push(terminal);
+        }
+        if cards.is_empty() {
+            cards.extend(claude_approval::idle_choice(record));
+        }
+        if cards.is_empty() && complete {
+            cards.extend(startup_choice::current(record));
+        }
     }
     cards.sort_by(|a, b| {
         a["created_at"]
@@ -363,7 +438,129 @@ fn collect(record: &Value, deadline: Option<std::time::Instant>) -> Result<Optio
             .unwrap_or(0.0)
             .total_cmp(&b["created_at"].as_f64().unwrap_or(0.0))
     });
-    Ok(Some(cards))
+    Ok(Some((cards, complete)))
+}
+
+/// The current cards of the deferred answer kind's sources
+/// (`deferred_answer::SOURCES`), rebuilt with pure reads only, in
+/// `collect`'s order: no fit, no `claude_approval` listing, no Codex question
+/// index or startup lock, nothing written. The three Kimi wire sources get
+/// `can_answer`, `answer_transport` and `answer_unavailable_reason` exactly
+/// as `inspection` sets them, from their pure availability checks; a panel
+/// that `inspection` would have fitted but is clipped now therefore yields no
+/// card or no transport, and the comparison fails closed.
+pub(super) fn observe_current(record: &Value) -> Result<Vec<Value>> {
+    let events = wire_events(record)?;
+    let mut cards: Vec<Value> = recover_wire(record, &events).into_values().collect();
+    cards.extend(kimi_plan::recover(record, &events));
+    cards.extend(kimi_approval::recover(record, &events));
+    cards.extend(
+        [
+            claude_permission::current(record),
+            claude_resume::current(record),
+            claude_usage_limit::current(record),
+            claude_trust::current(record),
+            codex_trust::current(record),
+            codex_sandbox::current(record),
+            codex_hooks_trust::current(record),
+            codex_update::current(record),
+            codex_rate_limit::current(record),
+            kimi_trust::current(record),
+            kimi_cache_hint::current(record),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let sources = zerus_client_core::desktop::deferred_answer::SOURCES;
+    cards.retain(|card| sources.contains(&string(card, "source")));
+    for card in &mut cards {
+        let source = string(card, "source").to_owned();
+        if string(record, "agent") != "kimi"
+            || ![kimi_plan::SOURCE, kimi_approval::SOURCE, "kimi_wire"].contains(&source.as_str())
+        {
+            continue;
+        }
+        let available = if source == kimi_plan::SOURCE {
+            kimi_plan::available(record, card)
+        } else if source == kimi_approval::SOURCE {
+            kimi_approval::available(record, card)
+        } else {
+            super::question_terminal::available(record, card)
+        };
+        match available {
+            Ok(()) => {
+                card["can_answer"] = json!(true);
+                card["answer_transport"] = json!("kimi_tui");
+                card["answer_unavailable_reason"] = json!("");
+            }
+            Err(error) => card["answer_unavailable_reason"] = json!(error),
+        }
+    }
+    cards.sort_by(|a, b| {
+        a["created_at"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&b["created_at"].as_f64().unwrap_or(0.0))
+    });
+    Ok(cards)
+}
+
+/// The observation's stdin: one question of one exact run and conversation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserveRequest {
+    question_id: String,
+    expected_run_id: String,
+    expected_conversation_id: String,
+}
+/// The largest observation reply.
+const MAX_OBSERVATION_BYTES: usize = 64 << 10;
+
+/// `hgs answer <session> --observe --json`: the consent identity of one
+/// pending question of the deferred answer kind's sources, read without any
+/// effect ([`observe_current`]). It never answers, locks, fits a panel,
+/// writes a receipt or writes anything else.
+fn observe_dispatch(name: &str) -> Result<i32> {
+    let mut input = Vec::new();
+    io::stdin()
+        .take(MAX_PAYLOAD_BYTES + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| error.to_string())?;
+    if input.len() as u64 > MAX_PAYLOAD_BYTES {
+        return Err("observation payload exceeds 128 KiB".into());
+    }
+    let request: ObserveRequest = serde_json::from_slice(crate::state::without_bom(&input))
+        .map_err(|error| format!("invalid observation payload: {error}"))?;
+    if request.expected_run_id.is_empty() || request.question_id.is_empty() {
+        return Err("question identities are required".into());
+    }
+    expect(name, &request.expected_run_id, &request.expected_conversation_id)?;
+    let record = read(name)?;
+    // The answer path's own identity and availability rule, read only.
+    let current = names_session(
+        &record,
+        &request.expected_run_id,
+        &request.expected_conversation_id,
+    ) && matches(&record, panes_of(&live()?, &record))
+        && process_alive(&record)
+        && !pause_active(&record)
+        && string(&record, "error").is_empty()
+        && (string(&record, "expected_id").is_empty() || startup_question_id(&request.question_id));
+    let card = if current {
+        observe_current(&record)?
+            .into_iter()
+            .find(|card| string(card, "question_id") == request.question_id)
+    } else {
+        None
+    };
+    let reply = json!({"found": card.is_some(),
+        "consent_identity": card.map(|card| zerus_client_core::questions::consent_identity(&card))});
+    let text = reply.to_string();
+    if text.len() > MAX_OBSERVATION_BYTES {
+        return Err("observation exceeds 64 KiB".into());
+    }
+    println!("{text}");
+    Ok(0)
 }
 
 pub(super) fn wire_response(record: &Value, question_id: &str) -> Result<Option<Value>> {
@@ -394,24 +591,50 @@ pub(super) fn response(record: &Value, card: &Value) -> Result<Option<Value>> {
     }
 }
 
-pub(super) fn inspection(record: &Value, live_pane: bool) -> Result<Value> {
+/// The pending questions of an inspection, and whether they are complete.
+/// The Codex question index works only until `deadline` and keeps its
+/// progress; until it is complete, no Codex question is listed or offered
+/// and the list is not complete (zerus-a4mub.8).
+pub(super) fn inspection(
+    record: &Value,
+    live_pane: bool,
+    deadline: std::time::Instant,
+) -> Result<(Value, bool)> {
     if !live_pane || !process_alive(record) {
-        return Ok(json!([]));
+        return Ok((json!([]), true));
     }
     kimi_trust::fit(record);
-    match current(record) {
-        Ok(mut pending) => {
+    match collect(record, Some(deadline), true, true).map(Option::unwrap_or_default) {
+        Ok((mut pending, complete)) => {
+            // The same complete index decides whether a Codex question is unique.
+            let codex: Vec<Value> = pending
+                .iter()
+                .filter(|c| string(c, "source") == "codex_async")
+                .cloned()
+                .collect();
             for card in &mut pending {
                 if string(card,"source")=="codex_async" {
                     card["can_skip"]=json!(card["answer_delivery"]["status"] != "submitted");
                     codex_questions::fit(record,card);
-                    match codex_questions::available(record,card) {
+                    match codex_questions::available_among(record,card,&codex) {
                         Ok(())=>{card["can_answer"]=json!(true);card["answer_transport"]=json!("codex_tui");card["answer_unavailable_reason"]=json!("");}
                         Err(error)=>card["answer_unavailable_reason"]=json!(error),
                     }
                 }
-                if string(record,"agent")=="claude" && string(card,"source")=="hook" {
-                    match answer_channel::route(record, card) {
+                if string(card, "source") == codex_approval::SOURCE {
+                    // Task #232: a Codex exec or apply-patch approval, answered
+                    // by its own dialog's choices; the command and folder are
+                    // in the card.
+                    match codex_approval::available(record, card) {
+                        Ok(()) => {
+                            card["can_answer"] = json!(true);
+                            card["answer_transport"] = json!("codex_tui");
+                            card["answer_unavailable_reason"] = json!("");
+                        }
+                        Err(error) => card["answer_unavailable_reason"] = json!(error),
+                    }
+                }
+                if string(record,"agent")=="claude" && string(card,"source")=="hook" {                    match answer_channel::route(record, card) {
                         // Claude's own hook waits beside the panel; the screen is not needed.
                         Ok(answer_channel::Route::Channel(_)) => { card["can_answer"]=json!(true); card["answer_transport"]=json!("claude_hook"); card["answer_unavailable_reason"]=json!(""); }
                         // An answer already belongs to the channel: never offer a second one.
@@ -459,7 +682,7 @@ pub(super) fn inspection(record: &Value, live_pane: bool) -> Result<Value> {
                     }
                 }
             }
-            Ok(json!(pending))
+            Ok((json!(pending), complete))
         }
         Err(error) => Err(error),
     }
@@ -553,18 +776,46 @@ fn validated_answers(card: &Value, answers: &[Answer]) -> Result<Value> {
     Ok(json!(normalized))
 }
 
+/// A pending question's native identity, or a session record's (`run_id`,
+/// `conversation_id`): a string is itself, and null is "". A new run's record
+/// holds its conversation as null until the first SessionStart, a startup
+/// card copies that null, and the snapshot and the answer request carry "";
+/// all of them are one identity. A missing key or another type is none at all.
+/// The answer command, the Teams confirmation policy and the approval audit
+/// read a question's identity only through this function (zerus-63rru.60).
+pub(crate) fn native_identity<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    match value.get(key)? {
+        Value::Null => Some(""),
+        Value::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// Whether `record` is the session a request names: its run, and its
+/// conversation by [`native_identity`].
+fn names_session(record: &Value, run: &str, conversation: &str) -> bool {
+    string(record, "run_id") == run
+        && native_identity(record, "conversation_id") == Some(conversation)
+}
+
 fn startup_question_id(id: &str) -> bool {
-    ["codex-hooks-trust:", "codex-update:", "codex-goal-resume:", "codex-trust:", "kimi-trust:", "claude-trust:", "claude-permissions:", "claude-resume:", "claude-usage-limit:"].iter().any(|prefix| id.starts_with(prefix))
+    ["codex-sandbox:", "codex-hooks-trust:", "codex-update:", "codex-goal-resume:", "codex-trust:", "kimi-trust:", "claude-trust:", "claude-bypass:", "claude-permissions:", "claude-resume:", "claude-usage-limit:"].iter().any(|prefix| id.starts_with(prefix))
 }
 
 fn matching_record(name: &str, request: &AnswerRequest) -> Result<Value> {
+    // zerus-ucck P3c: the request's identities select among sessions that
+    // share the label.
+    expect(name, &request.expected_run_id, &request.expected_conversation_id)?;
     let record = read(name)?;
-    if string(&record, "run_id") != request.expected_run_id
-        || string(&record, "conversation_id") != request.expected_conversation_id
-    {
+    terminating::check_mutation(&record)?;
+    if !names_session(
+        &record,
+        &request.expected_run_id,
+        &request.expected_conversation_id,
+    ) {
         return Err("session identity changed; refresh before answering".into());
     }
-    if !matches(&record, live()?.get(name))
+    if !matches(&record, panes_of(&live()?, &record))
         || !process_alive(&record)
         || pause_active(&record)
         || !string(&record, "error").is_empty()
@@ -666,7 +917,39 @@ fn own_question(name: &str, record: Option<&Value>, session: Option<&str>) -> bo
     record.is_some_and(|record| string(record, "name") == name) || session.is_some_and(|session| session == name)
 }
 
+/// The answer command's reading of its request: the exact fields, and the
+/// identities it requires. Only a startup question may name no conversation.
+fn read_request(input: &[u8]) -> Result<AnswerRequest> {
+    let request: AnswerRequest = serde_json::from_slice(crate::state::without_bom(input))
+        .map_err(|error| format!("invalid answer payload: {error}"))?;
+    uuid::Uuid::parse_str(&request.request_id).map_err(|_| "request_id must be a UUID")?;
+    if request.expected_run_id.is_empty()
+        || (request.expected_conversation_id.is_empty()
+            && !startup_question_id(&request.question_id))
+        || request.expected_question_hash.len() != 64
+    {
+        return Err("question identities are required; refresh before answering".into());
+    }
+    Ok(request)
+}
+
+/// What the answer command reads from a request it would accept: its run,
+/// conversation and question (for tests of the requests other code builds).
+// Its only callers are the Teams confirmation tests (Linux and macOS).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn read_answer_request(input: &[u8]) -> Result<(String, String, String)> {
+    let request = read_request(input)?;
+    Ok((
+        request.expected_run_id,
+        request.expected_conversation_id,
+        request.question_id,
+    ))
+}
+
 pub(super) fn dispatch(args: &[String]) -> Result<i32> {
+    if args.len() == 3 && args[1] == "--observe" && args[2] == "--json" {
+        return observe_dispatch(&args[0]);
+    }
     if args.len() != 2 || args[1] != "--json" {
         return Err("usage: hgs answer <session> --json (JSON from stdin)".into());
     }
@@ -678,18 +961,10 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
     if input.len() as u64 > MAX_PAYLOAD_BYTES {
         return Err("answer payload exceeds128 KiB".into());
     }
-    let request: AnswerRequest = serde_json::from_slice(crate::state::without_bom(&input))
-        .map_err(|error| format!("invalid answer payload: {error}"))?;
+    let request = read_request(&input)?;
     let request_id = uuid::Uuid::parse_str(&request.request_id)
         .map_err(|_| "request_id must be a UUID")?
         .to_string();
-    if request.expected_run_id.is_empty()
-        || (request.expected_conversation_id.is_empty()
-            && !startup_question_id(&request.question_id))
-        || request.expected_question_hash.len() != 64
-    {
-        return Err("question identities are required; refresh before answering".into());
-    }
     let digest = format!("{:x}", Sha256::digest(&input));
     let receipt_path = absolute_root()?
         .join("question_receipts")
@@ -706,6 +981,9 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
     // different hosts or carrying different UUIDs. Provider hooks never take
     // this lock, and must remain free to acknowledge completion.
     let _answer_guard = lock(Some(&answer_lock(&request.expected_run_id)?))?;
+    // Nested canonical receipt checks share this one budget; a new connection
+    // or terminal guard must not restart the person's SQLite wait.
+    let mut receipt_wait = receipt_index::QuestionAdmission::new();
     // Only the preparation is locked. Awaiting the UI must not block provider
     // hooks which confirm the very answer that we are waiting for.
     let (record, question, answers, mut receipt) = {
@@ -726,6 +1004,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             }
             return Err("delivery uncertain: this answer request may already be in Terminal; do not resend automatically".into());
         }
+        receipt_wait.prioritize(&absolute_root()?)?;
         let record = matching_record(name, &request)?;
         let question = current(&record)?
             .into_iter()
@@ -734,7 +1013,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         if string(&question, "question_hash") != request.expected_question_hash {
             return Err("question changed; refresh before answering".into());
         }
-        if !(["codex_hooks_trust", "codex_update", "codex_goal_resume", "codex_folder_trust", "codex_async", "kimi_wire", kimi_plan::SOURCE, kimi_approval::SOURCE, "kimi_cache_hint", "kimi_folder_trust", "claude_folder_trust", "claude_permission_mode", "claude_resume", "claude_usage_limit", "claude_tool_approval"]
+        if !(["codex_sandbox_setup", "codex_hooks_trust", "codex_update", "codex_goal_resume", "codex_rate_limit", "codex_folder_trust", "codex_async", codex_approval::SOURCE, "kimi_wire", kimi_plan::SOURCE, kimi_approval::SOURCE, "kimi_cache_hint", "kimi_folder_trust", "claude_folder_trust", "claude_bypass_warning", "claude_permission_mode", "claude_resume", "claude_usage_limit", "claude_tool_approval"]
             .contains(&string(&question, "source"))
             || string(&record,"agent")=="claude" && string(&question,"source")=="hook")
         {
@@ -762,18 +1041,26 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             claude_usage_limit::available(&record, &question)?;
         } else if string(&question, "source") == "claude_folder_trust" {
             claude_trust::available(&record, &question)?;
+        } else if string(&question, "source") == "claude_bypass_warning" {
+            claude_bypass::available(&record, &question)?;
         } else if string(&question, "source") == "codex_hooks_trust" {
             codex_hooks_trust::available(&record, &question)?;
         } else if string(&question, "source") == "codex_update" {
             codex_update::available(&record, &question)?;
+        } else if string(&question, "source") == "codex_rate_limit" {
+            codex_rate_limit::available(&record, &question)?;
         } else if string(&question, "source") == "codex_goal_resume" {
             codex_goal_resume::available(&record, &question)?;
+        } else if string(&question, "source") == "codex_sandbox_setup" {
+            codex_sandbox::available(&record, &question)?;
         } else if string(&question, "source") == "codex_folder_trust" {
             codex_trust::available(&record, &question)?;
+        } else if string(&question, "source") == codex_approval::SOURCE {
+            codex_approval::available(&record, &question)?;
         } else if string(&question, "source") == "kimi_folder_trust" {
             kimi_trust::available(&record, &question)?;
         } else if string(&question, "source") == "kimi_cache_hint" {
-            kimi_cache_hint::available(&record, &question)?;
+            kimi_cache_hint::available(&record, &question, &answers)?;
         } else if string(&question, "source") == kimi_plan::SOURCE {
             kimi_plan::available(&record, &question)?;
         } else if string(&question, "source") == kimi_approval::SOURCE {
@@ -785,22 +1072,22 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             "run_id":request.expected_run_id,"conversation_id":request.expected_conversation_id,
             "question_id":request.question_id,"question_hash":request.expected_question_hash,"digest":digest,
             "submitted_at":now(),"answers":answers});
-        atomic(&receipt_path, &receipt.to_string())?;
+        receipt_index::persist(&receipt_path, &receipt)?;
         (record, question, answers, receipt)
     };
     let tui_choice =
-        ["codex_hooks_trust", "codex_update", "codex_goal_resume", "codex_folder_trust", "kimi_cache_hint", "kimi_folder_trust", "claude_folder_trust", "claude_permission_mode", "claude_resume", "claude_usage_limit", "claude_tool_approval"].contains(&string(&question, "source"));
+        ["codex_sandbox_setup", "codex_hooks_trust", "codex_update", "codex_goal_resume", "codex_rate_limit", "codex_folder_trust", codex_approval::SOURCE, "kimi_cache_hint", "kimi_folder_trust", "claude_folder_trust", "claude_bypass_warning", "claude_permission_mode", "claude_resume", "claude_usage_limit", "claude_tool_approval"].contains(&string(&question, "source"));
     if string(&question,"source")=="codex_async" {
         let status = match codex_questions::answer(&record,&question,&answers,&request_id) {
             Ok(status) => status,
             Err(error) => {
-                if !error.contains("delivery uncertain") {receipt["status"]=json!("rejected");receipt["error"]=json!(error);let _=atomic(&receipt_path,&receipt.to_string());}
+                if !error.contains("delivery uncertain") {receipt["status"]=json!("rejected");receipt["error"]=json!(error);let _=receipt_index::persist(&receipt_path,&receipt);}
                 return Err(error);
             }
         };
         receipt["status"]=json!(status);receipt["skipped"]=json!(answers[0]["skip"]==true);
         if status == "answered" { receipt["answered_at"]=json!(now()); }
-        atomic(&receipt_path,&receipt.to_string()).map_err(|e|format!("delivery uncertain: {e}"))?;
+        receipt_index::persist(&receipt_path,&receipt).map_err(|e|format!("delivery uncertain: {e}"))?;
         println!("{receipt}");return Ok(0);
     }
     // Update now says whether Codex still runs its installer.
@@ -832,14 +1119,22 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         claude_usage_limit::answer(&record, &question, &answers)
     } else if string(&question, "source") == "claude_folder_trust" {
         claude_trust::answer(&record, &question, &answers)
+    } else if string(&question, "source") == "claude_bypass_warning" {
+        claude_bypass::answer(&record, &question, &answers)
     } else if string(&question, "source") == "codex_hooks_trust" {
         codex_hooks_trust::answer(&record, &question, &answers)
     } else if string(&question, "source") == "codex_update" {
         codex_update::answer(&record, &question, &answers).map(|phase| update_phase = phase)
+    } else if string(&question, "source") == "codex_rate_limit" {
+        codex_rate_limit::answer(&record, &question, &answers)
     } else if string(&question, "source") == "codex_goal_resume" {
         codex_goal_resume::answer(&record, &question, &answers)
+    } else if string(&question, "source") == "codex_sandbox_setup" {
+        codex_sandbox::answer(&record, &question, &answers)
     } else if string(&question, "source") == "codex_folder_trust" {
         codex_trust::answer(&record, &question, &answers)
+    } else if string(&question, "source") == codex_approval::SOURCE {
+        codex_approval::answer(&record, &question, &answers)
     } else if string(&question, "source") == "kimi_folder_trust" {
         kimi_trust::answer(&record, &question, &answers)
     } else if string(&question, "source") == "kimi_cache_hint" {
@@ -857,13 +1152,14 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             receipt["error"] = json!(error);
             // No terminal input was sent, so even a failed receipt update
             // cannot turn this definite rejection into a possible delivery.
-            let _ = atomic(&receipt_path, &receipt.to_string());
+            let _ = receipt_index::persist(&receipt_path, &receipt);
         }
         return Err(error);
     }
     if tui_choice {
         // Hook review and the native installer continue in Terminal.
         if (question["source"] == "codex_hooks_trust" && answers[0]["selected_option_ids"][0] == "review")
+            || (question["source"] == "codex_sandbox_setup" && answers[0]["selected_option_ids"][0] != "sandbox_2")
             || (question["source"] == "codex_update" && answers[0]["selected_option_ids"][0] == "update_now")
         {
             receipt["open_terminal"] = json!(true);
@@ -897,7 +1193,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             .map_err(|e| format!("delivery uncertain: {e}"))?;
         receipt["status"] = json!("answered");
         receipt["answered_at"] = json!(now());
-        atomic(&receipt_path, &receipt.to_string())
+        receipt_index::persist(&receipt_path, &receipt)
             .map_err(|e| format!("delivery uncertain: {e}"))?;
         println!("{receipt}");
         return Ok(0);
@@ -924,7 +1220,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
             })?;
             receipt["status"] = json!("answered");
             receipt["answered_at"] = json!(now());
-            atomic(&receipt_path, &receipt.to_string())
+            receipt_index::persist(&receipt_path, &receipt)
                 .map_err(|error| format!("delivery uncertain: {error}"))?;
             println!("{receipt}");
             return Ok(0);
@@ -940,6 +1236,25 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
 mod tests {
     use super::*;
 
+    /// Qwen Code's ask_user_question (0.27.4) is a question card, as Claude's
+    /// AskUserQuestion; only a Qwen session asks through that name, and its
+    /// result settles the card.
+    #[test]
+    fn qwen_codes_question_tool_makes_a_card_until_its_result() {
+        let mut record = json!({"agent":"qwen","run_id":"r1","conversation_id":"c1","active_tools":{}});
+        let asked = json!({"hook_event_name":"PreToolUse","tool_name":"ask_user_question","tool_use_id":"call_1",
+            "tool_input":{"questions":[{"question":"How do I reach the model?","header":"gb10","multiSelect":false,
+                "options":[{"label":"Give the address","description":"An OpenAI endpoint"},{"label":"Work without it","description":"Alone"}]}]}});
+        let card = from_hook(&record, &asked).expect("a Qwen question");
+        assert_eq!(card["tool_call_id"], "call_1");
+        assert_eq!(card["questions"][0]["options"][1]["label"], "Work without it");
+        assert!(from_hook(&json!({"agent":"claude","run_id":"r1","conversation_id":"c1"}), &asked).is_none(), "Claude has no such tool");
+        observe(&mut record, &asked);
+        assert!(record["pending_questions"]["call_1"].is_object());
+        observe(&mut record, &json!({"hook_event_name":"PostToolUse","tool_name":"ask_user_question","tool_use_id":"call_1"}));
+        assert!(record["pending_questions"].as_object().is_some_and(|pending| pending.is_empty()));
+    }
+
     /// N20: the caller's own card is never answered by its own session, so a
     /// subagent or background job of the lead cannot decide the lead's
     /// "Subagents" card while the owner has it.
@@ -951,6 +1266,72 @@ mod tests {
         assert!(!own_question("claude/x/lead", None, None), "the owner's CLI carries no session");
         assert!(own_question("claude/x/lead", None, Some("claude/x/lead")));
         assert!(!own_question("claude/x/lead", None, Some("claude/x/dev")));
+    }
+
+    /// zerus-63rru.60: one reading of a native identity. A record's or a
+    /// card's null conversation is "", a string is itself, and a missing key
+    /// or another type names no session.
+    #[test]
+    fn a_native_identity_is_read_once_for_records_and_cards() {
+        let with = |c: Option<Value>| {
+            let mut v = json!({"run_id":"run-1"});
+            if let Some(c) = c {
+                v["conversation_id"] = c;
+            }
+            v
+        };
+        assert_eq!(
+            native_identity(&with(Some(Value::Null)), "conversation_id"),
+            Some("")
+        );
+        assert_eq!(
+            native_identity(&with(Some(json!(""))), "conversation_id"),
+            Some("")
+        );
+        assert_eq!(
+            native_identity(&with(Some(json!("c-1"))), "conversation_id"),
+            Some("c-1")
+        );
+        assert_eq!(native_identity(&with(None), "conversation_id"), None);
+        assert_eq!(
+            native_identity(&with(Some(json!(7))), "conversation_id"),
+            None
+        );
+        assert!(names_session(&with(Some(Value::Null)), "run-1", ""));
+        assert!(names_session(&with(Some(json!(""))), "run-1", ""));
+        assert!(names_session(&with(Some(json!("c-1"))), "run-1", "c-1"));
+        assert!(!names_session(&with(Some(json!("c-1"))), "run-1", ""));
+        assert!(!names_session(&with(Some(Value::Null)), "run-2", ""));
+        assert!(!names_session(&with(None), "run-1", ""));
+        assert!(!names_session(&with(Some(json!(7))), "run-1", ""));
+    }
+
+    /// The answer command's request reader, in its own order: the exact
+    /// fields, a UUID request, then the identities. Only a startup question
+    /// may name no conversation.
+    #[test]
+    fn the_answer_request_reader_requires_identities_but_a_startup_conversation() {
+        let request = |id: &str, question: &str, conversation: &str| {
+            json!({"request_id":id,"expected_run_id":"run-1","expected_conversation_id":conversation,
+                "question_id":question,"expected_question_hash":"a".repeat(64),
+                "answers":[{"question_id":"trust","selected_option_ids":["trust_1"]}]})
+            .to_string()
+        };
+        let uuid = "00000000-0000-4000-8000-000000000060";
+        assert!(read_request(request(uuid, "claude-trust:abc", "").as_bytes()).is_ok());
+        assert!(read_request(request(uuid, "claude-approval:abc", "c-1").as_bytes()).is_ok());
+        assert_eq!(
+            read_request(request(uuid, "claude-approval:abc", "").as_bytes())
+                .err()
+                .unwrap(),
+            "question identities are required; refresh before answering"
+        );
+        assert_eq!(
+            read_request(request("not-a-uuid", "claude-approval:abc", "").as_bytes())
+                .err()
+                .unwrap(),
+            "request_id must be a UUID"
+        );
     }
 
     #[test]
@@ -969,6 +1350,40 @@ mod tests {
         let event = json!({"type":"interaction.resolved","response":{"answers":{
             "Which checks?":answer_text(&items[0], &answers[0]),"Anything else?":answer_text(&items[1], &answers[1])}}});
         assert!(response_matches(&card, &answers, &event));
+    }
+    /// Only a question listing may grow an unviewed pane to fit a clipped
+    /// Claude approval (`claude_approval::listed`); guards read the screen as
+    /// it is. A deadline or a partial Codex index must never turn a listing
+    /// into a guard: batch 5 once dropped pane fitting from inspection() so.
+    #[test]
+    fn listings_fit_clipped_claude_approvals_and_guards_do_not() {
+        use super::super::claude_approval::LAST_FIT;
+        let pid = std::process::id();
+        // Idle and without a supervisor: every reader stays off the terminal
+        // and the state root, and the approval read still records its fit.
+        let record = json!({"agent":"claude","run_id":"run","conversation_id":"conversation","phase":"idle",
+            "pid":pid,"process_start":super::super::storage::process_start(pid)});
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fit = |read: &dyn Fn()| {
+            LAST_FIT.with(|last| last.set(None));
+            read();
+            LAST_FIT.with(std::cell::Cell::get)
+        };
+        assert_eq!(
+            fit(&|| drop(inspection(&record, true, deadline()).unwrap())),
+            Some(true),
+            "inspection() is a listing"
+        );
+        assert_eq!(
+            fit(&|| drop(current(&record).unwrap())),
+            Some(true),
+            "current() is a listing"
+        );
+        assert_eq!(
+            fit(&|| drop(current_until(&record, deadline()).unwrap())),
+            Some(false),
+            "current_until() is a guard"
+        );
     }
     fn record() -> Value {
         json!({"agent":"kimi","run_id":"run","conversation_id":"session_test","active_tools":{"tool_test":{"name":"AskUserQuestion"}}})
@@ -991,6 +1406,7 @@ mod tests {
         let recovered = recover_wire(&record, &[event()]);
         assert_eq!(recovered["question_test"]["question_id"], "question_test");
         assert_eq!(recovered["question_test"]["created_at"], 1.0);
+        assert_eq!(recovered["question_test"]["blocking"], false);
         assert_eq!(
             recovered["question_test"]["questions"][0]["allow_other"],
             true
@@ -1000,6 +1416,32 @@ mod tests {
             &json!({"hook_event_name":"PostToolUse","tool_call_id":"tool_test"}),
         );
         assert_eq!(record["pending_questions"], json!({}));
+    }
+    #[test]
+    fn a_later_native_tool_call_retires_the_pending_questions_blocking_proof() {
+        let original = json!({"type":"context.append_loop_event","agentId":"main",
+            "event":{"type":"tool.call","toolCallId":"tool_test","turnId":"0",
+                "name":"AskUserQuestion","args":{"questions":items()}}});
+        let mut request = event();
+        request["request"]["toolCallId"] = json!("tool_test");
+        request["request"]["turnId"] = json!(0);
+        let recover =
+            |events: &[Value]| recover_wire(&record(), events)["question_test"]["blocking"].clone();
+        assert_eq!(recover(&[original.clone(), request.clone()]), true);
+        for replacement in [
+            json!({"type":"context.append_loop_event","agentId":"main","event":{
+                "type":"tool.call","toolCallId":"tool_test","turnId":"1","name":"AskUserQuestion",
+                "args":{"questions":items(),"background":true}}}),
+            json!({"type":"context.append_loop_event","agentId":"main","event":{
+                "type":"tool.call","toolCallId":"tool_test","turnId":"0","name":"AnotherTool"}}),
+        ] {
+            assert_eq!(
+                recover(&[original.clone(), request.clone(), replacement]),
+                false
+            );
+        }
+        // A future foreground call cannot turn an unproven earlier request into proof.
+        assert_eq!(recover(&[request, original]), false);
     }
     #[test]
     fn a_new_prompt_resolves_the_previous_permission_request() {

@@ -111,6 +111,13 @@ fn card(record: &Value, panel: &Panel) -> Option<Value> {
             "options":LABELS.iter().enumerate().map(|(i,label)|json!({"id":format!("trust_{i}"),"label":label})).collect::<Vec<_>>()}]}))
 }
 
+/// The card this producer writes for `record` at `screen`, its startup panel:
+/// the route the readers of these cards test with (zerus-63rru.60).
+#[cfg(test)]
+pub(super) fn produced(record: &Value, screen: &str) -> Option<Value> {
+    card(record, &parse(screen)?)
+}
+
 fn snapshot(record: &Value, screen: &str) -> Option<(Value, usize)> {
     let panel = parse(screen)?;
     Some((card(record, &panel)?["question_hash"].clone(), panel.selected))
@@ -119,7 +126,7 @@ fn snapshot(record: &Value, screen: &str) -> Option<(Value, usize)> {
 pub(super) fn current(record: &Value) -> Option<Value> {
     if !eligible(record) { return None; }
     let panel = parse(&kimi_tui_choice::capture(record).ok()?)?;
-    if !process_alive(record) || !matches(record, live().ok()?.get(string(record, "name"))) { return None; }
+    if !process_alive(record) || !matches(record, panes_of(&live().ok()?, record)) { return None; }
     input::checked_terminal(record, false).ok()?;
     card(record, &panel)
 }

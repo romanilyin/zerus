@@ -25,7 +25,7 @@ fn parse(agent: &str, screen: &str) -> Option<Queue> {
             }
         }
         let start = first;
-        let end = rows[start+1..].iter().position(|r|r.trim_start().starts_with('›') || r.trim_start().starts_with('╭')).map(|i|start+1+i).unwrap_or(rows.len());
+        let end = rows[start+1..].iter().position(|r|r.trim_start().starts_with('›') || r.trim_start().starts_with('»') || r.trim_start().starts_with('╭')).map(|i|start+1+i).unwrap_or(rows.len());
         let block = rows[start..end].join("\n");
         if !block.contains('↳') { return None; }
         let normalized = block.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -135,8 +135,10 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
     if bytes.len()>8192 {return Err("queue request is too large".into());}
     let request:Request=serde_json::from_slice(crate::state::without_bom(&bytes)).map_err(|e|e.to_string())?;
     let uuid=uuid::Uuid::parse_str(&request.request_id).map_err(|_|"request_id must be a UUID")?;
+    expect(&args[0], &request.expected_run_id, &request.expected_conversation_id)?;
     let _guard=lock(None)?;
     let record=read(&args[0])?;
+    terminating::check_mutation(&record)?;
     if record["run_id"]!=request.expected_run_id || record["conversation_id"]!=request.expected_conversation_id || !eligible(&record) {
         return Err("Session changed or is no longer working; nothing was sent".into());
     }

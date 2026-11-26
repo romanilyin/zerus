@@ -1,12 +1,41 @@
 use super::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::Digest;
+#[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::sync::OnceLock;
 
 /// Final replies are the conversation itself, not an excerpt: Activity reads
 /// them from the journal once the provider transcript window has moved on.
 pub(super) const REPLY_LIMIT: usize = 32_000;
+/// Activity bodies are separate from the short status/list preview. Larger
+/// messages carry an explicit incomplete flag; no delivery state is inferred.
+pub(super) const MESSAGE_TEXT_LIMIT: usize = 32_000;
+
+pub(super) fn activity_message_body(source: &str, text: &str, at: f64, id: &str) -> Value {
+    json!({"type":"UserMessageBody", "source":source, "agent_id":"", "at":at, "message_id":id,
+        "detail":clipped(&json!(text), MESSAGE_TEXT_LIMIT),
+        "message_text_truncated":text.chars().count() > MESSAGE_TEXT_LIMIT})
+}
+
+fn retain_message_text(data: &mut Value, event: &Value) {
+    if !["UserPromptSubmit", "UserPromptQueued", "TurnStarted"]
+        .contains(&string(event, "hook_event_name"))
+        || !string(data, "agent_id").is_empty()
+        || !string(data, "origin").is_empty()
+        || !["", "user"].contains(&string(data, "turn_origin"))
+    {
+        return;
+    }
+    let Some(text) = event["prompt"].as_str() else {
+        return;
+    };
+    data["message_text"] = json!(clipped(&json!(text), MESSAGE_TEXT_LIMIT));
+    data["message_text_truncated"] = json!(text.chars().count() > MESSAGE_TEXT_LIMIT);
+}
+/// `pending_questions_error` while the Codex question index is incomplete:
+/// the questions are unknown, not absent (zerus-a4mub.8).
+const QUESTIONS_INDEXING: &str = "Codex questions are still being indexed; refresh shortly";
 
 /// Claude records text pasted into its prompt as
 /// `<pasted_content id="…">\n…\n</pasted_content id="…">`. The person sent only
@@ -184,9 +213,26 @@ pub(super) fn mark_system_prompt(record: &Value, event: &mut Value, prompt: &str
 }
 
 /// The person's latest request. Older records may hold background work.
+/// The last reply the session shows, which a keep-warm ping does not replace.
+pub(super) fn last_message(record: &Value) -> &str {
+    if record["keep_warm_quiet"].is_object() {
+        return string(&record["keep_warm_quiet"], "last_message");
+    }
+    string(record, "last_message")
+}
+
 pub(super) fn user_prompt(record: &Value) -> &Value {
     static NONE: Value = Value::Null;
-    if system_prompt(string(record, "prompt")).is_some() { &NONE } else { &record["prompt"] }
+    if record["keep_warm_quiet"].is_object() {
+        return &record["keep_warm_quiet"]["prompt"];
+    }
+    if record["_listing"]["system_prompt"] == true
+        || system_prompt(string(record, "prompt")).is_some()
+    {
+        &NONE
+    } else {
+        &record["prompt"]
+    }
 }
 
 fn detail(event: &Value) -> String {
@@ -224,18 +270,74 @@ fn detail(event: &Value) -> String {
 }
 
 pub(super) fn event_db() -> Result<Connection> {
-    private_dir(&root())?;
-    let path = root().join("events.sqlite3");
+    event_db_at(&root())
+}
+
+/// A shared read connection to the events database (task 193). The writer keeps
+/// opening its own connection (a write needs `&mut`); a read reuses this
+/// process's connection instead of opening the database once per row, which
+/// cost about 50 ms a row in `hgs ls`.
+pub(super) struct EventDb(std::rc::Rc<Connection>);
+
+impl std::ops::Deref for EventDb {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+thread_local! {
+    /// The read connection and the journal it belongs to: a test (or a command)
+    /// that switches state roots gets its own, never a connection to the other.
+    static READ_DB: std::cell::RefCell<Option<(PathBuf, std::rc::Rc<Connection>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The shared read connection of this thread, opened once per state root.
+pub(super) fn event_db_shared() -> Result<EventDb> {
+    let root = root();
+    let path = root.join("events.sqlite3");
+    READ_DB.with(|slot| {
+        if let Some((cached, db)) = slot.borrow().as_ref() {
+            if *cached == path {
+                return Ok(EventDb(db.clone()));
+            }
+        }
+        let db = std::rc::Rc::new(event_db_at(&root)?);
+        *slot.borrow_mut() = Some((path, db.clone()));
+        Ok(EventDb(db))
+    })
+}
+
+fn event_db_at(root: &Path) -> Result<Connection> {
+    private_dir(root)?;
+    let path = root.join("events.sqlite3");
+    // Never close a raw descriptor of the live journal on Unix: it would drop
+    // the SQLite locks of every connection this process has open on it
+    // (zerus-iiee). Create it owner-only if missing, then bind the connection
+    // to the file it found; an existing journal is accepted as before.
+    #[cfg(unix)]
+    let identity = {
+        crate::sqlite_file::create(&path).map_err(|e| e.to_string())?;
+        crate::sqlite_file::existing(&path).map_err(|e| e.to_string())?
+    };
+    #[cfg(not(unix))]
     crate::platform::private_open(
         OpenOptions::new().create(true).truncate(false).read(true).write(true),
     )
     .open(&path)
     .map_err(|e| e.to_string())?;
-    let db = Connection::open(path).map_err(|e| e.to_string())?;
+    let db = Connection::open(&path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    crate::sqlite_file::bind(&db, identity).map_err(|e| e.to_string())?;
     db.busy_timeout(std::time::Duration::from_secs(3))
         .map_err(|e| e.to_string())?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, name TEXT, conversation TEXT, payload TEXT);
         CREATE INDEX IF NOT EXISTS events_session ON events(name, conversation, seq);
+        CREATE INDEX IF NOT EXISTS events_subagent_activity ON events(name, conversation,
+            json_extract(payload, '$.agent_id'), seq);
+        CREATE INDEX IF NOT EXISTS events_kimi_completions ON events(name, conversation,
+            json_extract(payload, '$.run_id'), json_extract(payload, '$.kimi_turn_id'))
+        WHERE json_extract(payload, '$.type') = 'Stop' AND json_extract(payload, '$.agent_id') = '';
         CREATE INDEX IF NOT EXISTS events_main_replies ON events(name, conversation, seq)
         WHERE json_extract(payload, '$.type') = 'Stop' AND json_extract(payload, '$.agent_id') = '';
         CREATE INDEX IF NOT EXISTS events_main_messages ON events(name, conversation, seq)
@@ -255,10 +357,18 @@ fn turn_origin<'a>(record: &Value, event: &'a Value) -> Option<&'a str> {
 }
 
 fn kimi_turn_id(record: &Value, event: &Value) -> Option<u64> {
-    if string(record, "agent") != "kimi" || string(event, "hook_event_name") != "TurnStarted" {
+    if string(record, "agent") != "kimi" || !["TurnStarted", "Stop"].contains(&string(event, "hook_event_name")) {
         return None;
     }
     event["turn_id"].as_u64().filter(|id| *id <= i64::MAX as u64)
+}
+
+fn kimi_completion_logged(db: &Connection, record: &Value, id: u64) -> Result<bool> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE name = ? AND conversation = ?
+        AND json_extract(payload, '$.run_id') = ? AND json_extract(payload, '$.kimi_turn_id') = ?
+        AND json_extract(payload, '$.type') = 'Stop' AND json_extract(payload, '$.agent_id') = '')",
+        params![journal_name(record), string(record, "conversation_id"), string(record, "run_id"), id],
+        |row| row.get(0)).map_err(|error| error.to_string())
 }
 
 pub(super) fn log_event(record: &Value, event: &Value) -> Result<()> {
@@ -284,9 +394,20 @@ pub(super) fn log_event(record: &Value, event: &Value) -> Result<()> {
     if let Some(origin) = turn_origin(record, event) {
         data["turn_origin"] = json!(origin);
     }
+    // A keep-warm ping is not the person's message, and its turn is no reply.
+    if let Some(mark) = event["keep_warm"].as_str() {
+        data["turn_origin"] = json!("keep_warm");
+        if mark == "prompt" {
+            data["origin"] = json!("keep_warm");
+        }
+    }
+    retain_message_text(&mut data, event);
     if let Some(id) = kimi_turn_id(record, event) {
         data["kimi_turn_id"] = json!(id);
         data["kimi_conversation_id"] = record["conversation_id"].clone();
+        if ["kimi_wire","kimi_hook"].contains(&string(event,"turn_identity_source")) {
+            data["turn_identity_source"] = event["turn_identity_source"].clone();
+        }
     }
     if let Some(question) = questions::from_hook(record, event) {
         data["question_request"] = question;
@@ -301,6 +422,16 @@ pub(super) fn log_event(record: &Value, event: &Value) -> Result<()> {
     }
     let mut db = event_db()?;
     let transaction = db.transaction().map_err(|e| e.to_string())?;
+    // Stop and the main-wire terminal event describe one native completion.
+    // Keep the original seq:at reply identity, including after a crash between
+    // this journal commit and the saved record. The expression index bounds
+    // this exact lookup; neither text nor arrival time establishes identity.
+    if let Some(id) = kimi_turn_id(record, event).filter(|_| {
+        string(event, "hook_event_name") == "Stop"
+            && ["", "main"].contains(&string(event, "agent_id"))
+    }) {
+        if kimi_completion_logged(&transaction, record, id)? { return Ok(()); }
+    }
     transaction
         .execute(
             "INSERT INTO events(name, conversation, payload) VALUES (?, ?, ?)",
@@ -327,6 +458,19 @@ pub(super) fn normalized_activity(record: &Value, live_pane: bool) -> Value {
     let alive = live_pane && process_alive(record);
     let mut activity = record.get("activity").cloned().unwrap_or(json!("unknown"));
     let mut phase = record.get("phase").cloned().unwrap_or(json!("unknown"));
+    if alive && codex_approval::running(record) {
+        phase = json!(if record["active_tools"].as_object().is_some_and(|tools| !tools.is_empty()) {
+            "tool"
+        } else {
+            "working"
+        });
+    }
+    // Archives keep the last hooks for history and restore, not current work.
+    // Normalize reads so old archives also stop reporting their last live turn.
+    if !live_pane && record["state"] == "archived" {
+        activity = json!("ended");
+        phase = json!("ended");
+    }
     // Legacy SessionEnd was overloaded as process death. It is not evidence of
     // either process death or idleness; old manifests remain restorable.
     if live_pane && (activity == "ended" || phase == "ended") && alive {
@@ -348,11 +492,135 @@ pub(super) fn normalized_activity(record: &Value, live_pane: bool) -> Value {
 // missed between polls. Child stops and initial SessionStart are not replies.
 // Reading the retained journal also covers sessions created before this feature.
 fn latest_reply(record: &Value, recurring_schedules: Option<u64>) -> Result<Value> {
+    let mut found = latest_reply_of(record, recurring_schedules)?;
+    // WhiteWh fork, task 244: a reply to a turn only Zerus's team pastes opened.
+    let seq = found["reply_id"].as_str().and_then(|id| id.split(':').next()).and_then(|seq| seq.parse::<i64>().ok());
+    if let Some(seq) = seq {
+        let db = event_db_shared()?;
+        if team_notice_turn(&db, record, seq)? {
+            found["reply_team_notice"] = json!(true);
+        }
+    }
+    Ok(found)
+}
+
+/// WhiteWh fork, task 244: a prompt Zerus pasted for the team, as the clients'
+/// notices read it (client notices.ts, Qt ActivityView teamMessage): a
+/// session's envelope (`peer_message`), a "[Zerus team, from: X ...]" header
+/// (with Zerus's middle dot) other than the owner's own "from: You", or
+/// Zerus's sender-less "[Zerus team]" / "[Zerus task N]" pastes. The owner's
+/// words never match: the header must open the prompt.
+pub(super) fn team_notice_prompt(event: &Value) -> bool {
+    if event["origin"] == "peer_message" {
+        return true;
+    }
+    let mut text = string(event, "detail").trim_start();
+    if let Some(rest) = text.strip_prefix("<zerus-message") {
+        text = rest.split_once('>').map_or("", |(_, body)| body).trim_start();
+    }
+    if let Some(rest) = text.strip_prefix("[Zerus team \u{00b7} from: ") {
+        let sender = rest.split(['\u{00b7}', ']']).next().unwrap_or("").trim();
+        return !sender.is_empty() && sender != "You";
+    }
+    let Some(rest) = text.strip_prefix("[Zerus ").and_then(|rest| rest.strip_prefix("team").or_else(|| rest.strip_prefix("task"))) else {
+        return false;
+    };
+    rest.starts_with(']') || (rest.starts_with(' ') && rest.split('\n').next().is_some_and(|line| line.contains(']')))
+}
+
+/// WhiteWh fork, tasks 244/#366: whether only team pastes made up the turn of
+/// the main Stop `stop`. A turn with any prompt of the owner's is the owner's:
+/// the opening prompt, a prompt the agent reports mid-turn, or the owner's
+/// message sent into the running turn (see `owner_prompt_in_turn`). A turn
+/// whose opening is not in the journal is not a notice turn.
+fn team_notice_turn(db: &Connection, record: &Value, stop: i64) -> Result<bool> {
+    let mut statement = db
+        .prepare(
+            "SELECT json_extract(payload, '$.type'), payload FROM events
+         WHERE name = ? AND conversation = ?
+           AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main')
+           AND json_extract(payload, '$.type') IN ('UserPromptSubmit','UserPromptQueued','UserMessage','TurnStarted','QuestionAnswered','AgentMessage','Stop')
+           AND seq < ?
+         ORDER BY seq DESC LIMIT 64",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(params![journal_name(record), string(record, "conversation_id"), stop], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut prompts = 0;
+    let mut opened: Option<f64> = None;
+    let mut stopped: Option<f64> = None;
+    for row in rows {
+        let (kind, payload) = row.map_err(|e| e.to_string())?;
+        match kind.as_deref() {
+            Some("Stop") => {
+                stopped = serde_json::from_str::<Value>(&payload).ok().and_then(|event| event["at"].as_f64());
+                break;
+            }
+            Some("UserPromptSubmit" | "UserPromptQueued" | "UserMessage" | "QuestionAnswered") => {
+                let event: Value = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                // Kimi's empty submit carries no prompt; its TurnStarted does.
+                if string(&event, "detail").is_empty() && event["origin"].is_null() {
+                    continue;
+                }
+                if kind.as_deref() == Some("QuestionAnswered") || !team_notice_prompt(&event) {
+                    return Ok(false);
+                }
+                // Scanning backwards, the last prompt seen opens the turn.
+                if let Some(at) = event["at"].as_f64() {
+                    opened = Some(at);
+                }
+                prompts += 1;
+            }
+            _ => {}
+        }
+    }
+    if prompts == 0 {
+        return Ok(false);
+    }
+    // #366: the agent reports a message that came into its running turn only
+    // when the turn ends, so the journal alone cannot see it; hgs's receipt can.
+    let opened = opened.unwrap_or(0.0);
+    let end = stopped.filter(|end| *end >= opened).unwrap_or(f64::MAX);
+    if owner_prompt_in_turn(record, opened, end) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// #366: whether hgs delivered a prompt of the owner's into the running turn
+/// between its opening (`from`) and the Stop (`to`). Claude and Codex queue a
+/// message sent while they work and report its `UserPromptSubmit` only at the
+/// turn's end, so the turn would otherwise fold as a team-notice reply. The
+/// last receipt names what was sent; a team paste queued the same way stays a
+/// notice.
+fn owner_prompt_in_turn(record: &Value, from: f64, to: f64) -> bool {
+    let sent = record["input_pending_at"].as_f64().unwrap_or(0.0);
+    if from <= 0.0 || sent <= from || sent > to {
+        return false;
+    }
+    let request = string(record, "input_pending_request");
+    if uuid::Uuid::parse_str(request).is_err() {
+        return false;
+    }
+    let Ok(root) = super::storage::absolute_root() else { return false };
+    let Ok(contents) = std::fs::read_to_string(root.join("input_receipts").join(format!("{request}.json"))) else {
+        return false;
+    };
+    let receipt: Value = serde_json::from_str(&contents).unwrap_or_default();
+    let text = string(&receipt, "submitted_text");
+    !text.trim().is_empty() && !team_notice_prompt(&json!({"type":"UserPromptSubmit","detail":text}))
+}
+
+fn latest_reply_of(record: &Value, recurring_schedules: Option<u64>) -> Result<Value> {
     let conversation = string(record, "conversation_id");
     if conversation.is_empty() {
         return Ok(json!({}));
     }
-    let db = event_db()?;
+    // Task 193: one read connection for every row of a listing.
+    let db = event_db_shared()?;
     let reply = |seq: i64, at: Value, scheduled: bool| {
         json!({"reply_id":format!("{}:{}", seq, at), "reply_at":at, "reply_scheduled":scheduled})
     };
@@ -365,6 +633,7 @@ fn latest_reply(record: &Value, recurring_schedules: Option<u64>) -> Result<Valu
         .query_row(
             "SELECT seq, payload FROM events WHERE name = ? AND conversation = ?
          AND json_extract(payload, '$.type') = 'Stop' AND json_extract(payload, '$.agent_id') = ''
+         AND COALESCE(json_extract(payload, '$.turn_origin'), '') != 'keep_warm'
          ORDER BY seq DESC LIMIT 1",
             params![journal_name(record), conversation],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -388,6 +657,13 @@ fn latest_reply(record: &Value, recurring_schedules: Option<u64>) -> Result<Valu
 // cache keepalive. Only the latest turn is read; a conversation that has had
 // no keepalive costs one indexed row.
 fn keepalive_turn(db: &Connection, record: &Value, stop: i64) -> Result<bool> {
+    keepalive_turn_in(db, journal_name(record), string(record, "conversation_id"), stop)
+}
+
+/// Task #437: the keep-warm turn of one journal and conversation, whatever
+/// view asks - the owner decided its ping, its reply and its notification are
+/// never Activity, history, a notification, an unread reply or a preview.
+fn keepalive_turn_in(db: &Connection, name: &str, conversation: &str, stop: i64) -> Result<bool> {
     let opening: Option<String> = db
         .query_row(
             "SELECT payload FROM events WHERE name = ? AND conversation = ?
@@ -395,7 +671,7 @@ fn keepalive_turn(db: &Connection, record: &Value, stop: i64) -> Result<bool> {
            AND json_extract(payload, '$.type') IN ('UserPromptSubmit','UserPromptQueued','UserMessage','TurnStarted','QuestionAnswered','AgentMessage','Stop')
            AND seq < ? AND json_extract(payload, '$.type') IN ('UserPromptSubmit','UserMessage','Stop')
          ORDER BY seq DESC LIMIT 1",
-            params![journal_name(record), string(record, "conversation_id"), stop],
+            params![name, conversation, stop],
             |row| row.get(0),
         )
         .optional()
@@ -408,6 +684,20 @@ fn keepalive_opening(payload: &str) -> bool {
         event["type"] != "Stop"
             && (event["origin"] == "cache_keepalive" || string(&event, "detail").starts_with(CACHE_KEEPALIVE))
     })
+}
+
+/// Task #437: a reply of a keep-warm turn in a history written before the
+/// marks existed - the Stop or AgentMessage after the ping's opening. The
+/// marked rows are already dropped by the query.
+fn legacy_keepalive_reply(db: &Connection, name: &str, conversation: &str, seq: i64, own: bool, payload: &str) -> bool {
+    if !own {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(payload) else { return false };
+    if !matches!(string(&event, "type"), "Stop" | "AgentMessage") {
+        return false;
+    }
+    keepalive_turn_in(db, name, conversation, seq).unwrap_or(false)
 }
 
 // The latest main Stop whose turn the person or the agent opened. Keepalive
@@ -477,6 +767,10 @@ fn kimi_reply(db: &Connection, record: &Value, skip_scheduled: bool) -> Result<O
     let mut stop: Option<(i64, Value)> = None;
     for row in rows {
         let (seq, kind, origin, payload) = row.map_err(|e| e.to_string())?;
+        // Keep-warm ping turns are never replies, nor the person's prompts.
+        if origin.as_deref() == Some("keep_warm") {
+            continue;
+        }
         match (kind.as_deref(), stop.take()) {
             (Some("AgentMessage"), pending) => stop = pending,
             (Some("Stop"), None) => {
@@ -499,10 +793,17 @@ fn kimi_reply(db: &Connection, record: &Value, skip_scheduled: bool) -> Result<O
 /// A session's status. Its readers of the live pane (the effort footer and
 /// every terminal chooser) share one capture of it.
 pub(super) fn summary(record: &Value, live_pane: bool) -> Value {
-    kimi_tui_choice::observing(|| observed_summary(record, live_pane))
+    // Every summary captures the latest reply.
+    #[cfg(test)]
+    read_order::note("reply");
+    kimi_tui_choice::observing(|| observed_summary(record, live_pane, None))
 }
 
-fn observed_summary(record: &Value, live_pane: bool) -> Value {
+pub(super) fn archive_summary(record: &Value, name_taken: bool) -> Value {
+    kimi_tui_choice::observing(|| observed_summary(record, false, Some(name_taken)))
+}
+
+fn observed_summary(record: &Value, live_pane: bool, archive_name_taken: Option<bool>) -> Value {
     let mut output = normalized_activity(record, live_pane);
     output["conversation_id"] = record["conversation_id"].clone();
     output
@@ -517,6 +818,12 @@ fn observed_summary(record: &Value, live_pane: bool) -> Value {
     }
     if !string(record, "launch_id").is_empty() {
         output["launch_id"] = record["launch_id"].clone();
+    }
+    if !string(record, "session_id").is_empty() {
+        output["session_id"] = record["session_id"].clone();
+    }
+    if let Some(parent) = parent_link::listed(record) {
+        output["parent"] = parent;
     }
     let last_tool = record["active_tools"]
         .as_object()
@@ -558,7 +865,12 @@ fn observed_summary(record: &Value, live_pane: bool) -> Value {
             .clone(),
     );
     let resumed = resume_input::summary_check(record, live_pane);
-    output.as_object_mut().unwrap().extend(session_action::summary(record,live_pane,&resumed).as_object().unwrap().clone());
+    output.as_object_mut().unwrap().extend(
+        session_action::summary(record, live_pane, &resumed, archive_name_taken)
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     output["terminal_supported"] = json!(live_pane && string(record,"archive_id").is_empty() && process_alive(record));
     output["terminal_reason"] = json!(if output["terminal_supported"] == true { "" } else { backend::TERMINAL_NEEDS_PANE.text() });
     output["subagent_count"] = output["subagent_active_count"].clone();
@@ -593,7 +905,11 @@ fn observed_summary(record: &Value, live_pane: bool) -> Value {
             output["activity_detail"] = output["status_detail"].clone();
             output["resume_message_reason"] = json!(codex_goal_resume::WAIT);
         }
-        let fallback = if recognized.is_some() { None } else { startup_choice::current(record) };
+        let fallback = if recognized.is_some() || storage::listing_scope::public(record) {
+            None
+        } else {
+            startup_choice::current(record)
+        };
         let shown = recognized.is_some() || fallback.is_some();
         if let Some(question) = fallback {
             output["activity"] = json!("busy");
@@ -606,6 +922,7 @@ fn observed_summary(record: &Value, live_pane: bool) -> Value {
         }
     }
     recovery::enrich(record, &mut output);
+    keep_warm::visible(&mut output, record);
     output
 }
 
@@ -622,8 +939,13 @@ pub(super) fn notification_summary(record: &Value, live_pane: bool) -> Result<Va
 /// question, the phase the summary shows and its detail. A later recognized
 /// panel wins. Dispatch refuses each of them (`input::checked_input`).
 pub(super) fn terminal_chooser(record: &Value) -> Option<(Value, &'static str, &'static str)> {
+    // Ordinary ls already recognized this row's complete composer in its
+    // held read-only frame. Native cards/proofs require the canonical path.
+    if storage::listing_scope::public(record) {
+        return None;
+    }
     type Current = fn(&Value) -> Option<Value>;
-    let choosers: [(Current, &str, &str); 12] = [
+    let choosers: [(Current, &str, &str); 15] = [
         // First: any panel a later, known chooser recognizes wins.
         (claude_approval::idle_choice, "input", "Claude is waiting for your choice in Terminal"),
         (claude_approval::current, "approval", "Claude is waiting for your tool or safety approval"),
@@ -631,9 +953,12 @@ pub(super) fn terminal_chooser(record: &Value) -> Option<(Value, &'static str, &
         (claude_usage_limit::current, "input", "Claude is waiting for your usage-limit choice"),
         (claude_permission::current, "approval", "Claude is waiting for your default permission mode choice"),
         (claude_trust::current, "approval", "Claude is waiting for folder trust approval"),
+        (claude_bypass::current, "approval", "Claude is waiting for your Bypass Permissions choice"),
+        (codex_sandbox::current, "approval", "Codex is waiting for your sandbox setup choice"),
         (codex_trust::current, "approval", "Codex is waiting for folder trust approval"),
         (codex_hooks_trust::current, "approval", "Codex is waiting for hook trust review"),
         (codex_update::current, "input", "Codex is waiting for an update choice"),
+        (codex_rate_limit::current, "input", "Codex is waiting for your rate-limit model choice; open Activity or Terminal"),
         (codex_goal_resume::current, "input", "Codex is waiting for your paused goal choice"),
         (kimi_trust::current, "approval", "Kimi is waiting for folder trust approval"),
         (kimi_cache_hint::current, "input", "Kimi is waiting for your context choice"),
@@ -650,6 +975,7 @@ pub(super) fn terminal_chooser(record: &Value) -> Option<(Value, &'static str, &
 /// fork and an effort change wait until it is answered, and a settings change
 /// is scheduled for Ready instead of applied now.
 fn wait_for_chooser(output: &mut Value) {
+    telemetry::pending_input_summary(output, true);
     if let Some(reason) = clear_context::answer_first(string(output, "phase")) {
         fork::wait_for_chooser(output, reason);
         effort::wait_for_chooser(output, reason);
@@ -664,22 +990,303 @@ const MESSAGE_EVENTS_BYTES: usize = 256 * 1024;
 // reader's cursor stays valid when a clear changes the conversation.
 pub(super) const TIMELINE: &str = "name=?1 AND (conversation IS ?2 OR conversation IN (SELECT value FROM json_each(?3)))";
 
+// How many forks back a fork's Activity reaches into its sources (zerus-b4qk).
+const LINEAGE: usize = 4;
+
+// A session's Activity: its own [`TIMELINE`] rows (the scope ?3's `$.earlier`
+// conversations) and each `$.inherited` source's rows of its conversation up
+// to the sequence number where the fork began. Every range is read on its
+// own (name, conversation, seq) index entries, ordered and limited there, so
+// a read touches at most one page per range however long a source is; only
+// those pages are merged. Search and other per-session reads keep
+// [`TIMELINE`]: a source's rows are found in the source, not again in a fork.
+const OWN_RANGE: &str = "name=?1 AND (conversation IS ?2 OR conversation IN (SELECT value FROM json_each(?3, '$.earlier')))";
+
+fn source_range(index: usize) -> String {
+    format!(
+        "name=json_extract(?3, '$.inherited[{index}][0]') AND conversation=json_extract(?3, '$.inherited[{index}][1]') \
+         AND seq<=json_extract(?3, '$.inherited[{index}][2]')"
+    )
+}
+
+/// `seq, payload, own, name` of the Activity rows that also match `extra`,
+/// by `seq` (descending when `newest`), at most `limit` of them.
+fn activity_query(extra: &str, newest: bool, limit: &str) -> String {
+    let order = if newest { "DESC" } else { "ASC" };
+    // Task #437: the keep-warm turn never reaches Activity, history or a
+    // preview. New rows carry its marks; a history written before them keeps
+    // the ping's envelope in the detail.
+    let quiet = " AND COALESCE(json_extract(payload, '$.turn_origin'), '') != 'keep_warm' \
+        AND COALESCE(json_extract(payload, '$.origin'), '') != 'cache_keepalive' \
+        AND COALESCE(json_extract(payload, '$.detail'), '') NOT LIKE '<zerus-cache-keepalive>%'";
+    let branch = |own: u8, range: &str| {
+        format!("SELECT * FROM (SELECT seq, payload, {own} AS own, name FROM events WHERE {range}{quiet}{extra} ORDER BY seq {order} LIMIT {limit})")
+    };
+    let mut branches = vec![branch(1, OWN_RANGE)];
+    branches.extend((0..LINEAGE).map(|index| branch(0, &source_range(index))));
+    format!(
+        "{} ORDER BY seq {order} LIMIT {limit}",
+        branches.join(" UNION ALL ")
+    )
+}
+
+/// The oldest Activity row: the least of each range's own first row.
+fn activity_oldest() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        let mut branches = vec![format!(
+            "SELECT MIN(seq) AS seq FROM events WHERE {OWN_RANGE}"
+        )];
+        branches.extend(
+            (0..LINEAGE)
+                .map(|index| format!("SELECT MIN(seq) FROM events WHERE {}", source_range(index))),
+        );
+        format!("SELECT MIN(seq) FROM ({})", branches.join(" UNION ALL "))
+    })
+}
+
+/// [`activity_query`] for a page of [`timeline_rows`]: after the cursor ?4,
+/// at most ?5 rows.
+fn activity_page(newest: bool) -> &'static str {
+    static OLDEST: OnceLock<String> = OnceLock::new();
+    static NEWEST: OnceLock<String> = OnceLock::new();
+    let query = if newest { &NEWEST } else { &OLDEST };
+    query.get_or_init(|| activity_query(" AND seq>?4", newest, "?5"))
+}
+
+/// [`activity_query`] for [`timeline_rows_before`]: the newest ?5 rows before
+/// the sequence number ?4, each range on its own index entries as above.
+fn activity_before() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY.get_or_init(|| activity_query(" AND seq<?4", true, "?5"))
+}
+
+/// The sources a fork's Activity inherits, oldest first, as `[journal name,
+/// conversation, last sequence number]`: what the fork recorded when it
+/// began, or for a fork recorded before that, what [`derived_lineage`] finds
+/// (which `inspect` saves once, so later reads do not search again).
+pub(super) fn lineage(db: &Connection, record: &Value) -> Vec<Value> {
+    match record["fork_lineage"].as_array() {
+        Some(recorded) => recorded
+            .iter()
+            .filter(|source| valid_source(source))
+            .cloned()
+            .collect(),
+        None => derived_lineage(db, record).unwrap_or_default(),
+    }
+}
+
+/// A fork recorded before its lineage: the source name it recorded, that
+/// conversation's rows up to the fork's creation and before the fork's own
+/// first row. One indexed search backwards from that row, under the source's
+/// label and, when that finds nothing, under the journal of the saved session
+/// that holds the label and had that conversation (a source journalled by its
+/// ID, zerus-ucck P2b). None for a session that is not such a fork.
+fn derived_lineage(db: &Connection, record: &Value) -> Option<Vec<Value>> {
+    let (source, parent) = (
+        string(record, "fork_source_name"),
+        string(record, "fork_parent_id"),
+    );
+    let created = record["created"].as_f64().unwrap_or(0.0);
+    if source.is_empty() || parent.is_empty() || created <= 0.0 || record["fork_lineage"].is_array()
+    {
+        return None;
+    }
+    let own: Option<i64> = db
+        .query_row(
+            "SELECT MIN(seq) FROM events WHERE name=?1",
+            [journal_name(record)],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let last = |journal: &str| -> Option<Option<i64>> {
+        db.query_row(
+            "SELECT seq FROM events WHERE name=?1 AND conversation=?2 AND seq<?3 \
+             AND CAST(json_extract(payload, '$.at') AS REAL)<=?4 ORDER BY seq DESC LIMIT 1",
+            params![journal, parent, own.unwrap_or(i64::MAX), created],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+    };
+    let mut found = last(source)?.map(|seq| (source.to_owned(), seq));
+    if found.is_none() {
+        let holder = read(source).ok().filter(|holder| {
+            string(holder, "conversation_id") == parent
+                || clear_context::earlier_conversations(holder)
+                    .as_array()
+                    .is_some_and(|earlier| earlier.iter().any(|id| id == parent))
+        });
+        if let Some(journal) = holder
+            .as_ref()
+            .map(journal_name)
+            .filter(|journal| *journal != source)
+        {
+            found = last(journal)?.map(|seq| (journal.to_owned(), seq));
+        }
+    }
+    Some(
+        found
+            .map(|(journal, seq)| vec![json!([journal, parent, seq])])
+            .unwrap_or_default(),
+    )
+}
+
+/// Saves a derived lineage into the fork's own record, with the label of a
+/// source whose journal is not its label. The journal search runs without the
+/// state lock (`inspect` has released it by then); only [`store_lineage`]
+/// takes it, briefly.
+pub(super) fn save_derived_lineage(db: &Connection, record: &mut Value) {
+    let Some(lineage) = derived_lineage(db, record) else {
+        return;
+    };
+    let source = string(record, "fork_source_name").to_owned();
+    let labels = lineage
+        .first()
+        .and_then(|entry| entry[0].as_str())
+        .filter(|journal| *journal != source)
+        .map(|journal| json!({journal: source}));
+    record["fork_lineage"] = json!(lineage);
+    if let Some(labels) = &labels {
+        record["fork_lineage_labels"] = labels.clone();
+    }
+    let _ = store_lineage(record, &lineage, labels.as_ref());
+}
+
+/// Under the state lock: re-reads the saved record and adds only its lineage,
+/// when it still names the same run and has none yet. Whatever another writer
+/// saved in the meantime (a hook, resume or rename) is kept. False when
+/// nothing was written.
+fn store_lineage(record: &Value, lineage: &[Value], labels: Option<&Value>) -> Result<bool> {
+    let _guard = lock(None)?;
+    let mut saved = read(string(record, "name"))?;
+    if saved["run_id"] != record["run_id"] || saved["fork_lineage"].is_array() {
+        return Ok(false);
+    }
+    saved["fork_lineage"] = json!(lineage);
+    if let Some(labels) = labels {
+        saved["fork_lineage_labels"] = labels.clone();
+    }
+    write(&mut saved)?;
+    Ok(true)
+}
+
+fn valid_source(source: &Value) -> bool {
+    source.as_array().is_some_and(|parts| {
+        parts.len() == 3
+            && parts[0].as_str().is_some_and(|name| !name.is_empty())
+            && parts[1]
+                .as_str()
+                .is_some_and(|conversation| !conversation.is_empty())
+            && parts[2].as_i64().is_some_and(|seq| seq > 0)
+    })
+}
+
+/// What a new fork of `source` inherits: the source's own lineage, then the
+/// source's conversation up to the journal's last row now. At most
+/// [`LINEAGE`] sources, the nearest kept.
+pub(super) fn fork_lineage(source: &Value) -> String {
+    event_db().map_or_else(|_| "[]".into(), |db| lineage_after(&db, source))
+}
+
+fn lineage_after(db: &Connection, source: &Value) -> String {
+    let mut sources = lineage(db, source);
+    let conversation = string(source, "conversation_id");
+    let last = db
+        .query_row("SELECT MAX(seq) FROM events", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .ok()
+        .flatten();
+    if let (false, Some(seq)) = (conversation.is_empty(), last) {
+        sources.push(json!([journal_name(source), conversation, seq]));
+    }
+    let keep = sources.len().saturating_sub(LINEAGE);
+    json!(sources[keep..]).to_string()
+}
+
+/// What a new fork of `source` names its inherited sources by: the label each
+/// had when the fork began, keyed by journal name, for the sources in
+/// `lineage` ([`fork_lineage`]) whose journal is not their label (zerus-ucck
+/// P2b). The lineage itself stays `[journal name, conversation, sequence]`,
+/// so a build that ignores the labels still reads the same rows.
+pub(super) fn fork_lineage_labels(source: &Value, lineage: &str) -> String {
+    let journals: std::collections::BTreeSet<String> = serde_json::from_str::<Vec<Value>>(lineage)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry[0].as_str().map(str::to_owned))
+        .collect();
+    let mut labels = serde_json::Map::new();
+    if let Some(inherited) = source["fork_lineage_labels"].as_object() {
+        for (journal, label) in inherited {
+            if journals.contains(journal) && label.as_str().is_some_and(|label| !label.is_empty()) {
+                labels.insert(journal.clone(), label.clone());
+            }
+        }
+    }
+    let (journal, name) = (journal_name(source), string(source, "name"));
+    if journal != name && !name.is_empty() && journals.contains(journal) {
+        labels.insert(journal.to_owned(), json!(name));
+    }
+    Value::Object(labels).to_string()
+}
+
+/// The label an inherited source of the fork `record` had when the fork
+/// began: from its `fork_lineage_labels`; for its direct source (the last
+/// lineage entry) without one, as a build that dropped the labels leaves it,
+/// the `fork_source_name` it recorded; else the journal name, which is that
+/// label for every source before P2b.
+pub(super) fn lineage_label<'a>(record: &'a Value, journal: &'a str) -> &'a str {
+    let nonempty = |value: &'a Value| value.as_str().filter(|label| !label.is_empty());
+    if let Some(label) = nonempty(&record["fork_lineage_labels"][journal]) {
+        return label;
+    }
+    let direct = record["fork_lineage"]
+        .as_array()
+        .and_then(|lineage| lineage.last())
+        .and_then(|entry| entry[0].as_str());
+    match nonempty(&record["fork_source_name"]) {
+        Some(source) if direct == Some(journal) => source,
+        _ => journal,
+    }
+}
+
+/// The `?3` scope of the Activity reads for a record.
+pub(super) fn activity_scope(db: &Connection, record: &Value) -> String {
+    json!({"earlier": clear_context::earlier_conversations(record), "inherited": lineage(db, record)}).to_string()
+}
+
+/// Marks a row another conversation's fork source wrote: read-only history the
+/// fork began from, named by the label that source had ([`lineage_label`]).
+fn mark_inherited(event: &mut Value, own: bool, name: &str) {
+    if !own {
+        event["inherited_from"] = json!(name);
+    }
+}
+
 // The activity tail includes tools and children. Keep main public messages in
 // a separate bounded window so a cold reader does not lose its newest prompt
 // merely because that turn has produced more than one hundred tool events.
-fn message_events(db: &Connection, name: &str, conversation: Option<&str>, earlier: &str) -> Result<(Vec<Value>, bool)> {
-    let mut query = db.prepare(&format!("SELECT seq,payload FROM events WHERE {TIMELINE}
-        AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main')
-        AND json_extract(payload, '$.type') IN ('SessionCleared','UserPromptSubmit','UserPromptQueued','UserMessage','TurnStarted','QuestionAnswered','AgentMessage','Stop')
-        ORDER BY seq DESC LIMIT 101")).map_err(|e| e.to_string())?;
-    let rows = query.query_map(params![name, conversation, earlier], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+fn message_events(db: &Connection, name: &str, conversation: Option<&str>, scope: &str, record: &Value) -> Result<(Vec<Value>, bool)> {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    let query = QUERY.get_or_init(|| activity_query(" AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main') \
+        AND json_extract(payload, '$.type') IN ('SessionCleared','UserPromptSubmit','UserPromptQueued','UserMessage','TurnStarted','QuestionAnswered','AgentMessage','Stop')", true, "101"));
+    let mut query = db.prepare(query).map_err(|e| e.to_string())?;
+    let rows = query.query_map(params![name, conversation, scope], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, String>(3)?))
+        })
         .map_err(|e| e.to_string())?;
     let (mut events, mut bytes, mut truncated) = (Vec::new(), 2, false);
     for row in rows {
-        let (seq, payload) = row.map_err(|e| e.to_string())?;
+        let (seq, payload, own, source) = row.map_err(|e| e.to_string())?;
         if events.len() == MESSAGE_EVENTS_LIMIT { truncated = true; break; }
+        // Task #437: the ping and the reply of a keep-warm turn are not
+        // messages; a history written before the marks keeps the reply.
+        if legacy_keepalive_reply(db, name, conversation.unwrap_or_default(), seq, own, &payload) { continue; }
         let mut event: Value = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
         event["seq"] = json!(seq);
+        mark_inherited(&mut event, own, lineage_label(record, &source));
         let size = event.to_string().len() + usize::from(!events.is_empty());
         if bytes + size > MESSAGE_EVENTS_BYTES { truncated = true; break; }
         bytes += size;
@@ -689,14 +1296,49 @@ fn message_events(db: &Connection, name: &str, conversation: Option<&str>, earli
     Ok((events, truncated))
 }
 
-pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, include_processes: bool) -> Result<Value> {
+/// Task 117: how long an inspection waits for the state lock.
+const INSPECT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(super) const STATE_BUSY: &str =
+    "The session state is busy: another hgs call held its lock for more than 3 s";
+
+pub(super) fn inspection(
+    name: &str,
+    after: i64,
+    archive_id: Option<&str>,
+    include_processes: bool,
+) -> Result<Value> {
+    inspection_with(name, after, archive_id, include_processes, false)
+}
+
+/// `inspection`, with `current_read` (`--current-read`) for a current tracked
+/// main session: see `read_marks::current_read` for the read order it needs.
+pub(super) fn inspection_with(
+    name: &str,
+    after: i64,
+    archive_id: Option<&str>,
+    include_processes: bool,
+    current_read: bool,
+) -> Result<Value> {
+    // Task 117: every step's milliseconds ride in the answer; a slow call is logged.
+    let mut phases = super::slow_calls::Phases::start();
     // An approval answered in Terminal sends no hook; settling it takes the lock.
     if archive_id.is_none() && record_path(name).exists() {
         if let Ok(record) = read(name) {
-            claude_approval::reconcile(record);
+            // Only watch enters this scope. Prime appended transcript bytes
+            // before the state writer lock, never while holding up hooks.
+            super::watch_index::prepare(&record);
+            kimi_completion::reconcile(claude_approval::reconcile(record));
         }
     }
-    let _guard = lock(None)?;
+    phases.mark("approval_reconcile");
+    // Task 117: a writer that keeps the state lock never holds an inspection
+    // past the desktop's limit; it answers that the state is busy, and the
+    // desktop keeps the last Activity and tries again.
+    let Some(_guard) = storage::writer_until(std::time::Instant::now() + INSPECT_LOCK_WAIT)? else {
+        let _ = phases.finish("inspect", name);
+        return Err(format!("{STATE_BUSY} [timings: {}]", phases.value()));
+    };
+    phases.mark("state_lock");
     let untracked = |cwds| {
         let mut value = json!({"name": name, "tracked": false, "events": [], "cursor": 0});
         value
@@ -704,9 +1346,17 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
             .unwrap()
             .extend(telemetry::unavailable().as_object().unwrap().clone());
         workspace::enrich(std::slice::from_mut(&mut value), &cwds);
+        match untracked_shell::capture(name) {
+            Ok(identity) => value["untracked_terminal"] = json!(identity),
+            Err(_) => {
+                value["untracked_terminal_reason"] =
+                    json!(zerus_client_core::untracked_shell::UNVERIFIED)
+            }
+        }
         value
     };
     if archive_id.is_none() && !record_path(name).exists() {
+        session_id::verify_absent(name)?;
         drop(_guard);
         return Ok(untracked(workspace::pane_cwds()));
     }
@@ -715,12 +1365,23 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
     } else {
         read(name)?
     };
-    let (snapshot, names) = live_sessions()?;
+    phases.mark("record");
+    if archive_id.is_some() && record["backend"] == "dsh" {
+        drop(_guard);
+        return dsh::retirement::inspect(&record, after);
+    }
+    if archive_id.is_none() {
+        input::acceptance::reconcile_locked(&mut record)?;
+    }
+    let (snapshot, mut names) = live_sessions()?;
+    phases.mark("live_sessions");
+    // The session's own terminal (P3b), never another under its label.
     let panes = if archive_id.is_some() {
         None
     } else {
-        snapshot.get(name)
+        panes_of(&snapshot, &record)
     };
+    workspace::relabel(&mut names, terminal_name(&record), name);
     if panes.is_some() && !matches(&record, panes) {
         drop(_guard);
         return Ok(untracked(workspace::snapshot_cwds(&names)));
@@ -770,21 +1431,43 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
             output[key] = value.clone();
         }
     }
-    output.as_object_mut().unwrap().extend(
-        summary(&record, panes.is_some())
-            .as_object()
-            .unwrap()
-            .clone(),
-    );
+    let summary = summary(&record, panes.is_some());
+    output
+        .as_object_mut()
+        .unwrap()
+        .extend(summary.as_object().unwrap().clone());
+    // U53: the account's label beside its id, which a move reads back.
+    if let Ok(config) = crate::config::Config::load() {
+        output["account_label"] = json!(crate::accounts::label(&config, string(&output, "account_id")));
+    }
     // The compact list preview must not shorten the existing inspector field.
     if !user_prompt(&record).is_null() {
         output["prompt"] = record["prompt"].clone();
     }
+    keep_warm::visible(&mut output, &record);
     output["tracked"] = json!(true);
     if archive_id.is_some() {
         output["state"] = json!("archived");
+        // The same locked predicate as Restore admission. Standing resume
+        // reads this through its bounded own-CLI observation, never by an
+        // unbounded backend call on the desktop worker (zerus-63rru.129).
+        output["restore_name_busy"] = json!(lifecycle::restore_name_busy(name)?);
     }
     drop(_guard);
+    // WhiteWh fork: a Kimi session that stays working although its wire ends
+    // the latest turn says which check refuses the end. Text only.
+    if archive_id.is_none() {
+        if let Some(why) = kimi_completion::refusal(&record) {
+            output["turn_end_refusal"] = json!(why);
+        }
+    }
+    phases.mark("summary");
+    // Before the listed questions and the provider messages below.
+    if current_read && archive_id.is_none() {
+        if let Some(current) = read_marks::current_read(name, &record, summary, panes.is_some()) {
+            output["current_read"] = current;
+        }
+    }
     if archive_id.is_none() {
         output.as_object_mut().unwrap().extend(
             input::first_message_summary(&record, panes.is_some())
@@ -793,14 +1476,34 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
                 .clone(),
         );
         input::attention_message_summary(&record, &mut output, panes.is_some());
+        // Task #7: an unconfirmed model or effort change and the agent's own
+        // evidence for it, read again with each inspection.
+        output["settings_confirmation"] = effort::confirmation_summary(&record, panes.is_some());
     }
-    match questions::inspection(&record, panes.is_some()) {
-        Ok(pending) => output["pending_questions"] = pending,
+    phases.mark("message_summary");
+    #[cfg(test)]
+    read_order::note("listed_questions");
+    // Codex question indexing shares one bounded budget per inspection and
+    // keeps its progress; until it is complete the questions are unknown,
+    // and recent messages never wait for it (zerus-a4mub.8).
+    let question_deadline = read_marks::question_budget();
+    match questions::inspection(&record, panes.is_some(), question_deadline) {
+        Ok((pending, complete)) => {
+            output["pending_questions"] = pending;
+            output["pending_questions_complete"] = json!(complete);
+            if !complete {
+                output["pending_questions_error"] = json!(QUESTIONS_INDEXING);
+            }
+        }
         Err(error) => {
             output["pending_questions"] = json!([]);
+            output["pending_questions_complete"] = json!(false);
             output["pending_questions_error"] = json!(error);
         }
     }
+    phases.mark("questions");
+    let pending = output["pending_questions"].as_array().is_some_and(|questions| !questions.is_empty());
+    telemetry::pending_input_summary(&mut output, pending);
     output["input_queue"] = if archive_id.is_none() { input_queue::inspection(&record, panes.is_some()).unwrap_or(Value::Null) } else { Value::Null };
     output["session_usage"] = if clear_context::awaiting_start(&record) {
         json!({"status":"unavailable","source":record["agent"],"scope":"conversation"})
@@ -815,17 +1518,21 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
     };
     output["session_clear"] = clear_context::event(&record).unwrap_or(Value::Null);
     output["clear_context_request"] = record["clear_context_request"].clone();
+    phases.mark("usage");
     if include_processes {
         output["processes"] = processes::snapshot(&record, archive_id.is_none() && panes.is_some() && process_alive(&record));
         output["process_work"] = processes::WorkSample::default().summary(&record,
             archive_id.is_none() && panes.is_some() && output["activity"] == "idle" && output["phase"] == "idle");
     }
+    phases.mark("processes");
     // Each unavailable action names its reason; an older host omits it.
     let context_reason = if archive_id.is_some() { Some("Restore the archived session first".to_owned()) }
         else { clear_context::unavailable_shown(&record,panes.is_some(),&output) };
     output["compact_context_supported"] = json!(context_reason.is_none());
     output["compact_context_reason"] = json!(context_reason.clone().unwrap_or_default());
     output["compact_context_request"] = record["compact_context_request"].clone();
+    let pre_send = &record["last_send_compaction"];
+    output["pre_send_compaction"] = if pre_send["run_id"] == record["run_id"] && pre_send["conversation_id"] == record["conversation_id"] { pre_send.clone() } else { Value::Null };
     // The summary above verified a pending resume once; its message and
     // actions reuse that result instead of checking the terminal again.
     // So did the summary of an interrupted Claude turn's prompt.
@@ -842,20 +1549,37 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
         && clear_context::dismissable(&record,panes.is_some()) && !clear_context::startup_choice(&output["pending_questions"]));
     output["interrupt_supported"] = json!(archive_id.is_none() && interrupt::available(&record,panes.is_some()));
     cache_hint::enrich(&record,&mut output,archive_id.is_none()&&panes.is_some());
+    phases.mark("actions");
+    #[cfg(test)]
+    read_order::note("provider_messages");
     let messages = if string(&record, "agent") == "kimi" {
         kimi_messages::read_with_turns(&record).map(|(messages, turns, complete)| {
             output["kimi_turns"] = json!(turns);
             output["kimi_turns_complete"] = json!(complete);
             messages
         })
-    } else { provider_messages::read(&record) };
+    } else { provider_messages::read_activity(&record) };
     match messages {
-        Ok(messages) => output["provider_messages"] = json!(messages),
+        Ok(messages) => {
+            // Display-only body candidates never become extra user rows in
+            // clients that consume the existing assistant-message window.
+            let (bodies, messages): (Vec<_>, Vec<_>) = messages
+                .into_iter()
+                .partition(|message| message["type"] == "UserMessageBody");
+            output["user_message_bodies"] = json!(bodies);
+            output["provider_messages"] = json!(messages);
+        }
         Err(error) => output["provider_messages_error"] = json!(error),
     }
     // Optional-question indexing must never suppress successfully read replies.
-    match codex_questions::messages(&record) {
-        Ok(questions) => {
+    match codex_questions::messages(&record, question_deadline) {
+        Ok(None) => {
+            output["pending_questions_complete"] = json!(false);
+            if output.get("pending_questions_error").is_none() {
+                output["pending_questions_error"] = json!(QUESTIONS_INDEXING);
+            }
+        }
+        Ok(Some(questions)) => {
             let mut messages = output["provider_messages"].as_array().cloned().unwrap_or_default();
             messages.extend(questions);
             messages.sort_by(|a,b|a["at"].as_f64().unwrap_or(0.).total_cmp(&b["at"].as_f64().unwrap_or(0.)));
@@ -868,77 +1592,181 @@ pub(super) fn inspection(name: &str, after: i64, archive_id: Option<&str>, inclu
         output["prompt"] = json!("");
         output["last_message"] = json!("");
         output["provider_messages"] = json!([]);
+        output["user_message_bodies"] = json!([]);
         output["kimi_turns"] = json!([]);
         output["kimi_turns_complete"] = json!(false);
         output["cache_hint"] = Value::Null;
     }
+    phases.mark("provider_messages");
     let db = event_db()?;
+    phases.mark("events_open");
+    // A fork recorded before its lineage finds its source once (zerus-b4qk),
+    // outside the state lock; saving it takes the lock again.
+    if archive_id.is_none() {
+        save_derived_lineage(&db, &mut record);
+    }
     let journal_name = journal_name(&record);
     let conversation = record["conversation_id"].as_str();
     let cleared = clear_context::earlier_conversations(&record);
-    let earlier = cleared.to_string();
     output["cleared_conversations"] = cleared;
+    let scope = activity_scope(&db, &record);
     let oldest: Option<i64> = db
         .query_row(
-            &format!("SELECT MIN(seq) FROM events WHERE {TIMELINE}"),
-            params![journal_name, conversation, earlier],
+            activity_oldest(),
+            params![journal_name, conversation, scope],
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())?;
     let rows = if after > 0 {
-        timeline_rows(&db, journal_name, conversation, &earlier, after, 200, false)?
+        timeline_rows(&db, journal_name, conversation, &scope, after, 200, false)?
     } else {
-        timeline_rows(&db, journal_name, conversation, &earlier, after, 100, true)?
+        timeline_rows(&db, journal_name, conversation, &scope, after, 100, true)?
     };
-    output["cursor"] = json!(rows.last().map(|(seq, _)| *seq).unwrap_or(after));
+    output["cursor"] = json!(rows.last().map(|row| row.seq).unwrap_or(after));
     output["history_truncated"] =
         json!(after > 0 && oldest.map(|seq| after < seq - 1).unwrap_or(false));
     let mut events = Vec::new();
-    for (seq, payload) in rows {
-        events.push(timeline_event(&record, seq, &payload)?);
+    for row in rows {
+        events.push(row.event(&record)?);
     }
     output["events"] = json!(events);
-    let (messages, truncated) = message_events(&db, journal_name, conversation, &earlier)?;
+    phases.mark("activity");
+    let (messages, truncated) =
+        message_events(&db, journal_name, conversation, &scope, &record)?;
     output["message_events"] = json!(messages);
     output["message_events_truncated"] = json!(truncated);
     output["message_events_limit"] = json!(MESSAGE_EVENTS_LIMIT);
     output["message_events_max_bytes"] = json!(MESSAGE_EVENTS_BYTES);
-    output["attachment_messages"] = attachments::messages(&record, "");
+    attachments::decorate(&record, "", &mut output);
     // U35: messages hgs holds until the agent takes the previous one, and that
     // this hgs holds them for a client that asks (`queue_when_unconfirmed`).
     output["input_hold_supported"] = json!(true);
     output["held_inputs"] = input_hold::inspection(string(&record, "name"));
+    // #511 N5: the latest held messages that were not delivered (failed or
+    // uncertain), so the composer that sent one restores its text.
+    output["held_settled"] = input_hold::settled(string(&record, "name"));
     output["voice_messages"] = conversation_history::inspected_voice_messages(&record, &output, None);
+    phases.mark("message_events");
     // The lock was released after `snapshot`, so a rename may have landed since.
     // The pane folders go by the session IDs, which a rename keeps, to the name
     // this inspection reports (zerus-byyw, as in `merge_listing`).
     workspace::enrich(std::slice::from_mut(&mut output), &workspace::snapshot_cwds(&names));
+    phases.mark("workspace");
     waits::decorate(std::slice::from_mut(&mut output));
+    phases.mark("waits");
     notifications::enrich(&mut output, notifications::load().as_ref(), journal_name);
+    phases.mark("notifications");
+    if archive_id.is_none() {
+        keep_warm::enrich(&mut output, keep_warm::load().as_ref(), &record);
+        // The person's per-child question route switch, as the listing
+        // shows it (zerus-sa9qn.33): the phones check an action against it.
+        super::question_routing::enrich(&mut output, super::question_routing::load().as_ref());
+        if let Some(outcomes) = super::question_route_outcomes::Reader::load() { outcomes.inspect(&mut output); }
+        let usage = output["session_usage"].clone();
+        keep_warm::describe(&mut output, &record, &usage);
+    }
+    phases.mark("keep_warm");
     // U30: after the notification preferences, which say whether it is muted.
     session_state::decorate(std::slice::from_mut(&mut output));
+    phases.mark("session_state");
+    phases.note("team_store", session_state::TEAM_READ_MS.load(std::sync::atomic::Ordering::Relaxed));
+    output["timings_ms"] = phases.finish("inspect", name);
     Ok(output)
 }
 
-/// A session timeline's rows after `after`, oldest first: the first `limit`
-/// of them, or with `newest` the last `limit`. `inspection` and `hgs watch`
-/// both read Activity through it and `timeline_event`.
-pub(super) fn timeline_rows(db: &Connection, journal_name: &str, conversation: Option<&str>, earlier: &str,
-    after: i64, limit: usize, newest: bool) -> Result<Vec<(i64, String)>> {
-    let mut statement = db.prepare(&if newest {
-        format!("SELECT seq, payload FROM events WHERE {TIMELINE} AND seq>?4 ORDER BY seq DESC LIMIT ?5")
-    } else { format!("SELECT seq, payload FROM events WHERE {TIMELINE} AND seq>?4 ORDER BY seq LIMIT ?5") }).map_err(|e| e.to_string())?;
-    let mut rows: Vec<(i64, String)> = statement
-        .query_map(params![journal_name, conversation, earlier, after, limit as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+/// One Activity row: its sequence number and payload, and for a row a fork
+/// inherited, the source's journal name.
+pub(super) struct TimelineRow {
+    pub(super) seq: i64,
+    payload: String,
+    inherited_from: Option<String>,
+}
+
+impl TimelineRow {
+    /// One `seq, payload, own, name` row of [`activity_query`].
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let own: bool = row.get(2)?;
+        Ok(Self {
+            seq: row.get(0)?,
+            payload: row.get(1)?,
+            inherited_from: (!own).then(|| row.get(3)).transpose()?,
         })
+    }
+
+    /// The row as `inspect` returns it.
+    pub(super) fn event(&self, record: &Value) -> Result<Value> {
+        let mut event = timeline_event(record, self.seq, &self.payload)?;
+        if let Some(source) = &self.inherited_from {
+            mark_inherited(&mut event, false, lineage_label(record, source));
+        }
+        Ok(event)
+    }
+}
+
+/// A session's Activity rows after `after`, oldest first: the first `limit`
+/// of them, or with `newest` the last `limit`. `scope` is [`activity_scope`].
+/// `inspection` and `hgs watch` both read Activity through it.
+pub(super) fn timeline_rows(
+    db: &Connection,
+    journal_name: &str,
+    conversation: Option<&str>,
+    scope: &str,
+    after: i64,
+    limit: usize,
+    newest: bool,
+) -> Result<Vec<TimelineRow>> {
+    let mut statement = db
+        .prepare(activity_page(newest))
+        .map_err(|e| e.to_string())?;
+    let mut rows: Vec<TimelineRow> = statement
+        .query_map(
+            params![journal_name, conversation, scope, after, limit as i64],
+            TimelineRow::read,
+        )
         .map_err(|e| e.to_string())?
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| e.to_string())?;
+    // Task #437: an old keep-warm reply carries no mark of its own; the ping
+    // before it says the turn is invisible.
+    let conversation = conversation.unwrap_or_default();
+    rows.retain(|row| !legacy_keepalive_reply(db, journal_name, conversation, row.seq, row.inherited_from.is_none(), &row.payload));
     if newest {
         rows.reverse();
     }
     Ok(rows)
+}
+
+/// The page of a session's Activity before the sequence number `before`: its
+/// newest `limit` rows, oldest first, the oldest sequence number the read
+/// covered (`before` when it found none) and whether older rows remain. An
+/// earlier page is read by position, never by guessing how far back the
+/// session's rows lie among every other session's. The cursor also covers
+/// rows left out afterwards, so a reader always moves back.
+pub(super) fn timeline_rows_before(
+    db: &Connection,
+    journal_name: &str,
+    conversation: Option<&str>,
+    scope: &str,
+    before: i64,
+    limit: usize,
+) -> Result<(Vec<TimelineRow>, i64, bool)> {
+    let mut statement = db.prepare(activity_before()).map_err(|e| e.to_string())?;
+    let mut rows: Vec<TimelineRow> = statement
+        .query_map(
+            params![journal_name, conversation, scope, before, limit as i64 + 1],
+            TimelineRow::read,
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    // One row beyond the page says whether another page exists.
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let cursor = rows.last().map_or(before, |row| row.seq);
+    let conversation = conversation.unwrap_or_default();
+    rows.retain(|row| !legacy_keepalive_reply(db, journal_name, conversation, row.seq, row.inherited_from.is_none(), &row.payload));
+    rows.reverse();
+    Ok((rows, cursor, more))
 }
 
 /// One Activity event as `inspect` returns it.
@@ -957,12 +1785,21 @@ pub(super) fn journal_name(record: &Value) -> &str {
     }
 }
 
+/// A Kimi profile child revived by a racing start: settled as ended by the
+/// next profile-group event once it has had no event of its own for this
+/// long, the first tier the unreadable-member path waits (zerus-63rru.93).
+pub(super) const REVIVED_KIMI_SETTLE_SECONDS: f64 = 60.0;
+
 pub(super) fn update_activity(record: &mut Value, event: &Value) {
+    update_activity_at(record, event, now());
+}
+
+pub(super) fn update_activity_at(record: &mut Value, event: &Value, timestamp: f64) {
+    if stale_kimi_turn(record, event) { return; }
     repair_kimi_main(record);
     repair_claude_internal(record);
     let was_busy = record["activity"] == "busy";
     let kind = string(event, "hook_event_name");
-    let timestamp = now();
     record["last_event_at"] = json!(timestamp);
     let mut children = record["subagents"].as_object().cloned().unwrap_or_default();
     let root_agent = string(record, "agent") == "kimi" && string(event, "agent_id") == "main";
@@ -1012,6 +1849,45 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
                 info["description"] = json!(clipped(&tool["detail"], 160));
             }
         }
+        // A Start for a child the record already holds as ended or interrupted
+        // is that child's own Stop or Interrupt that arrived first: the two hook
+        // processes race. Counting it working again would leave a child no later
+        // Stop ever ends, so the record keeps the end it already has. Nothing
+        // else about the child changes, and a late announcement is still kept.
+        // This is the one exception to "a later event resumes the child": a
+        // later Start of the same ID is not counted until its next event.
+        // "Interrupted" is the hook writer's own shape, never process
+        // uncertainty, which a fresh Start must clear: only the lifecycle
+        // projection sets process_unknown.
+        let interrupted = string(info, "state") == "working"
+            && string(info, "display_state") == "unknown"
+            && info["process_unknown"] != true;
+        let ended = ["finished", "ended"].contains(&string(info, "state")) || interrupted;
+        // A child's end is final for its ID (zerus-63rru.88). Claude and
+        // Codex name every subagent invocation with a fresh ID, so no event
+        // of theirs revives an ended child: a late Start is dropped here.
+        // A Kimi profile child really resumes under its profile name, so
+        // only its own start event revives it.
+        if kind == "SubagentStart" && ended && string(record, "agent") != "kimi" {
+            record["subagents"] = json!(children);
+            return;
+        }
+        // The non-start events of an ended child are recorded as history
+        // only: nothing but its producer's own start event (the guard above
+        // admits only Kimi's) sets it working again. An interrupted child
+        // (working with the hook writer's unknown display) is not an end:
+        // its own tool events resume it as before.
+        let final_end = ["finished", "ended"].contains(&string(info, "state"));
+        let revives = !final_end || kind == "SubagentStart";
+        // zerus-63rru.93: the Start that revives a finished or ended Kimi
+        // profile child records the revival; the next profile-group event
+        // settles it if nothing of its own has followed (the measure found
+        // nothing orderable in Kimi's frames, so the race cannot be told
+        // from a genuine resume by the bytes alone).
+        let revived = kind == "SubagentStart" && final_end && string(record, "agent") == "kimi";
+        if revived {
+            info["revived_at"] = json!(timestamp);
+        }
         if ["Stop", "SubagentStop"].contains(&kind) {
             let result = detail(event);
             if string(info, "state") != "finished"
@@ -1022,10 +1898,12 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
         }
         // A Claude child's StopFailure ends its turn with a provider error, such
         // as a usage limit; Claude sends no SubagentStop after it. The child is
-        // settled as an error, which never keeps its parent working. A newer
-        // event of the same child resumes it as usual.
-        let failed = kind == "StopFailure" && string(record, "agent") == "claude";
-        info["state"] = json!(if failed || ["SubagentStop", "SessionEnd", "Stop"].contains(&kind) {
+        // settled as an error, which never keeps its parent working. Any newer
+        // event of the same child but its Start resumes it as usual.
+        let failed = kind == "StopFailure" && matches!(string(record, "agent"), "claude" | "qwen");
+        info["state"] = json!(if !revives {
+            string(info, "state")
+        } else if failed || ["SubagentStop", "SessionEnd", "Stop"].contains(&kind) {
             "finished"
         } else {
             "working"
@@ -1038,10 +1916,12 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
             info["display_state"] = json!("error");
         } else if ["StopFailure", "Interrupt"].contains(&kind) {
             info["display_state"] = json!("unknown");
-        } else {
+        } else if revives {
             info.as_object_mut().unwrap().remove("display_state");
         }
         // Any newer child event ends its pending request (hooks.rs sets a new one).
+        info.as_object_mut().unwrap().remove("process_unknown");
+        info.as_object_mut().unwrap().remove("process_display_state");
         info.as_object_mut().unwrap().remove("attention_id");
         if kind == "PreToolUse" {
             info["current_tool"] = json!(clipped(&event["tool_name"], 120));
@@ -1082,22 +1962,24 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
         if children.len() > 64 {
             let remove: Vec<String> = children
                 .iter()
-                .filter(|(_, child)| string(child, "state") == "finished")
+                .filter(|(_, child)| ["finished","ended"].contains(&string(child, "state")))
                 .take(children.len() - 64)
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in remove {
-                children.remove(&key);
-                record["subagents_completed_pruned"] =
-                    json!(record["subagents_completed_pruned"].as_u64().unwrap_or(0) + 1);
+                let ended = children.remove(&key).is_some_and(|child| child["state"] == "ended");
+                let count = if ended {"subagents_ended_pruned"} else {"subagents_completed_pruned"};
+                record[count] = json!(record[count].as_u64().unwrap_or(0) + 1);
             }
         }
+        let _ = settle_quiet_revivals(record, &mut children, timestamp);
         record["subagents"] = json!(children);
         return;
     }
     record["subagents"] = json!(children);
     if ["UserPromptSubmit", "UserPromptQueued"].contains(&kind) {
         record["recovery_user_at"] = json!(timestamp);
+        kimi_completion::observe_submission(record, event, timestamp);
         record["recovery_user_text"] = json!(event["prompt"].as_str().map(str::to_owned).unwrap_or_else(||
             event["prompt"].as_array().into_iter().flatten().filter(|v|v["type"]=="text")
                 .map(|v|string(v,"text")).collect::<Vec<_>>().join("\n")));
@@ -1161,6 +2043,9 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
     }
     match kind {
         "UserPromptSubmit" | "UserPromptQueued" | "TurnStarted" | "TaskStarted" => {
+            // The agent accepted input: this, not a later tool event of a
+            // busy turn, confirms what hgs typed (input::input_unconfirmed).
+            record["input_seen_at"] = json!(timestamp);
             record["activity"] = json!("busy");
             if kind != "UserPromptQueued" || record["phase"] != "compacting" {
                 record["phase"] = json!("working");
@@ -1198,6 +2083,7 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
             record["activity"] = json!("busy");
             record["phase"] = json!(if ["AskUserQuestion", "request_user_input", "AskUser"]
                 .contains(&tool.as_str())
+                || (string(record, "agent") == "qwen" && tool == "ask_user_question")
             {
                 "input"
             } else {
@@ -1292,9 +2178,18 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
                 );
                 // Keep native type/code evidence when the rolling-window text
                 // would otherwise erase a permanent refusal during projection.
-                if provider_errors::rolling_rate_limit(&detail(event)) {
-                    failure["native_error_type"] = json!(clipped(&event["error_type"], 1200));
-                    failure["native_error_code"] = json!(clipped(&event["error"], 1200));
+                if provider_errors::rolling_rate_limit(&detail(event))
+                    || (string(record, "agent") == "kimi"
+                        && string(event, "error_type") == provider_errors::KIMI_RATE_LIMIT_TYPE) {
+                    for (source, target) in [("error_type", "native_error_type"), ("error", "native_error_code")] {
+                        failure[target] = match event.get(source) {
+                            None => json!(""),
+                            Some(value @ Value::String(_)) => json!(clipped(value, 1200)),
+                            // Closed, bounded invalid-evidence marker. Do not
+                            // erase objects/numbers/arrays into an absent code.
+                            Some(_) => Value::Null,
+                        };
+                    }
                 }
                 let category = provider_errors::native_kind(&failure).unwrap_or_else(|| provider_errors::category(&format!(
                     "{} {} {}",
@@ -1304,6 +2199,10 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
                 )));
                 if category != "provider" || provider_errors::native_kind(&failure).is_some() {
                     failure["error_kind"] = json!(category);
+                }
+                if provider_errors::rolling_rate_error(&failure)
+                    && ["", "provider", "quota", "rate_limit"].contains(&string(&failure, "error_kind")) {
+                    failure["error_kind"] = json!("rate_limit");
                 }
                 // Keep a provider deadline separate from the chosen backoff.
                 for (key,scale) in [("retry_after",1.0),("retry_after_seconds",1.0),("retry_after_ms",0.001)] {
@@ -1374,6 +2273,82 @@ pub(super) fn update_activity(record: &mut Value, event: &Value) {
         }
     }
     record["active_tools"] = json!(tools);
+    // zerus-63rru.93 round 2: the persisted settle also rides the session's
+    // next event of any kind (the main's Stop or turn end included), so a
+    // last invocation whose Start lost the race cannot keep the member busy
+    // for ever. Round 3: the map is rewritten only when a child settled.
+    let mut children = record["subagents"].as_object().cloned().unwrap_or_default();
+    if settle_quiet_revivals(record, &mut children, timestamp) {
+        record["subagents"] = json!(children);
+    }
+}
+
+/// zerus-63rru.93: a revived Kimi profile child that has had no event of its
+/// own for the settle period is ended, with no new timer; its group's counts
+/// follow so the listing the fleet reads shows no active child for it.
+/// Whether anything was settled.
+fn settle_quiet_revivals(record: &mut Value, children: &mut serde_json::Map<String, Value>, timestamp: f64) -> bool {
+    let quiet: Vec<String> = children
+        .iter()
+        .filter(|(_, child)| {
+            child["revived_at"].as_f64().is_some()
+                && child["updated"].as_f64().is_some_and(|at| {
+                    timestamp - at >= REVIVED_KIMI_SETTLE_SECONDS
+                })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let settled_any = !quiet.is_empty();
+    for id in quiet {
+        let Some(child) = children.get_mut(&id) else {
+            continue;
+        };
+        child["state"] = json!("ended");
+        child["detail"] = json!("Revived by a racing start and quiet since; the next event settled the child.");
+        child.as_object_mut().unwrap().remove("revived_at");
+        if let Some(groups) = record["subagent_groups"].as_object_mut() {
+            if let Some(group) = groups.get_mut(&id) {
+                // The read-time rule zeroes the profile's whole active count
+                // (the quiet revived profile has no live invocation left to
+                // be told apart), so the persisted settle agrees with it.
+                let active = group["active_count"].as_u64().unwrap_or(1);
+                group["active_count"] = json!(0);
+                group["completed_count"] = json!(group["completed_count"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(active));
+            }
+        }
+    }
+    settled_any
+}
+
+// Native turn IDs are monotonic, but the observation-only TurnStarted hook can
+// arrive after its blocking Stop. Keep one clock per exact run/conversation;
+// receiving an old start must neither reopen a completed turn nor erase work
+// from a genuinely newer prompt. Other agents and unbound events are unchanged.
+fn stale_kimi_turn(record: &mut Value, event: &Value) -> bool {
+    if !["", "main"].contains(&string(event, "agent_id")) { return false; }
+    let Some(id) = kimi_turn_id(record, event) else { return false };
+    let run = string(record, "run_id");
+    let conversation = string(record, "conversation_id");
+    if run.is_empty() || conversation.is_empty() { return false; }
+    let mut clock = record["kimi_turn_clock"].clone();
+    if string(&clock, "run_id") != run || string(&clock, "conversation_id") != conversation {
+        clock = json!({"run_id":run,"conversation_id":conversation});
+    }
+    let stopped = clock["stopped"].as_u64().filter(|id| *id <= i64::MAX as u64);
+    let started = clock["started"].as_u64().filter(|id| *id <= i64::MAX as u64);
+    let (key, stale) = if string(event, "hook_event_name") == "TurnStarted" {
+        ("started", stopped.is_some_and(|done| id <= done)
+            || started.is_some_and(|active| id < active))
+    } else {
+        ("stopped", started.is_some_and(|active| id < active)
+            || stopped.is_some_and(|done| id < done))
+    };
+    if !stale { clock[key] = json!(id); }
+    record["kimi_turn_clock"] = clock;
+    stale
 }
 
 // Kimi's reserved "main" agent ID describes the root, not a Swarm child.
@@ -1456,9 +2431,214 @@ pub(super) fn settle_children(record: &mut Value) {
     }
 }
 
+// Archives retain historical hooks without claiming current activity.
+#[cfg(test)]
+mod archived_activity_regressions {
+    use super::*;
+
+    #[test]
+    fn archived_activity_is_ended_without_changing_its_saved_history() {
+        for agent in ["kimi", "claude", "codex"] {
+            for phase in ["working", "tool", "approval", "input", "error", "idle"] {
+                let record = json!({"agent":agent,"state":"archived","activity":"busy","phase":phase,
+                    "pid":0,"process_start":"exited-fixture","conversation_state":"active",
+                    "run_id":"old-run","conversation_id":"saved-conversation",
+                    "archive_id":"11111111-1111-4111-8111-111111111111"});
+                let original = record.clone();
+                let activity = normalized_activity(&record, false);
+                assert_eq!(activity["activity"], "ended", "{agent}: {phase}");
+                assert_eq!(activity["phase"], "ended", "{agent}: {phase}");
+                assert_eq!(activity["runtime_state"], "stopped");
+                assert_eq!(activity["process_state"], "exited");
+                assert_eq!(activity["conversation_state"], "active");
+                assert_eq!(record, original, "the archive remains the restore source");
+
+                // The desktop already prioritizes Archive for the old wire
+                // shape as well as the normalized row.
+                let old_view = zerus_client_core::view::row(&record);
+                assert_eq!(old_view.status, "ended");
+                assert_eq!(old_view.caption, "Archived");
+                let mut projected = record.clone();
+                projected
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(activity.as_object().unwrap().clone());
+                let view = zerus_client_core::view::row(&projected);
+                assert_eq!(view.status, "ended");
+                assert_eq!(view.caption, "Archived");
+            }
+        }
+    }
+
+    #[test]
+    fn live_and_saved_activity_keeps_background_and_attention_semantics() {
+        let pid = std::process::id();
+        let start = storage::process_start(pid);
+        assert!(!start.is_empty());
+        for state in ["running", "paused", "stopped", "archived"] {
+            for phase in ["working", "tool", "approval", "input", "error"] {
+                let record = json!({"state":state,"activity":"busy","phase":phase,
+                    "pid":pid,"process_start":start});
+                let live = normalized_activity(&record, true);
+                assert_eq!(live["activity"], "busy", "{state}: {phase}");
+                assert_eq!(live["phase"], phase, "{state}: {phase}");
+                if state != "archived" {
+                    let saved = normalized_activity(&record, false);
+                    assert_eq!(saved["activity"], "busy", "{state}: {phase}");
+                    assert_eq!(saved["phase"], phase, "{state}: {phase}");
+                }
+            }
+            let record = json!({"state":state,"activity":"idle","phase":"idle",
+                "pid":pid,"process_start":start,"subagent_groups":{"worker":{"active_count":1}}});
+            let live = normalized_activity(&record, true);
+            assert_eq!(live["activity"], "busy", "live background work: {state}");
+            assert_eq!(live["phase"], "working", "live background work: {state}");
+        }
+    }
+}
+
+/// The order in which an inspection captures its reply and reads its
+/// questions and provider messages (`read_marks::current_read`).
+#[cfg(test)]
+pub(super) mod read_order {
+    use std::cell::RefCell;
+    thread_local! {
+        static STEPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(in crate::state) fn note(step: &'static str) {
+        STEPS.with(|steps| steps.borrow_mut().push(step));
+    }
+    pub(in crate::state) fn take() -> Vec<&'static str> {
+        STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+mod current_read_order {
+    use super::*;
+
+    /// zerus-a4mub.9: `current_read` signs only what the same inspection
+    /// shows. Its reply is captured before provider messages are read, and its
+    /// questions are read before the inspection lists its own. The fixture runs
+    /// in a child process with private state and tmux directories.
+    #[test]
+    fn current_read_is_captured_before_listed_questions_and_provider_messages() {
+        let state = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::journal::current_read_order::fixture",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("HGS_STATE_DIR", state.path())
+            .env("TMUX_TMPDIR", state.path())
+            .env("ZERUS_CURRENT_READ_ORDER_FIXTURE", "1")
+            .env_remove("TMUX")
+            .env_remove("HGS_SESSION")
+            .env_remove("HGS_SESSION_ID")
+            .env_remove("HGS_RUN_ID")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run by current_read_is_captured_before_listed_questions_and_provider_messages"]
+    fn fixture() {
+        if std::env::var_os("ZERUS_CURRENT_READ_ORDER_FIXTURE").is_none() {
+            return;
+        }
+        std::fs::create_dir_all(root()).unwrap();
+        let name = "claude/example/current-read";
+        let (run, conversation) = ("run-current", "conversation-current");
+        let record = json!({"version":1,"agent":"claude","name":name,"run_id":run,
+            "conversation_id":conversation,"session_id":uuid::Uuid::new_v4().to_string(),"created":1});
+        atomic(&record_path(name), &record.to_string()).unwrap();
+        read_order::take();
+        let output = inspection_with(name, 0, None, false, true).unwrap();
+        assert_eq!(
+            read_order::take(),
+            [
+                "reply",
+                "signed_questions",
+                "listed_questions",
+                "provider_messages"
+            ]
+        );
+        assert_eq!(
+            output["current_read"],
+            json!({"schema":1,"run_id":run,"conversation_id":conversation,"reply_id":null,
+                "attention_signature":null,"attention_complete":true})
+        );
+        // Without the flag nothing is signed and no field is added.
+        let plain = inspection(name, 0, None, false).unwrap();
+        assert_eq!(
+            read_order::take(),
+            ["reply", "listed_questions", "provider_messages"]
+        );
+        assert!(plain.get("current_read").is_none());
+        // As `hgs read`, a recurring job keeps its already read newer reply current;
+        // other sessions report the summary's reply even when a newer one was read.
+        atomic(&root().join("read-marks.json"), &json!({"version":1,"sessions":{name:{conversation:
+            {"conversation_id":conversation,"reply_id":"8:200.5","attention_signature":null,"at":1.0}}}}).to_string()).unwrap();
+        let summary = |recurring: u64| {
+            json!({"run_id":run,"conversation_id":conversation,
+            "reply_id":"7:100.5","reply_at":100.5,"schedules":{"recurring":recurring}})
+        };
+        let reply = |recurring| {
+            read_marks::current_read(name, &record, summary(recurring), false).unwrap()["reply_id"]
+                .clone()
+        };
+        assert_eq!(reply(1), json!("8:200.5"));
+        assert_eq!(reply(0), json!("7:100.5"));
+        read_order::take();
+        // A record without a conversation has nothing a mark could name.
+        let mut unbound = record.clone();
+        unbound["conversation_id"] = json!("");
+        assert!(read_marks::current_read(name, &unbound, summary(0), false).is_none());
+    }
+}
+
 #[cfg(test)]
 mod attention_regressions {
     use super::*;
+
+    /// zerus-ucck P2b: a fork names its inherited sources by the labels they
+    /// had, kept apart from the three-part lineage older builds read.
+    #[test]
+    fn a_fork_keeps_the_labels_of_sources_journalled_by_id() {
+        let id = "session:3f2a9c1d-0b4e-4d6a-9c1d-2e3f4a5b6c7d";
+        let source = json!({"name":"codex/p/root","journal_name":id,
+            "fork_lineage_labels":{"session:old":"codex/p/older","session:gone":"codex/p/dropped"}});
+        let lineage = json!([
+            ["session:old", "c-old", 3],
+            ["codex/p/plain", "c-plain", 4],
+            [id, "c-root", 9]
+        ])
+        .to_string();
+        let labels: Value = serde_json::from_str(&fork_lineage_labels(&source, &lineage)).unwrap();
+        let expected = json!({"session:old":"codex/p/older", id:"codex/p/root"});
+        assert_eq!(labels, expected);
+        let fork = json!({"fork_lineage_labels": labels});
+        assert_eq!(lineage_label(&fork, id), "codex/p/root");
+        assert_eq!(lineage_label(&fork, "codex/p/plain"), "codex/p/plain");
+        assert_eq!(lineage_label(&Value::Null, id), id);
+        // A build that dropped the labels: the direct source falls back to the
+        // label it recorded; an ancestor keeps its journal name.
+        let dropped = json!({"fork_source_name": "codex/p/root",
+            "fork_lineage": [["session:old", "c-old", 3], [id, "c-root", 9]]});
+        assert_eq!(lineage_label(&dropped, id), "codex/p/root");
+        assert_eq!(lineage_label(&dropped, "session:old"), "session:old");
+        let plain = json!({"name":"codex/p/plain"});
+        let lineage = json!([["codex/p/plain", "c-plain", 4]]).to_string();
+        assert_eq!(fork_lineage_labels(&plain, &lineage), "{}");
+    }
 
     #[test]
     fn native_kimi_turn_identity_retains_zero_without_inventing_ids_for_other_hooks() {
@@ -1466,6 +2646,8 @@ mod attention_regressions {
         let mut event = json!({"hook_event_name":"TurnStarted", "turn_id":0});
         assert_eq!(kimi_turn_id(&record, &event), Some(0));
         event["turn_id"] = json!(1);
+        assert_eq!(kimi_turn_id(&record, &event), Some(1));
+        event["hook_event_name"] = json!("Stop");
         assert_eq!(kimi_turn_id(&record, &event), Some(1));
         assert_eq!(kimi_turn_id(&json!({"agent":"claude"}), &event), None);
         event["hook_event_name"] = json!("UserPromptSubmit");
@@ -1477,15 +2659,103 @@ mod attention_regressions {
         }
     }
 
+    fn kimi_clock_record() -> Value {
+        json!({"agent":"kimi","run_id":"current-run","conversation_id":"current-conversation",
+            "activity":"idle","phase":"idle","active_tools":{},"subagents":{}})
+    }
+
+    #[test]
+    fn kimi_delayed_start_after_its_stop_keeps_the_completed_turn_idle_but_new_work_is_busy() {
+        let mut record=kimi_clock_record();
+        update_activity(&mut record,&json!({"hook_event_name":"UserPromptSubmit","prompt":"Follow-up after initial launch"}));
+        // Exact CI order: seq7 UserPromptSubmit, seq8 Stop, seq9 TurnStarted
+        // native turn1. Stop's ID is bound from its awaited native wire prefix.
+        update_activity(&mut record,&json!({"hook_event_name":"Stop","turn_id":1,"turn_identity_source":"kimi_wire"}));
+        assert_eq!((&record["activity"],&record["phase"],&record["main_done"]),(&json!("idle"),&json!("idle"),&json!(true)));
+        let completed=record.clone();
+        update_activity(&mut record,&json!({"hook_event_name":"TurnStarted","agent_id":"main","turn_id":1,"origin_kind":"user","prompt":"Follow-up after initial launch"}));
+        assert_eq!(record,completed,"late start must not reset timers, main_done or prompt");
+        let mut continued=completed.clone();
+        update_activity(&mut continued,&json!({"hook_event_name":"PreToolUse","tool_use_id":"same-turn-call","tool_name":"Shell"}));
+        let working=continued.clone();
+        update_activity(&mut continued,&json!({"hook_event_name":"TurnStarted","turn_id":1}));
+        assert_eq!(continued,working,"a delayed start cannot erase fresh positive work either");
+        assert_eq!(continued["phase"],"tool");
+        update_activity(&mut record,&json!({"hook_event_name":"TurnStarted","turn_id":2,"prompt":"genuinely newer"}));
+        assert_eq!((&record["activity"],&record["phase"],&record["main_done"]),(&json!("busy"),&json!("working"),&json!(false)));
+        let newer=record.clone();
+        for kind in ["TurnStarted","Stop"] {
+            update_activity(&mut record,&json!({"hook_event_name":kind,"turn_id":1}));
+            assert_eq!(record,newer,"old {kind} must not change newer work");
+        }
+        update_activity(&mut record,&json!({"hook_event_name":"Stop","turn_id":2}));
+        assert_eq!(record["phase"],"idle");
+    }
+
+    #[test]
+    fn kimi_completion_clock_is_scoped_and_does_not_turn_unknown_or_other_agent_work_idle() {
+        let mut completed=kimi_clock_record();
+        update_activity(&mut completed,&json!({"hook_event_name":"Stop","turn_id":0}));
+        let snapshot=completed.clone();
+        update_activity(&mut completed,&json!({"hook_event_name":"TurnStarted","turn_id":0}));
+        assert_eq!(completed,snapshot,"native turn zero is a real identity");
+        for key in ["run_id","conversation_id"] {
+            let mut changed=completed.clone();changed[key]=json!("replacement");
+            update_activity(&mut changed,&json!({"hook_event_name":"TurnStarted","turn_id":0}));
+            assert_eq!(changed["phase"],"working","{key}");
+        }
+        for agent in ["claude","codex","opencode","deepseek"] {
+            let mut other=completed.clone();other["agent"]=json!(agent);
+            update_activity(&mut other,&json!({"hook_event_name":"TurnStarted","turn_id":0}));
+            assert_eq!(other["phase"],"working","{agent} retains its own semantics");
+        }
+        for id in [Value::Null,json!(-1),json!("0"),json!(0.5),json!(u64::MAX)] {
+            let mut unknown=completed.clone();
+            update_activity(&mut unknown,&json!({"hook_event_name":"TurnStarted","turn_id":id}));
+            assert_eq!(unknown["phase"],"working","unknown identity is never declared complete");
+        }
+        for invalid in [json!(u64::MAX),json!("0"),json!(-1)] {
+            let mut damaged=completed.clone();damaged["kimi_turn_clock"]["stopped"]=invalid;
+            update_activity(&mut damaged,&json!({"hook_event_name":"TurnStarted","turn_id":0}));
+            assert_eq!(damaged["phase"],"working","malformed persisted bounds cannot suppress work");
+        }
+        let mut child=kimi_clock_record();
+        update_activity(&mut child,&json!({"hook_event_name":"Stop","agent_id":"child","turn_id":1}));
+        assert!(child.get("kimi_turn_clock").is_none());
+        update_activity(&mut child,&json!({"hook_event_name":"TurnStarted","turn_id":1}));
+        assert_eq!(child["phase"],"working");
+    }
+
+    #[test]
+    fn terminal_input_choosers_replace_the_earlier_activity_summary() {
+        for agent in ["claude", "codex", "kimi"] {
+            for earlier in ["Working", "Ready", "Bash"] {
+                let mut shown = json!({"agent":agent,"phase":"input","activity":"busy",
+                    "activity_summary":earlier,"pending_questions":[{"question_id":"choice"}]});
+                wait_for_chooser(&mut shown);
+                assert_eq!(shown["activity_summary"], "Needs attention", "{agent}: {earlier}");
+                assert_eq!(shown["phase"], "input");
+                assert_eq!(shown["pending_questions"][0]["question_id"], "choice");
+            }
+        }
+    }
+
     #[test]
     fn a_terminal_chooser_holds_back_forks_and_immediate_settings_as_dispatch_does() {
         // A Ready saved record; the summary shows a chooser only the terminal
         // reports. Dispatch refuses it, so inspect and the listing agree.
-        let mut record = telemetry::stale_hook_child();
-        record["base"] = json!(["kimi"]);
+        let record = json!({
+            "agent": "codex",
+            "run_id": "run",
+            "conversation_id": "conversation",
+            "base": ["codex"],
+            "activity": "idle",
+            "phase": "idle",
+            "main_done": true
+        });
         let shown = |phase: &str| {
             let mut output = fork::summary(&record, true);
-            for part in [session_action::summary(&record, true, &None),
+            for part in [session_action::summary(&record, true, &None, None),
                 json!({"phase":phase,"settings_apply_when":"now","effort_change_supported":true,"effort_change_reason":""})] {
                 output.as_object_mut().unwrap().extend(part.as_object().unwrap().clone());
             }
@@ -1562,7 +2832,7 @@ mod attention_regressions {
         insert_message(&db, "other", Some("conversation"), json!({"type":"UserPromptSubmit","agent_id":"","detail":"Other session"}));
         let answer = json!({"type":"QuestionAnswered","agent_id":"main","at":302,"detail":"Literal answer","question_id":"question","question_hash":"hash"});
         let answer_seq = insert_message(&db, "example", Some("conversation"), answer.clone());
-        let (messages, truncated) = message_events(&db, "example", Some("conversation"), "[]").unwrap();
+        let (messages, truncated) = message_events(&db, "example", Some("conversation"), r#"{"earlier":[]}"#, &Value::Null).unwrap();
         assert!(!truncated);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["seq"], seq);
@@ -1571,10 +2841,346 @@ mod attention_regressions {
         assert_eq!(messages[1], expected);
         // A conversation replaced by a confirmed clear stays in the same
         // timeline, in journal order; another session's rows never join it.
-        let (messages, _) = message_events(&db, "example", Some("conversation"), r#"["other"]"#).unwrap();
+        let (messages, _) = message_events(&db, "example", Some("conversation"), r#"{"earlier":["other"]}"#, &Value::Null).unwrap();
         assert_eq!(messages.iter().map(|m| m["detail"].as_str().unwrap()).collect::<Vec<_>>(),
             ["Synthetic latest own message", "Other conversation", "Literal answer"]);
     }
+    /// zerus-b4qk: a fork's Activity is its sources' rows up to where it began,
+    /// marked as inherited, then its own; search keeps the fork's own rows.
+    #[test]
+    fn a_fork_shows_its_sources_history_up_to_where_it_began() {
+        let db = message_db();
+        let row = |name: &str, conversation: &str, detail: &str, at: i64| {
+            insert_message(
+                &db,
+                name,
+                Some(conversation),
+                json!({"type":"UserPromptSubmit","agent_id":"","at":at,"detail":detail}),
+            )
+        };
+        row("codex/p/root", "c-root", "root before", 10);
+        row("codex/p/other", "c-other", "another session", 11);
+        let root = json!({"name":"codex/p/root","conversation_id":"c-root"});
+        let first = json!({"name":"codex/p/first","conversation_id":"c-first",
+            "fork_lineage": serde_json::from_str::<Value>(&lineage_after(&db, &root)).unwrap()});
+        row("codex/p/root", "c-root", "root after the first fork", 20);
+        row("codex/p/first", "c-first", "first own", 21);
+        let second = json!({"name":"codex/p/second","conversation_id":"c-second",
+            "fork_lineage": serde_json::from_str::<Value>(&lineage_after(&db, &first)).unwrap()});
+        row(
+            "codex/p/first",
+            "c-first",
+            "first after the second fork",
+            30,
+        );
+        row("codex/p/second", "c-second", "second own", 31);
+        let shown = |record: &Value| -> Vec<(String, Option<String>)> {
+            let scope = activity_scope(&db, record);
+            timeline_rows(
+                &db,
+                string(record, "name"),
+                record["conversation_id"].as_str(),
+                &scope,
+                0,
+                100,
+                false,
+            )
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let event = row.event(record).unwrap();
+                (
+                    event["detail"].as_str().unwrap().to_owned(),
+                    event["inherited_from"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+        };
+        let inherited = |detail: &str, from: &str| (detail.to_owned(), Some(from.to_owned()));
+        let own = |detail: &str| (detail.to_owned(), None);
+        assert_eq!(
+            shown(&first),
+            [
+                inherited("root before", "codex/p/root"),
+                own("first own"),
+                own("first after the second fork")
+            ]
+        );
+        // A fork of a fork reaches back through both sources, each up to its fork.
+        assert_eq!(
+            shown(&second),
+            [
+                inherited("root before", "codex/p/root"),
+                inherited("first own", "codex/p/first"),
+                own("second own")
+            ]
+        );
+        let scope = activity_scope(&db, &second);
+        let (messages, _) =
+            message_events(&db, "codex/p/second", Some("c-second"), &scope, &Value::Null).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (m["detail"].as_str().unwrap(), m["inherited_from"].as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("root before", Some("codex/p/root")),
+                ("first own", Some("codex/p/first")),
+                ("second own", None)
+            ]
+        );
+        // A fork recorded before the lineage: its source's rows up to its creation.
+        let legacy = json!({"name":"codex/p/legacy","conversation_id":"c-legacy","fork_parent_id":"c-root",
+            "fork_source_name":"codex/p/root","created":15});
+        assert_eq!(shown(&legacy), [inherited("root before", "codex/p/root")]);
+        // Its source's rows stop before its own first row, even one whose time
+        // is before the fork's creation but written after that row.
+        row("codex/p/legacy", "c-legacy", "legacy own", 16);
+        row("codex/p/root", "c-root", "late root row", 12);
+        assert_eq!(
+            shown(&legacy),
+            [inherited("root before", "codex/p/root"), own("legacy own")]
+        );
+        // Not a fork, or a malformed lineage: only its own rows.
+        assert_eq!(
+            shown(&root),
+            [
+                own("root before"),
+                own("root after the first fork"),
+                own("late root row")
+            ]
+        );
+        let broken = json!({"name":"codex/p/first","conversation_id":"c-first","fork_lineage":[["codex/p/root","c-root","7"],"x"]});
+        assert_eq!(
+            shown(&broken),
+            [own("first own"), own("first after the second fork")]
+        );
+        // At most four sources, the nearest kept.
+        let mut deep = root.clone();
+        for depth in 0..6 {
+            let name = format!("codex/p/deep{depth}");
+            row(&name, &format!("c-deep{depth}"), "deep", 40 + depth);
+            deep = json!({"name":name,"conversation_id":format!("c-deep{depth}"),
+                "fork_lineage": serde_json::from_str::<Value>(&lineage_after(&db, &deep)).unwrap()});
+        }
+        let sources = deep["fork_lineage"].as_array().unwrap();
+        assert_eq!(sources.len(), LINEAGE);
+        assert_eq!(sources[LINEAGE - 1][0], "codex/p/deep4");
+    }
+    /// #1235 review R2-1: the lineage search runs unlocked, so a record write
+    /// can land before the save; the save re-reads under the lock and keeps it.
+    #[test]
+    fn saving_a_derived_lineage_keeps_a_concurrent_record_write() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "state::journal::attention_regressions::lineage_save_probe",
+                "--exact",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("HGS_CONFIG_DIR", root.path().join("config"))
+            .env("HGS_STATE_DIR", root.path().join("state"))
+            .env("HGS_TEST_LINEAGE_PROBE", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("lineage probe passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lineage_save_probe() {
+        if std::env::var_os("HGS_TEST_LINEAGE_PROBE").is_none() {
+            return;
+        }
+        std::fs::create_dir_all(root()).unwrap();
+        let db = event_db().unwrap();
+        db.execute(
+            "INSERT INTO events(name,conversation,payload) VALUES('codex/p/source','c-source',?)",
+            [
+                json!({"type":"UserPromptSubmit","agent_id":"","at":10,"detail":"source"})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+        let record = json!({"version":1,"name":"codex/p/fork","agent":"codex","run_id":"run-1",
+            "conversation_id":"c-fork","fork_parent_id":"c-source","fork_source_name":"codex/p/source",
+            "created":20,"activity":"idle"});
+        write(&mut record.clone()).unwrap();
+        // The unlocked search, then another writer's change, then the save.
+        let lineage = derived_lineage(&db, &record).unwrap();
+        assert_eq!(lineage, [json!(["codex/p/source", "c-source", 1])]);
+        let mut concurrent = read("codex/p/fork").unwrap();
+        concurrent["activity"] = json!("busy");
+        write(&mut concurrent).unwrap();
+        assert!(store_lineage(&record, &lineage, None).unwrap());
+        let saved = read("codex/p/fork").unwrap();
+        assert_eq!(
+            (&saved["activity"], &saved["fork_lineage"]),
+            (&json!("busy"), &json!(lineage))
+        );
+        // A new run meanwhile, or a lineage already saved: nothing is written.
+        let mut resumed = saved.clone();
+        resumed["run_id"] = json!("run-2");
+        resumed.as_object_mut().unwrap().remove("fork_lineage");
+        write(&mut resumed).unwrap();
+        assert!(!store_lineage(&record, &lineage, None).unwrap());
+        assert!(read("codex/p/fork").unwrap().get("fork_lineage").is_none());
+        let mut again = record.clone();
+        again["run_id"] = json!("run-2");
+        assert!(store_lineage(&again, &lineage, None).unwrap());
+        assert!(!store_lineage(&again, &[], None).unwrap());
+        assert_eq!(
+            read("codex/p/fork").unwrap()["fork_lineage"],
+            json!(lineage)
+        );
+        println!("lineage probe passed");
+    }
+
+    /// An earlier page is read by position: the newest rows before a sequence
+    /// number, however many rows of other sessions lie between them, and it
+    /// says where the next page starts and whether one exists.
+    #[test]
+    fn an_older_activity_page_is_read_by_position() {
+        let db = message_db();
+        let mut own = Vec::new();
+        for at in 0..25 {
+            insert_message(&db, "codex/p/t", Some("c1"), json!({"type":"Stop","agent_id":"","at":at,"detail":format!("own {at}")}));
+            own.push(db.last_insert_rowid());
+            // Other sessions write far more rows than this one.
+            for other in 0..40 {
+                insert_message(&db, "codex/p/other", Some("c2"), json!({"type":"Stop","agent_id":"","at":at,"detail":format!("other {other}")}));
+            }
+        }
+        let record = json!({"name":"codex/p/t","conversation_id":"c1"});
+        let scope = activity_scope(&db, &record);
+        let seqs = |rows: &[TimelineRow]| rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        let (rows, cursor, more) = timeline_rows_before(&db, "codex/p/t", Some("c1"), &scope, own[20], 10).unwrap();
+        assert_eq!(seqs(&rows), own[10..20]);
+        assert_eq!((cursor, more), (own[10], true));
+        let (rows, cursor, more) = timeline_rows_before(&db, "codex/p/t", Some("c1"), &scope, cursor, 10).unwrap();
+        assert_eq!(seqs(&rows), own[0..10]);
+        assert_eq!((cursor, more), (own[0], false));
+        let (rows, cursor, more) = timeline_rows_before(&db, "codex/p/t", Some("c1"), &scope, cursor, 10).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!((cursor, more), (own[0], false));
+        // The read stays on the session's own index entries.
+        let mut statement = db.prepare(activity_before()).unwrap();
+        let count = statement.query_map(params!["codex/p/t", "c1", scope, own[24], 11], |_| Ok(())).unwrap().count();
+        assert_eq!(count, 11);
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 2_000);
+    }
+
+    /// #1235 review R1: a fork's Activity reads one page per range, never
+    /// every inherited row. SQLite's step count bounds the work, so a source
+    /// of any length costs a fork's page what a page costs the source.
+    #[test]
+    fn a_forks_activity_reads_stay_one_page_per_range() {
+        use rusqlite::StatementStatus;
+        let mut db = message_db();
+        let transaction = db.transaction().unwrap();
+        for at in 0..20_000 {
+            let kind = if at % 2 == 0 {
+                "UserPromptSubmit"
+            } else {
+                "Stop"
+            };
+            transaction.execute("INSERT INTO events(name,conversation,payload) VALUES('codex/p/source','c-source',?)",
+                [json!({"type":kind,"agent_id":"","at":at,"detail":"source"}).to_string()]).unwrap();
+        }
+        transaction.commit().unwrap();
+        let point: i64 = db
+            .query_row("SELECT MAX(seq) FROM events", [], |row| row.get(0))
+            .unwrap();
+        for at in 0..40 {
+            insert_message(
+                &db,
+                "codex/p/fork",
+                Some("c-fork"),
+                json!({"type":"Stop","agent_id":"","at":30_000 + at,"detail":"own"}),
+            );
+        }
+        let fork = json!({"name":"codex/p/fork","conversation_id":"c-fork","fork_lineage":[["codex/p/source","c-source",point]]});
+        let scope = activity_scope(&db, &fork);
+        let steps = |sql: &str, after: Option<(i64, i64)>| {
+            let mut statement = db.prepare(sql).unwrap();
+            let rows = match after {
+                Some((after, limit)) => statement
+                    .query_map(
+                        params!["codex/p/fork", "c-fork", scope, after, limit],
+                        |_| Ok(()),
+                    )
+                    .unwrap()
+                    .count(),
+                None => statement
+                    .query_map(params!["codex/p/fork", "c-fork", scope], |_| Ok(()))
+                    .unwrap()
+                    .count(),
+            };
+            (rows, statement.get_status(StatementStatus::VmStep))
+        };
+        let budget = 40_000;
+        let (rows, newest) = steps(activity_page(true), Some((0, 100)));
+        assert_eq!(rows, 100);
+        let (rows, page) = steps(activity_page(false), Some((point - 500, 200)));
+        assert_eq!(rows, 200);
+        let (_, oldest) = steps(activity_oldest(), None);
+        static WINDOW: OnceLock<String> = OnceLock::new();
+        let window = WINDOW.get_or_init(|| {
+            activity_query(
+                " AND COALESCE(json_extract(payload, '$.agent_id'), '') IN ('', 'main')",
+                true,
+                "101",
+            )
+        });
+        let (rows, messages) = steps(window, None);
+        assert_eq!(rows, 101);
+        for (read, used) in [
+            ("newest page", newest),
+            ("cursor page", page),
+            ("oldest row", oldest),
+            ("message window", messages),
+        ] {
+            assert!(
+                used < budget,
+                "{read}: {used} SQLite steps for one page of a 20000-row source"
+            );
+        }
+        // The same reads still return the right rows across the fork point.
+        let shown = timeline_rows(
+            &db,
+            "codex/p/fork",
+            Some("c-fork"),
+            &scope,
+            point - 2,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            shown
+                .iter()
+                .map(|row| (row.seq, row.inherited_from.is_some()))
+                .take(3)
+                .collect::<Vec<_>>(),
+            [(point - 1, true), (point, true), (point + 1, false)]
+        );
+        let first: Option<i64> = db
+            .query_row(
+                activity_oldest(),
+                params!["codex/p/fork", "c-fork", scope],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, Some(1));
+    }
+
     #[test]
     fn cache_keepalive_turns_are_notices_and_never_replies() {
         let text = format!("{CACHE_KEEPALIVE}Reply with just: ok</zerus-cache-keepalive>");
@@ -1617,6 +3223,108 @@ mod attention_regressions {
         let stop = insert_message(&db, "only", Some("conversation"), json!({"type":"Stop","agent_id":"","at":1.0}));
         assert!(keepalive_turn(&db, &only, stop).unwrap());
         assert_eq!(real_reply(&db, &only, stop).unwrap(), None);
+
+        // Task #437 (owner, 2026-11-09): the ping, its reply and its
+        // notification never reach Activity or history; a reply from a
+        // history written before the marks is found through the ping before it.
+        let details = |shown: &[TimelineRow]| -> Vec<String> {
+            shown.iter().map(|row| {
+                let event: Value = serde_json::from_str(&row.payload).unwrap();
+                string(&event, "detail").to_owned()
+            }).collect()
+        };
+        main(json!({"type":"UserPromptSubmit","agent_id":"","origin":"cache_keepalive","turn_origin":"keep_warm","detail":"Cache warmed"}));
+        main(json!({"type":"AgentMessage","agent_id":"","turn_origin":"keep_warm","detail":"ok"}));
+        main(json!({"type":"Stop","agent_id":"","at":6.0,"turn_origin":"keep_warm"}));
+        let scope = activity_scope(&db, &claude);
+        let shown = timeline_rows(&db, "example", Some("conversation"), &scope, 0, 100, false).unwrap();
+        let presented = details(&shown);
+        assert!(presented.contains(&"Fix the build".to_owned()), "{presented:?}");
+        assert!(!presented.contains(&"ok".to_owned()), "the keep-warm reply is not Activity");
+        assert!(!presented.contains(&"Cache warmed".to_owned()), "the ping is not Activity");
+        // The same history before the marks existed: the reply carries none.
+        main(json!({"type":"UserPromptSubmit","agent_id":"","detail":text}));
+        main(json!({"type":"AgentMessage","agent_id":"","detail":"old ok"}));
+        main(json!({"type":"Stop","agent_id":"","at":7.0}));
+        let shown = timeline_rows(&db, "example", Some("conversation"), &scope, 0, 100, false).unwrap();
+        assert!(!details(&shown).contains(&"old ok".to_owned()), "an old keep-warm reply stays out too");
+    }
+    #[test]
+    fn a_reply_to_a_turn_only_team_pastes_opened_is_a_team_notice_reply() {
+        // Task 244: the clients do not notify the owner of these replies.
+        let prompt = |detail: &str| json!({"type":"UserPromptSubmit","agent_id":"","detail":detail});
+        assert!(team_notice_prompt(&prompt("[Zerus team \u{00b7} from: Zerus \u{00b7} inbox]\nReport for task #185")));
+        assert!(team_notice_prompt(&prompt("<zerus-message from=\"a\">[Zerus team \u{00b7} from: Lead \u{00b7} task: #2]\nGo</zerus-message>")));
+        assert!(team_notice_prompt(&prompt("[Zerus team] 1 new message for you: hgs team inbox")));
+        assert!(team_notice_prompt(&prompt("[Zerus task 12] Fix the build")));
+        assert!(team_notice_prompt(&json!({"type":"UserPromptSubmit","origin":"peer_message","detail":"Message from claude/p/qa"})));
+        for owner in ["Please fix the build", "[Zerus team \u{00b7} from: You \u{00b7} task: #3]\nYour turn ended", "What does [Zerus team] mean?", "[Zerus teams] are great", "[zerus team] lower"] {
+            assert!(!team_notice_prompt(&prompt(owner)), "{owner}");
+        }
+
+        let db = message_db();
+        let lead = json!({"agent":"claude","name":"lead","conversation_id":"conversation"});
+        let main = |event: Value| insert_message(&db, "lead", Some("conversation"), event);
+        main(prompt("Plan the next phase"));
+        let owner = main(json!({"type":"Stop","agent_id":"","at":1.0}));
+        assert!(!team_notice_turn(&db, &lead, owner).unwrap());
+        main(prompt("[Zerus team \u{00b7} from: Zerus \u{00b7} inbox]\nReport for task #185"));
+        main(json!({"type":"PreToolUse","agent_id":"","tool":"Bash"}));
+        main(json!({"type":"AgentMessage","agent_id":""}));
+        let notice = main(json!({"type":"Stop","agent_id":"","at":2.0}));
+        assert!(team_notice_turn(&db, &lead, notice).unwrap());
+        // A doorbell and the owner's message in one turn: the owner's.
+        main(prompt("[Zerus team] 1 new message"));
+        main(json!({"type":"UserPromptQueued","agent_id":"","detail":"And check the light theme"}));
+        let mixed = main(json!({"type":"Stop","agent_id":"","at":3.0}));
+        assert!(!team_notice_turn(&db, &lead, mixed).unwrap());
+        // An answered question is the owner's; a Stop without its opening is not a notice turn.
+        main(json!({"type":"QuestionAnswered","agent_id":"","detail":"Yes"}));
+        let answered = main(json!({"type":"Stop","agent_id":"","at":4.0}));
+        assert!(!team_notice_turn(&db, &lead, answered).unwrap());
+        let orphan = main(json!({"type":"Stop","agent_id":"","at":5.0}));
+        assert!(!team_notice_turn(&db, &lead, orphan).unwrap());
+        // A child's prompt never decides.
+        main(json!({"type":"UserPromptSubmit","agent_id":"child","detail":"do it"}));
+        main(prompt("[Zerus team \u{00b7} from: Tester \u{00b7} task: #4]\nDone"));
+        let member = main(json!({"type":"Stop","agent_id":"","at":6.0}));
+        assert!(team_notice_turn(&db, &lead, member).unwrap());
+    }
+    #[test]
+    fn a_team_notice_turn_that_took_the_owners_message_mid_turn_is_the_owners() {
+        // #366: a notice opened the turn, the owner's message came into the
+        // running turn (hgs's receipt), and the agent reports that prompt only
+        // when the turn ends; the reply must still show in full.
+        let dir = tempfile::tempdir().unwrap();
+        crate::state::with_test_state_root(dir.path(), || {
+            let db = message_db();
+            let lead = json!({"agent":"claude","name":"lead","conversation_id":"conversation"});
+            let main = |event: Value| insert_message(&db, "lead", Some("conversation"), event);
+            main(json!({"type":"UserPromptSubmit","agent_id":"","at":10.0,
+                "detail":"[Zerus team \u{00b7} from: Zerus \u{00b7} inbox]\nReport for task #185"}));
+            let request = "00000000-0000-4000-8000-000000000001";
+            let folder = dir.path().join("input_receipts");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(format!("{request}.json")), json!({"status":"submitted",
+                "submitted_text":"Where do hundreds of GB come from?","submitted_at":20.0}).to_string()).unwrap();
+            let mut record = lead.clone();
+            record["input_pending_at"] = json!(20.0);
+            record["input_pending_request"] = json!(request);
+            let mixed = main(json!({"type":"Stop","agent_id":"","at":30.0}));
+            assert!(!team_notice_turn(&db, &record, mixed).unwrap());
+            // The team's own paste queued the same way leaves a notice turn.
+            std::fs::write(folder.join(format!("{request}.json")), json!({"status":"submitted",
+                "submitted_text":"[Zerus team] 1 new message for you: hgs team inbox","submitted_at":40.0}).to_string()).unwrap();
+            record["input_pending_at"] = json!(40.0);
+            main(json!({"type":"UserPromptSubmit","agent_id":"","at":40.0,"detail":"[Zerus team] 1 new message"}));
+            let only = main(json!({"type":"Stop","agent_id":"","at":50.0}));
+            assert!(team_notice_turn(&db, &record, only).unwrap());
+            // A send before the turn opened belongs to the previous turn.
+            record["input_pending_at"] = json!(5.0);
+            main(json!({"type":"UserPromptSubmit","agent_id":"","at":60.0,"detail":"[Zerus team] 1 new message"}));
+            let earlier = main(json!({"type":"Stop","agent_id":"","at":70.0}));
+            assert!(team_notice_turn(&db, &record, earlier).unwrap());
+        });
     }
     #[test]
     fn kimi_scheduled_ticks_are_not_replies_while_a_recurring_job_remains() {
@@ -1670,13 +3378,13 @@ mod attention_regressions {
         for index in 0..105 {
             insert_message(&db, "example", None, json!({"type":"UserMessage","at":index,"detail":"Synthetic repeated message"}));
         }
-        let (messages, truncated) = message_events(&db, "example", None, "[]").unwrap();
+        let (messages, truncated) = message_events(&db, "example", None, r#"{"earlier":[]}"#, &Value::Null).unwrap();
         assert!(truncated); assert_eq!(messages.len(), MESSAGE_EVENTS_LIMIT);
         assert_eq!(messages[0]["at"], 5); assert_eq!(messages[99]["at"], 104);
         for _ in 0..10 {
             insert_message(&db, "unicode", Some("conversation"), json!({"type":"UserMessage","detail":"🦀".repeat(20_000)}));
         }
-        let (messages, truncated) = message_events(&db, "unicode", Some("conversation"), "[]").unwrap();
+        let (messages, truncated) = message_events(&db, "unicode", Some("conversation"), r#"{"earlier":[]}"#, &Value::Null).unwrap();
         assert!(truncated); assert_eq!(messages.len(), 3);
         assert!(json!(messages).to_string().len() <= MESSAGE_EVENTS_BYTES);
     }
@@ -1750,6 +3458,24 @@ mod attention_regressions {
         record["turn_started"] = json!(123.0);
         update_activity(&mut record, &json!({"hook_event_name":"UserPromptQueued"}));
         assert!(record["turn_started"].as_f64().unwrap() > 123.0);
+    }
+    #[test]
+    fn kimi_stop_failure_preserves_typed_window_evidence_without_fabricating_a_status() {
+        let message = "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends.";
+        let event = json!({"hook_event_name":"StopFailure","error_type":"APIProviderRateLimitError","error_message":message});
+        for (agent, expected) in [("kimi", "rate_limit"), ("claude", "quota")] {
+            let mut record = json!({"agent":agent,"run_id":"original","active_tools":{},"subagents":{}});
+            update_activity(&mut record, &event);
+            let failure = &record["provider_error"];
+            assert_eq!(failure["error_kind"], expected);
+            assert_eq!(failure["detail"], message);
+            if agent == "kimi" {
+                assert_eq!(failure["native_error_type"], "APIProviderRateLimitError");
+                let mut output = json!({});
+                provider_errors::apply(&mut output, failure);
+                assert_eq!(output["provider_error"], *failure);
+            } else { assert!(failure.get("native_error_type").is_none()); }
+        }
     }
     #[test]
     fn provider_failure_survives_heartbeat_and_children_but_clears_on_new_work() {
@@ -2112,5 +3838,119 @@ mod attention_regressions {
         let mut claude = json!({"agent":"claude","subagents":{"main":{"state":"working"}}});
         repair_kimi_main(&mut claude);
         assert_eq!(claude["subagents"]["main"]["state"], "working");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_regressions {
+    use super::*;
+    use crate::sqlite_file::foreign_lock_refused;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// zerus-iiee: opening the event journal again, as every hook event does,
+    /// keeps the SQLite locks of a connection already open, also after a
+    /// restart.
+    #[test]
+    fn opening_the_journal_again_keeps_a_live_connection_s_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let path = root.join("events.sqlite3");
+        // The second round is a restart: every earlier connection is gone.
+        for round in 0..2 {
+            let live = event_db_at(&root).unwrap();
+            live.execute("INSERT INTO events(name,conversation,payload) VALUES('n','c','{}')", [])
+                .unwrap();
+            live.execute_batch("BEGIN").unwrap();
+            let _: i64 = live.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).unwrap();
+            assert!(foreign_lock_refused(&path), "round {round}: the reader holds its lock");
+            drop(event_db_at(&root).unwrap());
+            assert!(foreign_lock_refused(&path), "round {round}: another open kept the lock");
+            live.execute_batch("COMMIT").unwrap();
+            drop(live);
+            assert!(!foreign_lock_refused(&path), "round {round}: the lock went with its connection");
+        }
+        let mode = std::fs::symlink_metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "created owner-only");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 193: one shared read connection per thread and state root: a write
+    /// from a fresh connection is seen on the next read, and a second call reuses
+    /// the connection instead of opening the events database again.
+    #[test]
+    fn a_shared_read_connection_sees_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::state::with_test_state_root(dir.path(), || {
+            let shared = event_db_shared().unwrap();
+            let writer = event_db().unwrap();
+            writer.execute("INSERT INTO events(name, conversation, payload) VALUES ('n','c','{}')", []).unwrap();
+            let count: i64 = shared.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1);
+            let again = event_db_shared().unwrap();
+            let count: i64 = again.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1);
+        });
+    }
+}
+
+#[cfg(test)]
+mod full_own_message {
+    use super::*;
+
+    #[test]
+    fn journal_keeps_full_body_separate_from_bounded_preview() {
+        let state = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::journal::full_own_message::fixture",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("HGS_STATE_DIR", state.path())
+            .env("TMUX_TMPDIR", state.path())
+            .env("ZERUS_FULL_OWN_FIXTURE", "1")
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "private child of journal_keeps_full_body_separate_from_bounded_preview"]
+    fn fixture() {
+        if std::env::var_os("ZERUS_FULL_OWN_FIXTURE").is_none() {
+            return;
+        }
+        std::fs::create_dir_all(root()).unwrap();
+        for agent in ["codex", "claude", "kimi"] {
+            for length in [1800, 40000] {
+                let text = "x".repeat(length) + "TRAILING TEXT";
+                let record = json!({"name":format!("{agent}/example/full"), "agent":agent, "run_id":"run", "conversation_id":"cid"});
+                let event = json!({"hook_event_name":"UserPromptSubmit", "prompt":text, "agent_id":if agent == "kimi" {"main"} else {""}});
+                log_event(&record, &event).unwrap();
+                let payload: String = event_db()
+                    .unwrap()
+                    .query_row(
+                        "SELECT payload FROM events ORDER BY seq DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let saved: Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(saved["detail"], json!("x".repeat(1200) + "…"));
+                assert_eq!(saved["message_text"], json!(clipped(&json!(text), 32000)));
+                assert_eq!(saved["message_text_truncated"], json!(length > 32000));
+            }
+        }
     }
 }

@@ -1,0 +1,560 @@
+/* Plan view: phase bands, the dependency graph and task cards. The geometry
+   (232x60 cards, layer rows) follows design/agent-teams/plan-modes; a hovered
+   task lights its whole chain and its edges. */
+
+.pt-plan {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  background: var(--z-color-page);
+  color: var(--z-color-text);
+}
+.pt-plan-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--z-color-divider);
+  background: var(--z-color-pane);
+}
+.pt-plan-mode { padding: 4px 10px; border-radius: var(--z-radius-md); background: var(--z-color-segment-on); color: var(--z-color-accent); font-size: var(--fs-xs); font-weight: 600; }
+.pt-plan-summary { display: inline-flex; gap: 10px; color: var(--z-color-muted); font-size: var(--fs-xs); }
+
+.pt-plan-body { flex: 1; min-height: 0; display: flex; position: relative; }
+.pt-plan-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 6px 12px 24px; }
+.pt-plan-canvas { position: relative; min-width: 100%; }
+.pt-row { position: absolute; left: 0; right: 0; }
+.pt-row-header { padding-top: 8px; }
+
+.pt-phase {
+  display: flex; align-items: center; gap: 8px;
+  height: 100%; padding: 0 10px;
+  border: 1px solid var(--z-color-card-border);
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: var(--z-color-card);
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.pt-phase.pt-row-end { border-bottom: 1px solid var(--z-color-card-border); border-radius: 10px; }
+.pt-phase:hover { background: var(--z-color-card-hover); }
+.pt-phase:focus-visible { outline: 2px solid var(--z-color-focus); outline-offset: -2px; }
+.pt-phase-done { border-color: color-mix(in srgb, var(--z-color-status-ready) 35%, var(--z-color-card-border)); }
+.pt-phase-running { border-color: color-mix(in srgb, var(--z-color-accent) 45%, var(--z-color-card-border)); }
+.pt-phase-draft { border-style: dashed; border-color: color-mix(in srgb, var(--z-color-warn) 50%, var(--z-color-card-border)); }
+.pt-phase-paused { opacity: .8; }
+.pt-pn {
+  display: grid; place-items: center; flex: none;
+  width: 20px; height: 20px; border-radius: 10px;
+  background: var(--z-color-hover); color: var(--z-color-muted);
+  font-size: var(--fs-2xs); font-variant-numeric: tabular-nums;
+}
+.pt-phase-title { font-size: var(--fs-md); overflow: hidden; text-overflow: ellipsis; }
+.pt-chip {
+  display: inline-flex; align-items: center; height: 19px; padding: 0 7px;
+  border: 1px solid var(--z-color-card-border); border-radius: 10px;
+  font-size: var(--fs-2xs); color: var(--z-color-text-3); white-space: nowrap;
+}
+.pt-chip-done { color: var(--z-color-status-ready); border-color: color-mix(in srgb, var(--z-color-status-ready) 40%, transparent); }
+.pt-chip-running { color: var(--z-color-accent); border-color: color-mix(in srgb, var(--z-color-accent) 40%, transparent); }
+.pt-chip-draft { color: var(--z-color-warn); border-color: color-mix(in srgb, var(--z-color-warn) 45%, transparent); border-style: dashed; }
+.pt-chip-auto, .pt-chip-barrier { color: var(--z-color-muted); }
+.pt-health { color: var(--z-color-warn); font-size: var(--fs-2xs); overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+.pt-approval { color: var(--z-color-warn); font-size: var(--fs-2xs); }
+.pt-grow { flex: 1; min-width: 4px; }
+.pt-progress { display: inline-flex; gap: 2px; width: 84px; height: 5px; flex: none; align-self: center; }
+.pt-progress i { flex: 1; border-radius: 2px; background: var(--z-color-border); }
+.pt-progress i.on { background: var(--z-color-accent-muted); }
+.pt-count { color: var(--z-color-muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+
+.pt-layer {
+  position: absolute; left: 0;
+  border-left: 1px solid var(--z-color-card-border);
+  border-right: 1px solid var(--z-color-card-border);
+  background: var(--z-color-card);
+  overflow: visible;
+}
+.pt-layer.pt-row-end { border-bottom: 1px solid var(--z-color-card-border); border-radius: 0 0 10px 10px; }
+.pt-edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.pt-edge { fill: none; stroke: var(--z-color-dim); stroke-width: 1.3; opacity: .65; }
+.pt-edge.lit { stroke: var(--z-color-accent); opacity: 1; stroke-width: 1.8; }
+.pt-edge.dim { opacity: .1; }
+
+.pt-card {
+  --pt-tone: var(--z-color-muted);
+  position: absolute;
+  width: 232px; height: 60px;
+  display: flex; flex-direction: column; justify-content: center; gap: 2px;
+  padding: 5px 8px 5px 10px;
+  border: 1px solid var(--z-color-card-border);
+  border-left: 3px solid var(--pt-tone);
+  border-radius: 9px;
+  background: var(--z-color-surface);
+  color: var(--z-color-text);
+  text-align: left;
+  overflow: hidden;
+  transition: background var(--z-motion-fast), border-color var(--z-motion-fast), opacity var(--z-motion-fast);
+}
+.pt-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--pt-tone); }
+.pt-card:hover, .pt-card-on { background: var(--z-color-card-hover); border-color: var(--z-color-accent-muted); box-shadow: 0 0 0 1px var(--z-color-accent-muted) inset; }
+.pt-card-lit { border-color: color-mix(in srgb, var(--z-color-accent) 45%, var(--z-color-card-border)); }
+.pt-card-dim { opacity: .42; }
+.pt-card-l1, .pt-card-l2, .pt-card-l3 { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.pt-card-l1 { font-size: var(--fs-sm); }
+.pt-card-l2, .pt-card-l3 { font-size: var(--fs-2xs); color: var(--z-color-muted); }
+.pt-dot { flex: none; width: 7px; height: 7px; border-radius: 4px; background: var(--z-color-muted); }
+.pt-dot-working { background: var(--z-color-plan-work); }
+.pt-dot-work { background: var(--z-color-plan-work); }
+.pt-dot-notstarted { background: var(--z-color-plan-notstarted); }
+.pt-dot-cancelled { background: var(--z-color-plan-cancelled); }
+.pt-dot-review { background: var(--z-color-plan-review); }
+.pt-dot-done { background: var(--z-color-plan-done); }
+.pt-dot-danger { background: var(--z-color-status-error); }
+.pt-dot-submitted { background: var(--z-color-status-working); }
+.pt-id { flex: none; color: var(--z-color-text-3); font-variant-numeric: tabular-nums; }
+.pt-title { flex: 1 1 auto; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-badge { flex: none; padding: 0 5px; border-radius: 6px; background: var(--z-color-accent-bg); color: var(--z-color-accent); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.pt-role { flex: none; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--z-color-text-2); }
+.pt-model { flex: none; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--z-color-dim); }
+.pt-meta { color: var(--z-color-muted); }
+.pt-deps { flex: none; margin-left: auto; color: var(--z-color-warn); white-space: nowrap; }
+/* Task #60: a follow-up's "spawned from" link; it never blocks, so it is muted. */
+.pt-origin { color: var(--z-color-text-3, inherit); white-space: nowrap; font-style: italic; }
+.pt-chip-origin { cursor: pointer; }
+.pt-waits { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-muted { color: var(--z-color-dim); }
+
+.pt-detail {
+  position: absolute; right: 12px; top: 12px; bottom: 12px; width: 360px;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 14px; overflow: auto;
+  border: 1px solid var(--z-color-card-border); border-radius: 11px;
+  background: var(--z-color-raised); box-shadow: var(--z-shadow, 0 8px 24px rgba(0, 0, 0, .25));
+  z-index: 3;
+}
+.pt-detail-head { display: flex; align-items: center; gap: 6px; }
+.pt-detail-head b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-detail-meta { display: flex; flex-wrap: wrap; gap: 5px; }
+.pt-detail { border-left: 3px solid transparent; }
+.pt-detail-work { border-left-color: var(--z-color-plan-work); }
+.pt-detail-review { border-left-color: var(--z-color-plan-review); }
+.pt-detail-done { border-left-color: var(--z-color-plan-done); }
+.pt-detail-notstarted { border-left-color: var(--z-color-plan-notstarted); }
+.pt-detail-cancelled { border-left-color: var(--z-color-plan-cancelled); }
+.pt-detail-notstarted { border-left-color: var(--z-color-plan-notstarted); }
+.pt-detail-cancelled { border-left-color: var(--z-color-plan-cancelled); }
+.pt-detail-note { color: var(--z-color-text-2); font-size: var(--fs-sm); line-height: 1.45; }
+.pt-detail-section { display: flex; flex-direction: column; gap: 4px; }
+.pt-detail-label { color: var(--z-color-label); font-size: var(--fs-xs); }
+.pt-detail-links { display: flex; flex-wrap: wrap; gap: 5px; }
+.pt-link { padding: 2px 7px; border-radius: 6px; background: var(--z-color-hover); color: var(--z-color-accent); font-size: var(--fs-xs); }
+.pt-link:hover { background: var(--z-color-segment-on); }
+.pt-detail-p { color: var(--z-color-text-2); font-size: var(--fs-xs); line-height: 1.45; white-space: pre-wrap; }
+
+/* Plan modes (task 41): board columns, layer rows, profile tiles and tests. */
+.pm-modes { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border-radius: var(--z-radius-md); background: var(--z-color-field); }
+.pm-mode { padding: 4px 9px; border: 0; border-radius: calc(var(--z-radius-md) - 2px); background: transparent; color: var(--z-color-muted); font: inherit; font-size: var(--fs-xs); cursor: pointer; }
+.pm-mode.on { background: var(--z-color-segment-on); color: var(--z-color-accent); font-weight: 600; }
+.pm-check { display: inline-flex; align-items: center; gap: 5px; color: var(--z-color-muted); font-size: var(--fs-xs); }
+.pm-board { flex: 1; min-height: 0; display: flex; gap: 8px; overflow: auto; padding: 10px; }
+.pm-column { flex: 0 0 240px; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--z-color-card-border); border-radius: 10px; background: var(--z-color-card); }
+.pm-column-head, .pm-layer-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: 1px solid var(--z-color-divider); font-size: var(--fs-sm); }
+.pm-count { margin-left: auto; color: var(--z-color-muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+.pm-column-body { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 6px; padding: 7px; }
+.pm-card { --heat: 0; display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 6px 8px; border: 1px solid var(--z-color-card-border); border-left: 3px solid var(--pm-tone, var(--z-color-muted)); border-radius: 8px; background: color-mix(in srgb, var(--z-color-danger) calc(var(--heat) * 22%), var(--z-color-surface)); color: var(--z-color-text); text-align: left; font: inherit; cursor: pointer; }
+.pm-card:hover { border-color: var(--z-color-accent-muted); }
+.pm-card-line { display: flex; gap: 5px; align-items: baseline; min-width: 0; }
+.pm-card-meta { display: flex; gap: 6px; color: var(--z-color-muted); font-size: var(--fs-2xs); overflow: hidden; }
+.pm-id { color: var(--z-color-text-3); font-variant-numeric: tabular-nums; flex: none; }
+.pm-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.pm-stages { display: flex; gap: 4px; flex-wrap: wrap; }
+.pm-stage { padding: 1px 5px; border-radius: 6px; background: var(--z-color-hover); color: var(--z-color-text-2); font-size: 9px; }
+.pm-stage-passed, .pm-stage-accepted { color: var(--z-color-status-ready); }
+.pm-stage-returned, .pm-stage-failed, .pm-stage-rejected { color: var(--z-color-danger); }
+.pm-stage-waiting, .pm-stage-delivered, .pm-stage-running { color: var(--z-color-accent); }
+.pm-tone-working { --pm-tone: var(--z-color-accent); }
+.pm-tone-review { --pm-tone: var(--z-color-violet); }
+.pm-tone-test { --pm-tone: var(--z-color-warn); }
+.pm-tone-done { --pm-tone: var(--z-color-status-ready); }
+.pm-tone-danger { --pm-tone: var(--z-color-danger); }
+.pm-more, .pm-empty { color: var(--z-color-muted); font-size: var(--fs-xs); padding: 8px; }
+.pm-layers { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; }
+.pm-layer { border: 1px solid var(--z-color-card-border); border-radius: 10px; background: var(--z-color-card); }
+.pm-layer-body { display: flex; gap: 6px; overflow: auto; padding: 7px; }
+.pm-layer .pm-card { width: 232px; flex: none; }
+.pm-profile, .pm-tests { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; }
+.pm-profile h3, .pm-tests h3 { font-size: var(--fs-sm); color: var(--z-color-text-2); margin: 12px 0 6px; }
+.pm-tiles { display: flex; gap: 8px; flex-wrap: wrap; }
+.pm-tile { display: flex; flex-direction: column; gap: 2px; min-width: 120px; padding: 8px 10px; border: 1px solid var(--z-color-card-border); border-radius: 9px; background: var(--z-color-card); font-size: var(--fs-xs); color: var(--z-color-muted); }
+.pm-tile b { color: var(--z-color-text); font-size: var(--fs-md); }
+.pm-note { color: var(--z-color-muted); font-size: var(--fs-2xs); }
+.pm-loss-row, .pm-role-row, .pm-run, .pm-queue { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-bottom: 1px solid var(--z-color-divider); font-size: var(--fs-xs); }
+.pm-loss-kind { color: var(--z-color-warn); }
+.pm-tokens { color: var(--z-color-violet); font-variant-numeric: tabular-nums; }
+.pm-run-status { min-width: 58px; color: var(--z-color-muted); }
+.pm-run-suite { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pm-passed .pm-run-status { color: var(--z-color-status-ready); }
+.pm-failed .pm-run-status, .pm-timed-out .pm-run-status { color: var(--z-color-danger); }
+.pm-reused .pm-run-status, .pm-queued .pm-run-status { color: var(--z-color-warn); }
+.pm-pill { padding: 0 5px; border-radius: 6px; background: var(--z-color-warn-bg); color: var(--z-color-warn); font-size: 9px; }
+.pt-stages { display: flex; gap: 3px; flex-wrap: nowrap; overflow: hidden; }
+.pt-stage { padding: 0 4px; border-radius: 5px; background: var(--z-color-hover); color: var(--z-color-text-2); font-size: 9px; white-space: nowrap; }
+.pt-stage-passed, .pt-stage-accepted { color: var(--z-color-status-ready); }
+.pt-stage-returned, .pt-stage-failed { color: var(--z-color-danger); }
+.pt-stage-waiting, .pt-stage-delivered { color: var(--z-color-accent); }
+/* Task 82: the heat tints by the task's own lateness against the plan, in the
+   danger colour; the overrun badge has its own scale, muted to violet. */
+.pt-card { background: color-mix(in srgb, var(--z-color-danger) calc(var(--heat, 0) * 20%), var(--z-color-surface)); }
+.pm-heat-line { display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.pm-late { font-size: 11px; font-weight: 600; white-space: nowrap; color: color-mix(in srgb, var(--z-color-danger) calc(var(--heat, 0) * 100%), var(--z-color-muted)); }
+.pm-late-muted { font-weight: 400; color: var(--z-color-dim); }
+.pm-overrun { --over: 0; font-size: 10px; font-weight: 600; white-space: nowrap; padding: 0 4px; border: 1px solid currentColor; border-radius: 4px;
+  color: color-mix(in srgb, var(--z-color-violet) calc(var(--over) * 100%), var(--z-color-muted));
+  background: color-mix(in srgb, var(--z-color-violet) calc(var(--over) * 14%), transparent); }
+.pm-heat-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 4px 12px 6px; font-size: 11px; color: var(--z-color-muted); }
+.pm-heat-scale { display: inline-flex; align-items: center; gap: 6px; }
+.pm-heat-ramp { display: inline-block; width: 80px; height: 8px; border-radius: 4px; border: 1px solid var(--z-color-card-border);
+  background: linear-gradient(to right, var(--z-color-surface), color-mix(in srgb, var(--z-color-danger) 20%, var(--z-color-surface))); }
+.pm-heat-note { color: var(--z-color-dim); }
+/* Task #59: a phase's and the team's planning mode (Qt's Free and Standard badges). */
+.pt-chip-free { color: var(--z-color-violet); border-color: color-mix(in srgb, var(--z-color-violet) 45%, transparent); }
+.pt-chip-standard { color: var(--z-color-text-3); }
+.team-phase-mode, .team-mode { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+/* Task #79: the profile's span swatches and their legend, which wraps. */
+.pm-swatch { flex: none; width: 16px; height: 10px; border-radius: 2px; border: 1px solid transparent; }
+.pm-swatch.strip { height: 4px; align-self: center; }
+.pm-swatch.none { visibility: hidden; }
+.pm-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 10px 0; font-size: var(--fs-xs); color: var(--z-color-text-2); }
+.pm-legend-title { color: var(--z-color-muted); font-weight: 600; }
+.pm-legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.pt-origin-edge { fill: none; stroke: var(--z-color-violet); stroke-width: 1.6; stroke-dasharray: 5 4; opacity: .9; }
+.pt-origin-head { fill: none; stroke: var(--z-color-violet); stroke-width: 1.4; }
+.pt-legend { display: inline-flex; gap: 10px; align-items: center; color: var(--z-color-muted); font-size: var(--fs-2xs); }
+.pt-legend-item { display: inline-flex; gap: 4px; align-items: center; }
+.pt-legend-dep, .pt-legend-origin { display: inline-block; width: 16px; height: 0; border-top: 1.5px solid var(--z-color-border); }
+.pt-legend-origin { border-top: 1.5px dashed var(--z-color-violet); }
+.pt-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 3px; flex: none; border: 1px solid transparent; }
+.pt-swatch-done { background: var(--z-color-plan-done); border-color: var(--z-color-plan-done); }
+.pt-swatch-work { background: var(--z-color-plan-work); border-color: var(--z-color-plan-work); }
+.pt-swatch-review { background: var(--z-color-plan-review); border-color: var(--z-color-plan-review); }
+.pt-swatch-notstarted { background: var(--z-color-plan-notstarted); border-color: var(--z-color-plan-notstarted); }
+.pt-swatch-cancelled { background: repeating-linear-gradient(45deg, var(--z-color-plan-cancelled) 0 3px, transparent 3px 6px); border-color: var(--z-color-plan-cancelled); }
+.pm-origin { color: var(--z-color-violet); font-size: var(--fs-2xs); }
+
+/* Task 92: the profile's Time view (Qt's TeamProfileTimeline), one canvas. */
+.pm-profile-scroll { flex: 1; min-height: 0; overflow: auto; }
+/* Task #339: the totals, the lanes and the Top losses in Qt's order. */
+.pm-profile-summary { flex: none; overflow: visible; }
+.pm-profile-details { flex: none; overflow: visible; }
+/* Task #410: the Profile page's two lower sections side by side; each folds to
+   its first rows by default and remembers the choice per view. */
+.pm-details-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+@media (max-width: 1100px) { .pm-details-columns { grid-template-columns: minmax(0, 1fr); } }
+.pm-section { min-width: 0; padding: 6px 9px 8px; border: 1px solid var(--z-color-card-border); border-radius: var(--z-radius-md); background: var(--z-color-card); }
+.pm-section-head { display: flex; align-items: center; gap: 8px; padding-bottom: 3px; }
+.pm-section-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--z-color-text-2); font-size: var(--fs-sm); }
+.pm-section-toggle b { color: var(--z-color-text); font-weight: 600; }
+.pm-section-count { padding: 0 6px; border-radius: 999px; background: var(--z-color-hover); color: var(--z-color-muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+.pm-section-more { color: var(--z-color-accent); font-size: var(--fs-2xs); }
+.pm-section-more:hover { text-decoration: underline; }
+.pm-unknown { color: var(--z-color-muted); cursor: help; }
+.tl-section { padding: 12px 14px 0; }
+.tl-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tl-head h3 { font-size: var(--fs-sm); color: var(--z-color-text-2); margin: 0; }
+.tl-scope { max-width: 100%; font-size: var(--fs-xs); }
+.tl { margin-top: 8px; border: 1px solid var(--z-color-card-border); border-radius: var(--z-radius-md); background: var(--z-color-card); }
+.tl-zoom { display: flex; align-items: center; gap: 6px; padding: 6px 8px 0; }
+/* Task #339: as tall as its lanes, as Qt's card; the page scrolls, and the
+   legend follows the last lane with no band between them. */
+.tl-host { position: relative; overflow: hidden; }
+.tl-host canvas { display: block; cursor: default; }
+.tl-host.panning canvas { cursor: grab; }
+.tl-host.panning canvas:active { cursor: grabbing; }
+.tl-tip { position: absolute; z-index: 2; max-width: 260px; padding: 6px 8px; border-radius: 6px; pointer-events: none;
+  background: var(--z-color-surface); border: 1px solid var(--z-color-card-border); color: var(--z-color-text); font-size: var(--fs-xs);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.25); white-space: pre-wrap; }
+.tl-tip-head { font-weight: 600; }
+/* Task #339: the legend hugs the lanes card it explains, as Qt's legend. */
+.tl-section .pm-legend { margin: 8px 0 0; }
+.tl-estimates { margin: 10px 0 0; padding: 8px 10px; border: 1px solid var(--z-color-card-border); border-radius: var(--z-radius-md); font-size: var(--fs-xs); }
+.tl-estimates-head { display: flex; align-items: center; gap: 8px; color: var(--z-color-muted); }
+.tl-estimates-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+.tl-estimates-table th { text-align: left; font-size: var(--fs-2xs); color: var(--z-color-muted); font-weight: 600; padding: 2px 6px; }
+.tl-estimates-table td { padding: 2px 6px; color: var(--z-color-text-2); }
+.tl-estimates-table .link { background: none; border: 0; padding: 0; color: var(--z-color-accent); cursor: pointer; text-align: left; }
+.tl-section .warn, .tl-estimates .warn { color: var(--z-color-warn); }
+
+/* Task 88: a run's tests from its report, failures first. */
+.pm-run[role="button"] { cursor: pointer; }
+.pm-run-bad { color: var(--z-color-danger); }
+.pm-cases { padding: 4px 7px 8px 24px; border-bottom: 1px solid var(--z-color-divider); }
+.pm-case { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 2px 0; font-size: var(--fs-xs); }
+.pm-case-name { overflow-wrap: anywhere; }
+.pm-case-bad .pm-case-name { color: var(--z-color-danger); font-weight: 600; }
+.pm-case-message { flex-basis: 100%; margin: 0 0 2px 12px; color: var(--z-color-muted); white-space: pre-wrap; }
+
+/* Task 196: the phase header by state (Qt TeamWorkspace phase header): its
+   notes, the collapsed one-line summary, the lead's note on its own line, the
+   actions and their menu; and editing the plan (link handle, edge hit area). */
+.pt-phase:has(.pt-phase-lead-note) { flex-wrap: wrap; align-content: center; row-gap: 4px; }
+.pt-phase-lead-note { flex-basis: 100%; overflow: hidden; text-overflow: ellipsis; color: var(--z-color-text-3); font-size: var(--fs-2xs); padding-left: 28px; }
+.pt-phase-note { flex: none; font-size: var(--fs-2xs); overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+.pt-phase-note-dim { color: var(--z-color-muted); }
+.pt-phase-note-warn { color: var(--z-color-warn); }
+.pt-phase-note-accent { color: var(--z-color-accent); }
+.pt-phase-summary { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; color: var(--z-color-muted); font-size: var(--fs-2xs); }
+.pt-phase-rejected { border-color: color-mix(in srgb, var(--z-color-danger) 45%, var(--z-color-card-border)); }
+.pt-phase-awaiting { border-color: color-mix(in srgb, var(--z-color-warn) 55%, var(--z-color-card-border)); }
+.pt-phase-cancelled { opacity: .6; }
+.pt-chip-rejected { color: var(--z-color-danger); border-color: color-mix(in srgb, var(--z-color-danger) 40%, transparent); }
+.pt-chip-awaiting { color: var(--z-color-warn); border-color: color-mix(in srgb, var(--z-color-warn) 45%, transparent); }
+.pt-chip-queued { color: var(--z-color-accent); border-color: color-mix(in srgb, var(--z-color-accent) 30%, transparent); border-style: dashed; }
+.team-phase-actions { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.team-phase-actions .btn.small { height: 22px; padding: 0 8px; }
+.team-phase-notice { font-size: var(--fs-2xs); max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.team-phase-check { display: inline-grid; place-items: center; width: 12px; }
+.team-phase-more-btn { width: 24px; height: 22px; }
+.pt-link-handle {
+  position: absolute; right: 0; top: 0; bottom: 0; width: 10px; cursor: crosshair; z-index: 1;
+  background: linear-gradient(to right, transparent, color-mix(in srgb, var(--z-color-accent) 25%, transparent));
+  opacity: 0; transition: opacity var(--z-motion-fast);
+}
+.pt-card:hover .pt-link-handle, .pt-link-handle:focus-visible { opacity: 1; }
+.pt-edge-hit { fill: none; stroke: transparent; stroke-width: 10; pointer-events: stroke; cursor: pointer; }
+.pt-edge-hit:hover { stroke: color-mix(in srgb, var(--z-color-danger) 35%, transparent); }
+.team-plan-tools { display: flex; align-items: center; gap: 10px; padding: 6px 12px; font-size: var(--fs-2xs); border-bottom: 1px solid var(--z-color-divider); }
+.team-plan-tools .dim { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.team-edit-phase .dlg-body, .team-add-task .dlg-body, .team-plan-task .dlg-body { display: flex; flex-direction: column; gap: 6px; min-width: min(520px, 86vw); }
+.team-edit-phase-task { display: flex; align-items: center; gap: 8px; }
+.team-edit-phase-task .field { flex: 1; }
+
+/* Task 197: Qt parity. One graph per phase (P1): the header, then one body
+   that scrolls sideways on its own (P3), one SVG for all the phase's links
+   under its cards; Board (P7) and Layers (P8) inside each phase. */
+.pt-row { padding-bottom: 8px; }
+.pt-row > .pt-phase { height: 44px; }
+.pt-phase { border-bottom: 0; border-radius: 10px 10px 0 0; }
+.pt-phase.pt-phase-closed { border-bottom: 1px solid var(--z-color-card-border); border-radius: 10px; }
+.pt-inline { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--z-color-muted); font-size: var(--fs-2xs); }
+.pt-healthy { color: var(--z-color-accent); font-size: var(--fs-2xs); white-space: nowrap; }
+.pt-healthy.warn { color: var(--z-color-warn); }
+.pt-phase-body, .pm-board-phase {
+  overflow-x: auto; overflow-y: hidden;
+  border: 1px solid var(--z-color-card-border); border-top: 0;
+  border-radius: 0 0 10px 10px;
+  background: var(--z-color-card);
+  scrollbar-width: thin;
+}
+.pt-phase-sizer { position: relative; }
+.pt-phase-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.pt-layer-band { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--z-color-text) 3%, transparent); }
+.pt-layer-band.odd { background: color-mix(in srgb, var(--z-color-text) 1.5%, transparent); }
+.pt-layer-label {
+  position: absolute; top: 8px; height: 18px;
+  display: flex; align-items: center; gap: 6px; padding-left: 20px;
+  color: var(--z-color-dim); font-size: var(--fs-2xs); letter-spacing: .04em; text-transform: uppercase;
+}
+.pt-layer-label b { color: var(--z-color-text-3); font-weight: 600; }
+.pt-edges { z-index: 0; }
+.pt-edge { stroke-width: 1.4; opacity: .7; }
+.pt-edge.back { stroke-dasharray: 2 3; }
+.pt-edge-head { fill: var(--z-color-dim); stroke: none; }
+.pt-origin-edge { fill: none; stroke: var(--z-color-violet); stroke-width: 1.2; stroke-dasharray: 4 3; opacity: .8; }
+.pt-card { z-index: 1; justify-content: center; gap: 4px; background: color-mix(in srgb, var(--z-color-danger) calc(var(--heat, 0) * 22%), var(--z-color-surface)); }
+.pt-card-off { opacity: .3; }
+.pt-card-problem { border-color: color-mix(in srgb, var(--pt-tone) 65%, var(--z-color-card-border)); background: color-mix(in srgb, var(--pt-tone) 9%, var(--z-color-surface)); }
+.pt-card-draft { border-style: dashed; }
+.pt-state { display: inline-flex; flex: none; color: var(--pt-tone, var(--z-color-muted)); }
+.pt-card-l2 { gap: 6px; }
+.pt-card-l2 .agent-badge { flex: none; }
+.pt-role.role-badge { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+.pt-time { display: inline-flex; gap: 5px; min-width: 0; overflow: hidden; white-space: nowrap; color: var(--z-color-muted); font-size: var(--fs-2xs); }
+/* Task 342 (owner, 2026-11-08): the five task states in every plan mode - the
+   card's accent (left bar, border) and its tint. Done is green, in work a light
+   blue, in review a deeper blue, not started a pale grey and cancelled a grey
+   hatch; a problem or a wait keeps its amber/red. */
+.pt-card-notstarted, .pt-tone-notstarted { --pt-tone: var(--z-color-plan-notstarted); --pm-tone: var(--z-color-plan-notstarted); background: var(--z-color-plan-notstarted-bg); }
+.pt-card-work, .pt-tone-work { --pt-tone: var(--z-color-plan-work); --pm-tone: var(--z-color-plan-work); background: var(--z-color-plan-work-bg); }
+.pt-card-review, .pt-tone-review { --pt-tone: var(--z-color-plan-review); --pm-tone: var(--z-color-plan-review); background: var(--z-color-plan-review-bg); }
+.pt-card-done, .pt-tone-done { --pt-tone: var(--z-color-plan-done); --pm-tone: var(--z-color-plan-done); background: var(--z-color-plan-done-bg); }
+.pt-card-cancelled, .pt-tone-cancelled {
+  --pt-tone: var(--z-color-plan-cancelled); --pm-tone: var(--z-color-plan-cancelled);
+  background: repeating-linear-gradient(45deg, var(--z-color-plan-cancelled-bg) 0 5px, transparent 5px 10px), var(--z-color-surface);
+}
+.pt-card-danger, .pt-tone-danger { --pt-tone: var(--z-color-status-error); --pm-tone: var(--z-color-status-error); }
+.pt-card-warn, .pt-tone-warn { --pt-tone: var(--z-color-warn); --pm-tone: var(--z-color-warn); }
+.pt-activity { overflow: hidden; text-overflow: ellipsis; }
+.pt-worked { flex: none; font-variant-numeric: tabular-nums; }
+.pt-worked.over, .pm-layer-time.over { color: var(--z-color-warn); }
+.pt-problem { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-2xs); color: var(--z-color-warn); }
+.pt-problem-danger { color: var(--z-color-status-error); }
+.pt-problem-warn { color: var(--z-color-warn); }
+
+/* The toolbar (P6). */
+.pt-plan { flex: 1 1 auto; min-width: 0; }
+.pt-plan-bar { flex-wrap: wrap; }
+.pt-plan-bar .pm-check { white-space: nowrap; }
+.pm-segment { display: inline-flex; gap: 2px; padding: 2px; border-radius: var(--z-radius-md); background: var(--z-color-field); }
+.pm-segment button { padding: 2px 9px; border: 0; border-radius: var(--z-radius-sm); background: none; color: var(--z-color-muted); font: inherit; font-size: var(--fs-xs); cursor: pointer; }
+.pm-segment button.on { background: var(--z-color-segment-on); color: var(--z-color-accent); font-weight: 600; }
+.pm-focus { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border: 1px solid var(--z-color-accent); border-radius: 10px; background: none; color: var(--z-color-accent); font: inherit; font-size: var(--fs-xs); font-weight: 600; cursor: pointer; }
+.pm-heat-mode { font: inherit; font-size: var(--fs-xs); padding: 1px 4px; border: 1px solid var(--z-color-border); border-radius: var(--z-radius-sm); background: var(--z-color-field); color: var(--z-color-text); }
+.pm-zoom { display: inline-flex; align-items: center; gap: 2px; }
+.pm-zoom-value { min-width: 38px; text-align: center; color: var(--z-color-muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+
+/* Task #436 (owner, screenshot of package 167): the plan toolbar is a row of
+   segmented control groups with a divider between them and the legend grouped
+   at the right. Every view button carries its icon, Fit and Collapse all carry
+   theirs, and the toggles are the skin's chips. */
+.pm-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; width: 100%; }
+.pm-tools > .pm-group { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.pm-tools > .pm-group + .pm-group { padding-left: 10px; border-left: 1px solid var(--z-color-divider); }
+.pm-mode { display: inline-flex; align-items: center; gap: 5px; }
+.pm-mode-label { white-space: nowrap; }
+.pm-heat { gap: 6px; }
+.pm-heat-pick { min-width: 96px; font-size: var(--fs-xs); }
+.pm-toggle { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 9px; border: 0; border-radius: 12px; background: var(--z-color-hover); color: var(--z-color-muted); font: inherit; font-size: var(--fs-xs); cursor: pointer; }
+.pm-toggle:hover { color: var(--z-color-text); }
+.pm-toggle.on { color: var(--z-color-text); background: var(--z-color-segment-on); }
+
+/* Board (P7): each phase's columns; the titles stay pinned. */
+.pm-board-scroll, .pm-layers-scroll { padding: 6px 12px 24px; }
+.pm-phase { margin-bottom: 10px; }
+.pm-phase > .pt-phase { height: 44px; position: sticky; top: 0; z-index: 3; }
+.pm-board-phase .pm-board { display: grid; gap: 6px; padding: 6px; overflow: visible; min-width: min-content; }
+.pm-board-phase .pm-column { min-height: 60px; flex: none; }
+.pm-column.empty { background: transparent; border-color: color-mix(in srgb, var(--z-color-card-border) 60%, transparent); }
+.pm-column.problems { border-color: color-mix(in srgb, var(--z-color-danger) 55%, var(--z-color-card-border)); }
+.pm-board-phase .pm-column-head { align-self: stretch; color: var(--z-color-text-3); font-size: var(--fs-2xs); border-radius: 10px 10px 0 0; }
+.pm-board-phase .pm-column-body { overflow: visible; }
+.pm-board-card { gap: 4px; }
+.pm-board-card.problem { border-color: color-mix(in srgb, var(--pm-tone) 70%, var(--z-color-card-border)); }
+.pm-board-card.draft { border-style: dashed; }
+.pm-board-card .pm-card-meta { align-items: center; overflow: hidden; }
+/* Task #415: a No report card shows the kept reply and the one action. */
+.pm-card-noreport { display: flex; align-items: center; gap: 6px; min-width: 0; padding-top: 2px; border-top: 1px dashed var(--z-color-divider); color: var(--z-color-text-2); font-size: var(--fs-2xs); }
+.pm-card-noreport .ell { min-width: 0; flex: 1; }
+.pm-card-noreport .btn { flex: none; }
+.pm-deps { flex: none; color: var(--z-color-folder, var(--z-color-muted)); font-size: var(--fs-2xs); white-space: nowrap; }
+.pm-empty-dash { align-self: center; color: var(--z-color-dim); font-size: var(--fs-2xs); }
+
+/* Layers (P8): compact rows by layer, inside each phase. */
+.pm-layers-phase { border: 1px solid var(--z-color-card-border); border-top: 0; border-radius: 0 0 10px 10px; background: var(--z-color-card); padding: 6px 8px 8px; }
+.pm-layer-group { display: flex; flex-direction: column; gap: 2px; }
+.pm-layer-group + .pm-layer-group { margin-top: 2px; }
+.pm-layer-label { flex: none; width: 20px; color: var(--z-color-dim); font-size: var(--fs-2xs); }
+.pm-layer-row {
+  --heat: 0;
+  display: flex; align-items: center; gap: 7px; width: 100%; min-height: 30px; padding: 3px 8px;
+  border: 1px solid transparent; border-left: 3px solid var(--pt-tone); border-radius: 7px;
+  background: color-mix(in srgb, var(--z-color-danger) calc(var(--heat) * 22%), var(--z-color-surface));
+  color: var(--z-color-text); font: inherit; font-size: var(--fs-xs); text-align: left; cursor: pointer;
+}
+.pm-layer-row:hover { border-color: var(--z-color-accent-muted); }
+.pm-layer-row.problem { background: color-mix(in srgb, var(--pt-tone) 9%, var(--z-color-surface)); }
+.pm-layer-title { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.pm-layer-activity { color: var(--z-color-muted); font-size: var(--fs-2xs); white-space: nowrap; }
+.pm-layer-time { flex: none; min-width: 84px; text-align: right; color: var(--z-color-muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+.pm-layer-row .pt-role { flex: none; max-width: 110px; }
+.pm-layer-agent { flex: none; width: 18px; display: inline-flex; }
+.team-member.focused { box-shadow: 0 0 0 1px var(--z-color-accent) inset; }
+.team-member { cursor: pointer; }
+
+/* Task #219: every phase header's Standard | Free toggle. */
+.team-phase-toggle { display: inline-flex; align-items: stretch; border: 1px solid var(--z-color-card-border); border-radius: 7px; overflow: hidden; background: var(--z-color-field); }
+.team-phase-toggle button { border: 0; background: transparent; color: var(--z-color-muted); font-size: var(--fs-2xs); padding: 2px 7px; cursor: pointer; }
+.team-phase-toggle button + button { border-left: 1px solid var(--z-color-card-border); }
+.team-phase-toggle button.on { background: var(--z-color-accent); color: var(--z-color-accent-text, #fff); font-weight: 600; cursor: default; }
+.team-phase-toggle button:disabled { opacity: .62; cursor: default; }
+.team-phase-toggle button.on:disabled { opacity: 1; }
+.team-phase-toggle button:not(:disabled):hover { color: var(--z-color-text); }
+.team-phase-proposed { margin-left: 5px; padding: 1px 5px; border-radius: 5px; font-size: var(--fs-2xs); color: var(--z-color-warn); border: 1px solid color-mix(in srgb, var(--z-color-warn) 45%, transparent); }
+.team-phase-mode-notice { margin-left: 6px; font-size: var(--fs-xs); }
+
+/* Task #226: the plan's lanes, as Qt's lane sections. */
+.pm-lanes { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 10px; padding: 10px; }
+.pm-lanes-phase { border: 1px solid var(--z-color-card-border); border-radius: 10px; background: var(--z-color-card); }
+.pm-lanes-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--z-color-divider); font-size: var(--fs-sm); }
+.pm-lanes-head .pm-lane-tip { margin-left: auto; color: var(--z-color-muted); font-size: var(--fs-2xs); }
+.pm-lane { position: relative; border-bottom: 1px solid var(--z-color-divider); }
+.pm-lane:last-child { border-bottom: 0; }
+.pm-lane-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px; }
+.pm-lane-toggle { display: flex; align-items: center; gap: 5px; padding: 3px 4px; border: 0; background: none; color: var(--z-color-text-2); font-size: var(--fs-xs); font-weight: 600; cursor: pointer; }
+.pm-lane-toggle:hover { color: var(--z-color-text); }
+.pm-lane-actions { position: relative; display: inline-flex; margin-left: auto; }
+.pm-lane-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 20; min-width: 180px; max-height: 40vh; overflow: auto; display: flex; flex-direction: column; padding: 4px; border: 1px solid var(--z-color-card-border); border-radius: 8px; background: var(--z-color-surface); box-shadow: 0 8px 22px rgb(0 0 0 / 0.25); }
+.pm-lane-menu button { text-align: left; padding: 5px 8px; border: 0; border-radius: 6px; background: none; color: var(--z-color-text); font-size: var(--fs-sm); cursor: pointer; }
+.pm-lane-menu button:hover, .pm-lane-menu button.on { background: var(--z-color-hover); }
+.pm-lane-body { display: flex; flex-direction: column; gap: 1px; padding: 0 8px 8px 22px; }
+.pm-lane-task { display: flex; align-items: baseline; gap: 8px; }
+.pm-lane-task .pm-lane-actions { margin-left: auto; }
+.pm-lane-open { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; border: 0; border-radius: 6px; background: none; color: inherit; text-align: left; cursor: pointer; }
+.pm-lane-open:hover { background: var(--z-color-hover); }
+.pm-lane-open b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pm-lane-heat { color: var(--z-color-warn); font-size: var(--fs-2xs); }
+.pm-lane-note { margin: 0; font-size: var(--fs-sm); }
+.pm-lane-note.danger { color: var(--z-color-danger); }
+.pm-profile-head { display: flex; align-items: center; gap: 8px; padding: 0 0 6px; }
+
+/* Task #230: a Crit task's node border and links are violet; Minor is quiet. */
+.pt-card.pt-card-crit { border-color: var(--z-color-violet); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--z-color-violet) 45%, transparent); }
+.pt-card.pt-card-crit.pt-card-problem { border-color: var(--z-color-violet); }
+.pt-edge.pt-edge-crit { stroke: var(--z-color-violet); opacity: 1; }
+.pt-chip-crit { color: var(--z-color-violet); border-color: color-mix(in srgb, var(--z-color-violet) 55%, var(--z-color-border)); }
+.pt-chip-minor { color: var(--z-color-text-3); border-color: var(--z-color-border); background: transparent; }
+.pt-crit-gate { color: var(--z-color-violet); font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pm-board-card.crit, .pm-layer-row.crit { border-color: var(--z-color-violet); }
+.pm-board-card.minor, .pm-layer-row.minor { border-style: dashed; }
+.pt-phase[data-phase-kind="minor"] .pt-phase-title { color: var(--z-color-text-2); }
+
+/* Task 316 (F4): a readable phase title. */
+.pt-phase-title { flex: 1 1 220px; min-width: 120px; white-space: nowrap; }
+
+/* Task 332: one even border with four round corners. A folded card carries
+   pt-phase-closed (PlanView), so it closes its bottom; content wider than the
+   card is clipped inside its padding, so a cut progress strip or button never
+   runs into the right border and doubles it. */
+.pt-phase { overflow: clip; overflow-clip-margin: content-box; }
+/* An open card is the header and the body:
+   they share the header's state colour and style, so the frame reads as one. */
+.pt-row:has(> .pt-phase-done) > .pt-phase-body { border-color: color-mix(in srgb, var(--z-color-status-ready) 35%, var(--z-color-card-border)); }
+.pt-row:has(> .pt-phase-running) > .pt-phase-body { border-color: color-mix(in srgb, var(--z-color-accent) 45%, var(--z-color-card-border)); }
+.pt-row:has(> .pt-phase-draft) > .pt-phase-body { border-style: dashed; border-color: color-mix(in srgb, var(--z-color-warn) 50%, var(--z-color-card-border)); }
+.pt-row:has(> .pt-phase-rejected) > .pt-phase-body { border-color: color-mix(in srgb, var(--z-color-danger) 45%, var(--z-color-card-border)); }
+.pt-row:has(> .pt-phase-awaiting) > .pt-phase-body { border-color: color-mix(in srgb, var(--z-color-warn) 55%, var(--z-color-card-border)); }
+
+
+
+/* Task 428: the selected card keeps its own look while it is the selection;
+   the hover look (pt-card-on, :hover) follows the pointer only. */
+.pt-card.pt-card-selected { border-color: var(--z-color-accent); box-shadow: 0 0 0 1px var(--z-color-accent) inset; background: color-mix(in srgb, var(--z-color-accent) 8%, var(--z-color-surface)); }
+.pt-card:focus { outline: none; }
+.pt-card:focus-visible { outline: 2px solid var(--z-color-focus); outline-offset: 1px; }
+
+/* Task #462 (owner, package 168): the profile's four modes, its tables and the
+   Builds mode's own counts. */
+.pm-profile-modes { margin: 0 0 8px; }
+.pm-loss-order { display: flex; justify-content: flex-end; padding: 0 2px 6px; }
+.pm-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
+.pm-table th { padding: 4px 8px; border-bottom: 1px solid var(--z-color-divider); color: var(--z-color-muted); font-weight: 500; text-align: left; }
+.pm-table td { padding: 5px 8px; border-bottom: 1px solid var(--z-color-divider); vertical-align: top; }
+.pm-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.pm-table .warn { color: var(--z-color-warn); }
+.pm-table .accent { color: var(--z-color-accent); }
+.pm-tests-counts { display: flex; gap: 6px; padding: 2px 0 8px; }
+.pm-tests-counts .pm-pill { background: var(--z-color-field); color: var(--z-color-muted); }
+.pm-tests-counts .pm-count-on { background: var(--z-color-segment-on); color: var(--z-color-accent); }
+
+/* Owner, 2026-11-09 ("темнее весь бэк вкладок, всё белесым смотрится"): the
+   plan's phase and layer backgrounds sit close to the page, so the task cards
+   stand out. */
+.pt-phase, .pt-layer, .pm-column, .pm-layer { background: color-mix(in srgb, var(--z-color-card) 35%, var(--z-color-page)); }
+.pt-phase:hover { background: color-mix(in srgb, var(--z-color-card) 55%, var(--z-color-page)); }
+/* Owner, 2026-11-09: a task in progress turns the Zerus mark (the working agent's spin). */
+.pt-working-mark { display: inline-grid; place-items: center; color: var(--z-color-accent); }
+.pt-working-mark > svg { will-change: transform; animation: zl-spin 3s infinite; }

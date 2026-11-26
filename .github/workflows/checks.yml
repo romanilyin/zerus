@@ -16,12 +16,28 @@ on:
       run_macos:
         type: boolean
         default: false
+      arch_check_in_source:
+        description: Release source job runs check() for this exact same SHA before sealing
+        type: boolean
+        default: false
       run_windows:
+        type: boolean
+        default: false
+      windows_installer_version:
+        description: Installer release version (empty uses the ZIP product version)
+        type: string
+        default: ''
+      retain_membership_probe:
+        description: Opt-in test-only artifact for private Windows membership qualification
         type: boolean
         default: false
       run_ios:
         type: boolean
         default: false
+      windows_flake_rounds:
+        description: Opt-in loaded native Windows sample rounds; no retry after refusal or unknown
+        type: number
+        default: 0
       filter_pr_platforms:
         type: boolean
         default: false
@@ -70,17 +86,48 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           python3 scripts/ci/select-coverage.py
 
+  client-frontend:
+    name: Desktop frontend tests and build
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci
+        working-directory: client
+      - run: npm run check
+        working-directory: client
+      - run: npm test
+        working-directory: client
+      - run: npm run build
+        working-directory: client
+      - name: Main JavaScript chunk budget
+        run: python3 client/scripts/check-bundle-size.py
+
   quick:
     name: Quick checks (source and Rust 1.99)
     needs: source
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Reclaim unused hosted Ubuntu tools
+        run: python3 scripts/ci/ubuntu-disk.py prepare
       - run: python3 scripts/ci/check-source.py
       - name: No dot separators in the web UI
         run: python3 scripts/check-ui-separators.py
@@ -93,6 +140,18 @@ jobs:
           "$RUNNER_TEMP/speech-http-venv/bin/python" -m unittest discover -s services/speech/tests -v
       - name: Release publication contract checks
         run: python3 -m unittest discover -s tests -p 'test_*publication.py'
+      - name: Credential-free release scheduling and archive controls
+        working-directory: tests
+        run: python3 -m unittest test_release_source test_regression_overlap test_release_test_scheduling
+      - name: Windows installer and runtime prerequisite contracts
+        working-directory: tests
+        run: python3 -m unittest test_windows_installer test_webview2_ci
+      - name: Linux package staging contracts
+        run: python3 -m unittest discover -s tests -p test_linux_packaging.py
+      - name: Linux desktop service registration contracts
+        run: python3 -m unittest discover -s tests -p test_linux_desktop_service.py
+      - name: Hosted Ubuntu disk cleanup contracts
+        run: python3 -m unittest discover -s tests -p test_ci_disk.py
       - name: Workflow trust boundary checks
         run: python3 -m unittest discover -s tests -p test_ci_security.py
       - name: Scan the tree and all history for secrets
@@ -135,6 +194,15 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           "$lint_dir/actionlint" -color -ignore 'unexpected key "cache-mode" for "(workflow|job)" section'
 
+      - name: Linux tmux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev libncurses-dev bison pkg-config
+      - name: Pinned tmux with verified input-mode support
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash scripts/ci/install-tmux.sh "$RUNNER_TEMP/tmux"
+          echo "$RUNNER_TEMP/tmux/bin" >> "$GITHUB_PATH"
       - run: rustup toolchain install 1.99.1 --profile minimal
       # Rust caches: the compiler identity and a monthly epoch precede the lock
       # hash. A Cargo.lock change restores the previous target; a new month or
@@ -152,31 +220,96 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: msrv-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: msrv-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+          key: msrv-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Disk usage after cache restore
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-cache-restore
       - run: cargo +1.99.1 test --locked
-      - name: Replica crates (format, lints, tests, golden vectors, the mobile binding surface)
+      - name: Disk usage after root tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-root-tests
+      - name: Client readiness fixture matches root service status
+        shell: bash
         run: |
-          rustup component add --toolchain 1.99.1 rustfmt clippy
-          cargo +1.99.1 fmt --check --manifest-path crates/replica/Cargo.toml
-          cargo +1.99.1 clippy --locked --manifest-path crates/replica/Cargo.toml --target-dir target/replica --all-targets -- -D warnings
-          cargo +1.99.1 test --locked --manifest-path crates/replica/Cargo.toml --target-dir target/replica
-          cargo +1.99.1 fmt --check --manifest-path crates/replica-ffi/Cargo.toml
-          cargo +1.99.1 clippy --locked --manifest-path crates/replica-ffi/Cargo.toml --target-dir target/replica-ffi --all-targets -- -D warnings
-          cargo +1.99.1 test --locked --manifest-path crates/replica-ffi/Cargo.toml --target-dir target/replica-ffi
+          set -euo pipefail
+          cargo +1.99.1 test --locked --bin hgs desktop::delivery::tests::actual_root_projection_is_consumed_by_the_client_without_ready_json_fixtures -- --exact --nocapture |
+            python3 client/scripts/generate-delivery-status-fixture.py --check
+      - name: Replica crates (format, lints, tests, golden vectors, the mobile binding surface)
+        run: bash scripts/ci/replica.sh
+      - name: Disk usage after replica tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-replica-tests
+      - name: Ordinary file lock crate (format, lints, owner and fork tests)
+        env:
+          CARGO_BUILD_JOBS: "4"
+          RUST_TEST_THREADS: "4"
+        run: |
+          cargo +1.99.1 fmt --check --manifest-path crates/file-lock/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/file-lock/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/file-lock/Cargo.toml --target-dir target
       - name: Watch protocol crate (format, lints, tests)
         run: |
           cargo +1.99.1 fmt --check --manifest-path crates/watch-protocol/Cargo.toml
-          cargo +1.99.1 clippy --locked --manifest-path crates/watch-protocol/Cargo.toml --target-dir target/watch-protocol --all-targets -- -D warnings
-          cargo +1.99.1 test --locked --manifest-path crates/watch-protocol/Cargo.toml --target-dir target/watch-protocol
-      - name: Desktop client core crate (format, lints, tests)
+          cargo +1.99.1 clippy --locked --manifest-path crates/watch-protocol/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/watch-protocol/Cargo.toml --target-dir target
+      - name: Disk usage after watch tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-watch-tests
+      - name: Lore wrapper crate (format, lints, tests)
         run: |
-          cargo +1.99.1 fmt --check --manifest-path client/core/Cargo.toml
-          cargo +1.99.1 clippy --locked --manifest-path client/core/Cargo.toml --target-dir target/client-core --all-targets -- -D warnings
-          cargo +1.99.1 test --locked --manifest-path client/core/Cargo.toml --target-dir target/client-core
+          cargo +1.99.1 fmt --check --manifest-path crates/lore-bin/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/lore-bin/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/lore-bin/Cargo.toml --target-dir target
+      - name: Team plan crate (format, lints, tests)
+        run: |
+          cargo +1.99.1 fmt --check --manifest-path crates/team-plan/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/team-plan/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/team-plan/Cargo.toml --target-dir target
+      - name: Mobile task edit crate (format, lints, tests)
+        run: |
+          cargo +1.99.1 fmt --check --manifest-path crates/mobile-task-edit/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/mobile-task-edit/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/mobile-task-edit/Cargo.toml --target-dir target
+      # hgs and client/core take these by path, which builds them but never runs their tests.
+      # Every Quick Cargo check shares target: compatible dependencies are built once.
+      - name: Desktop crates (format, lints, tests)
+        run: |
+          cargo +1.99.1 fmt --check --manifest-path crates/content-search/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/content-search/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/content-search/Cargo.toml --target-dir target
+          cargo +1.99.1 fmt --check --manifest-path crates/desktop-catalog/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/desktop-catalog/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/desktop-catalog/Cargo.toml --target-dir target
+          cargo +1.99.1 fmt --check --manifest-path crates/desktop-ledger/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/desktop-ledger/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/desktop-ledger/Cargo.toml --target-dir target
+          cargo +1.99.1 fmt --check --manifest-path crates/desktop-migration/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/desktop-migration/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/desktop-migration/Cargo.toml --target-dir target
+          cargo +1.99.1 fmt --check --manifest-path crates/desktop-read-policy/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/desktop-read-policy/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/desktop-read-policy/Cargo.toml --target-dir target
+          cargo +1.99.1 fmt --check --manifest-path crates/presence-sampler/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/presence-sampler/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/presence-sampler/Cargo.toml --target-dir target
+      - name: Disk usage after desktop crate tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-desktop-crate-tests
+      - name: Freedesktop notification wire crate (format, lints, private bus tests)
+        run: |
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y dbus-daemon
+          cargo +1.99.1 fmt --check --manifest-path crates/freedesktop-notify/Cargo.toml
+          cargo +1.99.1 clippy --locked --manifest-path crates/freedesktop-notify/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path crates/freedesktop-notify/Cargo.toml --target-dir target
       # Packages fail without a notice for every shipped crate; find out here.
+      - name: Disk usage after notification tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-notification-tests
       - name: Rust license notices
-        run: python3 scripts/collect-licenses.py "$RUNNER_TEMP/rust-licenses"
+        run: |
+          cargo fetch --locked --manifest-path crates/lore-bin/Cargo.toml
+          python3 scripts/collect-licenses.py "$RUNNER_TEMP/rust-licenses" --manifest-path Cargo.toml --manifest-path crates/lore-bin/Cargo.toml
       - name: Save Rust 1.99 cache
         if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -186,12 +319,80 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Disk usage after cache save
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-cache-save
+
+  client-core:
+    name: Desktop client core checks (format, lints, tests)
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    cache-mode: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Check pinned source disk helper support
+        id: disk-helper
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, runpy
+          path = pathlib.Path('scripts/ci/ubuntu-disk.py')
+          helper = runpy.run_path(str(path)) if path.exists() else {}
+          supported = all('client-core' in helper.get(name, ()) for name in ('REPORT_JOBS', 'CLEANUP_JOBS'))
+          if not supported:
+              print('Pinned source disk helper lacks client-core support; omitting disk diagnostics and cache restore, building client-core cold.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('supported=' + str(supported).lower() + '\n')
+          PY
+      - name: Reclaim unused hosted Ubuntu tools
+        if: ${{ steps.disk-helper.outputs.supported == 'true' }}
+        run: python3 scripts/ci/ubuntu-disk.py prepare
+      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      # Reuse Quick's compatible compiler/month cache without a second writer
+      # or another target-cache family within the existing shared cache limit.
+      - name: Restore Rust 1.99 cache (read only)
+        id: rust-cache
+        # An older pinned helper cannot reclaim space for Quick's full target.
+        # Build just client-core cold instead of restoring it onto that runner.
+        if: ${{ steps.disk-helper.outputs.supported == 'true' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('client/core/Cargo.lock') }}
+          restore-keys: msrv-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Disk usage after cache restore
+        if: ${{ !cancelled() && steps.disk-helper.outputs.supported == 'true' }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-cache-restore
+      - name: Desktop client core crate (format, lints, tests)
+        run: bash scripts/ci/client-core.sh
+      - name: Disk usage after client core tests
+        if: ${{ !cancelled() && steps.disk-helper.outputs.supported == 'true' }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-client-core-tests
 
   relay:
     name: Rust relay (v1, PostgreSQL and connector contracts)
     needs: source
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       postgres:
         image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -207,6 +408,8 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
+      - name: Reclaim unused hosted Ubuntu tools
+        run: python3 scripts/ci/ubuntu-disk.py prepare
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       # Each storage contract and relay fixture creates and drops its own
       # database on the service. With the requirement set, a missing URL fails
@@ -242,6 +445,9 @@ jobs:
           }
           serde_features
           serde_features --no-default-features
+      - name: Disk usage after relay contracts
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-relay-contracts
       - name: Encrypted endpoint protocol and workspace contracts
         env:
           ZERUS_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
@@ -258,6 +464,16 @@ jobs:
       # run against the retained Python reference relay. The black-box connector
       # suites (test_bb_*) run in the connector job; the end-to-end suites run
       # here against both connectors, the Rust one built beside the relay.
+      - name: Disk usage after crypto contracts
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-crypto-contracts
+      - name: Private tmux for the native archive paging fixture
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev libncurses-dev bison pkg-config
+          bash scripts/ci/install-tmux.sh "$RUNNER_TEMP/tmux"
+          echo "$RUNNER_TEMP/tmux/bin" >> "$GITHUB_PATH"
       - name: Released HTTP and outbound connector compatibility
         env:
           ZERUS_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
@@ -265,6 +481,8 @@ jobs:
         run: |
           cargo +1.99.1 build --locked --bin hgs
           cargo +1.99.1 build --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir services/mobile/relay/target
+          cargo +1.99.1 build --locked --manifest-path crates/replica-ffi/Cargo.toml --example task_exchange_phone --target-dir target
+          export ZERUS_TASK_TEST_PHONE="$GITHUB_WORKSPACE/target/debug/examples/task_exchange_phone"
           export ZERUS_CONNECTOR_E2E_COMMAND="$GITHUB_WORKSPACE/services/mobile/relay/target/debug/zerus-mobile-connector"
           python3 -m venv "$RUNNER_TEMP/relay-venv"
           "$RUNNER_TEMP/relay-venv/bin/pip" install ./services/mobile -r services/mobile/tests/requirements.txt
@@ -274,14 +492,22 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/services/mobile/relay/target/debug:$PATH"
           "$RUNNER_TEMP/relay-venv/bin/python" -m unittest discover -s services/mobile/tests -p 'test_[!b]*.py' -v
           env -u ZERUS_RELAY_BINARY "$RUNNER_TEMP/relay-venv/bin/python" -m unittest discover -s services/mobile/tests -p 'test_mobile_speech*.py' -v
+      - name: Retire completed relay host build outputs
+        run: python3 scripts/ci/ubuntu-disk.py relay-before-image
       - name: Build the deployment image
         run: docker build --tag zerus-relay-contract services/mobile
+      - name: Disk usage after deployment image
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-deployment-image
       - name: Enforce the 256 MiB runtime envelope
         run: |
           "$RUNNER_TEMP/relay-venv/bin/python" services/mobile/relay/tests/load.py --kind attachments_unicode
           "$RUNNER_TEMP/relay-venv/bin/python" services/mobile/relay/tests/load.py --kind late-malformed
           "$RUNNER_TEMP/relay-venv/bin/python" services/mobile/relay/tests/load.py --kind attachments_unicode --repeats 2 --concurrency 2
           "$RUNNER_TEMP/relay-venv/bin/python" services/mobile/relay/tests/load.py --kind attachments_unicode --backend postgres
+      - name: Disk usage after runtime envelope
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-runtime-envelope
 
   # The Rust connector against the golden vectors, the Python connector and hgs
   # on one journal, and the black-box suites against both implementations.
@@ -597,12 +823,239 @@ jobs:
           path: artifacts/test-results
           retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
 
+  client-native-linux:
+    name: Desktop client native checks (ubuntu-24.04)
+    needs: source
+    if: needs.source.outputs.run_linux == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Disk usage after native checkout
+        run: python3 scripts/ci/ubuntu-disk.py report after-native-checkout
+      - name: Prepare native disk headroom
+        run: python3 scripts/ci/ubuntu-disk.py prepare
+      - name: Linux media, video and Tauri build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y
+          libasound2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+          libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev xvfb dbus-bin dbus-daemon
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Disk usage after native dependencies
+        run: python3 scripts/ci/ubuntu-disk.py report after-native-dependencies
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore native client Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
+          restore-keys: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Disk usage after native cache restore
+        run: python3 scripts/ci/ubuntu-disk.py report after-native-cache-restore
+      - name: Media and video tests and Tauri media clippy
+        # The script reports between its existing Linux build phases.
+        run: bash scripts/ci/client-native.sh linux
+      - name: Disk usage after native checks
+        if: ${{ !cancelled() }}
+        run: python3 scripts/ci/ubuntu-disk.py report after-native-checks
+      - name: Save native client Rust cache
+        if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  client-native-macos-core:
+    name: Desktop client core checks (macos-15)
+    needs: source
+    if: needs.source.outputs.run_macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore native client Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
+          restore-keys: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Core tests
+        run: bash scripts/ci/client-native.sh macos core
+      - name: Media and video check
+        run: bash scripts/ci/client-native.sh macos media
+
+  client-native-macos-tauri:
+    name: Desktop client Tauri checks (macos-15)
+    needs: source
+    if: needs.source.outputs.run_macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore native client Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
+          restore-keys: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Tauri tests
+        timeout-minutes: 25
+        run: bash scripts/ci/client-native.sh macos tauri-test
+      - name: Tauri clippy
+        if: always()
+        timeout-minutes: 25
+        run: bash scripts/ci/client-native.sh macos tauri-clippy
+      - name: Save native client Rust cache
+        if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
+  client-native-windows:
+    name: Desktop client native checks (windows-2025)
+    needs: source
+    if: needs.source.outputs.run_windows == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - name: Check out text files unchanged
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore native client Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
+          restore-keys: client-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Core tests
+        run: bash scripts/ci/client-native.sh windows core
+      - name: Media checks
+        if: ${{ !cancelled() }}
+        run: bash scripts/ci/client-native.sh windows media
+      - name: Tauri clippy
+        if: ${{ !cancelled() }}
+        run: bash scripts/ci/client-native.sh windows tauri-clippy
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ !cancelled() }}
+        with:
+          node-version: '24'
+      - name: Windows shell tests and disposable app
+        if: ${{ !cancelled() }}
+        id: windows-shell
+        run: bash scripts/ci/windows-next-shell.sh
+      - name: Loaded native Windows task-mode samples
+        if: ${{ !cancelled() && steps.windows-shell.outcome == 'success' && github.event_name == 'workflow_dispatch' && inputs.windows_flake_rounds != 0 }}
+        timeout-minutes: 20
+        env:
+          ZERUS_WINDOWS_FLAKE_ROUNDS: ${{ inputs.windows_flake_rounds }}
+        run: |
+          HGS_TEST_BIN=$(cygpath -w "$PWD/artifacts/zerus-next-windows-shell/hgs.exe")
+          HGS_WINDOWS_FRONTEND_FIXTURE=$(cygpath -w "$PWD/artifacts/zerus-next-windows-shell/windows-frontend-tests.exe")
+          export HGS_TEST_BIN HGS_WINDOWS_FRONTEND_FIXTURE
+          cp tests/windows_flake_samples.py artifacts/zerus-next-windows-shell/native-tests/
+          cd tests
+          python -m unittest -v windows_flake_samples.ModeSamples </dev/null
+      - name: Retain disposable Windows shell
+        if: ${{ !cancelled() && hashFiles('artifacts/zerus-next-windows-shell/zerus-client.exe') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerus-next-windows-shell
+          path: artifacts/zerus-next-windows-shell
+          retention-days: 3
+          if-no-files-found: error
+      - name: Retain Windows shell loader diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-shell-loader
+          path: artifacts/windows-shell-loader
+          retention-days: 3
+          if-no-files-found: ignore
+      - name: Save native client Rust cache
+        if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+
   cli:
     name: CLI (ubuntu-24.04)
     needs: source
     if: needs.source.outputs.run_linux == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # Regular runs take 27-30 minutes; the keyless agent checks need headroom.
+    timeout-minutes: 50
     env:
       CARGO_TERM_COLOR: always
       HOMEBREW_NO_AUTO_UPDATE: 1
@@ -654,6 +1107,9 @@ jobs:
           echo "$RUNNER_TEMP/dsh/node_modules/.bin" >> "$GITHUB_PATH"
           echo "ZERUS_TEST_DSH_RECEIPT=$GITHUB_WORKSPACE/artifacts/test-results/dsh-fixture/installed.json" >> "$GITHUB_ENV"
       - run: bash scripts/ci/cli.sh
+      # U62: every test file and every source area is in .zerus/test-map.json.
+      - name: The test map is current
+        run: target/debug/hgs test map --check
       - name: Save Rust cache
         if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -664,7 +1120,7 @@ jobs:
             target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
       - name: Keyless latest Codex, Claude Code and OpenCode compatibility
-        run: python3 scripts/ci/agent-compatibility.py
+        run: bash scripts/ci/native-compatibility.sh '${{ needs.source.outputs.commit }}'
       - name: Retain test logs
         if: always() && (github.event_name != 'schedule' || failure())
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -720,6 +1176,11 @@ jobs:
             cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
       - name: Complete original unit, debug and fake-agent builds
         run: bash scripts/ci/cli.sh debug
+      - name: Seal the private same-source native Effort test image
+        run: |
+          python3 scripts/ci/native-effort-seed.py build --source-sha "$SOURCE_COMMIT" \
+            --hgs "$GITHUB_WORKSPACE/target/debug/hgs" --image "$GITHUB_WORKSPACE/target/debug/hgs-effort-seed" \
+            --receipt "$GITHUB_WORKSPACE/target/debug/hgs-effort-seed.json"
       - name: Seal the tested debug executables and their provenance
         id: seal
         run: python3 scripts/ci/macos-debug-artifact.py seal --directory artifacts/mac-cli-debug
@@ -731,6 +1192,7 @@ jobs:
           path: |
             artifacts/mac-cli-debug/hgs
             artifacts/mac-cli-debug/fake_agent
+            artifacts/mac-cli-debug/effort_seed
             artifacts/mac-cli-debug/manifest.json
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
@@ -901,87 +1363,58 @@ jobs:
               raise SystemExit('The selected macOS CLI producer, integration/release and native jobs must all succeed.')
           PY
 
-  # Compiler caches use one entry per saving run and restore the newest by
-  # prefix. A save follows a successful build that compiled something, keeping
-  # only the entries this build used. Cache directories stay outside the
-  # workspace, so they never reach packages, the portable zip or artifacts.
-  arch:
-    name: Arch desktop
+  # Root CLI Clippy for macOS, all targets, check only (zerus-3ldf4,
+  # zerus-8evem). The macOS CLI jobs build and test the root hgs but never
+  # lint it, so macOS-only unused items reached main unseen (zerus-snrs7). It
+  # restores the CLI producer's cache and never saves one; it publishes and
+  # admits nothing.
+  clippy-macos:
+    name: macOS CLI Clippy (check only)
     needs: source
-    if: needs.source.outputs.run_arch == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    container:
-      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    if: needs.source.outputs.run_macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
     env:
-      CCACHE_DIR: /home/user/.cache/ccache
-      CCACHE_MAXSIZE: 150M
-      # Ninja starts a suite's own sources while the libraries it links still build.
-      CMAKE_GENERATOR: Ninja
-      ZERUS_BUILD_JOBS: 4
+      CARGO_TERM_COLOR: always
     steps:
-      - name: Bootstrap Git before checkout
-        run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
-      - name: Arch dependencies and unprivileged builder
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Rust cache identity
+        id: rust
         run: |
-          pacman -Syu --noconfirm --needed base-devel git cmake ninja qt6-base qt6-tools qt6-webengine qt6-multimedia qt6-svg kstatusnotifieritem kwindowsystem kidletime tmux openssh python ccache dbus
-          useradd -m user
-          chown -R user:user "$GITHUB_WORKSPACE"
-      - name: Restore ccache
-        id: ccache-restore
+          echo "rustc=$(rustc +1.99.1 -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore the CLI cache (never saved here)
+        id: rust-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /home/user/.cache/ccache
-          key: arch-ccache-v1-${{ github.run_id }}
-          restore-keys: arch-ccache-v1-
-      - name: Reset ccache statistics
-        id: ccache-start
-        run: |
-          chown -R user:user /home/user
-          runuser -u user -- ccache -z
-          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - name: Desktop build
-        id: build
-        run: runuser -u user -- bash scripts/ci/gui.sh build
-      - name: ccache statistics
-        id: ccache
-        if: ${{ !cancelled() }}
-        env:
-          SAVE: ${{ inputs.save_caches && steps.build.outcome == 'success' }}
-          STARTED: ${{ steps.ccache-start.outputs.started }}
-        run: |
-          runuser -u user -- ccache -sv
-          misses=$(runuser -u user -- ccache --print-stats | awk -F'\t' '$1 == "cache_miss" { print $2 + 0 }')
-          if [ "$SAVE" = true ] && [ "${misses:-0}" -gt 0 ]; then
-            runuser -u user -- ccache --evict-older-than "$(( $(date +%s) - STARTED + 60 ))s"
-            echo save=true >> "$GITHUB_OUTPUT"
-          fi
-      - name: Save ccache
-        if: inputs.save_caches && steps.ccache.outputs.save == 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /home/user/.cache/ccache
-          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
-      - name: Offscreen Qt suites
-        run: runuser -u user -- env QTWEBENGINE_DISABLE_SANDBOX=1 bash scripts/ci/gui.sh test
-      - name: Retain desktop test logs
-        if: always() && (github.event_name != 'schedule' || failure())
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: arch-desktop-results
-          path: artifacts/test-results
-          retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}debug
+          restore-keys: |
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}complete
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+            cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      - name: Root CLI Clippy for macOS, all targets
+        run: cargo +1.99.1 clippy --locked --all-targets -- -D warnings
 
+  # Compiler caches use one entry per saving run and restore the newest by
+  # prefix. A save follows a successful build that compiled something, keeping
+  # only the entries this build used. Cache directories stay outside the
+  # workspace, so they never reach packages, the portable zip or artifacts.
   arch-package:
     name: Arch package
     needs: source
     if: needs.source.outputs.run_arch == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The recipe's cold release build and full check() take about 30 minutes
+    # on a fast standard runner and over 45 on a slow one (zerus-wnm5z).
+    timeout-minutes: 75
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
@@ -1001,7 +1434,7 @@ jobs:
       # desktop build, so it has a cache family of its own.
       - name: Arch packaging dependencies and unprivileged builder
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust cmake ninja qt6-base qt6-tools qt6-webengine qt6-multimedia qt6-svg kstatusnotifieritem kwindowsystem kidletime tmux openssh python ccache namcap desktop-file-utils
+          pacman -Syu --noconfirm --needed base-devel git rust nodejs npm webkit2gtk-4.1 gtk3 alsa-lib gstreamer gst-plugins-base-libs libappindicator dbus gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav tmux openssh python ccache namcap desktop-file-utils xorg-server-xvfb
           grep -qx 'BUILDENV=(!distcc color !ccache check !sign)' /etc/makepkg.conf ||
             { echo 'The default makepkg BUILDENV changed; review the ccache drop-in.' >&2; exit 1; }
           echo 'BUILDENV=(!distcc color ccache check !sign)' > /etc/makepkg.conf.d/ccache.conf
@@ -1017,7 +1450,7 @@ jobs:
           path: |
             /home/user/.cargo/registry
             /home/user/.cargo/git
-          key: arch-cargo-v1-${{ steps.epoch.outputs.month }}-${{ hashFiles('Cargo.lock', 'services/mobile/connector/Cargo.lock') }}
+          key: arch-cargo-v1-${{ steps.epoch.outputs.month }}-${{ hashFiles('Cargo.lock', 'services/mobile/connector/Cargo.lock', 'client/src-tauri/Cargo.lock', 'client/media/Cargo.lock', 'client/core/Cargo.lock') }}
           restore-keys: arch-cargo-v1-${{ steps.epoch.outputs.month }}-
       - name: Restore ccache
         id: ccache-restore
@@ -1034,7 +1467,15 @@ jobs:
           echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
       - name: Build and check package
         id: build
-        run: runuser -u user -- bash scripts/build-arch-package.sh
+        env:
+          SOURCE_CHECK_COMMIT: ${{ inputs.arch_check_in_source && github.sha || '' }}
+        shell: bash
+        run: |
+          if [ -n "$SOURCE_CHECK_COMMIT" ]; then
+            runuser -u user -- bash scripts/build-arch-package.sh --checked-source "$SOURCE_CHECK_COMMIT"
+          else
+            runuser -u user -- bash scripts/build-arch-package.sh
+          fi
       - name: ccache statistics
         id: ccache
         if: ${{ !cancelled() }}
@@ -1077,73 +1518,12 @@ jobs:
           path: artifacts
           retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
 
-  mac-desktop:
-    name: macOS desktop
-    needs: source
-    if: needs.source.outputs.run_macos == 'true'
-    runs-on: macos-15
-    timeout-minutes: 45
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: 1
-      CCACHE_MAXSIZE: 100M
-      CMAKE_GENERATOR: Ninja
-      ZERUS_BUILD_JOBS: 3
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.source.outputs.commit }}
-          persist-credentials: false
-      - run: brew install cmake ninja qt qtmultimedia ccache
-      - name: Restore ccache
-        id: ccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: mac-desktop-ccache-v1-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: mac-desktop-ccache-v1-${{ runner.arch }}-
-      - name: Reset ccache statistics
-        id: ccache-start
-        run: |
-          ccache -z
-          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - name: Desktop build
-        id: build
-        run: bash scripts/ci/gui.sh build
-      - name: ccache statistics
-        id: ccache
-        if: ${{ !cancelled() }}
-        env:
-          SAVE: ${{ inputs.save_caches && steps.build.outcome == 'success' }}
-          STARTED: ${{ steps.ccache-start.outputs.started }}
-        run: |
-          ccache -sv
-          misses=$(ccache --print-stats | awk -F'\t' '$1 == "cache_miss" { print $2 + 0 }')
-          if [ "$SAVE" = true ] && [ "${misses:-0}" -gt 0 ]; then
-            ccache --evict-older-than "$(( $(date +%s) - STARTED + 60 ))s"
-            echo save=true >> "$GITHUB_OUTPUT"
-          fi
-      - name: Save ccache
-        if: inputs.save_caches && steps.ccache.outputs.save == 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
-      - name: Offscreen Qt suites
-        run: bash scripts/ci/gui.sh test
-      - name: Retain desktop test logs
-        if: always() && (github.event_name != 'schedule' || failure())
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: mac-desktop-results
-          path: artifacts/test-results
-          retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
-
-  windows-desktop:
-    name: Windows client, desktop and portable zip
+  windows-tests:
+    name: Windows unit and connector contracts
     needs: source
     if: needs.source.outputs.run_windows == 'true'
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -1152,13 +1532,8 @@ jobs:
       # Line tables keep test backtraces readable and bound the cached target size.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 4
       ZERUS_BUILD_JOBS: 4
-      # ccache caches MSVC compiles without /Zi, as in Release. Depend mode reads
-      # the includes from Ninja's /showIncludes instead of preprocessing again.
-      # No base_dir: it would make __FILE__ relative, and suites locate their
-      # fixtures from it; the runner's workspace path never changes anyway.
-      CCACHE_DEPEND: 1
-      CCACHE_MAXSIZE: 500M
     steps:
       # Before checkout: the runner's Git converts text files to CRLF by default,
       # which changes fixtures, scripts and embedded text.
@@ -1170,7 +1545,7 @@ jobs:
           persist-credentials: false
       # One exact interpreter for every Python step; the runner image's default
       # changes with the image.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13.15'
       - run: rustup toolchain install stable --profile minimal && rustup default stable && rustup toolchain install 1.99.1 --profile minimal --component clippy
@@ -1187,48 +1562,165 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock', 'crates/lore-bin/Cargo.lock', 'client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
           restore-keys: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
-      # The runner gives every step a synchronous pipe as stdin. Windows OpenSSH
-      # (and the fake client, which refuses it) must never inherit it, so steps
-      # that start hgs, ssh or the desktop app read from /dev/null.
-      - name: Rust client tests, Rust 1.99 lints and release build
+      - name: Build opted-in Windows membership qualification fixture
+        if: inputs.retain_membership_probe
+        env:
+          QUALIFICATION_SOURCE: ${{ needs.source.outputs.commit }}
+        run: |
+          mkdir -p artifacts/test-results
+          python scripts/ci/outside-job.py --custody-only --timeout 1800 \
+            --log artifacts/test-results/membership-build.log -- python scripts/ci/windows-membership-artifact.py
+      - name: Retain opted-in Windows membership qualification fixture
+        if: inputs.retain_membership_probe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: membership-qualification-windows-release-${{ needs.source.outputs.commit }}
+          path: artifacts/membership-qualification-windows
+          if-no-files-found: error
+          retention-days: 1
+      - name: Compare opted-in hosted Windows membership phases
+        if: inputs.retain_membership_probe
+        env:
+          QUALIFICATION_SOURCE: ${{ needs.source.outputs.commit }}
+        run: |
+          python scripts/ci/outside-job.py --custody-only --timeout 660 \
+            --log artifacts/test-results/membership-hosted.log -- python scripts/ci/windows-membership-hosted.py
+      - name: Retain opted-in hosted membership timing data
+        if: ${{ always() && inputs.retain_membership_probe }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: membership-hosted-timing-windows-${{ needs.source.outputs.commit }}
+          path: artifacts/membership-hosted-timing
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Windows mobile target contracts
+        run: |
+          mkdir -p artifacts/test-results
+          cargo test --locked --test mobile_target_contract </dev/null 2>&1 \
+            | tee artifacts/test-results/windows-mobile-target.log
+      - name: Root unit tests and pinned lints
+        id: root-tests
         run: |
           mkdir -p artifacts/test-results
           cargo test --locked </dev/null 2>&1 | tee artifacts/test-results/rust.log
-          # Pinned like the relay lints, so a new stable release cannot fail an
-          # unchanged commit. Windows-only code is compiled nowhere else, so this
-          # also checks it against Rust 1.99.
           cargo +1.99.1 clippy --locked --all-targets -- -D warnings 2>&1 | tee artifacts/test-results/clippy.log
-          cargo build --release --locked
-          cargo build --locked --example fake_ssh
-          cargo build --locked --example fake_agent
-      - name: Save Rust cache
-        if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Windows connector filesystem contracts
+        run: |
+          cargo +1.99.1 clippy --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --all-targets -- -D warnings
+          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --lib windows_management::tests </dev/null \
+            2>&1 | tee artifacts/test-results/windows-gateway-locks.log
+          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --features test-hooks --lib hooks::tests </dev/null \
+            2>&1 | tee artifacts/test-results/windows-gateway-stderr.log
+          # The fixture captures only its own redacted child startup diagnostics.
+          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --features test-hooks --test windows_gateway </dev/null \
+            2>&1 | tee artifacts/test-results/windows-gateway-config.log
+          cargo +1.99.1 test --locked --offline -j2 --manifest-path services/mobile/connector/Cargo.toml --target-dir target -p zerus-windows-private --lib -- --test-threads=2 </dev/null \
+            2>&1 | tee artifacts/test-results/windows-gateway-launch-builder.log
+      - name: Windows encrypted runtime contracts
+        # Keep an unrelated root failure visible without hiding this independent
+        # qualification, only after the root step passed setup and was admitted.
+        if: ${{ !cancelled() && (steps.root-tests.outcome == 'success' || steps.root-tests.outcome == 'failure') }}
+        run: |
+          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --lib encrypted_runtime </dev/null \
+            2>&1 | tee artifacts/test-results/windows-encrypted-runtime.log
+      - name: Retain Windows unit and connector logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-unit-results-${{ needs.source.outputs.commit }}
+          path: artifacts/test-results
+          retention-days: 7
+
+  windows-desktop:
+    name: Windows client, desktop and portable zip
+    needs: source
+    if: needs.source.outputs.run_windows == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      WINDOWS_INSTALLER_VERSION: ${{ inputs.windows_installer_version }}
+      CARGO_TERM_COLOR: always
+      # Line tables keep test backtraces readable and bound the cached target size.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 4
+      ZERUS_BUILD_JOBS: 4
+    steps:
+      # Before checkout: the runner's Git converts text files to CRLF by default,
+      # which changes fixtures, scripts and embedded text.
+      - name: Check out text files unchanged
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      # One exact interpreter for every Python step; the runner image's default
+      # changes with the image.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13.15'
+      - run: rustup toolchain install stable --profile minimal && rustup default stable && rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Rust cache identity
+        id: rust
+        run: |
+          echo "rustc=$(rustc -Vv | git hash-object --stdin | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Restore Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
-      - name: Windows mobile connector build and native filesystem contracts
+          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock', 'crates/lore-bin/Cargo.lock', 'client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
+          restore-keys: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
+      # The runner gives every step a synchronous pipe as stdin. Windows OpenSSH
+      # (and the fake client, which refuses it) must never inherit it, so steps
+      # that start hgs, ssh or the desktop app read from /dev/null.
+      - name: Release CLI and connector for host and package checks
         run: |
-          cargo +1.99.1 clippy --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --all-targets -- -D warnings
-          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --lib windows_management::tests </dev/null \
-            2>&1 | tee artifacts/test-results/windows-gateway-locks.log
-          cargo +1.99.1 test --locked --manifest-path services/mobile/connector/Cargo.toml --target-dir target --test windows_gateway </dev/null \
-            2>&1 | tee artifacts/test-results/windows-gateway-config.log
-          cargo +1.99.1 test --locked --offline -j2 --manifest-path services/mobile/connector/Cargo.toml --target-dir target -p zerus-windows-private --lib -- --test-threads=2 </dev/null \
-            2>&1 | tee artifacts/test-results/windows-gateway-launch-builder.log
+          mkdir -p artifacts/test-results
+          cargo build --release --locked
+          # Task 182: lore runs as hgs's subprocess; it is built from its own lock.
+          cargo build --release --locked --manifest-path crates/lore-bin/Cargo.toml --target-dir target/lore
+          cargo build --locked --example fake_ssh
+          cargo build --locked --example fake_agent
           cargo +1.99.1 build --locked --release --manifest-path services/mobile/connector/Cargo.toml --target-dir target
       - name: Windows client integration tests
         run: |
           HGS_TEST_BIN=$(cygpath -w "$PWD/target/release/hgs.exe")
           HGS_TEST_FAKE_SSH=$(cygpath -w "$PWD/target/debug/examples/fake_ssh.exe")
           export HGS_TEST_BIN HGS_TEST_FAKE_SSH
+          python -m unittest discover -s tests -p test_outside_job.py -v </dev/null 2>&1 | tee artifacts/test-results/outside-job.log
           python -m unittest discover -s tests -p test_windows_client.py -v </dev/null 2>&1 | tee artifacts/test-results/windows-client.log
           python -m unittest discover -s tests -p test_repositories.py -v </dev/null 2>&1 | tee artifacts/test-results/windows-repositories.log
+      - name: Native Windows bootstrap and framed transport
+        timeout-minutes: 6
+        run: |
+          HGS_TEST_FAKE_AGENT=$(cygpath -w "$PWD/target/debug/examples/fake_agent.exe")
+          export HGS_TEST_FAKE_AGENT
+          cd tests
+          python ../scripts/ci/outside-job.py --custody-only --timeout 300 \
+            --log ../artifacts/test-results/windows-native-transport.log -- \
+            python -m unittest -v test_windows_bootstrap test_remote_windows.WindowsNativeTransport </dev/null
+      - name: Loaded native Windows transport samples
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_flake_rounds != 0 }}
+        timeout-minutes: 25
+        env:
+          ZERUS_WINDOWS_FLAKE_ROUNDS: ${{ inputs.windows_flake_rounds }}
+        run: |
+          HGS_TEST_FAKE_AGENT=$(cygpath -w "$PWD/target/debug/examples/fake_agent.exe")
+          export HGS_TEST_FAKE_AGENT
+          cd tests
+          python ../scripts/ci/outside-job.py --custody-only --timeout 1400 \
+            --log ../artifacts/test-results/windows-transport-samples.log -- \
+            python -m unittest -v windows_flake_samples.TransportSamples </dev/null
       # Microsoft's ConPTY pair (spec D6) from the NuGet package pinned in
       # packaging/windows/conpty.json: the package's SHA-256 is checked before it
       # is opened, then each of the two files'. Nothing from it runs here; the
@@ -1268,95 +1760,71 @@ jobs:
           python scripts/ci/outside-job.py --custody-only --timeout 900 \
             --log artifacts/test-results/windows-mobile-gateway.log -- \
             python -m unittest discover -s tests -p test_windows_mobile_gateway.py -v </dev/null
-      # Only trusted main checks save it; PR, manual and candidate runs restore
-      # it. The key covers the Qt pin and the installer.
-      - name: Restore Qt 6.10.3 for MSVC
-        id: qt-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          path: ${{ runner.temp }}/Qt
-          key: windows-qt-6.10.3-win64_msvc2022_64-${{ hashFiles('packaging/windows/qt.json', 'scripts/install-qt-windows.py', 'scripts/qt_archives.py') }}
-      # The official archives pinned in packaging/windows/qt.json, each checked
-      # against its size and SHA-256 and listed before any is extracted, with the
-      # runner image's 7-Zip. No Python package is installed for it.
-      - name: Install the pinned Qt 6.10.3 for MSVC
-        if: steps.qt-cache.outputs.cache-hit != 'true'
-        run: python scripts/install-qt-windows.py --output "$RUNNER_TEMP/Qt" </dev/null
-      # A restored installation must also be the pinned one.
-      - name: Use Qt 6.10.3
-        run: |
-          python scripts/install-qt-windows.py --check "$RUNNER_TEMP/Qt" </dev/null
-          qt=$(cygpath -w "$RUNNER_TEMP/Qt/6.10.3/msvc2022_64")
-          test -f "$(cygpath -u "$qt")/bin/windeployqt.exe"
-          echo "QT_ROOT_DIR=$qt" >> "$GITHUB_ENV"
-      # The official ccache release, verified like the other downloaded tools
-      # (the digest matches its minisign-signed archive). gui.sh adds the
-      # compiler launcher when ccache is on PATH.
-      - name: Pinned ccache 4.14.1
-        run: |
-          cd "$(cygpath -u "$RUNNER_TEMP")"
-          curl -fsSLO https://github.com/ccache/ccache/releases/download/v4.14.1/ccache-4.14.1-windows-x86_64.zip
-          echo '6219f3865ca59aec41ee4b678df171d5d35855ecb2b6dbbbd20690b3a68af7b4  ccache-4.14.1-windows-x86_64.zip' | sha256sum --check --strict
-          python -m zipfile -e ccache-4.14.1-windows-x86_64.zip .
-          cygpath -w "$PWD/ccache-4.14.1-windows-x86_64" >> "$GITHUB_PATH"
-          echo "CCACHE_DIR=$(cygpath -w "$RUNNER_TEMP/ccache")" >> "$GITHUB_ENV"
-      - name: Restore ccache
-        id: ccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/ccache
-          key: windows-ccache-v1-${{ runner.arch }}-qt6.10.3-${{ github.run_id }}
-          restore-keys: windows-ccache-v1-${{ runner.arch }}-qt6.10.3-
-      - name: Reset ccache statistics
-        id: ccache-start
-        run: |
-          ccache -z
-          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - name: Desktop build
-        id: build
-        run: bash scripts/ci/gui.sh build </dev/null
-      - name: ccache statistics
-        id: ccache
-        if: ${{ !cancelled() }}
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install the locked Zerus Next frontend
+        timeout-minutes: 5
+        working-directory: client
+        run: npm ci </dev/null
+      - name: Build the Tauri Windows switch desktop
+        timeout-minutes: 25
+        working-directory: client
         env:
-          SAVE: ${{ inputs.save_caches && steps.build.outcome == 'success' }}
-          STARTED: ${{ steps.ccache-start.outputs.started }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/windows-next
+          CARGO_BUILD_JOBS: 4
         run: |
-          ccache -sv
-          misses=$(ccache --print-stats | awk -F'\t' '$1 == "cache_miss" { print $2 + 0 }')
-          if [ "$SAVE" = true ] && [ "${misses:-0}" -gt 0 ]; then
-            ccache --evict-older-than "$(( $(date +%s) - STARTED + 60 ))s"
-            echo save=true >> "$GITHUB_OUTPUT"
-          fi
-      - name: Save ccache
-        if: inputs.save_caches && steps.ccache.outputs.save == 'true'
+          npm run tauri -- build --ci --no-bundle --config src-tauri/tauri.windows.switch.conf.json --features video </dev/null \
+            2>&1 | tee ../artifacts/test-results/windows-next-build.log
+          test -f ../target/windows-next/release/hgs-tray.exe
+      - name: Save Rust cache
+        if: inputs.save_caches && steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/ccache
-          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
-      # Saved only after the desktop build has used it, so an incomplete
-      # installation never becomes the exact-key entry every later run restores.
-      - name: Save Qt 6.10.3
-        if: inputs.save_caches && steps.qt-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/Qt
-          key: ${{ steps.qt-cache.outputs.cache-primary-key }}
-      - name: Offscreen Qt suites
-        run: bash scripts/ci/gui.sh test </dev/null
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Frontend runtime license notices
+        run: python client/scripts/collect-notices.py artifacts/windows-frontend-licenses </dev/null
+      # The app installer checks but never silently installs a shared runtime.
+      # Only this disposable CI runner may use the verified bootstrapper.
+      - name: WebView2 Evergreen prerequisite for Windows package tests
+        timeout-minutes: 6
+        run: python scripts/ci/ensure-webview2.py </dev/null
       - name: Portable zip from the tested executables
         run: |
-          python scripts/package-windows.py --cli target/release/hgs.exe --gui .ci-build/gui/hgs-tray.exe \
-            --connector target/release/zerus-mobile-connector.exe --conpty "$RUNNER_TEMP/conpty" --output artifacts/zerus-windows-x86_64.zip </dev/null 2>&1 | tee artifacts/test-results/package.log
+          python scripts/package-windows.py --cli target/release/hgs.exe --lore target/lore/release/lore.exe \
+            --gui target/windows-next/release/hgs-tray.exe \
+            --connector target/release/zerus-mobile-connector.exe --frontend-licenses artifacts/windows-frontend-licenses \
+            --conpty "$RUNNER_TEMP/conpty" --output artifacts/zerus-windows-x86_64.zip </dev/null 2>&1 | tee artifacts/test-results/package.log
           python scripts/check-windows-portable.py artifacts/zerus-windows-x86_64.zip --run --selftest \
             </dev/null 2>&1 | tee artifacts/test-results/portable.log
       # The per-user installer (packaging/windows/zerus.iss) from that zip, with
       # the runner image's Inno Setup 6: its payload is the zip's files byte for
-      # byte. Release assembly takes only the zip at the top of this artifact.
+      # byte. Assembly carries both unchanged and checks their CI build metadata.
       - name: Per-user installer from the portable zip
         run: |
           python scripts/package-windows-installer.py artifacts/zerus-windows-x86_64.zip \
+            --version "${WINDOWS_INSTALLER_VERSION:-$(cat VERSION)}" \
+            --info artifacts/installer/windows-installer-info.json \
             --output artifacts/installer/zerus-windows-x86_64-setup.exe </dev/null 2>&1 | tee artifacts/test-results/installer-package.log
+      # Retain release inputs BEFORE the survival test: even a runner-level
+      # timeout must not lose the zip/installer. Job success still gates release
+      # assembly; the test result is never converted to continue-on-error.
+      # Installer diagnostics are retained separately afterwards.
+      - name: Retain Windows portable zip and test logs
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x86_64-${{ needs.source.outputs.commit }}
+          path: artifacts
+          retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
+          compression-level: 0
+
       # Install, upgrade over it and uninstall while a session host of the
       # installed build runs from its staged image, outside the step's job as the
       # host suites run.
@@ -1366,20 +1834,21 @@ jobs:
           HGS_TEST_BIN=$(cygpath -w "$PWD/target/release/hgs.exe")
           HGS_TEST_INSTALLER=$(cygpath -w "$PWD/artifacts/installer/zerus-windows-x86_64-setup.exe")
           HGS_TEST_PORTABLE_ZIP=$(cygpath -w "$PWD/artifacts/zerus-windows-x86_64.zip")
-          export HGS_TEST_BIN HGS_TEST_INSTALLER HGS_TEST_PORTABLE_ZIP
+          HGS_TEST_INSTALLER_VERSION="${WINDOWS_INSTALLER_VERSION:-$(cat VERSION)}"
+          HGS_TEST_INSTALLER_LOG_DIR=$(cygpath -w "$PWD/artifacts/test-results/installer-setup")
+          export HGS_TEST_BIN HGS_TEST_INSTALLER HGS_TEST_PORTABLE_ZIP HGS_TEST_INSTALLER_VERSION HGS_TEST_INSTALLER_LOG_DIR
           cd tests
           python ../scripts/ci/outside-job.py --timeout 600 --end "$HGS_TEST_BIN" --end '*\hgs-host-*\hgs.exe' \
             --log ../artifacts/test-results/installer.log -- \
-            python -m unittest -v test_windows_installer_survival </dev/null
-      # Stable and nightly assembly download this artifact from the same run.
-      - name: Retain Windows portable zip and test logs
+            python -u -m unittest -v test_windows_installer_survival </dev/null
+      - name: Retain installer survival diagnostics
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: windows-x86_64-${{ needs.source.outputs.commit }}
-          path: artifacts
+          name: windows-installer-logs-${{ needs.source.outputs.commit }}
+          path: artifacts/test-results/installer*
           retention-days: ${{ github.event_name == 'schedule' && 3 || 7 }}
-          compression-level: 0
 
   # The latest win32-x64 Claude Code and Codex packages selected by
   # scripts/ci/agent-compatibility.py through isolated session hosts of the
@@ -1404,7 +1873,7 @@ jobs:
         with:
           ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13.15'
       - run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -1423,7 +1892,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock') }}
+          key: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-${{ hashFiles('Cargo.lock', 'crates/lore-bin/Cargo.lock', 'client/core/Cargo.lock', 'client/media/Cargo.lock', 'client/src-tauri/Cargo.lock') }}
           restore-keys: windows-cli-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ steps.rust.outputs.epoch }}-
       - run: cargo build --release --locked
       - name: Pinned ConPTY pair
@@ -1459,7 +1928,7 @@ jobs:
   gate:
     name: Suite results
     if: always() && (github.event.repository.private == false || github.event_name == 'workflow_dispatch')
-    needs: [source, quick, relay, connector, connector-macos, ios, android, cli, cli-macos-debug, cli-macos-core, cli-macos-native, cli-macos, arch, arch-package, mac-desktop, windows-desktop, windows-host]
+    needs: [source, quick, client-core, client-frontend, relay, connector, connector-macos, ios, android, client-native-linux, client-native-macos-core, client-native-macos-tauri, client-native-windows, cli, cli-macos-debug, cli-macos-core, cli-macos-native, cli-macos, clippy-macos, arch-package, windows-tests, windows-desktop, windows-host]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -1477,19 +1946,25 @@ jobs:
           selected = {
               'source': True,
               'quick': True,
+              'client-core': True,
+              'client-frontend': True,
               'relay': True,
               'connector': True,
               'android': True,
+              'client-native-linux': json.loads(os.environ['RUN_LINUX']),
+              'client-native-macos-core': json.loads(os.environ['RUN_MACOS']),
+              'client-native-macos-tauri': json.loads(os.environ['RUN_MACOS']),
+              'client-native-windows': json.loads(os.environ['RUN_WINDOWS']),
               'cli': json.loads(os.environ['RUN_LINUX']),
               'cli-macos-debug': json.loads(os.environ['RUN_MACOS']),
               'cli-macos-core': json.loads(os.environ['RUN_MACOS']),
               'cli-macos-native': json.loads(os.environ['RUN_MACOS']),
               'cli-macos': json.loads(os.environ['RUN_MACOS']),
-              'arch': json.loads(os.environ['RUN_ARCH']),
+              'clippy-macos': json.loads(os.environ['RUN_MACOS']),
               'arch-package': json.loads(os.environ['RUN_ARCH']),
-              'mac-desktop': json.loads(os.environ['RUN_MACOS']),
               'connector-macos': json.loads(os.environ['RUN_MACOS']),
               'ios': json.loads(os.environ['RUN_IOS']),
+              'windows-tests': json.loads(os.environ['RUN_WINDOWS']),
               'windows-desktop': json.loads(os.environ['RUN_WINDOWS']),
               'windows-host': json.loads(os.environ['RUN_WINDOWS']),
           }
@@ -1500,3 +1975,4 @@ jobs:
                   raise SystemExit(f"{name}: {actual}, expected {expected}")
           print('All selected CI suites passed; unselected suites were skipped.')
           PY
+

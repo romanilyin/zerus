@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Optional Codex questions: real private PTY, no model/network or user sessions."""
+import contextlib
 import json
 import os
+import select
 import signal
 import subprocess
+import sys
+import time
 import unittest
 import uuid
+import receipt_locator
 import test_input as fixtures
 
 FAKE = fixtures.SIGNAL_SAFE_READ + r'''
@@ -118,17 +123,69 @@ class CodexAsync(unittest.TestCase):
         self.append(dict(type='response_item',timestamp='2026-10-07T15:00:00Z',payload=dict(type='function_call',name='request_user_input_async',call_id='call_one',arguments=json.dumps(dict(questions=[dict(title='Which option?',**({'options':self.options} if self.options else {}))])))))
         self.append(dict(type='response_item',payload=dict(type='function_call_output',call_id='call_one',output='{"accepted":true}')))
         return self.inspect()['pending_questions'][0]
-    def inspect(self):
+    def inspect_once(self):
         result=subprocess.run([str(fixtures.HGS),'inspect',self.name],env=self.env,text=True,capture_output=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stderr);return json.loads(result.stdout)
-    def optional(self):
-        result=subprocess.run([str(fixtures.HGS),'ls','--json','--local'],env=self.env,text=True,capture_output=True,timeout=15)
-        self.assertEqual(result.returncode,0,result.stderr)
-        return next(row for row in json.loads(result.stdout)['sessions'] if row['name']==self.name)['optional_questions']
+    def inspect(self):
+        # The receipt locator indexes each fixture's fresh question receipts in
+        # the background (zerus-a4mub.11); until then the questions are
+        # explicitly unknown, never a list to act on (zerus-a4mub.8).
+        until=time.monotonic()+20
+        while True:
+            result=self.inspect_once()
+            if not (result.get('pending_questions_complete') is False
+                    and 'still being indexed' in result.get('pending_questions_error','')):
+                return result
+            self.assertLess(time.monotonic(),until,'questions stayed unknown')
+            time.sleep(0.2)
+    def optional(self,settled=True):
+        until=time.monotonic()+20
+        while True:
+            result=subprocess.run([str(fixtures.HGS),'ls','--json','--local'],env=self.env,text=True,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr)
+            value=next(row for row in json.loads(result.stdout)['sessions'] if row['name']==self.name)['optional_questions']
+            if value is not None or not settled or time.monotonic()>=until:
+                return value
+            time.sleep(0.2)
     def answer(self,card,answer=None,request_id=None):
         payload=dict(request_id=request_id or str(uuid.uuid4()),expected_run_id=self.run_id,expected_conversation_id=self.conversation_id,question_id=card['question_id'],expected_question_hash=card['question_hash'],answers=[answer or dict(question_id='q_0',text='Accepted answer')])
         result=subprocess.run([str(fixtures.HGS),'answer',self.name,'--json'],input=json.dumps(payload),env=self.env,text=True,capture_output=True,timeout=15)
         return result,payload
+    @unittest.skipUnless(sys.platform.startswith(('linux','darwin')), 'native advisory flock control')
+    def test_answer_priority_survives_its_later_native_acknowledgment_wait(self):
+        import fcntl
+        card=self.request();(self.root/'queue-answer').touch()
+        payload=dict(request_id=str(uuid.uuid4()),expected_run_id=self.run_id,
+            expected_conversation_id=self.conversation_id,question_id=card['question_id'],
+            expected_question_hash=card['question_hash'],answers=[dict(question_id='q_0',text='Accepted answer')])
+        child=subprocess.Popen([str(fixtures.HGS),'answer',self.name,'--json'],env=self.env,
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            child.stdin.write(json.dumps(payload));child.stdin.close();child.stdin=None
+            self.wait_for(lambda:(self.root/'queued').exists())
+            self.assertIsNone(child.poll(),'native acknowledgment should still be pending')
+            with (self.state/'receipt-index-priority.lock').open('a+b') as probe:
+                with self.assertRaises(BlockingIOError):fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            queued=(self.root/'queued').read_text()
+            self.append(dict(type='event_msg',payload=dict(type='user_message',message=queued)))
+            out,err=child.communicate(timeout=10)
+            self.assertEqual(child.returncode,0,err)
+            self.assertEqual(json.loads(out)['status'],'answered')
+        finally:
+            if child.poll() is None:child.terminate();child.wait(timeout=5)
+
+    def test_an_exact_answer_receipt_remains_readable_when_priority_is_unavailable(self):
+        card=self.request()
+        result,payload=self.answer(card)
+        self.assertEqual(result.returncode,0,result.stderr)
+        before=self.received()
+        path=self.state/'receipt-index-priority.lock'
+        path.unlink(missing_ok=True);path.mkdir()
+        replay,_=self.answer(card,request_id=payload['request_id'])
+        self.assertEqual(replay.returncode,0,replay.stderr)
+        self.assertEqual(replay.stdout,result.stdout)
+        self.assertEqual(self.received(),before)
+
     def test_questions_before_recent_tail_are_recovered_and_legacy_cache_migrates(self):
         # No prior inspection: the pending question is already outside 8 MiB.
         self.append(dict(type='response_item',timestamp='2026-10-07T15:00:00Z',payload=dict(type='function_call',name='request_user_input_async',call_id='call_one',arguments=json.dumps(dict(questions=[dict(title='Which option?',options=self.options)])))))
@@ -142,7 +199,7 @@ class CodexAsync(unittest.TestCase):
         # An already-installed tail-only cache must be repaired automatically.
         cache.pop('scan_version');cache['items']={};cache_path.write_text(json.dumps(cache))
         result=self.inspect();self.assertEqual(result['pending_questions'][0]['question_id'],card['question_id'])
-        self.assertEqual(json.loads(cache_path.read_text())['scan_version'],2)
+        self.assertEqual(json.loads(cache_path.read_text())['scan_version'],3)
         # A durable local Skip survives reindexing, even for an old question.
         response,_=self.answer(card,dict(question_id='q_0',skip=True));self.assertEqual(response.returncode,0,response.stderr)
         cache=json.loads(cache_path.read_text());cache.pop('scan_version');cache_path.write_text(json.dumps(cache))
@@ -155,7 +212,225 @@ class CodexAsync(unittest.TestCase):
         result=self.inspect()
         self.assertIn('pending_questions_error',result)
         self.assertTrue(any(m.get('detail')=='Public activity remains visible' for m in result['provider_messages']))
-        self.assertIsNone(self.optional())  # Unknown, never a count of 0.
+        self.assertIsNone(self.optional(settled=False))  # Unknown, never a count of 0.
+
+    def test_inspection_never_waits_for_question_indexing_and_shows_unknown(self):
+        # zerus-a4mub.8: while another process holds the question index (as a
+        # long cold scan or receipt recovery does), recent activity still
+        # returns at once and the questions are unknown, never absent.
+        import fcntl,time
+        card=self.request()
+        self.append(dict(type='response_item',timestamp='2026-10-07T15:02:00Z',payload=dict(type='message',role='assistant',channel='commentary',content=[dict(type='output_text',text='Recent activity while indexing')])))
+        lock_path=next((self.state/'codex_questions').glob('*.json')).with_suffix('.lock')
+        with open(lock_path,'a') as held:
+            fcntl.flock(held,fcntl.LOCK_EX)
+            try:
+                started=time.monotonic();result=self.inspect_once();elapsed=time.monotonic()-started
+                optional=self.optional(settled=False)
+            finally:fcntl.flock(held,fcntl.LOCK_UN)
+        self.assertLess(elapsed,10,'inspection waited for the question index')
+        self.assertTrue(any(m.get('detail')=='Recent activity while indexing' for m in result['provider_messages']))
+        self.assertEqual(result['pending_questions'],[])
+        self.assertIs(result['pending_questions_complete'],False)
+        self.assertIn('still being indexed',result['pending_questions_error'])
+        self.assertIsNone(optional)  # Unknown, never a count of 0.
+        # Released: the same exact question is listed and answerable again.
+        current=self.inspect()
+        self.assertIs(current['pending_questions_complete'],True)
+        self.assertNotIn('pending_questions_error',current)
+        self.assertEqual([c['question_id'] for c in current['pending_questions']],[card['question_id']])
+        self.assertTrue(current['pending_questions'][0]['can_answer'])
+        # Without a live agent no question is pending, but the question rows
+        # of its history are still unknown while the index is held.
+        os.kill(self.record['pid'],signal.SIGKILL)
+        self.wait_for(lambda:self.inspect().get('pending_questions')==[])
+        with open(lock_path,'a') as held:
+            fcntl.flock(held,fcntl.LOCK_EX)
+            try:stopped=self.inspect_once()
+            finally:fcntl.flock(held,fcntl.LOCK_UN)
+        self.assertIs(stopped['pending_questions_complete'],False)
+        self.assertIn('still being indexed',stopped['pending_questions_error'])
+        self.assertTrue(any(m.get('detail')=='Recent activity while indexing' for m in stopped['provider_messages']))
+
+    def receipt_worker(self):
+        worker=subprocess.run([str(fixtures.HGS),'__state','receipt-index-worker'],env=self.env,text=True,capture_output=True,timeout=15)
+        self.assertEqual(worker.returncode,0,worker.stderr)
+        import sqlite3
+        return sqlite3.connect('file:'+str(self.state/'delivery-receipts-v1.sqlite3')+'?mode=ro',uri=True)
+    @contextlib.contextmanager
+    def receipt_writer(self):
+        # Only this fixture's state: hold a real WAL writer until the parent
+        # releases it, rather than racing a sleep against the inspection.
+        receipt_locator.settle(fixtures.HGS,self.env)
+        script = '''import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+db.execute('BEGIN IMMEDIATE')
+db.execute("UPDATE receipt_meta SET value=value WHERE key='epoch'")
+print('held',flush=True)
+sys.stdin.buffer.read(1)
+db.rollback()
+db.close()
+'''
+        writer=subprocess.Popen([sys.executable,'-u','-c',script,str(self.state/'delivery-receipts-v1.sqlite3')],
+                                env=self.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            self.assertTrue(select.select([writer.stdout],[],[],15)[0],'private writer did not acquire its lock')
+            self.assertEqual(writer.stdout.readline(),'held\n')
+            yield
+        finally:
+            writer.stdin.close()
+            try:writer.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                writer.kill();writer.wait();raise
+            error=writer.stderr.read();writer.stdout.close();writer.stderr.close()
+            self.assertEqual(writer.returncode,0,error)
+    def test_receipt_writer_keeps_the_complete_question_answerable(self):
+        self.configure(panel=True)
+        card=self.request()
+        self.assertTrue(card['can_answer'],card.get('answer_unavailable_reason'))
+        with self.receipt_writer():
+            result=self.inspect_once()
+            self.assertIs(result['pending_questions_complete'],True,result)
+            self.assertNotIn('pending_questions_error',result)
+            self.assertEqual([c['question_id'] for c in result['pending_questions']],[card['question_id']])
+            current=result['pending_questions'][0]
+            self.assertTrue(current['can_answer'],current.get('answer_unavailable_reason'))
+            self.assertEqual(self.received(),b'')
+        response,_=self.answer(card)
+        self.assertEqual(response.returncode,0,response.stderr)
+    def test_receipt_writer_does_not_relax_duplicate_question_checks(self):
+        self.configure(panel=True)
+        self.request()
+        self.append(dict(type='response_item',payload=dict(type='function_call',name='request_user_input_async',call_id='call_two',arguments=json.dumps(dict(questions=[dict(title='Which option?',options=self.options)])))))
+        self.append(dict(type='response_item',payload=dict(type='function_call_output',call_id='call_two',output='{"accepted":true}')))
+        self.assertEqual(len(self.inspect()['pending_questions']),2)
+        with self.receipt_writer():
+            result=self.inspect_once()
+            self.assertIs(result['pending_questions_complete'],True,result)
+            self.assertEqual(len(result['pending_questions']),2)
+            for card in result['pending_questions']:
+                self.assertFalse(card['can_answer'])
+                self.assertIn('same text',card['answer_unavailable_reason'])
+            self.assertEqual(self.received(),b'')
+    def test_answer_waits_for_receipt_contention_and_expiry_sends_no_input(self):
+        self.configure(panel=True)
+        card=self.request()
+        with self.receipt_writer():
+            started=time.monotonic()
+            response,payload=self.answer(card)
+            elapsed=time.monotonic()-started
+            self.assertNotEqual(response.returncode,0)
+            self.assertIn('SQLite DatabaseBusy',response.stderr)
+            # The writer stays held until this refusal, so no timed release
+            # races the admission. Scheduling delays can only increase this.
+            self.assertGreaterEqual(elapsed,0.7,'admission used the background 20ms busy wait')
+            self.assertEqual(self.received(),b'')
+        response,_=self.answer(card,request_id=payload['request_id'])
+        self.assertEqual(response.returncode,0,response.stderr)
+    def warm_with_old_marker(self):
+        # A completed, warm question cache, plus an older build's completion
+        # marker for this run: neither may stand in for current receipts.
+        card=self.request()
+        self.assertIs(self.inspect()['pending_questions_complete'],True)
+        cache_path=next((self.state/'codex_questions').glob('*.json'))
+        cache=json.loads(cache_path.read_text());cache['submission_scan_run']=self.run_id
+        cache_path.write_text(json.dumps(cache))
+        return card,cache_path
+    def test_a_completed_cache_never_answers_over_a_newly_indexed_submission(self):
+        # zerus-a4mub.8 review P1: an exact submitted receipt indexed after the
+        # cache completed makes a different request refuse, with no input.
+        card,cache_path=self.warm_with_old_marker()
+        original=str(uuid.uuid4())
+        receipt=dict(status='submitted',request_id=original,name=self.name,run_id=self.run_id,conversation_id=self.conversation_id,
+            question_id=card['question_id'],question_hash=card['question_hash'],digest='f'*64,submitted_at=time.time(),
+            answers=[dict(question_id='q_0',text='Already submitted')])
+        folder=self.state/'question_receipts';folder.mkdir(exist_ok=True)
+        (folder/(original+'.json')).write_text(json.dumps(receipt))
+        with self.receipt_worker() as db:
+            indexed=db.execute("SELECT COUNT(*) FROM receipt_rows WHERE source='question' AND request=?",[original]).fetchone()[0]
+        self.assertEqual(indexed,1,'the earlier receipt was not indexed')
+        attempt,_=self.answer(card,answer=dict(question_id='q_0',text='Accepted answer'))
+        self.assertNotEqual(attempt.returncode,0,attempt.stdout)
+        self.assertIn('already submitted',attempt.stderr.lower())
+        self.assertEqual(self.received(),b'')
+        self.assertFalse((self.root/'submitted').exists(),'an answer reached the native terminal')
+        # Inspection shows the same submission, never an answerable question.
+        current=self.inspect()['pending_questions'][0]
+        self.assertFalse(current['can_answer']);self.assertEqual(current['answer_delivery']['request_id'],original)
+    def test_a_completed_cache_reports_a_newly_recorded_receipt_gap(self):
+        # zerus-a4mub.8 review P1: a gap the locator records after the cache
+        # completed makes inspection incomplete, never complete and answerable.
+        card,_=self.warm_with_old_marker()
+        folder=self.state/'question_receipts';folder.mkdir(exist_ok=True)
+        (folder/'corrupt.json').write_text('{')
+        with self.receipt_worker() as db:
+            errors=db.execute("SELECT errors FROM receipt_sources WHERE source='question'").fetchone()[0]
+        self.assertGreater(errors,0,'the control did not establish a known locator gap')
+        value=self.inspect_once()
+        self.assertIs(value.get('pending_questions_complete'),False,'a completed cache hid the new receipt gap')
+        self.assertEqual(value['pending_questions'],[])
+        self.assertIn('cannot all be checked',value.get('pending_questions_error',''))
+        attempt,_=self.answer(card,answer=dict(question_id='q_0',text='Accepted answer'))
+        self.assertNotEqual(attempt.returncode,0,attempt.stdout)
+        self.assertEqual(self.received(),b'')
+
+    def test_a_missing_original_is_a_known_gap_after_reconciliation_not_permanent_indexing(self):
+        card,_=self.warm_with_old_marker()
+        request=str(uuid.uuid4())
+        receipt=dict(status='submitted',request_id=request,name=self.name,run_id=self.run_id,conversation_id=self.conversation_id,
+            question_id=card['question_id'],question_hash=card['question_hash'],digest='f'*64,submitted_at=time.time(),
+            answers=[dict(question_id='q_0',text='Already submitted')])
+        folder=self.state/'question_receipts';folder.mkdir(exist_ok=True)
+        path=folder/(request+'.json');original=json.dumps(receipt);path.write_text(original)
+        with self.receipt_worker() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM receipt_rows WHERE source='question'").fetchone()[0],1)
+        path.unlink()
+        with self.receipt_worker() as db:
+            self.assertEqual(db.execute("SELECT indexed,complete,errors FROM receipt_sources WHERE source='question'").fetchone(),(1,1,1))
+            self.assertEqual(db.execute("SELECT reason FROM receipt_errors WHERE source='question'").fetchone(),('missing',))
+        current=self.inspect_once()
+        self.assertIs(current['pending_questions_complete'],False)
+        self.assertEqual(current['pending_questions'],[])
+        self.assertIn('cannot all be checked',current['pending_questions_error'])
+        self.assertNotIn('still being indexed',current['pending_questions_error'])
+        attempt,_=self.answer(card,answer=dict(question_id='q_0',text='Accepted answer'))
+        self.assertNotEqual(attempt.returncode,0,attempt.stdout)
+        self.assertEqual(self.received(),b'')
+        path.write_text(original)
+        with self.receipt_worker() as db:
+            self.assertEqual(db.execute("SELECT indexed,complete,errors FROM receipt_sources WHERE source='question'").fetchone(),(1,1,0))
+        restored=self.inspect()['pending_questions'][0]
+        self.assertFalse(restored['can_answer'])
+        self.assertEqual(restored['answer_delivery']['request_id'],request)
+        self.assertEqual(self.received(),b'')
+
+    def test_cached_name_repair_never_hides_submitted_answer_evidence(self):
+        card,_=self.warm_with_old_marker()
+        request=str(uuid.uuid4())
+        folder=self.state/'question_receipts';folder.mkdir(exist_ok=True)
+        path=folder/(request+'.json')
+        receipt=dict(status='submitted',request_id=request,name=self.name,run_id=self.run_id,
+            conversation_id=self.conversation_id,question_id=card['question_id'],
+            question_hash=card['question_hash'],digest='f'*64,submitted_at=time.time(),
+            answers=[dict(question_id='q_0',text='Already submitted')])
+        path.write_text(json.dumps(receipt));original=path.read_bytes(),path.stat().st_mtime_ns
+        with self.receipt_worker() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM receipt_rows WHERE source='question'").fetchone()[0],1)
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(self.state/'delivery-receipts-v1.sqlite3')) as db,db:
+            db.execute("UPDATE receipt_rows SET name='codex/foreign/cache-only' WHERE source='question' AND request=?",[request])
+        with self.receipt_worker() as db:
+            cached_name=db.execute("SELECT name FROM receipt_rows WHERE source='question'").fetchone()[0]
+        current=self.inspect()['pending_questions'][0]
+        self.assertFalse(current['can_answer'],'a cache-only name change hid the original submission')
+        self.assertEqual(cached_name,self.name)
+        self.assertEqual(current['answer_delivery']['request_id'],request)
+        attempt,payload=self.answer(card,answer=dict(question_id='q_0',text='Accepted answer'))
+        self.assertNotEqual(payload['request_id'],request)
+        self.assertNotEqual(attempt.returncode,0,attempt.stdout)
+        self.assertEqual(self.received(),b'')
+        self.assertEqual((path.read_bytes(),path.stat().st_mtime_ns),original)
 
     def test_answer_from_normal_prompt_has_native_identity_and_removes_only_that_question(self):
         card=self.request();self.assertTrue(card['optional']);self.assertTrue(card['can_answer']);self.assertTrue(card['can_skip'])
@@ -206,6 +481,18 @@ class CodexAsync(unittest.TestCase):
         before=self.received();current=self.inspect()['pending_questions'][0]
         self.assertFalse(current['can_answer']);self.assertIn('draft in Terminal',current['answer_unavailable_reason'])
         result,_=self.answer(card);self.assertNotEqual(result.returncode,0);self.assertEqual(self.received(),before)
+    def test_pending_settings_refuse_an_answer_before_any_key(self):
+        # zerus-cqkoh: pending model or effort settings would be typed before
+        # the answer. The CLI refuses first, so its rejected receipt is exact.
+        card=self.request();before=self.received()
+        self.record['pending_settings']=dict(request_id=str(uuid.uuid4()),run_id=self.run_id,conversation_id=self.conversation_id,
+            model='gpt-5.5',effort='high',receipt_name=self.name,receipt_run_id=self.run_id)
+        self.write_record()
+        result,payload=self.answer(card);self.assertNotEqual(result.returncode,0)
+        self.assertIn('settings would be typed first',result.stderr)
+        self.assertEqual(self.received(),before)
+        receipt=json.loads((self.state/'question_receipts'/(payload['request_id']+'.json')).read_text())
+        self.assertEqual(receipt['status'],'rejected',receipt)
     def test_different_native_ack_is_uncertain_and_never_retried(self):
         card=self.request();(self.root/'wrong-ack').touch()
         result,payload=self.answer(card);self.assertNotEqual(result.returncode,0);self.assertIn('delivery uncertain',result.stderr)
@@ -221,6 +508,9 @@ class CodexAsync(unittest.TestCase):
                 for directory in ['question_receipts','input_receipts']:
                     if (self.state/directory).exists():
                         for path in (self.state/directory).glob('*.json'):path.unlink()
+                # A locator that still lists deleted originals can never verify
+                # its coverage again; production never deletes them.
+                receipt_locator.reset(self.state)
                 self.configure(panel=panel);card=self.request();(self.root/'queue-answer').touch()
                 result,payload=self.answer(card);self.assertEqual(result.returncode,0,result.stderr)
                 receipt=json.loads(result.stdout);self.assertEqual(receipt['status'],'submitted');self.assertNotIn('answered_at',receipt)

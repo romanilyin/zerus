@@ -16,7 +16,7 @@ const DROP: &str = "70-zerus-workspace-connector.conf";
 const MARKER: &str =
     "# Written by Zerus workspace migration; only this marked drop-in may be replaced.\n";
 const LIMIT: usize = 65_536;
-const PROPERTIES: &str = "LoadState,ActiveState,SubState,MainPID,InvocationID,KillMode,Restart,RestartForceExitStatus,ExecStart,FragmentPath,DropInPaths,ExecStop,ExecStopPost,ExecStartPre,ExecStartPost,OnSuccess,OnFailure,BoundBy,ConsistsOf,PropagatesStopTo,UpheldBy,TriggeredBy,Job,Type,RemainAfterExit,ExitType,FailureAction,SuccessAction,WatchdogUSec,RuntimeMaxUSec,Result,ExecMainStatus,ExecCondition,Conflicts,Requires,Wants,BindsTo,Upholds,Slice,StopWhenUnneeded,MemoryMax,MemoryHigh,CPUQuotaPerSecUSec,TasksMax,RootDirectory,RootImage,RootMStack,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,MountImages,ExtensionImages,ExtensionDirectories,InaccessiblePaths,Environment,EnvironmentFiles,PassEnvironment";
+const PROPERTIES: &str = "LoadState,ActiveState,SubState,MainPID,InvocationID,ControlGroup,KillMode,Restart,RestartForceExitStatus,ExecStart,FragmentPath,DropInPaths,ExecStop,ExecStopPost,ExecStartPre,ExecStartPost,OnSuccess,OnFailure,BoundBy,ConsistsOf,PropagatesStopTo,UpheldBy,TriggeredBy,Job,Type,RemainAfterExit,ExitType,FailureAction,SuccessAction,WatchdogUSec,RuntimeMaxUSec,Result,ExecMainStatus,ExecCondition,Conflicts,Requires,Wants,BindsTo,Upholds,Slice,StopWhenUnneeded,MemoryMax,MemoryHigh,CPUQuotaPerSecUSec,TasksMax,RootDirectory,RootImage,RootMStack,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,MountImages,ExtensionImages,ExtensionDirectories,InaccessiblePaths,Environment,EnvironmentFiles,PassEnvironment";
 type Unit = BTreeMap<String, String>;
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +54,7 @@ struct Details {
     #[serde(default)]
     managed: Option<Managed>,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Managed {
     process: Process,
@@ -112,12 +112,22 @@ pub struct TestPaths {
     pub manager: PathBuf,
     pub binary: PathBuf,
     pub dropin: PathBuf,
+    pub cgroup: PathBuf,
+    pub acknowledgement_waiting: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 #[cfg(feature = "test-hooks")]
 tokio::task_local! { static TEST_PATHS: TestPaths; }
 #[cfg(feature = "test-hooks")]
 pub async fn test_scope<T>(paths: TestPaths, future: impl std::future::Future<Output = T>) -> T {
     TEST_PATHS.scope(paths, future).await
+}
+#[cfg(feature = "test-hooks")]
+pub(super) fn acknowledgement_waiting() {
+    let _ = TEST_PATHS.try_with(|paths| {
+        if let Some(waiting) = &paths.acknowledgement_waiting {
+            waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
 }
 fn manager_program() -> PathBuf {
     #[cfg(feature = "test-hooks")]
@@ -399,6 +409,9 @@ fn bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 fn process(unit: &Unit, binding: &Binding) -> Result<Process> {
+    process_bound(unit, binding, None)
+}
+fn process_bound(unit: &Unit, binding: &Binding, observed: Option<&Process>) -> Result<Process> {
     let pid = get(unit, "MainPID")?
         .parse::<i32>()
         .map_err(|_| refused())?;
@@ -433,13 +446,47 @@ fn process(unit: &Unit, binding: &Binding) -> Result<Process> {
         .filter(|b| !b.is_empty())
         .map(|b| String::from_utf8(b.to_vec()).map_err(|_| refused()))
         .collect::<Result<Vec<_>>>()?;
+    let args = match args.as_slice() {
+        [exe, admit, revision, flag, config]
+            if admit == "--admit-revision" && revision == &binding.revision =>
+        {
+            vec![exe.clone(), flag.clone(), config.clone()]
+        }
+        _ => args,
+    };
     if args.len() != 3 || args[1] != "--config" || Path::new(&args[2]) != binding.config {
         return Err(refused());
     }
-    let running = image(&base.join("exe"))?;
+    let running = if let Some(observed) = observed {
+        // Stop may target the retained old image after an installed binary was
+        // atomically replaced. Verify the kernel-held bytes/inode against the
+        // observed generation, never adopt the new pathname's executable.
+        let file = File::open(base.join("exe")).map_err(|_| refused())?;
+        let metadata = file.metadata().map_err(|_| refused())?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| refused())?;
+        if !bytes.starts_with(b"\x7fELF")
+            || bytes.len() > 64 * 1024 * 1024
+            || metadata.dev() != observed.image.dev
+            || metadata.ino() != observed.image.ino
+            || zerus_relay::json::digest(bytes) != observed.image.sha256
+        {
+            return Err(refused());
+        }
+        observed.image.clone()
+    } else {
+        image(&base.join("exe"))?
+    };
     let declared = arguments(unit)?;
-    let declared_image = image(Path::new(&declared[0]))?;
-    if declared_image != running || Path::new(&declared[2]) != binding.config {
+    if Path::new(&declared[2]) != binding.config
+        || if observed.is_some() {
+            Path::new(&declared[0]) != running.path
+        } else {
+            image(Path::new(&declared[0]))? != running
+        }
+    {
         return Err(refused());
     }
     let cfg = binding.config.symlink_metadata().map_err(|_| refused())?;
@@ -498,6 +545,180 @@ fn process(unit: &Unit, binding: &Binding) -> Result<Process> {
         lock_ino: m.ino(),
     })
 }
+// The unit snapshot proves service policy; cgroup membership proves that no
+// agent, shell, extra process or delegated scope shares its exit lifecycle.
+fn process_group(pid: i32) -> Result<String> {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(path) = TEST_PATHS.try_with(|p| p.cgroup.join("proc-cgroup")) {
+        return group_path(&bounded(&path, 4096)?);
+    }
+    group_path(&bounded(Path::new(&format!("/proc/{pid}/cgroup")), 4096)?)
+}
+fn group_path(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| refused())?;
+    let mut lines = text.lines();
+    let group = lines
+        .next()
+        .and_then(|line| line.strip_prefix("0::"))
+        .ok_or_else(refused)?;
+    if lines.next().is_some()
+        || !group.starts_with('/')
+        || (group != "/"
+            && group
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err(refused());
+    }
+    Ok(group.into())
+}
+fn only_main_process(unit: &Unit, pid: i32) -> Result<()> {
+    let group = get(unit, "ControlGroup")?;
+    if group_path(format!("0::{group}\n").as_bytes())? != group
+        || process_group(pid)? != group
+        || !group.ends_with(&format!("/{UNIT}"))
+    {
+        return Err(refused());
+    }
+    #[cfg(feature = "test-hooks")]
+    let root = TEST_PATHS
+        .try_with(|p| p.cgroup.clone())
+        .unwrap_or_else(|_| PathBuf::from("/sys/fs/cgroup"));
+    #[cfg(not(feature = "test-hooks"))]
+    let root = PathBuf::from("/sys/fs/cgroup");
+    let directory = root.join(group.strip_prefix('/').ok_or_else(refused)?);
+    // No symlink traversal and no delegated subgroup, even an empty one: another
+    // scope can acquire members without changing the parent's cgroup.procs.
+    for path in directory.ancestors().take_while(|p| p.starts_with(&root)) {
+        if !path
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            return Err(refused());
+        }
+    }
+    let entries = std::fs::read_dir(&directory).map_err(|_| refused())?;
+    for (n, entry) in entries.enumerate() {
+        if n >= 256
+            || entry
+                .map_err(|_| refused())?
+                .file_type()
+                .map_err(|_| refused())?
+                .is_dir()
+        {
+            return Err(refused());
+        }
+    }
+    let bytes = bounded(&directory.join("cgroup.procs"), LIMIT)?;
+    let pids = std::str::from_utf8(&bytes)
+        .map_err(|_| refused())?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if pids != [pid.to_string()] {
+        return Err(refused());
+    }
+    Ok(())
+}
+fn control_matches(control: &Value, process: &Process) -> Result<()> {
+    if control.as_object().map(|o| o.len()) != Some(3)
+        || control["version"] != 1
+        || control["pid"].as_i64() != Some(process.pid as i64)
+        || !control["generation"]
+            .as_str()
+            .is_some_and(|g| g.len() == 32 && g.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+pub(super) async fn stop_preflight(
+    record: Option<&Record>,
+    binding: &Binding,
+    control: &Value,
+) -> Result<()> {
+    let before = unit().await?;
+    if get(&before, "ActiveState")? == "active" {
+        let record = record.ok_or_else(refused)?;
+        if record.binding.config != binding.config
+            || record.activated_revision.as_deref() != Some(&binding.revision)
+            || record.managed_node_id.as_deref() != Some(&binding.node_id)
+            || record.transfer.is_some()
+        {
+            return Err(refused());
+        }
+        let detail = details(record)?;
+        // A managed marked definition must still match the saved handover; no
+        // mutation, reload, signal or manager Stop is part of this admission.
+        if !detail.definition_verified {
+            return Err(refused());
+        }
+        definition_shape(&detail, &before)?;
+        let observed = detail.managed.as_ref().ok_or_else(refused)?;
+        let process = process_bound(&before, binding, Some(&observed.process))?;
+        if observed.process != process
+            || observed.revision != binding.revision
+            || observed.state != binding.state
+            || control["generation"] != observed.generation
+        {
+            return Err(refused());
+        }
+        control_matches(control, &process)?;
+        only_main_process(&before, process.pid)?;
+        let after = unit().await?;
+        definition_shape(&detail, &after)?;
+        if process_bound(&after, binding, Some(&observed.process))? != process {
+            return Err(refused());
+        }
+        only_main_process(&after, process.pid)
+    } else {
+        // A known inactive/absent unit grants no service authority. The only
+        // exception is a separately verified foreground process, never an
+        // unobserved or orphaned managed start.
+        if !matches!(get(&before, "LoadState")?, "loaded" | "not-found")
+            || get(&before, "ActiveState")? != "inactive"
+            || get(&before, "MainPID")? != "0"
+            || record.is_some_and(|r| r.managed_node_id.is_some())
+        {
+            return Err(refused());
+        }
+        let pid = control["pid"]
+            .as_i64()
+            .and_then(|p| i32::try_from(p).ok())
+            .filter(|p| *p > 1)
+            .ok_or_else(refused)?;
+        let group = process_group(pid)?;
+        if group.split('/').any(|p| {
+            p.ends_with(".service") && !(p.starts_with("user@") && p.ends_with(".service"))
+        }) {
+            return Err(refused());
+        }
+        let exe = image(Path::new(&format!("/proc/{pid}/exe")))?;
+        safe_path(&binding.config)?;
+        let foreground = Unit::from([
+            ("MainPID".into(), pid.to_string()),
+            ("InvocationID".into(), String::new()),
+            (
+                "ExecStart".into(),
+                format!(
+                    "{{ argv[]={} --config {} ; }}",
+                    exe.path.display(),
+                    binding.config.display()
+                ),
+            ),
+        ]);
+        let process = process(&foreground, binding)?;
+        control_matches(control, &process)?;
+        let after = unit().await?;
+        if before != after
+            || process_group(pid)? != group
+            || self::process(&foreground, binding)? != process
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+}
 fn same_definition(before: &Unit, after: &Unit) -> Result<()> {
     policy(after)?;
     for (k, v) in before {
@@ -505,6 +726,7 @@ fn same_definition(before: &Unit, after: &Unit) -> Result<()> {
             k.as_str(),
             "ExecStart"
                 | "DropInPaths"
+                | "ControlGroup"
                 | "ActiveState"
                 | "SubState"
                 | "MainPID"
@@ -1300,57 +1522,82 @@ pub(super) async fn reserve_start(store: &Store, record: &mut Record) -> Result<
         already_running,
     })
 }
+fn running(plan: &StartPlan, current: &Unit) -> Result<Option<(Value, Managed)>> {
+    after_definition(&plan.detail, current)?;
+    if workspace_cli::read_config(&plan.binding.config)?.1 != plan.binding.revision {
+        return Err(refused());
+    }
+    if get(current, "ActiveState")? == "active" {
+        // The main process may not have acquired the journal yet. Only a
+        // fully verified process+generation can complete this reservation.
+        if let Ok(process) = process(current, &plan.binding) {
+            if process.image != plan.detail.desired {
+                return Err(refused());
+            }
+            if let Ok(status) = crate::workspace_lifecycle::status(&plan.state) {
+                if status["running"] == true
+                    && (plan.already_running
+                        || status["generation"].as_str() != plan.previous_generation.as_deref())
+                {
+                    let generation = status["generation"]
+                        .as_str()
+                        .ok_or_else(refused)?
+                        .to_owned();
+                    let control =
+                        workspace_cli::read_private(&plan.state, "workspace-control.json")?
+                            .ok_or_else(refused)?;
+                    let control: Value = serde_json::from_slice(&control).map_err(|_| refused())?;
+                    if control["pid"].as_i64() != Some(process.pid as i64)
+                        || control["generation"] != generation
+                    {
+                        return Err(refused());
+                    }
+                    return Ok(Some((
+                        status,
+                        Managed {
+                            process,
+                            generation,
+                            state: plan.state.clone(),
+                            revision: plan.binding.revision.clone(),
+                        },
+                    )));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 pub(super) async fn start(plan: StartPlan) -> Result<(Value, Managed)> {
     if !plan.already_running {
         manager(&["start", UNIT]).await?;
     }
     loop {
-        let current = unit().await?;
-        after_definition(&plan.detail, &current)?;
-        if workspace_cli::read_config(&plan.binding.config)?.1 != plan.binding.revision {
-            return Err(refused());
-        }
-        if get(&current, "ActiveState")? == "active" {
-            // The main process may not have acquired the journal yet. Only a
-            // fully verified process+generation can complete this reservation.
-            if let Ok(process) = process(&current, &plan.binding) {
-                if process.image != plan.detail.desired {
-                    return Err(refused());
-                }
-                if let Ok(status) = crate::workspace_lifecycle::status(&plan.state) {
-                    if status["running"] == true
-                        && (plan.already_running
-                            || status["generation"].as_str() != plan.previous_generation.as_deref())
-                    {
-                        let generation = status["generation"]
-                            .as_str()
-                            .ok_or_else(refused)?
-                            .to_owned();
-                        let control =
-                            workspace_cli::read_private(&plan.state, "workspace-control.json")?
-                                .ok_or_else(refused)?;
-                        let control: Value =
-                            serde_json::from_slice(&control).map_err(|_| refused())?;
-                        if control["pid"].as_i64() != Some(process.pid as i64)
-                            || control["generation"] != generation
-                        {
-                            return Err(refused());
-                        }
-                        return Ok((
-                            status,
-                            Managed {
-                                process,
-                                generation,
-                                state: plan.state,
-                                revision: plan.binding.revision,
-                            },
-                        ));
-                    }
-                }
-            }
+        if let Some(observed) = running(&plan, &unit().await?)? {
+            return Ok(observed);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+// Revalidate the exact observed generation after Store admission, without a job.
+pub(super) async fn confirm_start(record: &Record, observed: &Managed) -> Result<Value> {
+    let plan = StartPlan {
+        detail: details(record)?,
+        binding: Binding {
+            revision: observed.revision.clone(),
+            node_id: record.managed_node_id.clone().ok_or_else(refused)?,
+            config: record.binding.config.clone(),
+            state: observed.state.clone(),
+            relay_binding: String::new(),
+        },
+        state: observed.state.clone(),
+        previous_generation: None,
+        already_running: true,
+    };
+    let (status, current) = running(&plan, &unit().await?)?.ok_or_else(refused)?;
+    if current != *observed {
+        return Err(refused());
+    }
+    Ok(status)
 }
 pub(super) fn observed(store: &Store, record: &mut Record, observed: Managed) -> Result<()> {
     let mut detail = details(record)?;
@@ -1368,6 +1615,24 @@ mod tests {
         }
         for(k,v)in[("LoadState","loaded"),("Type","simple"),("KillMode","process"),("Restart","on-failure"),("RemainAfterExit","no"),("ExitType","main"),("FailureAction","none"),("SuccessAction","none"),("WatchdogUSec","0"),("RuntimeMaxUSec","infinity"),("StopWhenUnneeded","no"),("ExecStart","{ path=/usr/bin/zerus-mobile-connector ; argv[]=/usr/bin/zerus-mobile-connector --config /private/connector.json ; ignore_errors=no ; }")]{u.insert(k.into(),v.into());}
         u
+    }
+    #[test]
+    fn stop_cgroup_paths_refuse_ambiguous_or_escaping_hierarchies() {
+        assert_eq!(
+            group_path(b"0::/user.slice/app.slice/zerus-mobile-connector.service\n").unwrap(),
+            "/user.slice/app.slice/zerus-mobile-connector.service"
+        );
+        assert_eq!(group_path(b"0::/\n").unwrap(), "/");
+        for group in [
+            "",
+            "1:name=systemd:/unit",
+            "0::relative",
+            "0::/../unit",
+            "0::/a//unit",
+            "0::/unit\n0::/other",
+        ] {
+            assert!(group_path(group.as_bytes()).is_err(), "{group}");
+        }
     }
     #[test]
     fn ordinary_user_service_needs_no_base_installer_marker() {

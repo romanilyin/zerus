@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_OUTPUT: u64 = 1024 * 1024;
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -21,7 +21,7 @@ fn text(v: &Value, key: &str) -> String {
         .take(256)
         .collect()
 }
-fn read_json(path: &Path) -> Value {
+pub(super) fn read_json(path: &Path) -> Value {
     fs::File::open(path)
         .ok()
         .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f.take(MAX_OUTPUT))).ok())
@@ -87,6 +87,9 @@ pub(super) fn native_command(provider: &str, home: &Path, native: bool) -> Comma
     // command shim (`codex.cmd`) runs what it would run, never through cmd.exe.
     let mut cmd = crate::platform::agent_command(&[provider.to_owned()])
         .unwrap_or_else(|_| Command::new(provider));
+    // The inspection's test seam belongs to the inspection: no native agent
+    // child (login included) inherits it.
+    cmd.env_remove(KIMI_TEST_BASE_ENV);
     if let Ok(key) = home_var(provider) {
         // Preserve native Claude's keychain service name when its directory was implicit.
         if !native || env::var(key).is_ok_and(|v| !v.is_empty()) {
@@ -105,7 +108,22 @@ pub(super) fn native_command(provider: &str, home: &Path, native: bool) -> Comma
     }
     cmd
 }
-fn http_json(url: &str, token: &str, extra: &[&str]) -> std::result::Result<Value, String> {
+/// How curl is run for one Kimi request. `isolated` is true only for the
+/// Zerus test seam: `-q` (which curl honours only as its first argument) and
+/// `--noproxy '*'` keep `~/.curlrc`, `$CURL_HOME`, `$XDG_CONFIG_HOME` and every
+/// proxy variable from routing the token anywhere but the validated endpoint.
+#[derive(Clone, Copy)]
+struct CurlPolicy {
+    allow_http: bool,
+    isolated: bool,
+}
+
+fn http_json(
+    url: &str,
+    token: &str,
+    extra: &[&str],
+    policy: CurlPolicy,
+) -> std::result::Result<Value, String> {
     if token.is_empty() || token.chars().any(char::is_control) {
         return Err("Sign in with the native agent to read usage.".into());
     }
@@ -120,10 +138,13 @@ fn http_json(url: &str, token: &str, extra: &[&str]) -> std::result::Result<Valu
     let mut cmd = Command::new("curl");
     // WhiteWh fork: the status code follows the body, so a refused token
     // (UNAUTHORIZED) is told apart from an unreachable service.
+    if policy.isolated {
+        cmd.args(["-q", "--noproxy", "*"]);
+    }
     cmd.args([
         "--silent",
         "--proto",
-        "=https",
+        if policy.allow_http { "=http,https" } else { "=https" },
         "--connect-timeout",
         "3",
         "--max-time",
@@ -151,7 +172,94 @@ fn http_json(url: &str, token: &str, extra: &[&str]) -> std::result::Result<Valu
 }
 /// `http_json`'s error for a token the service refused.
 const UNAUTHORIZED: &str = "The native sign-in was refused.";
-fn window(
+thread_local! {
+    /// WhiteWh fork: set when the usage service refused the token of the last
+    /// `claude_http` call on this thread, so the account can say "expired".
+    static USAGE_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn claude_http(url: &str, token: &str) -> claude_usage::Reply {
+    use claude_usage::Reply;
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return Reply::Unavailable;
+    }
+    let Ok(dir) = tempfile::tempdir() else {
+        return Reply::Unavailable;
+    };
+    let headers = dir.path().join("headers");
+    let Ok(file) = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&headers)
+    else {
+        return Reply::Unavailable;
+    };
+    if platform::make_private(&file).is_err() {
+        return Reply::Unavailable;
+    }
+    // Keep the grant in stdin, never argv. curl's stderr and response body are
+    // never logged or cached. There is no refresh-token or inference request.
+    let config = format!("url = {}\nheader = {}\nheader = \"Accept: application/json\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\n",
+        json!(url), json!(format!("Authorization: Bearer {token}")));
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "--silent",
+        "--proto",
+        if cfg!(test) && url.starts_with("http://127.0.0.1:") {
+            "=http"
+        } else {
+            "=https"
+        },
+        "--connect-timeout",
+        "3",
+        "--max-time",
+        "6",
+        "--max-filesize",
+        "1048576",
+        "--dump-header",
+    ])
+    .arg(&headers)
+    .args(["--write-out", "\n%{http_code}", "--config", "-"]);
+    let response = capture(cmd, config.as_bytes(), 7);
+    let mut header_bytes = Vec::new();
+    if fs::File::open(headers)
+        .and_then(|f| f.take(32 * 1024 + 1).read_to_end(&mut header_bytes))
+        .is_err()
+        || header_bytes.len() > 32 * 1024
+    {
+        header_bytes.clear();
+    }
+    let headers = String::from_utf8_lossy(&header_bytes);
+    let limited = headers
+        .lines()
+        .rfind(|line| line.starts_with("HTTP/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("429");
+    if limited {
+        // A known 429 still carries its cooldown when curl refuses an oversized
+        // body or the connection closes before that body finishes.
+        return Reply::RateLimited(claude_usage::retry_after(&headers, now()));
+    }
+    let Ok(bytes) = response else {
+        return Reply::Unavailable;
+    };
+    let Some(split) = bytes.iter().rposition(|b| *b == b'\n') else {
+        return Reply::Unavailable;
+    };
+    match &bytes[split + 1..] {
+        b"200" => serde_json::from_slice(&bytes[..split])
+            .map(Reply::Usage)
+            .unwrap_or(Reply::Unavailable),
+        b"429" => Reply::RateLimited(claude_usage::retry_after(&headers, now())),
+        b"401" => {
+            // WhiteWh fork: a refused token is told apart from an unreachable service.
+            USAGE_REFUSED.with(|refused| refused.set(true));
+            Reply::Unavailable
+        }
+        _ => Reply::Unavailable,
+    }
+}
+
+pub(super) fn window(
     id: &str,
     label: &str,
     used: Option<f64>,
@@ -271,12 +379,12 @@ fn codex(home: &Path, native: bool) -> Value {
     let _ = reader.join();
     result
 }
-fn claude(home: &Path, native: bool) -> Value {
+fn claude(config: &Config, home: &Path, native: bool, seed: &Value) -> Result<Value> {
     // WhiteWh fork: a local model has no Anthropic sign-in or plan limits.
     if let Some(local) = super::local_model::read(home).filter(|_| !native) {
-        return json!({"identity":{"auth_method":"Ollama","plan":local.model},"windows":[],"source":"Ollama",
+        return Ok(json!({"identity":{"auth_method":"Ollama","plan":local.model},"windows":[],"source":"Ollama",
             "status":"configured","auth_status":"configured","endpoint":local.endpoint,
-            "reachable":super::local_model::reachable(&local.endpoint)});
+            "reachable":super::local_model::reachable(&local.endpoint)}));
     }
     let mut result =
         json!({"identity":{},"windows":[],"source":"Claude Code","status":"unavailable"});
@@ -285,7 +393,7 @@ fn claude(home: &Path, native: bool) -> Value {
     // Claude returns valid signed-out JSON with exit code 1.
     if let Ok(bytes) = capture_with_exit(cmd, &[], 5, Some(1)) {
         if let Ok(a) = serde_json::from_slice::<Value>(&bytes) {
-            result["identity"] = json!({"email":text(&a,"email"),"plan":text(&a,"subscriptionType"),"organization":text(&a,"orgName"),"auth_method":text(&a,"authMethod")});
+            result["identity"] = json!({"email":text(&a,"email"),"plan":text(&a,"subscriptionType"),"organization":text(&a,"orgName"),"organization_id":text(&a,"orgId"),"auth_method":text(&a,"authMethod")});
             if a["loggedIn"] == false {
                 result["status"] = json!(claude::missing_login_status(home, native));
                 result["auth_status"] = result["status"].clone();
@@ -293,7 +401,7 @@ fn claude(home: &Path, native: bool) -> Value {
                     result["identity"] = claude::saved_identity(home, native);
                     result["identity_cached"] = json!(true);
                 }
-                return result;
+                return Ok(result);
             }
             if a["loggedIn"] == true { result["auth_status"] = json!("signed_in"); }
         }
@@ -327,43 +435,33 @@ fn claude(home: &Path, native: bool) -> Value {
         // status or refresh credentials just to display a quota report.
         // WhiteWh fork: but say so, as for Kimi: opening Claude Code renews the
         // grant, or a revoked one needs a new sign-in. "limits n/a" said neither.
+        // Only the usage status says it; the account's auth status stays.
         result["status"] = json!("expired");
-        return result;
+        return Ok(result);
     }
     // Native OAuth usage endpoint used by /usage; never sends a message or refreshes a grant.
-    let usage = http_json(
-        "https://api.anthropic.com/api/oauth/usage",
-        auth["accessToken"].as_str().unwrap_or(""),
-        &["anthropic-beta: oauth-2025-04-20"],
-    );
-    if usage.as_ref().is_err_and(|e| e == UNAUTHORIZED) {
+    // Without a current native account identity, neither a prior identity nor
+    // its quota/cooldown can safely stand in for this account.
+    if result["auth_status"] != "signed_in" || text(&result["identity"], "email").is_empty() {
+        return Ok(result);
+    }
+    let key = claude_usage::key(home, &result["identity"], &credentials, true);
+    let same_sample = seed["_claude_usage_key"].as_str() == Some(&key)
+        || (seed["_claude_usage_key"].is_null()
+            && claude_usage::same_identity(&result["identity"], &seed["identity"]));
+    USAGE_REFUSED.with(|refused| refused.set(false));
+    let quota = claude_usage::get(&config.dir, &key, if same_sample { seed } else { &Value::Null }, now, || {
+        claude_http("https://api.anthropic.com/api/oauth/usage", auth["accessToken"].as_str().unwrap_or(""))
+    })?;
+    result["_claude_usage_key"] = json!(key);
+    for field in ["windows", "status", "checked_at", "attempted_at", "retry_at"] {
+        result[field] = quota[field].clone();
+    }
+    // WhiteWh fork: the service refused the token (not a cooldown or an outage).
+    if USAGE_REFUSED.with(std::cell::Cell::take) && result["status"] != "ok" {
         result["status"] = json!("expired");
     }
-    if let Ok(usage) = usage {
-        let mut windows = Vec::new();
-        for (key, label, minutes) in [
-            ("five_hour", "", 300),
-            ("seven_day", "", 10080),
-            ("seven_day_sonnet", "Sonnet", 10080),
-            ("seven_day_opus", "Opus", 10080),
-        ] {
-            let w = &usage[key];
-            if let Some(w) = window(
-                key,
-                label,
-                w["utilization"].as_f64(),
-                Some(minutes),
-                w["resets_at"].clone(),
-            ) {
-                windows.push(w);
-            }
-        }
-        if !windows.is_empty() {
-            result["windows"] = json!(windows);
-            result["status"] = json!("ok");
-        }
-    }
-    result
+    Ok(result)
 }
 struct KimiEnvironment {
     credentials: String,
@@ -404,6 +502,218 @@ fn kimi_environment(home: &Path) -> KimiEnvironment {
     }
     environment
 }
+// A successful authenticated identity answer is the only proof of sign-in: a
+// plan may report no quota at all, so a quota answer only ever decides the quota
+// status. Returns the allowlisted identity and whether the service named a user.
+fn kimi_identity(value: &Value) -> (Value, bool) {
+    let user = value
+        .get("user")
+        .or_else(|| value.get("data"))
+        .unwrap_or(value);
+    let identity = json!({
+        "name": text(user, "nickname"),
+        "email": text(user, "email"),
+        "plan": text(user, "user_level_name"),
+        "auth_method": "Kimi Code",
+    });
+    // Only a stable account field proves the token belongs to a user; a plan or
+    // a nickname alone also appears in anonymous and half-filled answers.
+    let known = ["email", "user_id", "global_id"]
+        .into_iter()
+        .any(|key| !text(user, key).is_empty());
+    (identity, known)
+}
+
+// Only the windows the service reports; a plan without quota answers `{}`, or
+// leaves `usages` out, which is not an error.
+fn kimi_windows(usage: &Value) -> Vec<Value> {
+    let usages = &usage["usages"];
+    let mut windows = Vec::new();
+    for (key, label, minutes) in [
+        ("limit_5h", "", Some(300)),
+        ("limit_7d", "", Some(10080)),
+        ("limit_month_total", "Monthly", None),
+        ("limit_month_code", "Monthly code", None),
+    ] {
+        let w = &usages[key];
+        if let Some(w) = window(
+            key,
+            label,
+            w["used_ratio"].as_f64().map(|x| x * 100.),
+            minutes,
+            w["reset_time"].clone(),
+        ) {
+            windows.push(w);
+        }
+    }
+    windows
+}
+
+fn kimi_report(me: Option<&Value>, usage: Option<&Value>) -> Value {
+    let mut result =
+        json!({"identity":{},"windows":[],"source":"Kimi Code","status":"unavailable"});
+    if let Some(me) = me {
+        let (identity, verified) = kimi_identity(me);
+        if verified {
+            result["auth_status"] = json!("signed_in");
+        }
+        result["identity"] = identity;
+    }
+    if let Some(usage) = usage {
+        let windows = kimi_windows(usage);
+        if !windows.is_empty() {
+            result["windows"] = json!(windows);
+            result["status"] = json!("ok");
+        }
+    }
+    result
+}
+
+// Track the actual grant, not signature(): a new login to the same user keeps
+// the catalog signature. Never expose credential bytes in diagnostics.
+pub(super) fn kimi_login_grant(home: &Path) -> Option<String> {
+    let environment = kimi_environment(home);
+    let auth = read_json(&home.join(&environment.credentials));
+    let token = auth["access_token"].as_str().filter(|token| !token.is_empty())?;
+    let mut digest = Sha256::new();
+    digest.update(environment.credentials.as_bytes());
+    digest.update(token.as_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+// Windows Kimi can abort in libuv after saving a successful device login.
+// An old account, a quota answer, or cancellation must never turn that failed
+// command into success. The caller supplies a forced, fresh identity probe.
+pub(super) fn kimi_login_recovered(
+    code: i32,
+    before: Option<&str>,
+    after: Option<&str>,
+    report: &Value,
+) -> bool {
+    code == 3
+        && after.is_some()
+        && before != after
+        && report["auth_status"] == "signed_in"
+        && report["status"] != "signed_out"
+        && report["status"] != "expired"
+}
+
+const KIMI_API_BASE: &str = "https://api.kimi.com/coding/v1";
+const KIMI_API_BASE_SLASH: &str = "https://api.kimi.com/coding/v1/";
+/// Zerus's test seam; a person's Kimi CLI never reads it.
+pub(super) const KIMI_TEST_BASE_ENV: &str = "HGS_TEST_KIMI_API_BASE";
+/// The Kimi CLI's own platform variable. The inspection reads it only to stay
+/// on the provider; the person's custom platform never receives this token.
+const KIMI_CLI_BASE_ENV: &str = "KIMI_CODE_BASE_URL";
+
+/// A test endpoint is accepted only when its host is a loopback address. Any
+/// other value is ignored and named in the inspection's detail; it never
+/// receives the token.
+fn ignored_kimi_base(result: &mut Value, variable: &str) {
+    let reason = if variable == KIMI_TEST_BASE_ENV {
+        "Kimi account inspection uses only a loopback http or https address."
+    } else {
+        "Kimi account inspection sends its token only to the default platform."
+    };
+    let sentence = format!("Ignored {variable}: {reason}");
+    // An invalid seam and a non-default CLI value can both apply; the later
+    // rule adds its own sentence instead of hiding the seam's.
+    result["detail"] = match result["detail"].as_str().filter(|text| !text.is_empty()) {
+        Some(earlier) => json!(format!("{earlier} {sentence}")),
+        None => json!(sentence),
+    };
+}
+
+/// A `[::1]` or literal loopback host, then the end, a `/`, or `:PORT` with 1
+/// to 5 digits inside curl's range. Anything curl would refuse, and anything
+/// that would move the host out of the authority, is refused here instead.
+fn loopback_authority(rest: &str) -> Option<()> {
+    let (host, tail) = match rest.strip_prefix('[') {
+        Some(after) => after.split_once(']')?,
+        None => {
+            let end = rest.find([':', '/']).unwrap_or(rest.len());
+            rest.split_at(end)
+        }
+    };
+    if !(host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1") {
+        return None;
+    }
+    if tail.is_empty() || tail.starts_with('/') {
+        return Some(());
+    }
+    let port = tail.strip_prefix(':')?;
+    let digits = port.split('/').next().unwrap_or("");
+    if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.parse::<u32>().ok()? > 65535 {
+        return None;
+    }
+    let after = &port[digits.len()..];
+    (after.is_empty() || after.starts_with('/')).then_some(())
+}
+
+fn loopback_test_base(value: &str) -> Option<(String, bool)> {
+    let (scheme, rest) = value.split_once("://")?;
+    let allow_http = match scheme.to_ascii_lowercase().as_str() {
+        "https" => false,
+        "http" => true,
+        _ => return None,
+    };
+    if rest.contains('?') || rest.contains('#') || rest.contains('@') {
+        return None;
+    }
+    loopback_authority(rest)?;
+    Some((value.trim_end_matches('/').to_owned(), allow_http))
+}
+
+/// A valid Zerus test endpoint takes precedence over the Kimi CLI's platform
+/// variable; an invalid one is named in the detail, then that variable's rule
+/// applies. Any non-default `KIMI_CODE_BASE_URL` means the person's Kimi CLI
+/// uses another platform, so the inspection makes no request and sends no
+/// token. Only unset or the provider's own address (with or without its
+/// trailing slash) reaches the provider.
+fn kimi_base(result: &mut Value) -> Option<(String, CurlPolicy)> {
+    match env::var(KIMI_TEST_BASE_ENV) {
+        // Every account session's environment carries the seam as an empty
+        // value; that is unset, never an ignored endpoint.
+        Ok(value) if value.is_empty() => {}
+        Ok(value) => {
+            if let Some((base, allow_http)) = loopback_test_base(&value) {
+                return Some((
+                    base,
+                    CurlPolicy {
+                        allow_http,
+                        isolated: true,
+                    },
+                ));
+            }
+            ignored_kimi_base(result, KIMI_TEST_BASE_ENV);
+        }
+        Err(env::VarError::NotPresent) => {}
+        Err(env::VarError::NotUnicode(_)) => {
+            ignored_kimi_base(result, KIMI_TEST_BASE_ENV);
+        }
+    }
+    match env::var(KIMI_CLI_BASE_ENV) {
+        Ok(value) if value != KIMI_API_BASE && value != KIMI_API_BASE_SLASH => {
+            ignored_kimi_base(result, KIMI_CLI_BASE_ENV);
+            None
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => Some((
+            KIMI_API_BASE.to_owned(),
+            CurlPolicy {
+                allow_http: false,
+                isolated: false,
+            },
+        )),
+        Err(env::VarError::NotUnicode(_)) => {
+            ignored_kimi_base(result, KIMI_CLI_BASE_ENV);
+            None
+        }
+    }
+}
+
 fn kimi(home: &Path) -> Value {
     let mut result =
         json!({"identity":{},"windows":[],"source":"Kimi Code","status":"unavailable"});
@@ -422,7 +732,10 @@ fn kimi(home: &Path) -> Value {
         // Let the native server refresh/persist its own OAuth grant under its own lock.
         let mut cmd = Command::new("node");
         cmd.args(["--input-type=module", "-e", include_str!("kimi-read.mjs")])
-            .env("KIMI_CODE_HOME", home);
+            .env("KIMI_CODE_HOME", home)
+            // The test seam is the inspection's alone: `node` starts the real
+            // `kimi web`, which must never inherit it.
+            .env_remove(KIMI_TEST_BASE_ENV);
         for key in AUTH_ENV {
             cmd.env_remove(key);
         }
@@ -435,53 +748,47 @@ fn kimi(home: &Path) -> Value {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(result);
         // Without renewal the grant stays expired: opening Kimi or signing in again
-        // renews it, which "unavailable" would not say.
+        // renews it, which "unavailable" would not say. A sign-in the native server
+        // just verified outranks that stale on-disk expiry, though.
         let renewed = read_json(&credentials);
-        if output["status"] != "ok"
-            && renewed["expires_at"].as_u64().is_some_and(|expiry| expiry <= now() + 60)
+        if output["auth_status"] != "signed_in"
+            && output["status"] != "ok"
+            && renewed["expires_at"]
+                .as_u64()
+                .is_some_and(|expiry| expiry <= now() + 60)
         {
             output["status"] = json!("expired");
         }
         return output;
     }
-    // Only Kimi's managed endpoints receive this token; custom gateways stay untouched.
-    if ![
-        "https://api.kimi.com/coding/v1",
-        "https://api.kimi.ai/coding/v1",
-    ]
-    .contains(&environment.base_url.as_str())
-    {
+    // Upstream's rules first: its loopback test seam, and an ignored custom
+    // KIMI_CODE_BASE_URL. Otherwise the native config's endpoint (WhiteWh
+    // fork), and only Kimi's managed endpoints receive this token: custom
+    // gateways stay untouched.
+    let Some((base, policy)) = kimi_base(&mut result) else {
         return result;
-    }
-    if let Ok(a) = http_json(&format!("{}/me", environment.base_url), token, &[]) {
-        let a = a.get("user").or_else(|| a.get("data")).unwrap_or(&a);
-        result["identity"] = json!({"name":text(a,"nickname"),"email":text(a,"email"),"plan":text(a,"user_level_name"),"auth_method":"Kimi Code"});
-    }
-    if let Ok(usage) = http_json(&format!("{}/usages", environment.base_url), token, &[]) {
-        let mut windows = Vec::new();
-        for (key, label, minutes) in [
-            ("limit_5h", "", Some(300)),
-            ("limit_7d", "", Some(10080)),
-            ("limit_month_total", "Monthly", None),
-            ("limit_month_code", "Monthly code", None),
-        ] {
-            let w = &usage["usages"][key];
-            if let Some(w) = window(
-                key,
-                label,
-                w["used_ratio"].as_f64().map(|x| x * 100.),
-                minutes,
-                w["reset_time"].clone(),
-            ) {
-                windows.push(w);
-            }
+    };
+    let (base, policy) = if policy.isolated {
+        (base, policy)
+    } else {
+        if ![
+            "https://api.kimi.com/coding/v1",
+            "https://api.kimi.ai/coding/v1",
+        ]
+        .contains(&environment.base_url.as_str())
+        {
+            return result;
         }
-        if !windows.is_empty() {
-            result["windows"] = json!(windows);
-            result["status"] = json!("ok");
-        }
+        (environment.base_url.clone(), policy)
+    };
+    let me = http_json(&format!("{base}/me"), token, &[], policy).ok();
+    let usage = http_json(&format!("{base}/usages"), token, &[], policy).ok();
+    let mut report = kimi_report(me.as_ref(), usage.as_ref());
+    // An ignored endpoint's note (upstream's kimi_base) stays with the report.
+    if let Some(detail) = result.get("detail").filter(|detail| !detail.is_null()) {
+        report["detail"] = detail.clone();
     }
-    result
+    report
 }
 pub(super) fn dsh(home: &Path) -> Value {
     let fallback =
@@ -495,17 +802,22 @@ pub(super) fn dsh(home: &Path) -> Value {
         concat!(
             include_str!("../dsh/account-client.mjs"),
             "\n",
+            include_str!("../dsh/account-balance.mjs"),
+            "\n",
             include_str!("../dsh/account-read.mjs")
         ),
     ]);
-    capture(
+    let mut data = capture(
         cmd,
         json!({"url":url,"home":home}).to_string().as_bytes(),
         20,
     )
     .ok()
-    .and_then(|b| serde_json::from_slice(&b).ok())
-    .unwrap_or(fallback)
+    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    .filter(Value::is_object)
+    .unwrap_or(fallback);
+    super::deepseek::project_api_balance(&mut data);
+    data
 }
 
 // The signature identifies the signed-in account, so it is also the catalog's
@@ -591,7 +903,7 @@ fn cache_path(config: &Config, id: &str, home: &Path) -> PathBuf {
 // Catalog loading remains read-only and does not contact providers. A cached
 // identity is usable only for the same home and unchanged file credentials.
 pub(super) fn catalog_status(config: &Config, id: &str, provider: &str, home: &Path) -> Value {
-    let cache = read_json(&cache_path(config, id, home));
+    let cache = claude_usage::read_cache(&cache_path(config, id, home)).unwrap_or(Value::Null);
     if cache["signature"] != signature(home, provider) {
         return Value::Null;
     }
@@ -648,9 +960,19 @@ pub(super) fn catalog_status(config: &Config, id: &str, provider: &str, home: &P
     if let Some(unlimited) = data["credits"]["unlimited"].as_bool() {
         credits["unlimited"] = json!(unlimited);
     }
-    json!({"identity":identity,"status":text(data,"status"),"auth_status":text(data,"auth_status"),"checked_at":data["checked_at"],
+    let mut status = json!({"identity":identity,"status":text(data,"status"),"auth_status":text(data,"auth_status"),"checked_at":data["checked_at"],"retry_at":data["retry_at"],
         "windows":rows("windows",&["id","label","used_percent","window_minutes","resets_at"]),
-        "balances":rows("balances",&["kind","balance","currency"]),"credits":credits})
+        "balances":rows("balances",&["kind","balance","currency"]),"credits":credits});
+    if let Some(available) = data["balance_available"].as_bool() {
+        status["balance_available"] = json!(available);
+    }
+    if let Some(spend) = super::deepseek_spend::public(&data["spend"]) {
+        status["spend"] = spend;
+    }
+    if let Some(usage) = super::deepseek_usage::public(&data["local_usage"]) {
+        status["local_usage"] = usage;
+    }
+    status
 }
 
 // Quota and identity requests can succeed independently. A partial response
@@ -669,6 +991,82 @@ fn retain_cached_identity(data: &mut Value, cached: &Value, current_signature: &
     if !text(previous, "email").is_empty() || !text(previous, "account_id").is_empty() {
         data["identity"] = previous.clone();
         data["identity_cached"] = json!(true);
+    }
+}
+
+/// The Qwen subscription's plan as Qwen names it: "lite", "plus" or "pro"
+/// read as "Lite", "Plus" or "Pro".
+fn qwen_plan(info: &Value) -> String {
+    let member = info["member_type"].as_str().unwrap_or_default().trim();
+    let mut chars = member.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// Qwen's userinfo (`sub`, `name`, `email`, `member_type`) for the access token
+/// in `credentials`, only while it stays valid for another minute.
+fn qwen_user_info(credentials: &Value) -> Option<Value> {
+    use std::io::Read;
+    use ureq::tls::{RootCerts, TlsConfig};
+    let token = credentials["tokens"]["access_token"].as_str().filter(|token| !token.is_empty())?;
+    let expires = credentials["tokens"]["expiresAt"].as_f64()?;
+    if expires / 1000.0 <= now() as f64 + 60.0 {
+        return None;
+    }
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+        .build()
+        .new_agent();
+    let response = agent
+        .get("https://auth.qwen.ai/api/oauth/userinfo")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .call()
+        .ok()?;
+    let mut raw = Vec::new();
+    response.into_body().into_reader().take(64 * 1024).read_to_end(&mut raw).ok()?;
+    let info: Value = serde_json::from_slice(&raw).ok()?;
+    info["member_type"].as_str().is_some().then_some(info)
+}
+
+/// Qwen Code has no quota read: an account is configured when it has Qwen
+/// OAuth credentials or its settings choose a provider; a model server's
+/// account shows the server's speed instead (`gateway`).
+fn qwen(home: &Path) -> Value {
+    let settings = fs::read(home.join("settings.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_default();
+    let method = settings["security"]["auth"]["selectedType"].as_str().filter(|kind| !kind.is_empty())
+        .map(str::to_owned)
+        .or_else(|| home.join("oauth_creds.json").is_file().then(|| "qwen-oauth".to_owned()));
+    // The Qwen subscription (chat.qwen.ai Lite/Plus/Pro): its plan and owner
+    // from Qwen's own userinfo, read with the unexpired access token Qwen Code
+    // keeps. Zerus never refreshes that token itself: a refresh rotates the
+    // grant under Qwen Code's lock, and a second writer signs it out
+    // ("session_changed"). Qwen reports no remaining quota until it runs out.
+    if method.as_deref() == Some("qwen-subscription") {
+        let credentials = read_json(&home.join("subscription_credentials.json"));
+        let mut identity = json!({"auth_method":"Qwen Subscription"});
+        let mut result = json!({"status":"configured","source":"Qwen Code","identity":{},"windows":[],
+            "reason":"Qwen reports the subscription's credits only once they run out"});
+        if let Some(info) = qwen_user_info(&credentials) {
+            for (field, value) in [("plan", qwen_plan(&info)), ("email", info["email"].as_str().unwrap_or_default().to_owned()),
+                ("name", info["name"].as_str().unwrap_or_default().to_owned())] {
+                if !value.is_empty() { identity[field] = json!(value); }
+            }
+            result["auth_status"] = json!("signed_in");
+        } else if credentials["tokens"]["access_token"].as_str().is_none_or(str::is_empty) {
+            return json!({"status":"signed_out","auth_status":"signed_out","source":"Qwen Code","identity":{},"windows":[],
+                "reason":"Sign in to the Qwen subscription in Qwen Code (/auth)"});
+        }
+        result["identity"] = identity;
+        return result;
+    }
+    match method {
+        Some(method) => json!({"status":"configured","source":"Qwen Code","identity":{"auth_method":method},"windows":[],
+            "reason":"Qwen Code reports no quota; an account on a model server shows its speed"}),
+        None => json!({"status":"signed_out","auth_status":"signed_out","source":"Qwen Code","identity":{},"windows":[],
+            "reason":"Choose a provider in Qwen Code (/auth)"}),
     }
 }
 
@@ -709,24 +1107,40 @@ pub(super) fn inspect(config: &Config, args: &[String]) -> Result<Value> {
     let signature = signature(&home, &profile.provider);
     let cache_dir = config.dir.join("account-status");
     let cache_path = cache_path(config, &id, &home);
-    let cached = read_json(&cache_path);
+    let cached = claude_usage::read_cache(&cache_path)?;
     let refresh = args.iter().any(|s| s == "--refresh");
-    let mut data = if !refresh
-        && cached["signature"] == signature
+    let same = cached["signature"] == signature;
+    // Claude must observe native identity before reusing any quota/cooldown:
+    // its durable auth revision deliberately excludes rotating bearer tokens.
+    let mut data = if profile.provider != "claude" && same && !refresh
         && now().saturating_sub(cached["data"]["checked_at"].as_u64().unwrap_or(0)) < 60
     {
         cached["data"].clone()
     } else {
         let mut data = match profile.provider.as_str() {
             "codex" => codex(&home, native),
-            "claude" => claude(&home, native),
+            "claude" => claude(config, &home, native, if same { &cached["data"] } else { &Value::Null })?,
             "kimi" => kimi(&home),
             "dsh" => dsh(&home),
+            "qwen" => qwen(&home),
             "opencode"=>json!({"status":"configured","source":"OpenCode","identity":{},"windows":[],"reason":"OpenCode uses its native inference-provider configuration; quota inspection is not available"}),
             _ => Value::Null,
         };
-        retain_cached_identity(&mut data, &cached, &signature);
-        data["checked_at"] = json!(now());
+        if profile.provider != "claude" {
+            retain_cached_identity(&mut data, &cached, &signature);
+        }
+        // Both reuse this refresh: the balance it just read and local session logs.
+        if profile.provider == "dsh" {
+            if let Some(spend) = super::deepseek_spend::record(config, &id, &home, &data) {
+                data["spend"] = spend;
+            }
+            if let Some(usage) = super::deepseek_usage::refresh(config, &id, &home) {
+                data["local_usage"] = usage;
+            }
+        }
+        if data.get("checked_at").is_none() {
+            data["checked_at"] = json!(now());
+        }
         private_dir(&cache_dir)?;
         let mut f = tempfile::NamedTempFile::new_in(&cache_dir)?;
         platform::make_private(f.as_file())?;
@@ -739,6 +1153,9 @@ pub(super) fn inspect(config: &Config, args: &[String]) -> Result<Value> {
             .map_err(|_| Error::new(1, "Could not cache account status."))?;
         data
     };
+    if let Some(data) = data.as_object_mut() {
+        data.remove("_claude_usage_key");
+    }
     data["id"] = json!(id);
     data["provider"] = json!(profile.provider);
     data["label"] = json!(profile.label);
@@ -754,6 +1171,928 @@ pub(super) fn inspect(config: &Config, args: &[String]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    // The variable names are spelled out here: a mutant that changes the name
+    // the inspection reads must fail these tests.
+    const TEST_BASE_VAR: &str = "HGS_TEST_KIMI_API_BASE";
+    const CLI_BASE_VAR: &str = "KIMI_CODE_BASE_URL";
+
+    fn curl_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not turn every later curl/environment test red.
+        crate::accounts::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores every named variable on drop, including a previously unset one.
+    struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvVars {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(key, _)| (*key, env::var_os(key)))
+                .collect();
+            for (key, value) in pairs {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct PathEnv(Option<String>);
+
+    #[cfg(unix)]
+    impl PathEnv {
+        fn prepend(path: &Path) -> Self {
+            let old = env::var("PATH").ok();
+            let current = old.clone().unwrap_or_default();
+            env::set_var("PATH", format!("{}:{current}", path.display()));
+            Self(old)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+
+    fn kimi_home(token: &str, expires_at: u64) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("credentials")).unwrap();
+        fs::write(
+            home.path().join("credentials/kimi-code.json"),
+            json!({"access_token": token, "expires_at": expires_at}).to_string(),
+        )
+        .unwrap();
+        home
+    }
+
+    fn accept_with_timeout(server: &std::net::TcpListener) -> std::net::TcpStream {
+        let start = Instant::now();
+        loop {
+            match server.accept() {
+                Ok((stream, _)) => {
+                    // A Windows socket accepted from a non-blocking listener
+                    // is non-blocking too: its read timeout would not apply,
+                    // and a request not yet arrived would read as empty.
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(3),
+                        "the loopback server received no request"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("loopback accept failed: {error}"),
+            }
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            if stream.read_exact(&mut byte).is_err() {
+                break;
+            }
+            request.push(byte[0]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn respond(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    /// The stand-in's own writer: `/me` and `/usages` must arrive with the
+    /// native bearer token.
+    fn identity_worker(server: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for (path, body) in [
+                (
+                    "/me",
+                    r#"{"user":{"nickname":"Loop","email":"loop@example.test","user_level_name":"Pro"}}"#,
+                ),
+                (
+                    "/usages",
+                    r#"{"usages":{"limit_5h":{"used_ratio":0.5,"reset_time":123}}}"#,
+                ),
+            ] {
+                let mut stream = accept_with_timeout(&server);
+                let request = read_request(&mut stream);
+                assert!(request.starts_with(&format!("GET {path} ")), "{request}");
+                assert!(
+                    request.contains("Authorization: Bearer synthetic-token"),
+                    "{request}"
+                );
+                respond(&mut stream, body);
+            }
+        })
+    }
+
+    /// The `https` row's stand-in: curl must reach it directly, so it sends a
+    /// TLS handshake and never a proxy `CONNECT`.
+    #[cfg(unix)]
+    fn tls_worker(server: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut stream = accept_with_timeout(&server);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut record = [0u8; 1];
+            stream.read_exact(&mut record).unwrap();
+            assert_eq!(record[0], 0x16, "curl did not send a TLS handshake");
+        })
+    }
+
+    #[cfg(unix)]
+    fn no_connection(server: &std::net::TcpListener, who: &str) {
+        match server.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("{who} accept failed: {error}"),
+            Ok((_, peer)) => panic!("{who} received a connection from {peer}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn recording_curl(dir: &Path) -> PathEnv {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("curl");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+i=0
+while [ -e "$CURL_RECORD_DIR/argv.$i" ]; do i=$((i+1)); done
+printf '%s\n' "$@" > "$CURL_RECORD_DIR/argv.$i"
+cat > "$CURL_RECORD_DIR/stdin.$i"
+if grep -q '/me' "$CURL_RECORD_DIR/stdin.$i"; then
+  printf '{"user":{"nickname":"Provider","email":"provider@example.test","user_level_name":"Pro"}}'
+else
+  printf '{"usages":{"limit_5h":{"used_ratio":0.5,"reset_time":123}}}'
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        PathEnv::prepend(dir)
+    }
+
+    #[cfg(unix)]
+    const KIMI_DEFAULT_ARGV: &str = "--silent\n--fail\n--proto\n=https\n--connect-timeout\n3\n--max-time\n6\n--max-filesize\n1048576\n--config\n-\n";
+
+    #[test]
+    // WhiteWh fork: on Windows the stand-in reads an empty request from curl;
+    // upstream runs this seam on Linux and macOS.
+    #[cfg_attr(windows, ignore)]
+    fn kimi_inspection_uses_a_loopback_test_base_and_sends_the_token() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let worker = identity_worker(server);
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some(&base)),
+            (CLI_BASE_VAR, None),
+        ]);
+        let result = kimi(home.path());
+        worker.join().unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["identity"]["name"], "Loop");
+        assert_eq!(result["identity"]["email"], "loop@example.test");
+        assert_eq!(result["identity"]["plan"], "Pro");
+        assert_eq!(result["windows"][0]["used_percent"], 50.0);
+        assert!(result.get("detail").is_none());
+    }
+
+    #[test]
+    fn loopback_test_base_forms_reach_the_stand_in() {
+        let _lock = curl_lock();
+        for (pattern, v6) in [
+            ("http://127.0.0.1:{port}", false),
+            ("http://LOCALHOST:{port}", false),
+            ("http://localhost:{port}/", false),
+            ("http://[::1]:{port}", true),
+        ] {
+            let server = if v6 {
+                std::net::TcpListener::bind("[::1]:0")
+            } else {
+                std::net::TcpListener::bind("127.0.0.1:0")
+            };
+            let Ok(server) = server else {
+                continue; // No IPv6 loopback on this machine.
+            };
+            server.set_nonblocking(true).unwrap();
+            let port = server.local_addr().unwrap().port();
+            let base = pattern.replace("{port}", &port.to_string());
+            let worker = identity_worker(server);
+            let home = kimi_home("synthetic-token", now() + 3600);
+            let _env = EnvVars::set(&[
+                (TEST_BASE_VAR, Some(&base)),
+                (CLI_BASE_VAR, None),
+            ]);
+            let result = kimi(home.path());
+            worker.join().unwrap();
+            assert_eq!(result["status"], "ok", "{base}: {result}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_kimi_token_does_not_use_the_test_base_or_leak_it_to_the_refresh_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let home = kimi_home("synthetic-token", now().saturating_sub(120));
+        let bin = tempfile::tempdir().unwrap();
+        let marker = bin.path().join("leaked");
+        let fake = bin.path().join("kimi");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nif [ -n \"${HGS_TEST_KIMI_API_BASE+x}\" ]; then printf leaked > \"$KIMI_REFRESH_MARKER\"; fi\nexit 97\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let _path = PathEnv::prepend(bin.path());
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some(&base)),
+            (CLI_BASE_VAR, None),
+            ("KIMI_REFRESH_MARKER", Some(marker.to_str().unwrap())),
+        ]);
+        let result = kimi(home.path());
+        assert_ne!(result["status"], "ok", "{result}");
+        assert!(
+            server.accept().is_err(),
+            "the expired token reached the loopback base"
+        );
+        assert!(
+            !marker.exists(),
+            "the refresh child inherited HGS_TEST_KIMI_API_BASE"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_token_with_a_custom_kimi_cli_base_refreshes_without_a_platform_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = curl_lock();
+        let platform = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        platform.set_nonblocking(true).unwrap();
+        let platform_url = format!(
+            "http://{}/kimi-platform",
+            platform.local_addr().unwrap()
+        );
+        let bin = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let marker = record.path().join("node-called");
+        let child_env = record.path().join("node-env");
+        let node = bin.path().join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\nprintf 'called\\n' > '{}'\nenv > '{}'\nprintf '%s\\n' '{{\"identity\":{{\"name\":\"Fixture\",\"email\":\"fixture@example.test\",\"plan\":\"Pro\",\"auth_method\":\"Kimi Code\"}},\"windows\":[],\"source\":\"Kimi Code\",\"status\":\"ok\"}}'\n",
+                marker.display(),
+                child_env.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).unwrap();
+        let _path = PathEnv::prepend(bin.path());
+        let home = kimi_home("synthetic-token", now().saturating_sub(120));
+        let _env = EnvVars::set(&[
+            // An invalid seam: a base-first order would refuse before the refresh.
+            (TEST_BASE_VAR, Some("http://127.0.0.2:9")),
+            (CLI_BASE_VAR, Some(&platform_url)),
+            ("NODE_RECORD_DIR", Some(record.path().to_str().unwrap())),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["identity"]["auth_method"], "Kimi Code", "{result}");
+        assert_eq!(result["identity"]["name"], "Fixture", "{result}");
+        assert!(result.get("detail").is_none(), "{result}");
+        assert!(marker.exists(), "the expired token did not reach the refresh node");
+        let seen = fs::read_to_string(&child_env).unwrap();
+        assert!(
+            !seen.lines().any(|line| line.starts_with(&format!("{TEST_BASE_VAR}="))),
+            "the refresh child inherited {TEST_BASE_VAR}",
+        );
+        assert!(
+            platform.accept().is_err(),
+            "the inspection requested the custom platform"
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_test_base_is_ignored_without_a_request() {
+        let _lock = curl_lock();
+        // Bind all interfaces and use 127.0.0.2 as the override host: the
+        // listener would see a request if the non-loopback value were used.
+        let server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some(&format!("http://127.0.0.2:{port}"))),
+            (CLI_BASE_VAR, None),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "unavailable", "{result}");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored HGS_TEST_KIMI_API_BASE"),
+            "{result}"
+        );
+        assert!(
+            server.accept().is_err(),
+            "a non-loopback base received the token"
+        );
+    }
+
+    #[test]
+    fn a_custom_kimi_cli_base_is_ignored_even_when_it_is_loopback() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, None),
+            (CLI_BASE_VAR, Some(&base)),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "unavailable", "{result}");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored KIMI_CODE_BASE_URL"),
+            "{result}"
+        );
+        assert!(
+            server.accept().is_err(),
+            "a KIMI_CODE_BASE_URL loopback value received the token"
+        );
+    }
+
+    #[test]
+    fn a_non_default_kimi_cli_base_is_ignored_without_a_request() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("https://{}", server.local_addr().unwrap());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, None),
+            (CLI_BASE_VAR, Some(&base)),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "unavailable", "{result}");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored KIMI_CODE_BASE_URL"),
+            "{result}"
+        );
+        assert!(
+            server.accept().is_err(),
+            "a non-default KIMI_CODE_BASE_URL received the token"
+        );
+    }
+
+    #[test]
+    fn empty_and_doubled_kimi_cli_bases_keep_their_no_request_meaning() {
+        let _lock = curl_lock();
+        let home = kimi_home("synthetic-token", now() + 3600);
+        for value in ["", "https://api.kimi.com/coding/v1//"] {
+            let _env = EnvVars::set(&[
+                (TEST_BASE_VAR, None),
+                (CLI_BASE_VAR, Some(value)),
+            ]);
+            let result = kimi(home.path());
+            assert_eq!(result["status"], "unavailable", "{value}: {result}");
+            assert!(
+                result["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Ignored KIMI_CODE_BASE_URL"),
+                "{value}: {result}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_test_base_is_unset_without_a_detail() {
+        let _lock = curl_lock();
+        let bin = tempfile::tempdir().unwrap();
+        let _path = recording_curl(bin.path());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some("")),
+            (CLI_BASE_VAR, None),
+            ("CURL_RECORD_DIR", Some(bin.path().to_str().unwrap())),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(
+            result.get("detail").is_none(),
+            "an empty seam was reported as ignored: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(bin.path().join("argv.0")).unwrap(),
+            KIMI_DEFAULT_ARGV
+        );
+    }
+
+    #[test]
+    fn an_invalid_test_base_detail_survives_the_cli_base_detail() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some("http://127.0.0.2:9")),
+            (CLI_BASE_VAR, Some(&base)),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "unavailable", "{result}");
+        let detail = result["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("Ignored HGS_TEST_KIMI_API_BASE"),
+            "the seam's own detail was lost: {detail}"
+        );
+        assert!(
+            detail.contains("Ignored KIMI_CODE_BASE_URL"),
+            "the CLI base detail is missing: {detail}"
+        );
+        assert!(
+            server.accept().is_err(),
+            "a refused base received the token"
+        );
+    }
+
+    #[test]
+    // WhiteWh fork: on Windows the stand-in reads an empty request from curl;
+    // upstream runs this seam on Linux and macOS.
+    #[cfg_attr(windows, ignore)]
+    fn a_valid_test_base_wins_over_the_kimi_cli_base() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let worker = identity_worker(server);
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some(&base)),
+            (CLI_BASE_VAR, Some("https://example.invalid/")),
+        ]);
+        let result = kimi(home.path());
+        worker.join().unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.get("detail").is_none(), "{result}");
+    }
+
+    #[test]
+    fn an_invalid_test_base_leaves_the_kimi_cli_base_rule_in_charge() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some(&format!("http://127.0.0.2:{port}"))),
+            (CLI_BASE_VAR, Some(&format!("https://127.0.0.1:{port}"))),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "unavailable", "{result}");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored KIMI_CODE_BASE_URL"),
+            "{result}"
+        );
+        assert!(
+            server.accept().is_err(),
+            "the invalid test base or the CLI base received the token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_default_kimi_path_keeps_its_curl_arguments_and_stdin() {
+        let _lock = curl_lock();
+        let bin = tempfile::tempdir().unwrap();
+        let _path = recording_curl(bin.path());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, None),
+            (CLI_BASE_VAR, None),
+            ("CURL_RECORD_DIR", Some(bin.path().to_str().unwrap())),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "ok", "{result}");
+        let argv = fs::read_to_string(bin.path().join("argv.0")).unwrap();
+        assert_eq!(argv, KIMI_DEFAULT_ARGV);
+        assert!(!argv.contains("synthetic-token"));
+        assert_eq!(fs::read_to_string(bin.path().join("argv.1")).unwrap(), KIMI_DEFAULT_ARGV);
+        assert_eq!(
+            fs::read_to_string(bin.path().join("stdin.0")).unwrap(),
+            "url = \"https://api.kimi.com/coding/v1/me\"\nheader = \"Authorization: Bearer synthetic-token\"\nheader = \"Accept: application/json\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(bin.path().join("stdin.1")).unwrap(),
+            "url = \"https://api.kimi.com/coding/v1/usages\"\nheader = \"Authorization: Bearer synthetic-token\"\nheader = \"Accept: application/json\"\n"
+        );
+        assert_eq!(result["identity"]["name"], "Provider");
+        assert_eq!(result["windows"][0]["used_percent"], 50.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_invalid_test_base_falls_through_to_the_provider_rule() {
+        let _lock = curl_lock();
+        let bin = tempfile::tempdir().unwrap();
+        let _path = recording_curl(bin.path());
+        let home = kimi_home("synthetic-token", now() + 3600);
+        let _env = EnvVars::set(&[
+            (TEST_BASE_VAR, Some("http://127.0.0.2:9")),
+            (CLI_BASE_VAR, None),
+            ("CURL_RECORD_DIR", Some(bin.path().to_str().unwrap())),
+        ]);
+        let result = kimi(home.path());
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored HGS_TEST_KIMI_API_BASE"),
+            "{result}"
+        );
+        assert_eq!(
+            fs::read_to_string(bin.path().join("argv.0")).unwrap(),
+            KIMI_DEFAULT_ARGV
+        );
+    }
+
+    #[test]
+    fn native_kimi_children_and_sessions_never_inherit_the_test_base() {
+        let _lock = curl_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvVars::set(&[(TEST_BASE_VAR, Some("http://127.0.0.1:9"))]);
+        for native in [true, false] {
+            let command = native_command("kimi", home.path(), native);
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == std::ffi::OsStr::new(TEST_BASE_VAR)
+                        && value.is_none()),
+                "native_command({native}) passes the test base"
+            );
+        }
+        let environment = crate::accounts::run_environment(
+            "work-account",
+            "kimi",
+            "/private/profile",
+        );
+        assert!(
+            environment.contains(&format!("{TEST_BASE_VAR}=")),
+            "{environment:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum CurlrcProbe {
+        None,
+        Proxy,
+        ConnectTo,
+        Resolve,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Decoy {
+        Ephemeral,
+        EchoPort,
+    }
+
+    /// One report row: the stand-in must receive `/me` and `/usages` with the
+    /// token directly, and the second listener must receive nothing.
+    #[cfg(unix)]
+    fn direct_request(
+        label: &str,
+        host: &str,
+        https: bool,
+        proxy_var: Option<&'static str>,
+        curlrc: CurlrcProbe,
+        decoy: Decoy,
+    ) {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        echo.set_nonblocking(true).unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let decoy = match decoy {
+            Decoy::Ephemeral => std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap(),
+            Decoy::EchoPort => std::net::TcpListener::bind(("127.0.0.2", echo_port)).unwrap(),
+        };
+        decoy.set_nonblocking(true).unwrap();
+        let decoy_address = decoy.local_addr().unwrap();
+        let proxy = format!("http://{decoy_address}");
+        let base = format!(
+            "{}://{host}:{echo_port}",
+            if https { "https" } else { "http" }
+        );
+        let config = match curlrc {
+            CurlrcProbe::None => String::new(),
+            CurlrcProbe::Proxy => format!("proxy = \"{proxy}\"\n"),
+            CurlrcProbe::ConnectTo => format!("connect-to = \"::{decoy_address}\"\n"),
+            CurlrcProbe::Resolve => {
+                format!("resolve = \"localhost:{echo_port}:127.0.0.2\"\n")
+            }
+        };
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join(".curlrc"), &config).unwrap();
+        let config_path = home.path().to_str().unwrap().to_owned();
+        let account = kimi_home("synthetic-token", now() + 3600);
+        let worker = if https {
+            tls_worker(echo)
+        } else {
+            identity_worker(echo)
+        };
+        // CURL_HOME rather than HOME: curl prefers it for `.curlrc`, and the
+        // suite's other tests read the real HOME. XDG has no config file here.
+        let mut vars: Vec<(&'static str, Option<&str>)> = vec![
+            ("CURL_HOME", Some(&config_path)),
+            ("XDG_CONFIG_HOME", Some(&config_path)),
+            ("http_proxy", None),
+            ("HTTP_PROXY", None),
+            ("https_proxy", None),
+            ("HTTPS_PROXY", None),
+            ("all_proxy", None),
+            ("ALL_PROXY", None),
+            ("no_proxy", None),
+            ("NO_PROXY", None),
+            (TEST_BASE_VAR, Some(&base)),
+            (CLI_BASE_VAR, None),
+        ];
+        if let Some(var) = proxy_var {
+            vars.push((var, Some(&proxy)));
+        }
+        let _env = EnvVars::set(&vars);
+        let result = kimi(account.path());
+        drop(_env);
+        worker.join().unwrap();
+        if https {
+            assert_ne!(result["status"], "ok", "{label}: {result}");
+        } else {
+            assert_eq!(result["status"], "ok", "{label}: {result}");
+            assert_eq!(result["identity"]["name"], "Loop", "{label}: {result}");
+        }
+        no_connection(&decoy, label);
+    }
+
+    #[cfg(unix)]
+    mod proxy_rows {
+        use super::*;
+
+        // Each ambient setting must reach the stand-in directly and leave the
+        // distinct decoy endpoint empty. Five rows use separate ports on the
+        // configured loopback address; --resolve requires another address on
+        // the same port. A row that never exercises its setting is no test.
+
+        #[test]
+        fn http_proxy_cannot_route_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "http_proxy",
+                "127.0.0.1",
+                false,
+                Some("http_proxy"),
+                CurlrcProbe::None,
+                Decoy::Ephemeral,
+            );
+        }
+
+        #[test]
+        fn all_proxy_cannot_route_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "ALL_PROXY with localhost",
+                "localhost",
+                false,
+                Some("ALL_PROXY"),
+                CurlrcProbe::None,
+                Decoy::Ephemeral,
+            );
+        }
+
+        #[test]
+        fn https_proxy_cannot_tunnel_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "HTTPS_PROXY with https localhost",
+                "localhost",
+                true,
+                Some("HTTPS_PROXY"),
+                CurlrcProbe::None,
+                Decoy::Ephemeral,
+            );
+        }
+
+        #[test]
+        fn a_curlrc_proxy_cannot_route_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "curlrc proxy",
+                "127.0.0.1",
+                false,
+                None,
+                CurlrcProbe::Proxy,
+                Decoy::Ephemeral,
+            );
+        }
+
+        #[test]
+        fn a_curlrc_connect_to_cannot_move_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "curlrc connect-to",
+                "localhost",
+                false,
+                None,
+                CurlrcProbe::ConnectTo,
+                Decoy::Ephemeral,
+            );
+        }
+
+        #[test]
+        #[cfg_attr(
+            target_os = "macos",
+            ignore = "curl --resolve needs a second loopback address on the same port; standard macOS has no configured 127.0.0.2"
+        )]
+        fn a_curlrc_resolve_cannot_move_the_test_base() {
+            let _lock = curl_lock();
+            direct_request(
+                "curlrc resolve",
+                "localhost",
+                false,
+                None,
+                CurlrcProbe::Resolve,
+                Decoy::EchoPort,
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_test_bases_are_ignored_without_a_request() {
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let home = kimi_home("synthetic-token", now() + 3600);
+        for value in [
+            // Userinfo, which curl would read as `localhost:1` and send the
+            // token to `127.0.0.2`. M1 in the review.
+            format!("http://localhost:1@127.0.0.2:{port}"),
+            // Only the `@` check refuses this one: without it the authority
+            // parses as loopback and curl would send `/@` with the token.
+            format!("http://127.0.0.1:{port}/@"),
+            // A trailing dot and a longer name curl would resolve. M3.
+            format!("http://localhost.:{port}"),
+            "http://localhost.evil.example".to_string(),
+            // A global IPv6 address that ends with `::1`. M5.
+            "http://[2001:db8::1]".to_string(),
+            // Malformed after the host or the bracket, all refused by curl.
+            format!("http://127.0.0.1:{port}:{port}"),
+            "http://[::1]evil.example".to_string(),
+            "http://127.0.0.1:1evil.example".to_string(),
+            "http://[::1]:1evil".to_string(),
+            "http://127.0.0.1:".to_string(),
+            "http://[::1]:".to_string(),
+            "http://127.0.0.1:65536".to_string(),
+            "http://127.0.0.1:99999".to_string(),
+            "http://[::1]:65536".to_string(),
+            "http://127.0.0.1:+80".to_string(),
+            "ftp://127.0.0.1/".to_string(),
+            "https://user@127.0.0.1/".to_string(),
+            "http://127.0.0.1/me?x=1".to_string(),
+            "http://127.0.0.1/#x".to_string(),
+            " http://127.0.0.1/".to_string(),
+        ] {
+            let _env = EnvVars::set(&[
+                (TEST_BASE_VAR, Some(&value)),
+                (CLI_BASE_VAR, None),
+            ]);
+            let result = kimi(home.path());
+            assert_eq!(result["status"], "unavailable", "{value}: {result}");
+            assert!(
+                result["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Ignored HGS_TEST_KIMI_API_BASE"),
+                "{value}: {result}"
+            );
+        }
+        assert!(
+            server.accept().is_err(),
+            "a hostile test base sent the token"
+        );
+    }
+
+    #[test]
+    fn claude_429_headers_survive_curl_refusing_an_oversized_error_body() {
+        // The Kimi tests below replace PATH, CURL_HOME and the proxy
+        // variables to record and redirect curl; every test that starts curl
+        // shares this lock.
+        let _lock = curl_lock();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/usage", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0]; stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
+            }
+            write!(stream, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1000\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let before = now();
+        let reply = claude_http(&url, "synthetic-token");
+        assert!(matches!(reply, claude_usage::Reply::RateLimited(t) if t >= before + 1000));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn claude_http_fixture_preserves_429_cooldown_without_repeating_the_request() {
+        use std::net::TcpListener;
+        let _lock = curl_lock();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/usage", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for (status, headers, body) in [
+                ("200 OK", "", r#"{"five_hour":{"utilization":28,"resets_at":"2030-01-01T00:00:00Z"}}"#),
+                ("429 Too Many Requests", "Retry-After: 100\r\n", r#"{"error":{"type":"rate_limit_error"}}"#),
+            ] {
+                let (mut stream, _) = server.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0]; stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
+                }
+                assert!(String::from_utf8(request).unwrap().contains("Authorization: Bearer synthetic-token"));
+                write!(stream, "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let dir = crate::host::staging::private_tempdir();
+        let sampled = now().saturating_sub(360);
+        let first = claude_usage::get(dir.path(), "fixture", &Value::Null, || sampled, || claude_http(&url, "synthetic-token")).unwrap();
+        let limited = claude_usage::get(dir.path(), "fixture", &Value::Null, now, || claude_http(&url, "synthetic-token")).unwrap();
+        assert_eq!(limited["status"], "rate_limited");
+        assert_eq!(limited["checked_at"], sampled);
+        assert_eq!(limited["windows"], first["windows"]);
+        assert!(limited["retry_at"].as_u64().unwrap() >= now() + 99);
+        worker.join().unwrap(); // Only the original two HTTP requests exist.
+        let again = claude_usage::get(dir.path(), "fixture", &Value::Null, now, || panic!("manual refresh repeated HTTP")).unwrap();
+        assert_eq!(again, limited);
+    }
 
     #[test]
     fn partial_quota_refresh_keeps_identity_only_for_same_credentials() {
@@ -775,6 +2114,49 @@ mod tests {
         assert_eq!(identified["identity"]["email"], "other@example.test");
     }
 
+    #[test]
+    fn listing_reuses_a_cached_deepseek_api_key_balance() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            home: root.path().to_string_lossy().into(),
+            dir: root.path().join("config"),
+            state: root.path().join("state"),
+            selves: vec!["fixture".into()],
+            peers: vec![],
+            base_peers: vec![],
+            peers_from_environment: false,
+            machines: Default::default(),
+            tab: false,
+            tab_colors: String::new(),
+        };
+        let home = root.path().join("dsh");
+        private_dir(&config.dir.join("account-status")).unwrap();
+        let mut data = json!({"status":"configured","api_key_configured":true,"checked_at":100,
+            "identity":{"auth_method":"API key","account_id":"api-key:abc"},"windows":[],
+            "api_balance":{"is_available":false,"balance_infos":[
+                {"currency":"USD","total_balance":"0.00","granted_balance":"0.00","topped_up_balance":"0.00"}]}});
+        super::super::deepseek::project_api_balance(&mut data);
+        let mut cache = tempfile::NamedTempFile::new_in(config.dir.join("account-status")).unwrap();
+        platform::make_private(cache.as_file()).unwrap();
+        cache
+            .write_all(
+                json!({"signature":signature(&home,"dsh"),"data":data})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        platform::persist(cache, cache_path(&config, "native-dsh", &home)).unwrap();
+        let status = catalog_status(&config, "native-dsh", "dsh", &home);
+        assert_eq!(status["status"], "configured");
+        assert_eq!(status["balance_available"], false);
+        assert_eq!(
+            status["balances"][0],
+            json!({"kind":"Total","balance":"0.00","currency":"USD"})
+        );
+        assert_eq!(status["balances"].as_array().unwrap().len(), 3);
+        assert!(status.get("api_balance").is_none());
+    }
+
     fn jwt(claims: Value) -> String {
         use base64::Engine;
         let part = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
@@ -783,7 +2165,9 @@ mod tests {
 
     #[test]
     fn kimi_global_region_uses_its_active_scoped_credentials() {
-        let dir = tempfile::tempdir().unwrap();
+        // Upstream's Kimi tests set KIMI_CODE_BASE_URL under this lock.
+        let _lock = curl_lock();
+        let dir = crate::host::staging::private_tempdir();
         let home = dir.path();
         fs::create_dir_all(home.join("credentials")).unwrap();
         let config = r#"[providers."managed:kimi-code"]
@@ -804,9 +2188,12 @@ oauth_host = "https://auth.kimi.ai"
         fs::write(&scoped, json!({"access_token":token("user-a",1_000)}).to_string()).unwrap();
         fs::write(home.join("credentials/kimi-code.json"), r#"{"access_token":"old-default"}"#).unwrap();
         let first = signature(home, "kimi");
-        fs::write(&scoped, json!({"access_token":token("user-a",1_900)}).to_string()).unwrap();
+        let first_grant = kimi_login_grant(home).unwrap();
         fs::write(home.join("credentials/kimi-code.json"), r#"{"access_token":"changed-default"}"#).unwrap();
+        assert_eq!(kimi_login_grant(home).as_deref(), Some(first_grant.as_str()));
+        fs::write(&scoped, json!({"access_token":token("user-a",1_900)}).to_string()).unwrap();
         assert_eq!(signature(home, "kimi"), first);
+        assert_ne!(kimi_login_grant(home).as_deref(), Some(first_grant.as_str()));
         fs::write(&scoped, json!({"access_token":token("user-b",1_900)}).to_string()).unwrap();
         assert_ne!(signature(home, "kimi"), first);
 
@@ -816,7 +2203,7 @@ oauth_host = "https://auth.kimi.ai"
 
     #[test]
     fn kimi_token_refresh_keeps_the_account_signature() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::host::staging::private_tempdir();
         let home = dir.path();
         fs::create_dir_all(home.join("credentials")).unwrap();
         let sign_in = |user: &str, issued: u64| {
@@ -841,8 +2228,102 @@ oauth_host = "https://auth.kimi.ai"
     }
 
     #[test]
+    fn kimi_verified_identity_stands_without_any_quota() {
+        let me = json!({"user":{"user_id":"u-1","nickname":"Fixture","email":"kimi@example.invalid","user_level_name":"Free"}});
+        // An empty quota answer is a plan without limits to report, not a sign-out.
+        let signed_in = kimi_report(Some(&me), Some(&json!({})));
+        assert_eq!(signed_in["auth_status"], "signed_in");
+        assert_eq!(signed_in["status"], "unavailable");
+        assert_eq!(signed_in["windows"], json!([]));
+        assert_eq!(signed_in["identity"]["plan"], "Free");
+        // A quota read that fails entirely changes nothing about the sign-in.
+        let no_usage = kimi_report(Some(&me), None);
+        assert_eq!(no_usage["auth_status"], "signed_in");
+        assert_eq!(no_usage["status"], "unavailable");
+        // The identity rides in data too, and quotas keep their own status.
+        let wrapped = json!({"data":{"email":"other@example.invalid"}});
+        assert_eq!(kimi_report(Some(&wrapped), None)["identity"]["email"], "other@example.invalid");
+        // A stable id verifies even when the display identity carries no email.
+        let id_only = json!({"data":{"global_id":"g-1","user_level_name":"Free"}});
+        let id_report = kimi_report(Some(&id_only), None);
+        assert_eq!(id_report["auth_status"], "signed_in");
+        assert_eq!(id_report["identity"]["email"], "");
+        let quota = json!({"usages":{"limit_5h":{"used_ratio":0.25,"reset_time":null}}});
+        let both = kimi_report(Some(&me), Some(&quota));
+        assert_eq!((both["auth_status"].as_str(),both["status"].as_str()), (Some("signed_in"),Some("ok")));
+    }
+
+    #[test]
+    fn kimi_login_abort_needs_a_new_grant_and_fresh_verified_identity() {
+        let dir = crate::host::staging::private_tempdir();
+        let home = dir.path();
+        fs::create_dir(home.join("credentials")).unwrap();
+        assert_eq!(kimi_login_grant(home), None);
+        let path = home.join("credentials/kimi-code.json");
+        for invalid in ["not json", "{}", r#"{"access_token":""}"#] {
+            fs::write(&path, invalid).unwrap();
+            assert_eq!(kimi_login_grant(home), None);
+        }
+        fs::write(&path, r#"{"access_token":"old-grant"}"#).unwrap();
+        let before = kimi_login_grant(home).unwrap();
+        fs::write(&path, r#"{"access_token":"new-grant"}"#).unwrap();
+        let after = kimi_login_grant(home).unwrap();
+        let me = json!({"user_id":"fixture-user","user_level_name":"Free"});
+        let verified = kimi_report(Some(&me), None);
+        let quota_only = kimi_report(None, Some(&json!({"usages":{"limit_5h":{"used_ratio":0.25}}})));
+        for (code, old, new, report, recovered) in [
+            (3, Some(before.as_str()), Some(after.as_str()), &verified, true),
+            (3, None, Some(after.as_str()), &verified, true),
+            (3, Some(before.as_str()), Some(before.as_str()), &verified, false),
+            (3, Some(before.as_str()), None, &verified, false),
+            (130, Some(before.as_str()), Some(after.as_str()), &verified, false),
+            (1, Some(before.as_str()), Some(after.as_str()), &verified, false),
+            (0, Some(before.as_str()), Some(after.as_str()), &verified, false),
+            (3, Some(before.as_str()), Some(after.as_str()), &quota_only, false),
+            (3, Some(before.as_str()), Some(after.as_str()), &json!({"status":"unavailable","identity":{"email":"cached@example.invalid"}}), false),
+            (3, Some(before.as_str()), Some(after.as_str()), &json!({"status":"expired"}), false),
+        ] {
+            assert_eq!(kimi_login_recovered(code, old, new, report), recovered,
+                "code={code}, report={report}");
+        }
+    }
+
+    #[test]
+    fn kimi_identity_report_never_invents_a_sign_in() {
+        // A plan, a nickname or an empty answer proves nothing on its own.
+        for empty in [
+            json!({"user":{}}),
+            json!({}),
+            json!({"message":"ok"}),
+            json!({"user":{"nickname":"Fixture","user_level_name":"Free"}}),
+        ] {
+            let report = kimi_report(Some(&empty), None);
+            assert_eq!(report["auth_status"], Value::Null, "{empty}");
+            assert_eq!(report["status"], "unavailable");
+        }
+        // Without a verified profile a quota answer adds no explicit auth_status;
+        // its "ok" status keeps the meaning it already had.
+        let usage = json!({"usages":{"limit_7d":{"used_ratio":1.5}}});
+        let quota_only = kimi_report(None, Some(&usage));
+        assert_eq!(quota_only["auth_status"], Value::Null);
+        assert_eq!(quota_only["status"], "ok");
+    }
+
+    #[test]
+    fn kimi_missing_quota_sections_are_not_windows() {
+        for usage in [json!({}),json!({"usages":null}),json!({"usages":[]}),json!({"usages":{}})] {
+            assert!(kimi_windows(&usage).is_empty(), "{usage}");
+        }
+        let usage = json!({"usages":{"limit_7d":{"used_ratio":1.5,"reset_time":1793000000}}});
+        let windows = kimi_windows(&usage);
+        assert_eq!(windows.len(), 1);
+        assert_eq!((windows[0]["id"].as_str(),windows[0]["window_minutes"].as_u64()), (Some("limit_7d"),Some(10080)));
+        assert_eq!(windows[0]["used_percent"], 150.0);
+    }
+
+    #[test]
     fn claude_signature_follows_the_signed_in_account() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::host::staging::private_tempdir();
         let home = dir.path();
         let settings = |account: &str, startups: u64| {
             let settings = json!({"numStartups":startups,"projects":{"/workspace/example":{"lastCost":startups}},

@@ -1,0 +1,770 @@
+use super::*;
+
+#[test]
+fn the_dispatcher_hands_out_the_task_with_the_most_dependants_first() {
+    let mut team = team();
+    // #4 unblocks #5 and #6, more than #1 unblocks #3 (C6).
+    team.tasks.push(Task { id: 4, title: "Base".into(), assignee: "dev".into(), status: TaskStatus::Pending, ..Default::default() });
+    team.tasks.push(Task {
+        id: 5,
+        title: "Next".into(),
+        assignee: "dev".into(),
+        status: TaskStatus::Pending,
+        deps: vec![Dependency { task: 4, kind: DependencyKind::Hard }],
+        ..Default::default()
+    });
+    team.tasks.push(Task {
+        id: 6,
+        title: "Later".into(),
+        assignee: "dev".into(),
+        status: TaskStatus::Pending,
+        deps: vec![Dependency { task: 4, kind: DependencyKind::Hard }],
+        ..Default::default()
+    });
+    let dev = session("codex/x/dev", "r1", true);
+    let found = steps(&team, &[session("claude/x/lead", "r0", false), dev.clone()], 10.0);
+    assert!(found.contains(&Step::HandOut { task: 4, member: "dev".into() }), "{found:?}");
+    assert!(!found.iter().any(|step| matches!(step, Step::HandOut { task: 1, .. })), "{found:?}");
+}
+
+#[test]
+fn a_check_hand_out_names_the_command_and_its_exit_code() {
+    let mut team = team();
+    team.tasks.push(Task {
+        id: 4,
+        title: "Build".into(),
+        assignee: "dev".into(),
+        kind: TaskKind::Check,
+        check: Some(Check { command: "cargo test --locked".into(), expect_exit: 0, timeout_minutes: 30 }),
+        status: TaskStatus::Pending,
+        ..Default::default()
+    });
+    let attempt = Attempt { n: 1, id: "A4".into(), member: "dev".into(), state: AttemptState::Delivered, ..Default::default() };
+    let text = hand_off_text(&team, team.task(4).unwrap(), &attempt, "", "");
+    assert!(text.contains("This is a check task"), "{text}");
+    assert!(text.contains("cargo test --locked") && text.contains("Expected exit code: 0"), "{text}");
+    // The report command carries the check result the member fills in.
+    assert!(text.contains("\"check\":{\"exit\":0"), "{text}");
+    // A plan task's hand-out has no check section.
+    let normal = hand_off_text(&team, team.task(1).unwrap(), &attempt, "", "");
+    assert!(!normal.contains("This is a check task"), "{normal}");
+}
+
+#[test]
+fn a_member_with_no_ready_work_starves_the_plan_and_the_lead_hears_once() {
+    let mut team = team();
+    // All ready work belongs to qa; dev sits idle while tasks are open.
+    for id in [1, 2] {
+        team.task_mut(id).unwrap().assignee = "qa".into();
+    }
+    let lead = session("claude/x/lead", "r0", true);
+    let dev = session("codex/x/dev", "r1", true);
+    let qa = session("kimi/x/qa", "r2", true);
+    let seen = [lead.clone(), dev.clone(), qa.clone()];
+    // The first idle tick opens the episode.
+    assert!(steps(&team, &seen, 10.0).contains(&Step::Starving { member: "dev".into() }));
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().starved_since = Some(10.0);
+    // Not before 20 minutes, then once.
+    assert!(!steps(&team, &seen, 10.0 + 20.0 * 60.0 - 1.0).iter().any(|step| matches!(step, Step::PlanStarved { .. })));
+    let late = steps(&team, &seen, 10.0 + 20.0 * 60.0);
+    assert!(late.contains(&Step::PlanStarved { members: vec!["dev".into()] }), "{late:?}");
+    let text = starved_text(&team, &["dev".into()], 10.0 + 20.0 * 60.0).unwrap();
+    assert!(text.contains("starved") && text.contains("Backend") && text.contains("20 min"), "{text}");
+    assert!(text.contains("#1") && text.contains("hgs guide team-lead"), "{text}");
+    // Told once per episode.
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().starved_told = true;
+    assert!(!steps(&team, &seen, 10.0 + 30.0 * 60.0).iter().any(|step| matches!(step, Step::PlanStarved { .. })));
+    // Getting work ends the episode.
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().starved_told = false;
+    team.task_mut(2).unwrap().assignee = "dev".into();
+    assert!(steps(&team, &seen, 10.0 + 30.0 * 60.0).contains(&Step::StarvedEnded { member: "dev".into() }));
+    // A busy leader is not starving: it has work.
+    team.task_mut(1).unwrap().assignee = "qa".into();
+    team.task_mut(2).unwrap().assignee = "qa".into();
+    let busy_dev = session("codex/x/dev", "r1", false);
+    assert!(!steps(&team, &[lead, busy_dev, qa], 10.0 + 30.0 * 60.0).iter().any(|step| matches!(step, Step::Starving { .. })));
+}
+
+#[test]
+fn starving_stays_quiet_until_the_owner_approves_a_phase() {
+    let mut team = team();
+    // Every open task is in a draft phase: the owner owes an approval.
+    for task in &mut team.tasks {
+        task.phase = 2;
+        task.status = TaskStatus::Draft;
+    }
+    for id in [1, 2] {
+        team.task_mut(id).unwrap().assignee = "qa".into();
+    }
+    team.phases.push(Phase {
+        n: 2,
+        title: "Next".into(),
+        state: PhaseState::Draft,
+        tasks: team.tasks.iter().map(|task| task.id).collect(),
+        ..Default::default()
+    });
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().starved_since = Some(10.0);
+    let lead = session("claude/x/lead", "r0", true);
+    let dev = session("codex/x/dev", "r1", true);
+    let qa = session("kimi/x/qa", "r2", true);
+    let seen = [lead.clone(), dev.clone(), qa.clone()];
+    // U9: no episode starts or continues; the old one ends.
+    let waiting = steps(&team, &seen, 10.0 + 30.0 * 60.0);
+    assert!(
+        !waiting.iter().any(|step| matches!(step, Step::Starving { .. } | Step::PlanStarved { .. })),
+        "{waiting:?}"
+    );
+    assert!(waiting.contains(&Step::StarvedEnded { member: "dev".into() }), "{waiting:?}");
+    // The phase is approved and its tasks are in work: dev starves again.
+    team.phases[0].state = PhaseState::Approved;
+    for task in &mut team.tasks {
+        task.status = TaskStatus::Pending;
+    }
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().starved_since = None;
+    assert!(steps(&team, &seen, 10.0).contains(&Step::Starving { member: "dev".into() }));
+}
+
+#[test]
+fn a_declared_budget_ties_to_the_job_and_turns_amber_then_red() {
+    let mut team = team();
+    let lead = session("claude/x/lead", "r0", true);
+    let mut dev = session("codex/x/dev", "r1", true);
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().budget = Some(Budget {
+        label: "install".into(),
+        minutes: 15,
+        red_minutes: 30,
+        declared_at: 100.0,
+        ..Default::default()
+    });
+    // Without Background work the budget waits for its job (up to a minute).
+    let idle = steps(&team, &[lead.clone(), dev.clone()], 110.0);
+    assert!(!idle.iter().any(|step| matches!(step, Step::BudgetRed { .. } | Step::BudgetAmber { .. })), "{idle:?}");
+    // The job appears: the budget is tied to it and the episode starts.
+    dev.background = true;
+    dev.work = Some(SeenWork { command: "npm install".into(), started_at: 140.0 });
+    let tied = steps(&team, &[lead.clone(), dev.clone()], 150.0);
+    assert!(tied.contains(&Step::BackgroundStart { member: "dev".into() }), "{tied:?}");
+    assert!(
+        tied.contains(&Step::BudgetTie { member: "dev".into(), command: "npm install".into(), since: 140.0 }),
+        "{tied:?}"
+    );
+    // Tied and running: amber at 15 minutes, red at 30, once each.
+    let member = team.members.iter_mut().find(|member| member.id == "dev").unwrap();
+    member.background_since = Some(140.0);
+    member.budget.as_mut().unwrap().job = Some(JobRef { command: "npm install".into(), since: 140.0 });
+    let amber = steps(&team, &[lead.clone(), dev.clone()], 140.0 + 15.0 * 60.0);
+    assert!(amber.contains(&Step::BudgetAmber { member: "dev".into() }), "{amber:?}");
+    assert!(!amber.iter().any(|step| matches!(step, Step::BudgetRed { .. })));
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().budget.as_mut().unwrap().amber_told = true;
+    let red = steps(&team, &[lead.clone(), dev.clone()], 140.0 + 30.0 * 60.0);
+    assert!(red.contains(&Step::BudgetRed { member: "dev".into() }), "{red:?}");
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().budget.as_mut().unwrap().red_told = true;
+    assert!(!steps(&team, &[lead.clone(), dev.clone()], 140.0 + 40.0 * 60.0).iter().any(|step| matches!(step, Step::BudgetRed { .. })));
+    // The message names the label, the estimate, the command and the output.
+    let member = team.member("dev").unwrap().clone();
+    let text = budget_text(&team, &member, "npm install", 140.0, 140.0 + 34.0 * 60.0, "npm ERR! build failed");
+    assert!(text.contains("install") && text.contains("expected 15 min, red after 30 min"), "{text}");
+    assert!(text.contains("npm install") && text.contains("npm ERR! build failed"), "{text}");
+    // Background work without a budget is red at the default 30 minutes.
+    let mut plain = team.clone();
+    plain.members.iter_mut().find(|member| member.id == "dev").unwrap().budget = None;
+    plain.members.iter_mut().find(|member| member.id == "dev").unwrap().background_since = Some(0.0);
+    let late = steps(&plain, &[lead.clone(), dev.clone()], 31.0 * 60.0);
+    assert!(
+        late.contains(&Step::BackgroundRed { member: "dev".into(), command: "npm install".into(), since: 0.0 }),
+        "{late:?}"
+    );
+    // The job ends: the budget ends with it.
+    dev.background = false;
+    dev.work = None;
+    let ended = steps(&team, &[lead, dev], 140.0 + 41.0 * 60.0);
+    assert!(ended.contains(&Step::BackgroundEnd { member: "dev".into() }), "{ended:?}");
+}
+
+#[test]
+fn mcp_services_are_listed_on_the_member_and_not_background_work() {
+    let listing = json!([{"sessions":[
+        {"name":"codex/x/dev","process_state":"running","activity":"idle","phase":"idle",
+         "process_work":{"count":0,"services":[{"name":"socraticode","command":"node socraticode.js","since":5.0}]}}]}]);
+    let found = seen(&listing);
+    assert_eq!(
+        found[0].services,
+        vec![SeenService { name: "socraticode".into(), command: "node socraticode.js".into(), since: 5.0 }]
+    );
+    // G7: a session that only keeps its MCP server alive is not Background.
+    assert!(!found[0].background && found[0].free);
+    // The member carries its services for status.
+    let team = team();
+    let steps_now = steps(&team, &[session("claude/x/lead", "r0", true), found[0].clone()], 10.0);
+    assert!(
+        steps_now.iter().any(|step| matches!(step, Step::Services { member, services } if member == "dev" && services.len() == 1)),
+        "{steps_now:?}"
+    );
+}
+
+#[test]
+fn a_ready_task_goes_to_a_free_member_with_the_same_role() {
+    let (mut team, seen) = team_with_two_backends();
+    // dev works on #1; #2, also dev's, goes to the free dev2.
+    team.task_mut(1).unwrap().attempts.push(Attempt { n: 1, member: "dev".into(), state: AttemptState::Delivered, ..Default::default() });
+    team.task_mut(1).unwrap().status = TaskStatus::InProgress;
+    team.task_mut(1).unwrap().output = vec!["src/one.rs".into()];
+    team.task_mut(2).unwrap().output = vec!["src/two.rs".into()];
+    let now = steps(&team, &seen, 1.0);
+    assert!(now.contains(&Step::Rebalance { task: 2, from: "dev".into(), to: "dev2".into() }), "{now:?}");
+    // Your or the lead's choice stays with its member.
+    team.task_mut(2).unwrap().pinned = true;
+    assert!(!steps(&team, &seen, 1.0).iter().any(|s| matches!(s, Step::Rebalance { .. })));
+    // Task 259 (owner, 2026-11-08): another role doing the same kind of work
+    // is no wall when nobody of the exact role is free - rights decide, and
+    // the exact role only orders the choice.
+    team.task_mut(2).unwrap().pinned = false;
+    team.members.iter_mut().find(|m| m.id == "dev2").unwrap().role = "Backend DeepSeek".into();
+    let now = steps(&team, &seen, 1.0);
+    assert!(now.contains(&Step::Rebalance { task: 2, from: "dev".into(), to: "dev2".into() }), "{now:?}");
+    // An unrelated role stays out of a task whose role family is another one.
+    team.members.iter_mut().find(|m| m.id == "dev2").unwrap().role = "Frontend".into();
+    let now = steps(&team, &seen, 1.0);
+    assert!(!now.iter().any(|s| matches!(s, Step::Rebalance { .. })), "{now:?}");
+}
+
+#[test]
+fn rebalance_keeps_shared_output_and_unknown_output_with_the_working_member() {
+    // Task 259: a folder-level path (`src`, `src/`, `.`) is advisory and holds
+    // nothing; the file and module paths still keep the task with its member.
+    for (active, queued, moves) in [
+        (vec!["src/api.rs"], vec!["src/api.rs"], false),
+        (vec!["src"], vec!["src/api.rs"], true),
+        (vec!["src/api.rs"], vec!["src/"], true),
+        (vec!["."], vec!["docs/api.md"], true),
+        (vec!["src/api"], vec!["src/apis/new.rs"], true),
+        (vec!["src/api.rs"], vec!["docs/api.md"], true),
+        (vec!["src/api.rs"], vec![], false),
+        (vec![], vec![], false),
+        (vec!["src/api"], vec!["src/api/items.rs"], false),
+    ] {
+        let (mut team, seen) = team_with_two_backends();
+        team.task_mut(1).unwrap().output = active.iter().map(|p| p.trim_end_matches('/').to_string()).collect();
+        team.task_mut(2).unwrap().output = queued.iter().map(|p| p.trim_end_matches('/').to_string()).collect();
+        delivered(&mut team);
+        for modeled in [false, true] {
+            let mut team = team.clone();
+            if modeled {
+                team.task_mut(2).unwrap().models = vec!["test-model".into()];
+                for member in &mut team.members { member.model = "test-model".into(); }
+            }
+            let now = steps(&team, &seen, 1.0);
+            assert_eq!(now.iter().any(|step| matches!(step, Step::Rebalance { task: 2, .. })), moves,
+                "active={active:?} queued={queued:?} modeled={modeled}: {now:?}");
+        }
+    }
+}
+
+#[test]
+fn a_rejected_task_is_retried_by_a_fresh_member_when_one_is_free() {
+    let (mut team, mut seen) = team_with_two_backends();
+    submit(&mut team, 1, "dev", false);
+    ops::apply(&mut team, "reject", &json!({"task":1,"reason":"Try another context","fresh":true}),
+        &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+    // dev failed #1 and is free, yet the free dev2 takes the retry; dev takes #2.
+    let now = steps(&team, &seen, 1.0);
+    assert!(now.contains(&Step::Rebalance { task: 1, from: "dev".into(), to: "dev2".into() }), "{now:?}");
+    assert!(now.contains(&Step::HandOut { task: 2, member: "dev".into() }), "{now:?}");
+    // Without a free peer, the assignee retries rather than wait.
+    seen[2].free = false;
+    let now = steps(&team, &seen, 1.0);
+    assert!(now.contains(&Step::HandOut { task: 1, member: "dev".into() }), "{now:?}");
+}
+
+#[test]
+fn a_fresh_retry_leaves_the_failed_member_even_with_other_work() {
+    for overlapping in [false, true] {
+        for modeled in [false, true] {
+            let (mut team, mut seen) = team_with_two_backends();
+            submit(&mut team, 1, "dev", false);
+            ops::apply(&mut team, "reject", &json!({"task":1,"reason":"Use a fresh context","fresh":true}),
+                &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+            if overlapping {
+                team.task_mut(1).unwrap().output = vec!["src/shared.rs".into()];
+                team.task_mut(2).unwrap().output = vec!["src/shared.rs".into()];
+            }
+            team.task_mut(2).unwrap().status = TaskStatus::InProgress;
+            team.task_mut(2).unwrap().attempts.push(Attempt { n: 1, member: "dev".into(), state: AttemptState::Delivered, ..Default::default() });
+            seen[1].free = false;
+            if modeled {
+                team.task_mut(1).unwrap().models = vec!["test-model".into()];
+                for member in &mut team.members { member.model = "test-model".into(); }
+            }
+            let next = Step::Rebalance { task: 1, from: "dev".into(), to: "dev2".into() };
+            if overlapping {
+                // Task 155: #2 writes the same file and runs: the retry waits
+                // for it rather than run beside it on another branch.
+                assert!(!steps(&team, &seen, 100.0).iter().any(|step| matches!(step, Step::Rebalance { task: 1, .. } | Step::HandOut { task: 1, .. })),
+                    "modeled={modeled}");
+                continue;
+            }
+            assert!(steps(&team, &seen, 100.0).contains(&next), "overlapping={overlapping} modeled={modeled}");
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::open_at(&dir.path().join("teams.sqlite3"), true).unwrap();
+            store.create("11111111-1111-4111-8111-111111111111", &json!({}), team.clone(), vec![]).unwrap();
+            set_fake_hgs(Some(Box::new(|_, args, _| {
+                assert_eq!(&args[..2], &["send", "codex/x/dev2"]);
+                Ok(fake_output(0, r#"{"status":"submitted"}"#, ""))
+            })));
+            let result = run_step(&mut store, &team, &next, "");
+            set_fake_hgs(None);
+            result.unwrap();
+            let saved = store.load(&team.id).unwrap().unwrap();
+            assert_eq!(saved.task(1).unwrap().assignee, "dev2");
+            assert!(!saved.task(1).unwrap().fresh_retry);
+        }
+    }
+}
+
+#[test]
+fn an_automatic_refusal_keeps_overlapping_or_unknown_output_with_its_member() {
+    for missing_output in [false, true] {
+        for modeled in [false, true] {
+            let (team, mut seen) = team_with_two_backends();
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::open_at(&dir.path().join("teams.sqlite3"), true).unwrap();
+            store.create("11111111-1111-4111-8111-111111111111", &json!({}), team.clone(), vec![]).unwrap();
+            set_fake_hgs(Some(Box::new(|_, args, _| {
+                assert_eq!(&args[..2], &["send", "codex/x/dev"]);
+                Ok(fake_output(1, "", "session is busy"))
+            })));
+            let result = run_step(&mut store, &team, &Step::HandOut { task: 1, member: "dev".into() }, "");
+            set_fake_hgs(None);
+            result.unwrap();
+            let mut team = store.load(&team.id).unwrap().unwrap();
+            assert_eq!(team.task(1).unwrap().attempts.last().unwrap().state, AttemptState::Refused);
+            assert!(!team.task(1).unwrap().fresh_retry);
+            if !missing_output { team.task_mut(1).unwrap().output = vec!["src/shared.rs".into()]; }
+            team.task_mut(2).unwrap().output = vec!["src/shared.rs".into()];
+            team.task_mut(2).unwrap().status = TaskStatus::InProgress;
+            team.task_mut(2).unwrap().attempts.push(Attempt { n: 1, member: "dev".into(), state: AttemptState::Delivered, ..Default::default() });
+            seen[1].free = false;
+            if modeled {
+                team.task_mut(1).unwrap().models = vec!["test-model".into()];
+                for member in &mut team.members { member.model = "test-model".into(); }
+            }
+            // Expire the send-refusal backoff before checking Output protection.
+            let at = crate::state::now() + 60.0;
+            assert!(!steps(&team, &seen, at).iter().any(|step| matches!(step, Step::Rebalance { task: 1, .. })),
+                "missing_output={missing_output} modeled={modeled}");
+            change(&mut store, &team.id, |saved, _| { *saved = team.clone(); Ok(()) }).unwrap();
+            set_fake_hgs(Some(Box::new(|_, _, _| panic!("a stale rebalance must not send"))));
+            let result = run_step(&mut store, &team, &Step::Rebalance { task: 1, from: "dev".into(), to: "dev2".into() }, "");
+            set_fake_hgs(None);
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("task must stay with its member"), "{error}");
+            assert_eq!(store.load(&team.id).unwrap().unwrap().task(1).unwrap().assignee, "dev");
+        }
+    }
+}
+
+#[test]
+fn a_rework_keeps_its_member_and_reserves_it_until_decided() {
+    let (mut team, seen) = team_with_two_backends();
+    // #2 belongs to the other busy member and would otherwise rebalance to dev.
+    team.task_mut(2).unwrap().assignee = "dev2".into();
+    submit(&mut team, 1, "dev", false);
+    ops::apply(&mut team, "reject", &json!({"task":1,"reason":"Fix the race"}),
+        &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+    let mut seen = seen;
+    seen[2].free = false;
+    // The reservation survives a store reload rather than only this tick.
+    let mut team: Team = serde_json::from_value(serde_json::to_value(&team).unwrap()).unwrap();
+    let now = steps(&team, &seen, 1.0);
+    assert_eq!(team.task(1).unwrap().assignee, "dev");
+    assert!(now.contains(&Step::HandOut { task: 1, member: "dev".into() }), "{now:?}");
+    assert!(!now.iter().any(|step| matches!(step, Step::Rebalance { to, .. } if to == "dev")), "{now:?}");
+    // The model-routing path must retain the rejected member too.
+    let mut modeled = team.clone();
+    modeled.task_mut(1).unwrap().models = vec!["test-model".into()];
+    modeled.members.iter_mut().find(|member| member.id == "dev").unwrap().model = "test-model".into();
+    assert!(steps(&modeled, &seen, 1.0).contains(&Step::HandOut { task: 1, member: "dev".into() }));
+    // Exercise the actual hand-out entry point against a private store.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open_at(&dir.path().join("teams.sqlite3"), true).unwrap();
+    store.create("11111111-1111-4111-8111-111111111111", &json!({}), team.clone(), vec![]).unwrap();
+    set_fake_hgs(Some(Box::new(|_, args, _| {
+        assert_eq!(&args[..2], &["send", "codex/x/dev"]);
+        Ok(fake_output(0, r#"{"status":"submitted"}"#, ""))
+    })));
+    let result = run_step(&mut store, &team, &Step::HandOut { task: 1, member: "dev".into() }, "");
+    set_fake_hgs(None);
+    result.unwrap();
+    let saved = store.load(&team.id).unwrap().unwrap();
+    let retry = saved.task(1).unwrap().attempts.last().unwrap();
+    assert_eq!((retry.n, retry.member.as_str(), retry.state), (2, "dev", AttemptState::Delivered));
+    let retry_id = retry.id.clone();
+    let mut reported = saved;
+    ops::apply(&mut reported, "report", &json!({"task":1,"attempt":retry_id,"text":"Fixed"}),
+        &Actor::Member("dev".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+    assert!(!steps(&reported, &seen, 2.0).iter().any(|step| matches!(step, Step::Rebalance { to, .. } if to == "dev")));
+    for mut draining in [team.clone(), reported] {
+        ops::apply(&mut draining, "drain", &json!({"member":"dev"}), &Actor::Member("lead".into()),
+            &BTreeSet::new(), &mut Vec::new()).unwrap();
+        assert_eq!(draining.task(1).unwrap().assignee, "dev");
+        assert!(!steps(&draining, &seen, 2.0).iter().any(|step| matches!(step, Step::Drain { member, .. } if member == "dev")));
+        if draining.task(1).unwrap().status == TaskStatus::Pending {
+            for modeled in [false, true] {
+                let mut draining = draining.clone();
+                if modeled {
+                    draining.task_mut(1).unwrap().models = vec!["test-model".into()];
+                    draining.members.iter_mut().find(|member| member.id == "dev").unwrap().model = "test-model".into();
+                }
+                assert!(steps(&draining, &seen, 2.0).contains(&Step::HandOut { task: 1, member: "dev".into() }));
+            }
+            // Its rework is completed through the normal report/accept path,
+            // then the same drain can finish.
+            draining.task_mut(1).unwrap().attempts.push(Attempt { n: 2, id: "drain-rework".into(), member: "dev".into(), state: AttemptState::Delivered, ..Default::default() });
+            draining.task_mut(1).unwrap().status = TaskStatus::InProgress;
+            ops::apply(&mut draining, "report", &json!({"task":1,"attempt":"drain-rework","text":"Fixed"}),
+                &Actor::Member("dev".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+        }
+        ops::apply(&mut draining, "accept", &json!({"task":1}), &Actor::Member("lead".into()),
+            &BTreeSet::new(), &mut Vec::new()).unwrap();
+        assert!(steps(&draining, &seen, 3.0).iter().any(|step| matches!(step, Step::Drain { member, .. } if member == "dev")));
+    }
+    // Task 160 (owner, 2026-11-07): a held return reserves nobody; the
+    // member takes other work meanwhile, and the release reserves it again.
+    ops::apply(&mut team, "hold", &json!({"task":1}), &Actor::Member("lead".into()),
+        &BTreeSet::new(), &mut Vec::new()).unwrap();
+    let now = steps(&team, &seen, 2.0);
+    assert!(now.contains(&Step::Rebalance { task: 2, from: "dev2".into(), to: "dev".into() }), "{now:?}");
+    ops::apply(&mut team, "release", &json!({"task":1}), &Actor::Member("lead".into()),
+        &BTreeSet::new(), &mut Vec::new()).unwrap();
+    let now = steps(&team, &seen, 2.0);
+    assert!(!now.iter().any(|step| matches!(step, Step::Rebalance { to, .. } if to == "dev")), "{now:?}");
+    ops::apply(&mut team, "cancel", &json!({"task":1}), &Actor::Member("lead".into()),
+        &BTreeSet::new(), &mut Vec::new()).unwrap();
+    assert!(steps(&team, &seen, 3.0).contains(&Step::Rebalance { task: 2, from: "dev2".into(), to: "dev".into() }));
+}
+
+#[test]
+fn an_unavailable_rework_waits_without_timeout_and_reassign_still_moves_it() {
+    let (mut team, seen) = team_with_two_backends();
+    submit(&mut team, 1, "dev", false);
+    ops::apply(&mut team, "reject", &json!({"task":1,"reason":"Fix it"}),
+        &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+    team.task_mut(1).unwrap().rework_since = Some(crate::state::now() - 7.0 * 60.0);
+    for state in ["approval", "limit", "stopped", "paused"] {
+        let mut waiting = team.clone();
+        let mut seen = seen.clone();
+        // Native asking/limit/liveness evidence wins even if free was stale.
+        seen[1].free = state == "limit" || state == "approval" || state == "stopped";
+        seen[1].asking = state == "approval";
+        seen[1].live = state != "stopped";
+        if state == "limit" { seen[1].limited = Some(SeenLimit { at: 1.0, ..Default::default() }); }
+        if state == "paused" { waiting.members.iter_mut().find(|m| m.id == "dev").unwrap().state = MemberState::Paused; }
+        let member = waiting.members.iter_mut().find(|m| m.id == "dev").unwrap();
+        member.seen = Some(MemberSeen { at: 1.0, live: seen[1].live });
+        member.seen_phase = if state == "approval" { "approval" } else if state == "limit" { "error" } else { "idle" }.into();
+        for at in [60.0, 60.0 * 60.0 * 24.0 * 30.0] {
+            let now = steps(&waiting, &seen, at);
+            assert!(!now.iter().any(|s| matches!(s, Step::HandOut { task: 1, .. } | Step::Rebalance { task: 1, .. })), "{state}: {now:?}");
+        }
+        let item = crate::state::teams::inbox::items(&waiting).into_iter().find(|item| item.task == Some(1) && item.kind == "rework_waits").unwrap();
+        assert_eq!(item.summary, "#1 waits for its member, 7 min");
+        assert!(item.command.contains("reassign"));
+        assert!(!item.detail.ends_with(' '));
+        ops::apply(&mut waiting, "reassign", &json!({"task":1,"member":"dev2"}),
+            &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+        assert_eq!(waiting.task(1).unwrap().rework_since, None);
+        assert!(steps(&waiting, &seen, 100.0).contains(&Step::HandOut { task: 1, member: "dev2".into() }));
+    }
+}
+
+#[test]
+fn a_free_or_held_rework_has_no_member_wait_item() {
+    let mut team = team();
+    submit(&mut team, 1, "dev", false);
+    ops::apply(&mut team, "reject", &json!({"task":1,"reason":"Fix"}), &Actor::Member("lead".into()),
+        &BTreeSet::new(), &mut Vec::new()).unwrap();
+    let member = team.members.iter_mut().find(|m| m.id == "dev").unwrap();
+    member.seen = Some(MemberSeen { at: 1.0, live: true });
+    member.seen_phase = "idle".into();
+    member.seen_activity = "idle".into();
+    assert!(!crate::state::teams::inbox::items(&team).iter().any(|item| item.kind == "rework_waits"));
+    team.members.iter_mut().find(|m| m.id == "dev").unwrap().state = MemberState::Paused;
+    ops::apply(&mut team, "hold", &json!({"task":1}), &Actor::Member("lead".into()), &BTreeSet::new(), &mut Vec::new()).unwrap();
+    assert!(!crate::state::teams::inbox::items(&team).iter().any(|item| item.kind == "rework_waits"));
+}
+
+#[test]
+fn a_stage_returned_task_stays_with_its_implementer_not_a_peer() {
+    // #630 C2: a return's attempt is not failed(); the implementer keeps
+    // the task, while a lead's rejection still rebalances it.
+    let (mut team, seen) = team_with_two_backends();
+    let task = team.task_mut(1).unwrap();
+    task.attempts.push(Attempt { n: 1, member: "dev".into(), state: AttemptState::Rejected, pipeline_return: true, ..Default::default() });
+    task.status = TaskStatus::Pending;
+    let now = steps(&team, &seen, 1.0);
+    assert!(now.contains(&Step::HandOut { task: 1, member: "dev".into() }), "{now:?}");
+    assert!(!now.iter().any(|step| matches!(step, Step::Rebalance { task: 1, .. })), "{now:?}");
+    let mut rejected = team.clone();
+    rejected.task_mut(1).unwrap().attempts[0].pipeline_return = false;
+    let now = steps(&rejected, &seen, 1.0);
+    assert!(now.contains(&Step::Rebalance { task: 1, from: "dev".into(), to: "dev2".into() }), "{now:?}");
+}
+
+#[test]
+fn a_pinned_task_from_plan_is_never_rebalanced() {
+    let (mut team, _) = ops::create(
+        "t",
+        &json!({"name":"Checkout","lead":{"id":"lead","agent":"claude","session":{"name":"claude/x/lead","run_id":"r0"}}}),
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    ops::apply(
+        &mut team,
+        "plan",
+        &json!({"members":[{"id":"dev","role":"Backend","agent":"codex","session":{"name":"codex/x/dev","run_id":"r1"}}],
+            "tasks":[{"id":1,"title":"API","assignee":"dev"},{"id":2,"title":"More API","assignee":"dev","pinned":true}]}),
+        &Actor::Member("lead".into()),
+        &BTreeSet::new(),
+        &mut events,
+    )
+    .unwrap();
+    ops::apply(&mut team, "approve", &json!({}), &Actor::Human, &BTreeSet::new(), &mut events).unwrap();
+    assert!(team.task(2).unwrap().pinned);
+    let mut dev2 = team.member("dev").unwrap().clone();
+    dev2.id = "dev2".into();
+    dev2.session = Some(SessionRef { name: "codex/x/dev2".into(), run_id: "r3".into(), conversation_id: "c".into(), ..Default::default() });
+    team.members.push(dev2);
+    team.task_mut(1).unwrap().attempts.push(Attempt { n: 1, member: "dev".into(), state: AttemptState::Delivered, ..Default::default() });
+    team.task_mut(1).unwrap().status = TaskStatus::InProgress;
+    let seen = vec![session("claude/x/lead", "r0", false), session("codex/x/dev", "r1", true), session("codex/x/dev2", "r3", true)];
+    let now = steps(&team, &seen, 1.0);
+    // dev is busy with #1, but #2 stays with its member: no peer takes it.
+    assert!(!now.iter().any(|s| matches!(s, Step::Rebalance { .. })), "{now:?}");
+    assert!(!now.iter().any(|s| matches!(s, Step::HandOut { task: 2, .. })), "{now:?}");
+}
+
+#[test]
+fn a_deepseek_member_takes_its_settings_before_its_task() {
+    let mut team = team();
+    let dsh = team.members.iter_mut().find(|m| m.id == "dev").unwrap();
+    dsh.agent = "dsh".into(); dsh.effort = "low".into();
+    let seen = [session("claude/x/lead", "r0", true), session("codex/x/dev", "r1", true)];
+    let steps_now = steps(&team, &seen, 1.0);
+    assert!(steps_now.contains(&Step::Settings { member: "dev".into() }), "{steps_now:?}");
+    assert!(!steps_now.iter().any(|s| matches!(s, Step::HandOut { member, .. } if member == "dev")));
+    team.members.iter_mut().find(|m| m.id == "dev").unwrap().settings_applied = true;
+    assert!(steps(&team, &seen, 1.0).iter().any(|s| matches!(s, Step::HandOut { member, .. } if member == "dev")));
+}
+
+#[test]
+fn send_outcomes_are_classified_conservatively() {
+    let output = |code: i32, stdout: &str, stderr: &str| {
+        #[cfg(windows)]
+        let status = std::os::windows::process::ExitStatusExt::from_raw(code as u32);
+        #[cfg(unix)]
+        let status = std::os::unix::process::ExitStatusExt::from_raw(code << 8);
+        Ok(Output { status, stdout: stdout.into(), stderr: stderr.into() })
+    };
+    assert_eq!(classify(&output(0, r#"{"status":"submitted"}"#, "")), Sent::Delivered);
+    assert!(matches!(classify(&output(1, "", "session is busy")), Sent::Refused(_)));
+    assert!(matches!(classify(&output(1, "", "delivery uncertain: x")), Sent::Uncertain(_)));
+    assert!(matches!(classify(&output(255, "", "ssh: connection reset")), Sent::Uncertain(_)));
+    assert!(matches!(classify(&Err(anyhow::anyhow!("timed out"))), Sent::Uncertain(_)));
+}
+
+/// Owner, 2026-11-07: a report is only an explicit `hgs team report`; the
+/// hand-out must not invite a captured last reply.
+#[test]
+fn the_hand_out_never_invites_a_captured_last_reply() {
+    let team = team();
+    let attempt = Attempt { n: 1, id: "A1".into(), member: "dev".into(), state: AttemptState::Delivered, ..Default::default() };
+    let text = hand_off_text(&team, team.task(1).unwrap(), &attempt, "", "");
+    assert!(!text.contains("end your turn with"), "{text}");
+    assert!(!text.contains("Zerus gives it"), "{text}");
+    assert!(!text.contains("report as your last message"), "{text}");
+    // It still names the explicit report and No report, and keeps a question a
+    // question.
+    assert!(text.contains("A report is an explicit `hgs "), "{text}");
+    assert!(text.contains("No report"), "{text}");
+    assert!(text.contains("A progress line is not a report; a question is not a report."), "{text}");
+    assert!(text.contains("Report once at the end: hgs "), "{text}");
+}
+
+#[test]
+fn a_repeated_refusal_backs_off_to_fifteen_minutes() {
+    assert_eq!(crate::state::teams::dispatcher::refusal_pause(1), 30.0);
+    assert_eq!(crate::state::teams::dispatcher::refusal_pause(2), 60.0);
+    assert_eq!(crate::state::teams::dispatcher::refusal_pause(3), 120.0);
+    assert_eq!(crate::state::teams::dispatcher::refusal_pause(9), 15.0 * 60.0);
+}
+
+#[test]
+fn repeated_refusals_stay_one_attempt_with_a_count() {
+    let (team, _seen) = team_with_two_backends();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open_at(&dir.path().join("teams.sqlite3"), true).unwrap();
+    store.create("11111111-1111-4111-8111-111111111111", &json!({}), team.clone(), vec![]).unwrap();
+    set_fake_hgs(Some(Box::new(|_, _, _| Ok(fake_output(1, "", "terminal is busy")))));
+    run_step(&mut store, &team, &Step::HandOut { task: 1, member: "dev".into() }, "").unwrap();
+    // Move the stored refusal past its pause so the next hand-out is tried.
+    change(&mut store, &team.id, |saved, _| {
+        saved.task_mut(1).unwrap().attempts.last_mut().unwrap().sent_at = crate::state::now() - 31.0;
+        Ok(())
+    }).unwrap();
+    run_step(&mut store, &team, &Step::HandOut { task: 1, member: "dev".into() }, "").unwrap();
+    set_fake_hgs(None);
+    let task = store.load(&team.id).unwrap().unwrap().task(1).unwrap().clone();
+    assert_eq!(task.attempts.len(), 1, "one attempt carries every refusal");
+    assert_eq!(task.attempts[0].refusal_count, 2);
+    assert_eq!(task.attempts[0].refusal_reason, "terminal is busy");
+}
+
+/// Task #25: a member whose folder holds CodeLore's code map (a lore.toml with
+/// `[atlas] enabled = true`) is told how to search the code, the docs and the
+/// team's memory; any other folder's hand-out is as before.
+#[test]
+fn a_folder_with_the_code_map_gets_the_search_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().to_string_lossy().into_owned();
+    assert!(!super::code_map_in(&folder), "no lore.toml");
+    assert!(!super::code_map_in(""));
+    std::fs::write(dir.path().join("lore.toml"), "version = 1\nareas = []\n\n[atlas]\nenabled = false\n").unwrap();
+    assert!(!super::code_map_in(&folder), "a map that is off");
+    std::fs::write(dir.path().join("lore.toml"), "version = 1\nenabled = true\n\n[embed]\nprovider = \"none\"\n").unwrap();
+    assert!(!super::code_map_in(&folder), "enabled outside [atlas]");
+    let mut team = team();
+    let attempt = Attempt { n: 1, id: "A1".into(), member: "dev".into(), state: AttemptState::Delivered, ..Default::default() };
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().directory = folder.clone();
+    let before = hand_off_text(&team, team.task(1).unwrap(), &attempt, "", "");
+    assert!(!before.contains("lore atlas search"), "{before}");
+    std::fs::write(dir.path().join("lore.toml"), "version = 1\nareas = [\"use-the-project-store\"]\n\n[atlas]\nenabled = true\nsemantic = false\n").unwrap();
+    assert!(super::code_map_in(&folder));
+    let text = hand_off_text(&team, team.task(1).unwrap(), &attempt, "", "");
+    assert!(text.contains("lore atlas search") && text.contains("hgs team lore find") && text.contains("hgs guide code"), "{text}");
+}
+
+thread_local! {
+    /// Task #17's stand-in for the replaced session: busy until set false.
+    static OLD_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static SET_ASIDE_ASKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Task #17 (team ede724c4, 2026-11-10): dev1 was relaunched while it worked
+/// on task #1, and swapped to another account; its old session was renamed
+/// dev1-replaced while busy and kept working beside the new dev1 in the same
+/// worktree. Now a busy replaced session makes the start wait: it keeps the
+/// member's name, nothing new starts in its folder, the wait is said once,
+/// and only after it was paused does the one new session start.
+#[test]
+fn a_relaunch_and_a_swap_of_a_working_member_never_leave_two_sessions_in_its_folder() {
+    let root = tempfile::tempdir().unwrap();
+    crate::state::with_test_state_root(root.path(), || relaunch_and_swap_of_a_working_member(root.path()));
+}
+
+fn relaunch_and_swap_of_a_working_member(root: &std::path::Path) {
+    let folder = root.join("work");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut t = team();
+    t.folder = folder.to_string_lossy().into_owned();
+    let dev = t.members.iter_mut().find(|member| member.id == "dev").unwrap();
+    dev.state = MemberState::Active;
+    dev.folder = MemberFolder::Shared;
+    delivered(&mut t);
+    let attempt = t.task(1).unwrap().open_attempt().unwrap().id.clone();
+    let none = BTreeSet::new();
+    let mut events = Vec::new();
+    // The owner relaunches dev, then swaps it to another account.
+    super::super::ops::apply(&mut t, "relaunch", &json!({"member":"dev"}), &super::super::ops::Actor::Human, &none, &mut events).unwrap();
+    super::super::ops::apply(&mut t, "swap-member", &json!({"member":"dev","account":"additional"}), &super::super::ops::Actor::Human, &none, &mut events).unwrap();
+    let dev = t.member("dev").unwrap();
+    assert!(dev.session.is_none() && dev.launch_after_swap, "a new session is due");
+    assert_eq!(dev.replaced.as_ref().map(|old| old.name.as_str()), Some("codex/x/dev"), "the working session is the one replaced");
+    // The swap hands the task on: its attempt is revoked, so a late report
+    // from the old session records nothing twice.
+    assert!(t.task(1).unwrap().open_attempt().is_none());
+    assert!(t.task(1).unwrap().attempts.iter().any(|found| found.id == attempt && found.state == AttemptState::Revoked));
+    assert_eq!(steps(&t, &[], 100.0).iter().filter(|step| matches!(step, Step::Launch { member } if member == "dev")).count(), 1);
+
+    let mut store = Store::open_at(&root.join("teams.sqlite3"), true).unwrap();
+    store.create("11111111-1111-4111-8111-111111111111", &json!({}), t.clone(), vec![]).unwrap();
+    let launches = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let count = launches.clone();
+    set_fake_hgs(Some(Box::new(move |_, args, _| {
+        if args.contains(&"--launch-id") {
+            // A start while the old session still works would put two agents
+            // in one folder.
+            assert!(!OLD_BUSY.with(std::cell::Cell::get), "a new session started while the replaced one works: {args:?}");
+            count.set(count.get() + 1);
+        }
+        Ok(fake_output(0, "{}", ""))
+    })));
+    OLD_BUSY.with(|busy| busy.set(true));
+    SET_ASIDE_ASKED.with(|asked| asked.set(0));
+    super::set_test_set_aside(Some(|name| {
+        SET_ASIDE_ASKED.with(|asked| asked.set(asked.get() + 1));
+        Ok(if OLD_BUSY.with(std::cell::Cell::get) {
+            super::SetAside::Busy(name.to_owned())
+        } else {
+            super::SetAside::Done(Some(format!("the replaced session was paused and saved as {name}-replaced")))
+        })
+    }));
+    let launch = Step::Launch { member: "dev".into() };
+    // Two ticks while the old session works: nothing starts, the wait is said once.
+    for _ in 0..2 {
+        let team = store.load(&t.id).unwrap().unwrap();
+        assert!(steps(&team, &[], 100.0).contains(&launch), "the start is tried again each tick");
+        run_step(&mut store, &team, &launch, "").unwrap();
+        let saved = store.load(&t.id).unwrap().unwrap();
+        let dev = saved.member("dev").unwrap();
+        assert!(dev.session.is_none() && dev.launch_id.is_empty() && dev.error.is_empty(), "{dev:?}");
+        assert!(dev.replaced.is_some() && dev.replaced_busy && dev.launch_after_swap);
+    }
+    assert_eq!(launches.get(), 0, "no second session while the first works");
+    let waits = store.events(&t.id, None, 50).unwrap().to_string();
+    assert_eq!(waits.matches("launch_waiting").count(), 1, "said once: {waits}");
+    assert!(!waits.contains("member_retired") && !waits.contains("launch_failed"), "{waits}");
+    // Its turn ends and it is paused: now the one new session starts.
+    OLD_BUSY.with(|busy| busy.set(false));
+    let team = store.load(&t.id).unwrap().unwrap();
+    run_step(&mut store, &team, &launch, "").unwrap();
+    super::set_test_set_aside(None);
+    set_fake_hgs(None);
+    assert_eq!(launches.get(), 1, "exactly one new session");
+    assert_eq!(SET_ASIDE_ASKED.with(std::cell::Cell::get), 3, "the old session was set aside before the start");
+    let saved = store.load(&t.id).unwrap().unwrap();
+    let dev = saved.member("dev").unwrap();
+    assert!(dev.replaced.is_none() && !dev.replaced_busy && !dev.launch_id.is_empty(), "{dev:?}");
+    let feed = store.events(&t.id, None, 50).unwrap().to_string();
+    assert!(feed.contains("was paused and saved as codex/x/dev-replaced"), "{feed}");
+}
+
+/// RogueDOD (team 75549318, 2026-11-12): three idle DeepSeek secretaries
+/// whose role chose a model and effort never got a task for their role: such
+/// a member is not available until its settings are applied, and only an
+/// assignee's task applied them. A free member of the role takes its settings
+/// first; the next tick hands it the task.
+#[test]
+fn a_task_for_a_role_starts_a_deepseek_members_settings_and_then_goes_to_it() {
+    let mut team = team();
+    for (id, run) in [("sec1", "r5"), ("sec2", "r6")] {
+        team.members.push(Member {
+            id: id.into(), role: "Secretary".into(), agent: "dsh".into(), model: "deepseek-flash".into(), effort: "low".into(),
+            state: MemberState::Active, folder: MemberFolder::Shared, permissions_profile: "network".into(),
+            session: Some(SessionRef { name: format!("dsh/x/{id}"), run_id: run.into(), conversation_id: "c".into(), ..Default::default() }),
+            ..Default::default()
+        });
+    }
+    // The plan's own tasks are done; the role's task is the only ready one.
+    for task in team.tasks.iter_mut() {
+        task.status = TaskStatus::Accepted;
+    }
+    team.tasks.push(Task { id: 6, title: "ai: AIBehavior.md".into(), phase: 1, status: TaskStatus::Pending, role: "Secretary".into(),
+        output: vec!["lore:ai".into()], ..Default::default() });
+    let seen = vec![session("claude/x/lead", "r0", true), session("codex/x/dev", "r1", true), session("dsh/x/sec1", "r5", true), session("dsh/x/sec2", "r6", true)];
+    let first = steps(&team, &seen, 1.0);
+    assert!(first.contains(&Step::Settings { member: "sec1".into() }), "{first:?}");
+    assert!(!first.contains(&Step::Settings { member: "sec2".into() }), "one member for one task: {first:?}");
+    team.members.iter_mut().find(|m| m.id == "sec1").unwrap().settings_applied = true;
+    let next = steps(&team, &seen, 2.0);
+    assert!(next.iter().any(|s| matches!(s, Step::Rebalance { task: 6, to, .. } if to == "sec1") || matches!(s, Step::HandOut { task: 6, member } if member == "sec1")), "{next:?}");
+}

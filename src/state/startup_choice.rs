@@ -4,9 +4,9 @@
 //! still shows the wait: the visible panel verbatim, answered in Terminal.
 //! Zerus never sends keys to it.
 //!
-//! One reviewed chooser stays here on purpose: the sandbox setup that Codex
-//! 0.162 on Windows shows after folder trust. Zerus names it but never answers
-//! it (`codex_sandbox`).
+//! Sandbox setup keeps this read-only fallback when its dedicated parser
+//! cannot verify the complete native frame. This generic path names the
+//! legacy prompt (`codex_sandbox`) and never answers it.
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -59,6 +59,37 @@ fn text(rows: &[&str]) -> String {
     lines.join("\n").trim().to_owned()
 }
 
+/// Task 2: Claude's unnumbered chooser, read as `claude_approval` reads it
+/// after a turn: the panel's last row is "Enter to confirm · Esc to ...", and
+/// the rows right above it (after a blank row), two to nine with exactly one
+/// marked, are its options. "Claude in Chrome extension detected" at startup
+/// showed its options as body text before.
+fn hinted(panel: &[&str]) -> Option<Choice> {
+    let last = panel.iter().rposition(|row| !row.is_empty())?;
+    if !super::claude_approval::confirm_hint(panel[last]) {
+        return None;
+    }
+    let end = panel[..last].iter().rposition(|row| !row.is_empty())?;
+    let start = panel[..=end].iter().rposition(|row| row.is_empty())? + 1;
+    let options = &panel[start..=end];
+    if !(2..=9).contains(&options.len())
+        || options.iter().filter(|row| marked(row).is_some()).count() != 1
+        || options.iter().any(|row| row.starts_with(MARKERS) && marked(row).is_none())
+    {
+        return None;
+    }
+    let title = panel[..start].iter().position(|row| !row.is_empty())?;
+    Some(Choice {
+        title: panel[title].into(),
+        body: text(&panel[title + 1..start]),
+        options: options.iter().map(|row| option(row).to_owned()).collect(),
+    })
+}
+
+/// Pure recognition only, used to end startup observation at a manual choice.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn recognized(screen: &str) -> bool { parse(screen).is_some() }
+
 fn parse(screen: &str) -> Option<Choice> {
     let rows: Vec<&str> = screen.lines().map(str::trim_end).collect();
     let end = rows.iter().rposition(|row| !row.trim().is_empty())? + 1;
@@ -69,8 +100,14 @@ fn parse(screen: &str) -> Option<Choice> {
     let panel: Vec<&str> = rows[top..bottom].iter().map(|row| row.trim()).collect();
     let selected = selected - top;
     if numbered(option(panel[selected])).is_none() {
-        // Unnumbered choices cannot be told apart from their descriptions, so
-        // the panel stays verbatim. Its native key hint shows it is a chooser.
+        // Task 2: Claude's own unnumbered chooser ends with "Enter to confirm ·
+        // Esc to ..."; its options are the rows right above that hint.
+        if let Some(choice) = hinted(&panel) {
+            return Some(choice);
+        }
+        // Other unnumbered choices cannot be told apart from their
+        // descriptions, so the panel stays verbatim. Its native key hint
+        // shows it is a chooser.
         if !panel.iter().any(|row| hint(row)) {
             return None;
         }
@@ -142,18 +179,25 @@ fn codex_sandbox(choice: &Choice) -> bool {
             .is_some_and(|prompt| words(prompt) == CODEX_SANDBOX)
 }
 
-fn native_input(name: &str) -> PathBuf {
-    root().join("native-input").join(format!("{:x}.lock", Sha256::digest(name.as_bytes())))
+/// The session's native-input lock, keyed by its verified record (#1437
+/// review), so a session in the ID layout never shares one with the other
+/// holder of its label.
+fn native_input(record: &Value) -> PathBuf {
+    root().join("native-input").join(format!("{}.lock", storage::owner_key(record)))
 }
 
 /// Held while Zerus itself drives a native picker in this session, such as the
 /// model picker before the first message. That picker is not a startup wait.
-pub(super) fn driving(name: &str) -> Result<Guard> {
-    lock(Some(&native_input(name)))
+pub(super) fn driving(record: &Value) -> Result<Guard> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if effort::picker_entered() {
+        return effort::picker_refuse("The original picker keeper cannot reacquire native input".into());
+    }
+    lock(Some(&native_input(record)))
 }
 
-fn driven(name: &str) -> bool {
-    !matches!(lock_until(&native_input(name), std::time::Instant::now()), Ok(Some(_)))
+fn driven(record: &Value) -> bool {
+    !matches!(lock_until(&native_input(record), std::time::Instant::now()), Ok(Some(_)))
 }
 
 pub(super) fn eligible(record: &Value) -> bool {
@@ -205,11 +249,15 @@ fn card(record: &Value, choice: &Choice) -> Option<Value> {
 /// Callers check the reviewed startup parsers first; this only reports a wait
 /// none of them can answer.
 pub(super) fn current(record: &Value) -> Option<Value> {
-    if !eligible(record) || driven(string(record, "name")) {
+    if !eligible(record) || driven(record) {
         return None;
     }
     let record = kimi_tui_choice::identity(record).ok()?;
-    card(&record, &parse(&kimi_tui_choice::capture(&record).ok()?)?)
+    let screen = kimi_tui_choice::capture(&record).ok()?;
+    if let Some(theme) = claude_theme::card(&record, &screen) {
+        return Some(theme);
+    }
+    card(&record, &parse(&screen)?)
 }
 
 pub(super) fn detail(record: &Value, question: &Value) -> String {
@@ -242,13 +290,33 @@ mod tests {
     }
     #[test]
     fn unnumbered_choices_stay_verbatim_inside_their_frame() {
+        // Task 2: Claude's own chooser ("Enter to confirm · Esc to ...") has
+        // its options, still read-only; another hint keeps the panel verbatim.
         let claude = parse(&CLAUDE_TRUST.replace("No, exit", "No, quit")).unwrap();
         assert_eq!(claude.title, "Accessing workspace:");
-        assert!(claude.body.contains("17 tool permissions") && claude.body.contains("❯ No, quit"));
-        assert!(claude.options.is_empty());
+        assert!(claude.body.contains("17 tool permissions") && !claude.body.contains("No, quit"));
+        assert_eq!(claude.options, ["No, quit", "Yes, I trust this folder"]);
+        let other = parse(&CLAUDE_TRUST.replace("No, exit", "No, quit").replace("Enter to confirm · Esc to cancel", "Enter to continue · Esc to quit")).unwrap();
+        assert!(other.body.contains("❯ No, quit") && other.options.is_empty());
         let kimi = parse(&format!("unrelated launcher output\n{KIMI_TRUST}")).unwrap();
         assert_eq!(kimi.title, "Trust this folder?");
         assert!(!kimi.body.contains("launcher") && kimi.body.ends_with("Exit Kimi Code. Asked again next launch."));
+    }
+    #[test]
+    fn the_claude_in_chrome_panel_at_startup_has_its_two_options() {
+        // Task 2: Claude Code 2.1.318 asks this before the first conversation.
+        const CHROME: &str = include_str!("../../tests/fixtures/claude-chrome-detected.txt");
+        let choice = parse(CHROME).unwrap();
+        assert_eq!(choice.title, "Claude in Chrome extension detected");
+        assert_eq!(choice.options, ["Yes, use my browser", "No, keep browser tools off"]);
+        assert!(choice.body.starts_with("Claude will use your Chrome browser") && !choice.body.contains("use my browser"), "{}", choice.body);
+        let question = card(&record("claude"), &choice).unwrap();
+        assert_eq!((question["source"].clone(), question["can_answer"].clone()), (json!("startup_terminal_choice"), json!(false)));
+        let options = question["questions"][0]["options"].as_array().unwrap();
+        assert_eq!((options.len(), options[1]["label"].clone()), (2, json!("No, keep browser tools off")));
+        // Two marked rows, or one option, is no chooser of this kind.
+        assert!(parse(&CHROME.replace("   No, keep", " ❯ No, keep")).is_some_and(|choice| choice.options.is_empty()));
+        assert!(parse(&CHROME.replace("   No, keep browser tools off\n", "")).is_some_and(|choice| choice.options.is_empty()));
     }
     #[test]
     fn composers_and_incomplete_lists_are_not_choices() {

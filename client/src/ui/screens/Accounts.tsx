@@ -1,0 +1,550 @@
+import { Dropdown } from "../lib/Dropdown";
+import { TextInput } from "../lib/TextField";
+import { For, Index, Show, Switch, Match, createEffect, createMemo, createSignal, lazy, Suspense, onCleanup } from "solid-js";
+import { Icon } from "../lib/icons";
+import { MachineTile } from "../components/MachineTile";
+import { MachineLabel } from "../components/MachineLabel";
+import { Actions, Spinner, Status } from "../components/Status";
+import { AccountMarkCircle, AgentBadge, AgentTile } from "../sessions/SessionCard";
+import { accountAppearance, accountMark } from "../../store/accountMarks";
+import { settings } from "../../store/settings";
+import { ResizeHandle } from "../sessions/SessionList";
+import type { Account, LocalUsage, ModelUsage, Spend } from "../../types";
+import { agentKind, catalog } from "../../store/catalog";
+import { machineCards } from "../../store/machines";
+import { accountMachine, accountsPage, loadAccounts, requestedProfile, setAccountMachine, setRequestedProfile } from "../../store/accounts";
+import { connectionOf, osOf } from "../../store/overview";
+import { useNow } from "../../store/latest";
+import { sessionsWidth, setPage } from "../../store/ui";
+import { balanceCompact, balanceKind, balanceLow, balanceTitle, clock, providerName, rateLimitNotice, stateText, windowsAt } from "../lib/usage";
+import { UsageMeters } from "../components/UsageMeter";
+import { compactCount, exactCount, localUsageGroups, localUsageNotes, spendNotes, spendRows } from "../lib/deepseek-usage";
+import { accountManagement } from "../../store/accountManagement";
+import { accountSetup } from "../../store/accountSetup";
+import {accountDistribution} from "../../store/accountDistribution";
+import { creditsText, loginLabel, memberStateLabel, memberStateText, memberOf, panelWindow, profileTags, summaryLine, tone, visibleAccounts, visibleMembers, accountSignState, noAccountsMatch, signState, signedCounts, type SignFilter, identityFields, type AccountSort } from "./accounts-ui";
+import { useLocalSpeed } from "../lib/localSpeed";
+import { tr } from "../../i18n";
+import { trText } from "../../text";
+
+// Agent accounts (AccountsPage.cpp), ported from design/webui/src/screens/Accounts.tsx:
+// profiles grouped by provider identity across machines; choosing a machine
+// tag selects that machine's profile. Catalog edits use native snapshots;
+// setup and distribution share that writer and the existing terminal backend.
+
+const AccountDistributionDialog=lazy(()=>import("./AccountDistributionDialog"));
+const AccountMarkDialog=lazy(()=>import("./AccountMarkDialog"));
+const AccountSetupDialog = lazy(() => import("./AccountSetupDialog"));
+const OpenCodeBindDialog = lazy(() => import("./OpenCodeBindDialog"));
+const [bindPrompt, setBindPrompt] = createSignal<{ host: string; machine: string; home: string } | null>(null);
+const [bindNotice, setBindNotice] = createSignal("");
+const managementBusy=()=>accountManagement.busy()||accountSetup.busy()||accountDistribution.busy();
+const closeManagement=()=>{accountManagement.close();accountSetup.close();accountDistribution.close();};
+const clearManagementNotice=()=>{accountManagement.clearNotice();accountSetup.clearNotice();accountDistribution.clearNotice();};
+const openCatalog=(...args:Parameters<typeof accountManagement.open>)=>{accountSetup.close();accountDistribution.close();accountSetup.clearNotice();accountDistribution.clearNotice();return accountManagement.open(...args);};
+const AccountDefaultsDialog = lazy(() => import("./AccountDefaultsDialog"));
+const AccountPermissionsDialog = lazy(() => import("./AccountPermissionsDialog"));
+const AccountCatalogDialog = lazy(() => import("./AccountCatalogDialog"));
+
+const [selectedAccount, setSelectedAccount] = createSignal<string | undefined>();
+const [selectedProfile, setSelectedProfile] = createSignal<string | undefined>();
+// U25 (spec 9): All / Signed in / Signed out, counted on the machine filter (AccountsPage.cpp:276-290).
+const [signFilter, setSignFilter] = createSignal<SignFilter>("all");
+
+/** A signed-out or expired account's pill beside its provider (AccountsPage.cpp:190-195). */
+function SignPill(props: { state: "in" | "out" | "expired" }) {
+  return (
+    <Show when={props.state !== "in"}>
+      <span class="acct-sign" data-state={props.state} title={props.state === "expired" ? tr("Sign-in expired") : tr("Signed out")}>
+        {props.state === "expired" ? tr("Expired") : tr("Signed out")}
+      </span>
+    </Show>
+  );
+}
+
+/** The id tag that tells apart two profiles of one account on the same machine. */
+function ProfileTag(props: { tag?: string; id: string }) {
+  return <Show when={props.tag}><span class="acct-pid tabular" title={tr("Profile %1", props.id)}>{props.tag}</span></Show>;
+}
+
+function AccountRow(props: { a: Account; now: number; selected: boolean }) {
+  const on = () => props.selected;
+  const tags = createMemo(() => profileTags(props.a));
+  const sign = () => accountSignState(props.a, accountMachine());
+  const local = useLocalSpeed(() => props.a.members);
+  const pick = () => {
+    closeManagement();clearManagementNotice();
+    setSelectedAccount(props.a.key);
+    setSelectedProfile(memberOf(props.a, undefined, accountMachine())?.key);
+  };
+  return (
+    <button class="acct-row" classList={{ on: on() }} aria-current={on()} title={props.a.members.map((m) => `${m.machine}${tags().has(m.key) ? ` ${tags().get(m.key)}` : ""}: ${trText(m.permission_label)}`).join("\n")} onClick={pick}>
+      {/* Keep the same large agent tile and small account mark as session cards. */}
+      <span class="acct-av"><AgentTile agent={agentKind(props.a.provider)} /></span>
+      <span class="acct-l1">
+        <AccountMarkCircle mark={accountMark(props.a, settings)} />
+        <b class="ell grow">{props.a.label}</b>
+        <SignPill state={sign()} />
+        <AgentBadge agent={agentKind(props.a.provider)} />
+      </span>
+      <span class="row acct-row-tags">
+        <span class="row acct-machines">
+          <For each={props.a.members.slice(0, 3)}>{(m) => <span class="acct-mchip" classList={{ off: signState(m) !== "in" }}><MachineLabel alias={m.machine} dimmed={!m.online} /><ProfileTag tag={tags().get(m.key)} id={m.id} /></span>}</For>
+          <Show when={props.a.members.length > 3}><span class="dim">+{props.a.members.length - 3}</span></Show>
+        </span>
+        <span class="grow" />
+        <span class="acct-perm" classList={{ bypass: props.a.members.length > 0 && props.a.members.every((m) => m.permission === "bypass") }}>{trText(props.a.permission)}</span>
+      </span>
+      {/* The detail's usage windows in the Overview card's compact meters; the reset shows from 90%.
+          An account without windows but with a balance (a DeepSeek API key) shows the balance there instead. */}
+      {/* A local model account (GB10) shows its model's speed instead (owner, 2026-11-15). */}
+      <Show when={local.server()} fallback={
+        <Show when={props.a.usage.windows.length || balanceCompact(props.a.usage)}>
+          <span class="acct-row-usage"><UsageMeters windows={windowsAt(props.a.usage.windows, props.now)} compact resetFrom={90} summary={balanceCompact(props.a.usage)} summaryTitle={balanceTitle(props.a.usage)} /></span>
+        </Show>
+      }>
+        <span class="acct-row-usage"><UsageMeters windows={[]} compact summary={local.text()} summaryTitle={local.title()} /></span>
+      </Show>
+      <Show when={balanceLow(props.a.usage)}><span class="acct-balance-low">{tr("Balance too low for API calls")}</span></Show>
+      <Show when={rateLimitNotice(props.a.usage, props.now)}><span class="dim">{rateLimitNotice(props.a.usage, props.now)}</span></Show>
+    </button>
+  );
+}
+
+function UsagePanel(props: { a: Account }) {
+  // Resets and pace re-render every 15 s while shown; nothing else runs on a timer.
+  const now = useNow(15_000);
+  const u = () => props.a.usage;
+  return (
+    <section class="acct-usage box">
+      <div class="row">
+        <h3>{tr("Account usage")}</h3>
+        <span class="grow" />
+        <Show when={u().checked_at !== null}><span class="dim">{u().seeded ? tr("Checked %1", clock(u().checked_at!)) : tr("Updated %1", clock(u().checked_at!))}</span></Show>
+      </div>
+      <p class="muted">{tr("Shared by sessions using this account.")}</p>
+      <Show when={u().offline}><Status>{tr("Machine is offline. Showing the last available account data.")}</Status></Show>
+      <Show when={u().refreshing}><Status kind="busy">{tr("Updating… Previous values remain visible.")}</Status></Show>
+      <Show when={!u().refreshing && u().refresh_error}><Status kind="warn">{tr("Update failed. Showing the last available values.")}</Status></Show>
+      <Show when={rateLimitNotice(u(), now())}><Status kind="warn">{rateLimitNotice(u(), now())}</Status></Show>
+      <Show when={!u().windows.length && !u().balances.length && !u().offline}><p>{stateText(u())}</p></Show>
+      <For each={u().windows}>{(p) => {
+        const w = () => panelWindow(p, now());
+        return (
+          <div class="acct-window">
+            <div class="row"><b class="tabular">{w().period}</b><span class="tabular">{w().usedText}</span></div>
+            <div class="acct-meter rails">
+              <div class="acct-bar" classList={{ warn: w().tone === "warning", danger: w().tone === "critical" }}><i style={{ "--w": `${w().used}%` }} /></div>
+              <Show when={w().elapsed !== undefined}>
+                <div class="acct-bar elapsed" title={tr("%1% of the window elapsed", Math.round(w().elapsed!))}><i style={{ "--w": `${w().elapsed}%` }} /></div>
+              </Show>
+            </div>
+            <div class="row dim">
+              <Show when={w().resets}><span>{w().resets}</span></Show>
+              <Show when={u().seeded && u().checked_at !== null}><span>{tr("Checked %1", clock(u().checked_at!))}</span></Show>
+              <span class="grow" />
+              <span class="acct-pace">{w().forecast}</span>
+            </div>
+          </div>
+        );
+      }}</For>
+      <Show when={balanceLow(u())}><Status kind="warn">{tr("DeepSeek reports the balance is too low for API calls.")}</Status></Show>
+      <For each={u().balances}>{(b) => (
+        <div class="row acct-balance" classList={{ total: b.kind === "Total" }}>
+          <span>{balanceKind(b.kind)}</span>
+          <span class="grow" />
+          <span class="tabular">{`${b.balance} ${b.currency}`}</span>
+        </div>
+      )}</For>
+      <Show when={u().spend}>{(spend) => <SpendSection spend={spend()} />}</Show>
+      <Show when={u().local_usage}>{(usage) => <LocalUsageSection usage={usage()} />}</Show>
+      <Show when={creditsText(u().credits)}>{(text) => <p>{text()}</p>}</Show>
+    </section>
+  );
+}
+
+/** Account-wide spend from the DeepSeek balance readings. */
+function SpendSection(props: { spend: Spend }) {
+  return (
+    <div class="acct-spend">
+      <h4>{tr("Spending")}</h4>
+      <For each={spendRows(props.spend)}>{(row) => (
+        <div class="row acct-balance"><span>{row.label}</span><span class="grow" /><span class="tabular" title={row.title}>{row.value}</span></div>
+      )}</For>
+      <For each={spendNotes(props.spend)}>{(note) => <p class="muted acct-note">{note}</p>}</For>
+    </div>
+  );
+}
+
+function UsageRows(props: { rows: ModelUsage[] }) {
+  const cell = (n: number) => <td class="tabular" title={exactCount(n)}>{compactCount(n)}</td>;
+  return <For each={props.rows}>{(m) => <tr><th scope="row" class="ell" title={m.model}>{m.model}</th>{cell(m.requests)}{cell(m.cache_hit)}{cell(m.cache_miss)}{cell(m.output)}</tr>}</For>;
+}
+
+/** Requests and tokens of this computer's DeepSeek sessions, from their local logs. */
+function LocalUsageSection(props: { usage: LocalUsage }) {
+  const groups = createMemo(() => localUsageGroups(props.usage));
+  const head = (first: string) => (
+    <thead><tr><th scope="col">{first}</th><th scope="col">{tr("Requests")}</th><th scope="col">{tr("Cache read")}</th><th scope="col">{tr("Uncached input")}</th><th scope="col">{tr("Output")}</th></tr></thead>
+  );
+  return (
+    <div class="acct-local">
+      <h4>{tr("This computer's DeepSeek sessions")}</h4>
+      <p class="muted acct-note">{tr("Requests and tokens from session logs on this computer. Other computers and tools are not included.")}</p>
+      <For each={localUsageNotes(props.usage)}>{(note) => <p class="muted acct-note">{note}</p>}</For>
+      <Show when={groups().month.length} fallback={<p class="muted acct-note">{tr("No requests on this computer this month.")}</p>}>
+        <table class="acct-usage-table">
+          {head(tr("Model"))}
+          <tbody>
+            <tr class="group"><th scope="colgroup" colSpan={5}>{tr("Today")}</th></tr>
+            <Show when={groups().today.length} fallback={<tr><td colSpan={5} class="muted">{tr("No requests today.")}</td></tr>}>
+              <UsageRows rows={groups().today} />
+            </Show>
+            <tr class="group"><th scope="colgroup" colSpan={5}>{tr("This month")}</th></tr>
+            <UsageRows rows={groups().month} />
+          </tbody>
+        </table>
+        <details class="acct-days">
+          <summary>{tr("By day")}</summary>
+          <table class="acct-usage-table">
+            {head(tr("Day"))}
+            <tbody><UsageRows rows={groups().days} /></tbody>
+          </table>
+        </details>
+      </Show>
+    </div>
+  );
+}
+
+function MetadataValue(props: { kind: string; label: string; value: string }) {
+  return <span class="acct-meta-value ell" classList={{ muted: !props.value }} data-meta={props.kind} title={props.value || tr("Unavailable")} aria-label={`${props.label}: ${props.value || tr("Unavailable")}`}>{props.value || "—"}</span>;
+}
+
+function Detail(props: { a: Account }) {
+  const m = () => memberOf(props.a, selectedProfile(), accountMachine())!;
+  const fields = createMemo(() => identityFields(props.a));
+  const identityNote = createMemo(() => {
+    const f = fields();
+    return !f.name && !f.email && !f.organization && !f.plan && !f.signIn && props.a.identity_note ? trText(props.a.identity_note) : "";
+  });
+  const metadata = createMemo(() => [
+    { kind: "name", label: tr("Name"), value: fields().name },
+    { kind: "email", label: tr("Email"), value: fields().email },
+    { kind: "organization", label: tr("Organization"), value: fields().organization },
+    { kind: "plan", label: tr("Plan"), value: fields().plan },
+    { kind: "sign-in", label: tr("Sign-in"), value: fields().signIn },
+  ].filter((field) => !!field.value));
+  const [moreOpen, setMoreOpen] = createSignal(false);
+  const [moreQuery, setMoreQuery] = createSignal("");
+  let moreButton: HTMLButtonElement | undefined, moreInput: HTMLInputElement | undefined;
+  const closeMore = () => { setMoreOpen(false); if (moreButton?.isConnected) moreButton.focus(); };
+  const toggleMore = () => {
+    if (moreOpen()) { closeMore(); return; }
+    setMoreQuery(""); setMoreOpen(true);
+    queueMicrotask(() => {
+      // Switching accounts can remove this popup before its opening settles.
+      if (moreOpen() && moreInput?.isConnected) moreInput.focus();
+    });
+  };
+  const shown = () => visibleMembers(props.a, m().key);
+  const nativeConfig = () => props.a.provider === "opencode";
+  // zerus-f0uz8: one permission mode for the account unless it keeps one per computer.
+  const perComputer = () => !!props.a.permissions_per_computer;
+  const defaultable = () => props.a.provider !== "dsh" && !nativeConfig();
+  const matches = () => props.a.members.filter((x) => x.machine.toLowerCase().includes(moreQuery().trim().toLowerCase()));
+  const tags = createMemo(() => profileTags(props.a));
+  const [markEditor, setMarkEditor] = createSignal<{ origin: HTMLElement }>();
+  // The selected machine, with its profile tag when another profile shares it.
+  const where = () => (tags().has(m().key) ? `${m().machine} (${tags().get(m().key)})` : m().machine);
+  const choose = (key: string) => { setSelectedProfile(key); closeManagement(); clearManagementNotice(); };
+  const stepProfile = (event: KeyboardEvent & { currentTarget: HTMLDivElement }) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const rows = [...event.currentTarget.querySelectorAll<HTMLButtonElement>(".acct-mrow-pick")];
+    const at = rows.findIndex((row) => row === event.target);
+    // The adjacent Make default buttons keep their own keyboard behavior.
+    if (at < 0) return;
+    const next = event.key === "ArrowRight" || event.key === "ArrowDown" ? (at + 1) % rows.length
+      : event.key === "ArrowLeft" || event.key === "ArrowUp" ? (at + rows.length - 1) % rows.length
+      : event.key === "Home" ? 0 : event.key === "End" ? rows.length - 1 : undefined;
+    if (next === undefined) return;
+    event.preventDefault();
+    rows[next].click();
+    rows[next].focus();
+  };
+  return (
+    <div class="acct-detail">
+      <div class="acct-title">
+        <div class="acct-title-main">
+          <AccountMarkCircle mark={accountMark(props.a, settings)} size={22} />
+          <h2 class="ell" title={props.a.label} aria-label={props.a.label}>{props.a.label}</h2>
+          <AgentBadge agent={agentKind(props.a.provider)} />
+          <SignPill state={signState(m())} />
+          <span class="dim am-hidden" classList={{ shown: accountAppearance(settings, props.a.members).hidden }} title={tr("Hidden on session cards")} aria-label={tr("Hidden on session cards")} aria-hidden={!accountAppearance(settings, props.a.members).hidden}>{tr("Hidden on session cards")}</span>
+        </div>
+        <div class="acct-title-actions">
+          <button class="btn" onClick={event=>setMarkEditor({ origin: event.currentTarget })}><Icon name="palette" size={13} />{tr("Color and mark…")}</button>
+          <button class="btn" disabled={managementBusy()} onClick={event=>void openCatalog("rename",props.a.key,m().key,event.currentTarget)}><Icon name="pencil" size={13} />{tr("Rename…")}</button>
+        </div>
+      </div>
+      <Show when={markEditor()}>{(editor) => <Suspense><AccountMarkDialog account={props.a} origin={editor().origin} close={() => setMarkEditor(undefined)} /></Suspense>}</Show>
+      <div class="acct-identity selectable">
+        <Index each={metadata()} fallback={<div class="acct-meta-note muted" data-meta="note" title={identityNote() || tr("Unavailable")} aria-label={`${tr("Identity")}: ${identityNote() || tr("Unavailable")}`}>{identityNote() || tr("Unavailable")}</div>}>
+          {(field) => <div class="acct-meta-field"><span class="acct-meta-label" title={field().label}>{field().label}</span><MetadataValue kind={field().kind} label={field().label} value={field().value} /></div>}
+        </Index>
+      </div>
+
+      <section class="acct-card box">
+        <h3>{tr("Machines")}</h3>
+        {/* One row per profile: the row chooses it; the default is a badge or a separate button beside it. */}
+        <div class="acct-mrows" classList={{ defaults: defaultable() }} role="radiogroup" aria-label={tr("Machine profile")} onKeyDown={stepProfile}>
+          <For each={shown()}>{(x) => (
+            <div class="acct-mrow" classList={{ on: x.key === m().key, off: signState(x) !== "in" }}>
+              <button class="acct-mrow-pick" role="radio" aria-checked={x.key === m().key} tabIndex={x.key === m().key ? 0 : -1} onClick={() => choose(x.key)}>
+                <MachineTile os={osOf(machineCards[x.host]?.platform)} state={x.online ? connectionOf(catalog.computers[x.host]?.status).tile : "offline"} size={22} />
+                <MachineLabel alias={x.machine} dimmed={!x.online} />
+                <ProfileTag tag={tags().get(x.key)} id={x.id} />
+                <span class="grow" />
+                <span class="acct-mstate" data-tone={tone(x.state)}>{memberStateLabel(x.state)}</span>
+              </button>
+              <span class="acct-mrow-default">
+                <Show when={x.is_default} fallback={
+                  <Show when={x.online && x.state === "ready" && defaultable()}>
+                    <button class="btn small" disabled={managementBusy()} title={tr("Use this account for new %1 sessions on %2 when no account is specified. Existing sessions keep their account.", providerName(props.a.provider), x.machine)} onClick={event=>void openCatalog("default",props.a.key,x.key,event.currentTarget)}>{tr("Make default")}</button>
+                  </Show>
+                }>
+                  <span class="acct-default" title={tr("Default for new %1 sessions on %2 when no account is chosen", providerName(props.a.provider), x.machine)}>{tr("Default")}</span>
+                </Show>
+              </span>
+            </div>
+          )}</For>
+        </div>
+        <div class="row acct-mfoot">
+          <Show when={props.a.members.length > shown().length}>
+            <span class="acct-more-anchor">
+              <button class="btn small" ref={moreButton} aria-haspopup="dialog" aria-expanded={moreOpen()} onClick={toggleMore}>
+                {tr("+%1 more", props.a.members.length - shown().length)}
+              </button>
+              <Show when={moreOpen()}>
+                <div class="acct-more" role="dialog" aria-label={tr("Machines with %1", props.a.label)}
+                  onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeMore(); } }}>
+                  <TextInput class="field" ref={moreInput} type="search" placeholder={tr("Search %1 machines", props.a.members.length)} value={moreQuery()}
+                    onInput={(e) => setMoreQuery(e.currentTarget.value)} aria-label={tr("Search machines")} />
+                  <div class="acct-more-list">
+                    <For each={matches()} fallback={<div class="dim acct-more-empty">{tr("No machine matches.")}</div>}>
+                      {(x) => (
+                        <button class="acct-more-row" classList={{ on: x.key === m().key, off: signState(x) !== "in" }} onClick={() => { choose(x.key); closeMore(); }}>
+                          <MachineTile os={osOf(machineCards[x.host]?.platform)} state={x.online ? connectionOf(catalog.computers[x.host]?.status).tile : "offline"} size={22} />
+                          <MachineLabel alias={x.machine} />
+                          <ProfileTag tag={tags().get(x.key)} id={x.id} />
+                          <span class="grow" />
+                          <Show when={x.is_default}><span class="acct-default">{tr("Default")}</span></Show>
+                          <span class="dim">{memberStateText(x.state)}</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </div>
+              </Show>
+            </span>
+          </Show>
+          <button class="btn small acct-add" disabled={managementBusy()} onClick={event=>{accountManagement.close();accountSetup.close();accountManagement.clearNotice();accountSetup.clearNotice();void accountDistribution.open(props.a.key,m().key,event.currentTarget);}}><Icon name="plus" size={12} />{tr("Add to machine…")}</button>
+        </div>
+        <div class="acct-status">
+          <Status kind={tone(m().state)}>{trText(m().detail)}</Status>
+          <Actions>
+            <Show when={loginLabel(m())}>{(label) => <button class="btn" disabled={!m().online||!m().installed||managementBusy()} title={m().provider==="dsh"?tr("Save a DeepSeek API key on %1.", m().machine):undefined} onClick={event=>{accountManagement.close();accountManagement.clearNotice();void accountSetup.open(m().provider==="dsh"?"key":"login",event.currentTarget,props.a.key,m().key);}}><Icon name="key-round" size={13} />{label()}</button>}</Show>
+            <Show when={!m().installed}><button class="btn" disabled={!m().online||m().provider==="opencode"||managementBusy()} onClick={event=>{accountManagement.close();accountManagement.clearNotice();void accountSetup.open("install",event.currentTarget,props.a.key,m().key);}}><Icon name="download" size={13} />{tr("Install agent…")}</button></Show>
+            <Show when={m().opencode?.stopped}>
+              <button class="btn" disabled={!m().online||managementBusy()} onClick={event=>{accountManagement.close();accountManagement.clearNotice();void accountSetup.open("start",event.currentTarget,props.a.key,m().key);}}><Icon name="play" size={13} />{tr("Start OpenCode on %1", m().machine)}</button>
+            </Show>
+            <Show when={m().id==="native-opencode"&&!!m().home&&m().online}>
+              <button class="btn" disabled={managementBusy()} onClick={()=>{setBindNotice("");setBindPrompt({host:m().host,machine:m().machine,home:m().home});}}><Icon name="link" size={13} />{tr("Bind existing conversation…")}</button>
+            </Show>
+          </Actions>
+        </div>
+        <Show when={m().opencode}>{(oc) => (
+          <>
+            <Show when={oc().providers.length}>
+              <div class="acct-oc" aria-label={tr("OpenCode providers")}>
+                <For each={oc().providers}>{(p) => (
+                  <div class="acct-oc-row"><span class="grow">{p.label}</span><span class="muted tabular">{p.models}</span><span class="dim">{p.connection}</span></div>
+                )}</For>
+              </div>
+            </Show>
+            <Show when={oc().truncated}><p class="dim">{tr("Showing the first %1 providers.", oc().providers.length)}</p></Show>
+            <Show when={oc().stale_catalog_at !== null}>
+              <p class="dim">{tr("Last known catalog from %1.", new Date(oc().stale_catalog_at! * 1000).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" }))}</p>
+            </Show>
+          </>
+        )}</Show>
+        <div class="acct-setting">
+          <span title={trText(m().permission_hint)}>
+            {perComputer() ? tr("Permissions on %1:", m().machine) : tr("Permissions:")} <b classList={{ danger: m().permission === "bypass" }}>{trText(m().permission_label)}</b>
+            <span class="dim acct-src">{m().permission_default ? tr("Zerus default") : (m().permission_source ? m().permission_source === "zerus" : m().permission_mode === "bypass") ? tr("set in Zerus") : tr("from provider settings")}</span>
+          </span>
+          <span class="acct-actions">
+            <Show when={!perComputer() && props.a.permission_differs && !nativeConfig()}>
+              <span class="acct-differs">{tr("Differs between computers")}</span>
+              <button class="btn small" disabled={!m().online || managementBusy()} title={tr("Save the permission mode of %1 on every computer with this account", m().machine)} onClick={event=>void openCatalog("permissions",props.a.key,m().key,event.currentTarget)}>{tr("Use everywhere")}</button>
+            </Show>
+            <button class="btn small" disabled={!m().online || nativeConfig() || managementBusy()} title={perComputer() ? tr("Change permission defaults on %1", m().machine) : tr("Change permission defaults on every computer with this account")} onClick={event=>void openCatalog("permissions",props.a.key,m().key,event.currentTarget)}>{tr("Change…")}</button>
+          </span>
+        </div>
+        <Show when={!nativeConfig()}>
+          <div class="acct-setting">
+            <span class="dim">{perComputer() ? tr("Permissions are kept per computer.") : tr("Permissions are shared by every computer with this account.")}</span>
+            <button class="btn small" disabled={!m().online || managementBusy()} onClick={event=>void openCatalog("scope",props.a.key,m().key,event.currentTarget)}>{perComputer() ? tr("Share across computers…") : tr("Keep per computer…")}</button>
+          </div>
+        </Show>
+        <Show when={m().compact_on_expiry_supported && m().provider === "kimi"}>
+          <div class="acct-setting"><span>{tr("Compact after cache expiry")}: <b>{m().compact_on_expiry !== false ? tr("On") : tr("Off")}</b></span><button class="btn small" disabled={!m().online || managementBusy()} onClick={event=>void openCatalog("cache_expiry",props.a.key,m().key,event.currentTarget)}>{tr("Change…")}</button></div>
+        </Show>
+        <Show when={m().model_supported}>
+          <div class="acct-setting">
+            <span>{trText(m().model_text)}</span>
+            <span class="acct-actions">
+              <Show when={props.a.model_differs}>
+                <span class="acct-differs">{tr("Differs between computers")}</span>
+                <button class="btn small" disabled={!m().online || managementBusy()} title={tr("Save the model and effort of %1 on every computer with this account", m().machine)} onClick={event=>void openCatalog("model",props.a.key,m().key,event.currentTarget)}>{tr("Use everywhere")}</button>
+              </Show>
+              <button class="btn small" disabled={!m().online || managementBusy()} onClick={event=>void openCatalog("model",props.a.key,m().key,event.currentTarget)}>{tr("Model and effort…")}</button>
+            </span>
+          </div>
+        </Show>
+        <Actions>
+          <Show when={defaultable()}>
+            <button class="btn" disabled={m().is_default || !m().online || managementBusy()} title={tr("Use this account for new %1 sessions on %2 when no account is specified. Existing sessions keep their account.", providerName(props.a.provider), m().machine)} onClick={event=>void openCatalog("default",props.a.key,m().key,event.currentTarget)}>{m().is_default ? tr("Default on %1", where()) : tr("Make default on %1", where())}</button>
+          </Show>
+          <button class="btn danger" disabled={!m().online || managementBusy()} title={tr("Remove this profile from the selected machine's Zerus catalog. You will confirm the machine and consequences before anything changes.")} onClick={event=>void openCatalog("remove",props.a.key,m().key,event.currentTarget)}><Icon name="trash" size={13} />{props.a.members.length > 1 ? tr("Remove from %1…", where()) : tr("Remove…")}</button>
+        </Actions>
+        <Show when={accountManagement.notice()||accountSetup.notice()||accountDistribution.notice()}>{text=><Status kind="ok">{text()}</Status>}</Show>
+      </section>
+      <UsagePanel a={props.a} />
+    </div>
+  );
+}
+
+export function AccountsScreen() {
+  onCleanup(closeManagement);
+  const view = accountsPage;
+  const [query, setQuery] = createSignal("");
+  const [provider, setProvider] = createSignal("*");
+  const [sort, setSort] = createSignal<AccountSort>("agent");
+  const providerOptions = createMemo(() => {
+    const values = new Set(view().accounts.map((a) => a.provider));
+    if (provider() !== "*") values.add(provider());
+    return [...values].sort((a, b) => providerName(a).localeCompare(providerName(b)));
+  });
+  const filtered = () => !!query().trim() || provider() !== "*" || accountMachine() !== "*" || signFilter() !== "all";
+  const changed = () => { closeManagement(); clearManagementNotice(); };
+  /** "Clear filters": every machine, agent and sign-in state again, and no search (AccountsPage.cpp:315-318). */
+  const clearFilters = () => { changed(); setQuery(""); setProvider("*"); setSignFilter("all"); setAccountMachine("*"); };
+  const visible = createMemo(() => visibleAccounts(view(), accountMachine(), { query: query(), provider: provider(), sort: sort(), sign: signFilter() }));
+  const counts = createMemo(() => signedCounts(view(), accountMachine()));
+  // The rows' reset times re-render every 15 s; one timer serves every row.
+  const now = useNow(15_000);
+  // An Overview card asks for a profile: select its account once it is listed.
+  createEffect(() => {
+    const key = requestedProfile();
+    const account = key ? view().accounts.find((a) => a.members.some((m) => m.key === key)) : undefined;
+    if (!account) return;
+    // Explicit account navigation must not be hidden by this pane's text/agent filters.
+    setQuery(""); setProvider("*");
+    closeManagement();accountManagement.clearNotice();
+    setSelectedAccount(account.key);
+    setSelectedProfile(key);
+    setRequestedProfile(undefined);
+  });
+  const current = () => visible().find((a) => a.key === selectedAccount()) ?? visible()[0];
+  const filterName = () => view().hosts.find((h) => h.computer === accountMachine())?.name ?? accountMachine();
+  // Selection stays in view as the list scrolls or the filter changes; arrow keys move it.
+  let list: HTMLDivElement | undefined;
+  createEffect(() => {
+    const key = current()?.key;
+    if (!key || !list) return;
+    queueMicrotask(() => list?.querySelector<HTMLElement>(".acct-row.on")?.scrollIntoView({ block: "nearest" }));
+  });
+  const step = (e: KeyboardEvent) => {
+    const rows = [...(list?.querySelectorAll<HTMLButtonElement>(".acct-row") ?? [])];
+    const at = rows.findIndex((r) => r === document.activeElement);
+    const next = e.key === "ArrowDown" ? at + 1 : e.key === "ArrowUp" ? at - 1 : e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 : undefined;
+    if (next === undefined || !rows.length) return;
+    e.preventDefault();
+    const row = rows[Math.max(0, Math.min(rows.length - 1, next))];
+    row.focus();
+    row.click();
+  };
+  return (
+    <div class="acct-page">
+      {/* The Sessions list's pane: its width, border and handle; only the list scrolls under a fixed header. */}
+      <section class="acct-pane" style={{ "--pane-w": `${sessionsWidth()}px` }} aria-label={tr("Agent accounts")}>
+        <div class="sp-panel acct-panel">
+          <header class="sp-head acct-head">
+            <h1>{tr("Agent accounts")}</h1>
+            <button class="icon-btn hd" aria-label={tr("Refresh accounts")} disabled={view().busy || managementBusy()} onClick={() => void loadAccounts(true)}
+              title={view().busy ? tr("Updating accounts… %1 remaining", view().pending) : tr("Refresh account usage (automatically every 5 minutes)")}>
+              <Show when={!view().busy} fallback={<Spinner />}><Icon name="refresh-cw" size={15} /></Show>
+            </button>
+            <span class="grow" />
+            {/* The Sessions pane's "+" button: a text button cannot fit the pane in every language. */}
+            <button class="icon-btn hd" aria-label={tr("Add account")} data-tip={view().no_hosts ?? tr("Add account")} disabled={!!view().no_hosts||managementBusy()} onClick={event=>{accountManagement.close();accountManagement.clearNotice();void accountSetup.open("add",event.currentTarget,"","",accountMachine());}}><Icon name="add" size={18} /></button>
+          </header>
+          <p class="muted acct-summary">{tr("Your accounts across all machines. Choose an account to manage where it is available.")}</p>
+          <For each={view().notices}>{(notice) => <Status kind="warn">{notice}</Status>}</For>
+          <Show when={!view().no_hosts}>
+            <div class="acct-filters">
+              <TextInput class="field acct-search" type="search" aria-label={tr("Search accounts")} placeholder={tr("Search accounts")} value={query()} onInput={(event) => { changed(); setQuery(event.currentTarget.value); }} />
+              <Dropdown class="field acct-filter" aria-label={tr("Machine")} value={accountMachine()} onChange={(value) => { changed(); setAccountMachine(value); }} options={[{ value: "*", label: tr("All machines") }, ...((view().hosts) ?? []).map((h) => ({ value: h.computer, label: h.label }))]} />
+              <Dropdown class="field acct-provider-filter" aria-label={tr("Agent")} value={provider()} onChange={(value) => { changed(); setProvider(value); }} options={[{ value: "*", label: tr("All agents") }, ...providerOptions().map((value) => ({ value, label: providerName(value) }))]} />
+              <Dropdown class="field acct-sort" aria-label={tr("Sort accounts")} value={sort()} onChange={(value) => { changed(); setSort(value === "name" ? "name" : "agent"); }} options={[{ value: "agent", label: tr("Agent type, then name") }, { value: "name", label: tr("Account name") }]} />
+              <div class="acct-signs" role="group" aria-label={tr("Sign-in state")}>
+                <button type="button" class="btn small" classList={{ on: signFilter() === "all" }} aria-pressed={signFilter() === "all"}
+                  onClick={() => setSignFilter("all")}>{tr("All")}</button>
+                <button type="button" class="btn small" classList={{ on: signFilter() === "in" }} aria-pressed={signFilter() === "in"}
+                  onClick={() => setSignFilter("in")}>{tr("Signed in %1", counts().in)}</button>
+                <button type="button" class="btn small" classList={{ on: signFilter() === "out" }} aria-pressed={signFilter() === "out"}
+                  onClick={() => setSignFilter("out")}>{tr("Signed out %1", counts().out)}</button>
+              </div>
+            </div>
+            <Show when={view().snapshot}>
+              <div class="row acct-count"><Show when={view().pending}><Spinner size={12} /></Show><span class="muted ell grow">{summaryLine(view(), visible().length)}</span><Show when={filtered()}><button class="btn small" onClick={clearFilters}>{tr("Clear filters")}</button></Show></div>
+            </Show>
+          </Show>
+          <div class="acct-scroll" ref={list} role="list" aria-label={tr("Agent accounts")} onKeyDown={step}>
+            <Show when={!view().no_hosts}>
+              <Show when={view().snapshot} fallback={<div class="acct-loading"><div class="row"><Spinner /><span>{tr("Loading accounts…")}</span></div><p class="muted">{tr("Checking accounts across your machines.")}</p></div>}>
+                <Show when={visible().length} fallback={
+                  <div class="acct-none">
+                    <p class="muted">{filtered() && noAccountsMatch(view()) ? tr("No accounts match these filters.") : accountMachine() === "*" ? tr("No accounts.") : tr("No accounts on %1.", filterName())}</p>
+                    <Show when={filtered() && noAccountsMatch(view())}><button type="button" class="btn small" onClick={clearFilters}>{tr("Clear filters")}</button></Show>
+                  </div>
+                }>
+                  <Index each={visible()}>{(a) => <div role="listitem"><AccountRow a={a()} now={now()} selected={current()?.key === a().key} /></div>}</Index>
+                </Show>
+                <Show when={view().truncated > 0}><p class="dim acct-none">{tr("%1 more accounts are not shown.", view().truncated)}</p></Show>
+              </Show>
+            </Show>
+          </div>
+        </div>
+        <ResizeHandle />
+      </section>
+      <main class="acct-main">
+        <div class="acct-main-scroll">
+          <Show when={!view().no_hosts} fallback={
+            <div class="empty acct-empty"><Icon name="user-round-cog" size={28} /><h3>{tr("No machine keeps agent accounts")}</h3>
+              <p>{view().no_hosts}</p>
+              <button class="btn" onClick={() => setPage("machines")}>{tr("Open Machines")}</button></div>
+          }>
+            <Show when={view().snapshot && current()} fallback={<div class="acct-detail"><h2 class="muted">{tr("Choose an account")}</h2></div>}>
+              {(a) => <Show when={a().key} keyed><Detail a={a()} /></Show>}
+            </Show>
+          </Show>
+        </div>
+      </main>
+      <Show when={accountDistribution.prompt()}>{prompt=><Suspense><AccountDistributionDialog prompt={prompt()}/></Suspense>}</Show>
+      <Show when={accountSetup.prompt()}>{prompt=><Suspense><AccountSetupDialog prompt={prompt()} busy={accountSetup.busy()} close={accountSetup.close} confirm={(values,handle)=>void accountSetup.confirm(values,handle)}/></Suspense>}</Show><Show when={bindNotice()}>{text=><Status kind="ok">{text()}</Status>}</Show>
+      <Show when={bindPrompt()}>{p=><Suspense><OpenCodeBindDialog host={p().host} machine={p().machine} agentHome={p().home} close={()=>setBindPrompt(null)} bound={(name)=>{setBindPrompt(null);setBindNotice(tr("Existing OpenCode conversation is bound as %1. Native history was preserved.",name));void loadAccounts();}}/></Suspense>}</Show>
+      <Show when={accountManagement.prompt()}>{prompt=><Suspense><Switch><Match when={prompt().kind==="permissions" && prompt().permissions}>{editor=><AccountPermissionsDialog prompt={prompt()} editor={editor()} close={accountManagement.close} confirm={(values,handle)=>void accountManagement.confirm(values,handle)}/>}</Match><Match when={prompt().kind==="permissions" || prompt().kind==="model" || prompt().kind==="scope" || prompt().kind==="cache_expiry"}><AccountDefaultsDialog prompt={prompt()} close={accountManagement.close} confirm={(values,handle)=>void accountManagement.confirm(values,handle)}/></Match><Match when={true}><AccountCatalogDialog prompt={prompt()} close={accountManagement.close} confirm={(label,handle)=>void accountManagement.confirm(label,handle)}/></Match></Switch></Suspense>}</Show>
+    </div>
+  );
+}

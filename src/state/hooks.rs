@@ -17,9 +17,14 @@ const COMMON: &[&str] = &[
 ];
 
 fn events(agent: &str) -> Vec<&'static str> {
+    if agent == hermes::AGENT {
+        return hermes::TRACKED.to_vec();
+    }
     let mut events = COMMON.to_vec();
     match agent {
-        "claude" => events.extend(["PostToolUseFailure", "StopFailure", "Notification"]),
+        // Qwen Code runs Claude Code's hook events with the same payloads
+        // (verified with 0.27.4, 2026-11-16).
+        "claude" | "qwen" => events.extend(["PostToolUseFailure", "StopFailure", "Notification"]),
         "codex" => events.push("Interrupt"),
         "kimi" => events.extend([
             "PostToolUseFailure",
@@ -67,6 +72,360 @@ fn versioned_events(agent: &str) -> &'static [(&'static str, Version)] {
     }
 }
 
+thread_local! {
+    /// The programs hgs owns in the settings file at hand: the one the running
+    /// installation writes and those recorded for that file (zerus-b64dl).
+    static OWN_PROGRAMS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// While alive, entries that run one of these exact programs count as hgs's
+/// own, whatever their name: an `HGS_EXECUTABLE` wrapper writes them
+/// (zerus-s3wax). Nothing else is ever guessed from a name or path.
+struct OwnProgram(Vec<String>);
+
+impl OwnProgram {
+    #[cfg(all(test, unix))]
+    fn scoped(program: &str) -> Self {
+        Self::set(vec![program.to_owned()])
+    }
+
+    fn set(programs: Vec<String>) -> Self {
+        Self(OWN_PROGRAMS.with(|own| own.replace(programs)))
+    }
+
+    /// The scope for the settings file `config`: the program `executable`
+    /// writes, when known, and every program an install recorded for it.
+    fn for_config(executable: Option<&str>, config: &Path) -> Self {
+        let mut programs: Vec<String> = executable.map(written_program).into_iter().collect();
+        programs.extend(recorded_programs(config));
+        Self::set(programs)
+    }
+}
+
+/// The program as hook entries name it (on Windows with forward slashes).
+fn written_program(executable: &str) -> String {
+    #[cfg(windows)]
+    {
+        windows::path(executable).unwrap_or_else(|_| executable.to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        executable.to_owned()
+    }
+}
+
+/// Whether `program` is one of the programs owned in the current scope.
+fn own_program(program: &str) -> bool {
+    OWN_PROGRAMS.with(|own| own.borrow().iter().any(|own| own == program))
+}
+
+impl Drop for OwnProgram {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        OWN_PROGRAMS.with(|own| *own.borrow_mut() = previous);
+    }
+}
+
+/// The most programs, and the longest program, recorded for one settings file.
+const RECORDED_PROGRAMS: usize = 8;
+const RECORDED_PROGRAM_BYTES: usize = 4096;
+
+/// Where hgs keeps the exact programs it wrote into the settings file
+/// `config` (resolved past symlinks), in private state.
+fn owner_record(config: &Path) -> PathBuf {
+    root().join("hook-owners").join(format!(
+        "{:x}.json",
+        Sha256::digest(config.to_string_lossy().as_bytes())
+    ))
+}
+
+fn recordable(program: &str) -> bool {
+    !program.is_empty()
+        && program.len() <= RECORDED_PROGRAM_BYTES
+        && !program.chars().any(char::is_control)
+}
+
+/// The programs recorded in `record`, newest first; anything unreadable is none.
+fn recorded_at(record: &Path) -> Vec<String> {
+    let Ok(Some(bytes)) = super::hook_health::read_bounded(record, 64 * 1024) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Vec::new();
+    };
+    if value["schema"] != 1 {
+        return Vec::new();
+    }
+    value["programs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|program| recordable(program))
+        .take(RECORDED_PROGRAMS)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn recorded_programs(config: &Path) -> Vec<String> {
+    recorded_at(&owner_record(config))
+}
+
+/// Puts `program` first in `record`, keeping the newest few. The caller holds
+/// the settings file's lock.
+fn record_at(record: &Path, program: &str) -> Result<()> {
+    if !recordable(program) {
+        return Ok(());
+    }
+    let mut programs = recorded_at(record);
+    if programs.first().map(String::as_str) == Some(program) {
+        return Ok(());
+    }
+    programs.retain(|recorded| recorded != program);
+    programs.insert(0, program.to_owned());
+    programs.truncate(RECORDED_PROGRAMS);
+    atomic(record, &json!({"schema":1,"programs":programs}).to_string())
+}
+
+/// The program a hook command line runs before hgs's two arguments.
+fn program_of(command: &str) -> Option<String> {
+    // The PowerShell form, `& "PROGRAM" __state hook; exit $LASTEXITCODE`.
+    let command = command
+        .strip_prefix("& ")
+        .and_then(|rest| rest.strip_suffix("; exit $LASTEXITCODE"))
+        .unwrap_or(command);
+    let argv = shell_words::split(command).ok()?;
+    (argv.len() >= 3).then(|| argv[argv.len() - 3].clone())
+}
+
+/// Whether `content`, a settings file of `agent`, holds an hgs entry that runs
+/// exactly `program`. Call inside the scope that owns `program`.
+fn holds_program(content: &str, agent: &str, program: &str) -> bool {
+    if agent == "kimi" {
+        let Ok(document) = content.parse::<toml_edit::DocumentMut>() else {
+            return false;
+        };
+        return document
+            .get("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .is_some_and(|tables| {
+                tables.iter().any(|table| {
+                    table
+                        .get("command")
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(|command| {
+                            owns_hook(command) && program_of(command).as_deref() == Some(program)
+                        })
+                })
+            });
+    }
+    let Ok(document) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    document["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|hooks| hooks.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(|hook| {
+            let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            let named = if hook.get("args").is_some() {
+                command == program
+            } else {
+                program_of(command).as_deref() == Some(program)
+            };
+            named && (Entry::owned(hook, cfg!(windows)).is_some() || owns_channel(hook))
+        })
+}
+
+/// After hgs wrote or kept `content` as the settings file `config`, under its
+/// lock: records the program this installation writes when an entry runs it,
+/// so a later health read or repair without that `HGS_EXECUTABLE` still
+/// recognises it (zerus-b64dl). A failed record only costs that recognition.
+pub(super) fn record_written(config: &Path, agent: &str, content: &str) {
+    let Ok(executable) = runner_executable() else {
+        return;
+    };
+    let program = written_program(&executable);
+    let _own = OwnProgram::for_config(Some(&executable), config);
+    if holds_program(content, agent, &program) {
+        let _ = record_at(&owner_record(config), &program);
+    }
+}
+
+/// Repoint only tracking/channel entries whose exact program was recorded for
+/// this file. Personal fields, trusted legacy shims and unrecorded entries stay.
+fn migrate_recorded(
+    original: &str,
+    config: &Path,
+    agent: &str,
+    executable: &str,
+    windows: bool,
+) -> Result<Option<String>> {
+    let programs = recorded_programs(config);
+    migrate_programs(original, agent, executable, windows, programs)
+}
+
+fn migrate_programs(
+    original: &str,
+    agent: &str,
+    executable: &str,
+    windows: bool,
+    programs: Vec<String>,
+) -> Result<Option<String>> {
+    let current = written_program(executable);
+    let programs: Vec<_> = programs
+        .into_iter()
+        .filter(|program| program != &current)
+        .collect();
+    if programs.is_empty() {
+        return Ok(None);
+    }
+    let line = |command: &str| -> Result<Option<String>> {
+        let Ok(mut argv) = shell_words::split(command) else {
+            return Ok(None);
+        };
+        // Only the standalone form hgs writes. Prefixes belong to the person;
+        // parsing and re-quoting them would change shell operators/assignments.
+        if argv.len() != 3
+            || !programs.contains(&argv[0])
+            || !(argv[1..] == HOOK_ARGS || argv[1..] == CHANNEL_ARGS)
+        {
+            return Ok(None);
+        }
+        let channel = argv[2] == "answer-channel";
+        let with_args = |base: String| {
+            if channel {
+                format!("{}answer-channel", base.strip_suffix("hook").unwrap())
+            } else {
+                base
+            }
+        };
+        let original = if windows {
+            let Ok(base) = windows::shell_command(&argv[0]) else {
+                return Ok(None);
+            };
+            with_args(base)
+        } else {
+            join_command(&argv)
+        };
+        // shell_words drops comments and normalizes quoting. Tokens alone
+        // therefore cannot prove that the original line was written by hgs.
+        if command != original {
+            return Ok(None);
+        }
+        if windows {
+            return windows::shell_command(executable).map(|base| Some(with_args(base)));
+        }
+        argv[0] = current.clone();
+        Ok(Some(join_command(&argv)))
+    };
+    if agent == "kimi" {
+        let mut document = original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| e.to_string())?;
+        let mut changed = false;
+        for table in document
+            .get_mut("hooks")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .into_iter()
+            .flat_map(|tables| tables.iter_mut())
+        {
+            let Some(command) = table.get("command").and_then(toml_edit::Item::as_str) else {
+                continue;
+            };
+            if let Some(replacement) = line(command)? {
+                // Preserve the value's comments and surrounding whitespace.
+                if let Some(toml_edit::Value::String(value)) = table
+                    .get_mut("command")
+                    .and_then(toml_edit::Item::as_value_mut)
+                {
+                    let decor = value.decor().clone();
+                    *value = toml_edit::Formatted::new(replacement);
+                    *value.decor_mut() = decor;
+                    changed = true;
+                }
+            }
+        }
+        return Ok(changed.then(|| document.to_string()));
+    }
+    let mut document: Value = if original.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(original).map_err(|e| e.to_string())?
+    };
+    let mut changed = false;
+    for hook in document
+        .get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|hooks| hooks.values_mut())
+        .filter_map(Value::as_array_mut)
+        .flatten()
+        .filter_map(|group| group.get_mut("hooks").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let Some(command) = hook.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let replacement = if let Some(args) = hook.get("args") {
+            ((args == &json!(HOOK_ARGS) || args == &json!(CHANNEL_ARGS))
+                && programs.iter().any(|program| program == command))
+            .then(|| current.clone())
+        } else {
+            line(command)?
+        };
+        if let Some(replacement) = replacement {
+            hook["command"] = json!(replacement);
+            changed = true;
+        }
+        // Codex prefers its PowerShell override on Windows. Rewrite only the
+        // exact override hgs wrote; a personal override remains untouched.
+        if let Some(command) = hook.get("commandWindows").and_then(Value::as_str) {
+            if programs.iter().any(|program| {
+                windows::powershell_command(program).ok().as_deref() == Some(command)
+            }) {
+                hook["commandWindows"] = json!(windows::powershell_command(executable)?);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        Ok(Some(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+/// An unrecorded hgs-like basename is ambiguous, never proof of ownership.
+/// An unrelated program's choice of arguments cannot block explicit repair.
+fn unrecognised_program(command: &str, args: Option<&Value>) -> bool {
+    let ambiguous = |program: &str| {
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        name.to_ascii_lowercase().contains("hgs") && !names_hgs(program)
+    };
+    if let Some(args) = args {
+        return (args == &json!(HOOK_ARGS) || args == &json!(CHANNEL_ARGS)) && ambiguous(command);
+    }
+    shell_words::split(command).is_ok_and(|argv| {
+        let tail = argv.len().saturating_sub(2);
+        argv.len() >= 3
+            && (argv[tail..] == HOOK_ARGS || argv[tail..] == CHANNEL_ARGS)
+            && ambiguous(&argv[tail - 1])
+    })
+}
+
+/// An explicit repair never writes beside an ambiguous unrecorded hgs entry.
+const UNRECOGNISED_TRACKING: &str = "A hook entry runs an unrecorded hgs-like program; nothing was repaired. If it is your hgs wrapper, run repair or a supervised launch with HGS_EXECUTABLE set to that program to record it. Otherwise review or remove the ambiguous entry manually.";
+
 fn owns_hook(command: &str) -> bool {
     let Ok(argv) = shell_words::split(command) else {
         return false;
@@ -81,12 +440,16 @@ fn owns_hook(command: &str) -> bool {
     {
         return true;
     }
-    argv[argv.len() - 2] == "__state"
-        && Path::new(&argv[argv.len() - 3])
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name == "hgs" || name == "hgs.exe")
-            .unwrap_or(false)
+    argv[argv.len() - 2] == "__state" && names_hgs(&argv[argv.len() - 3])
+}
+
+/// Whether `command` is the PowerShell form of hgs's hook,
+/// `& "…/hgs.exe" __state hook; exit $LASTEXITCODE`.
+fn owns_powershell_hook(command: &str) -> bool {
+    command
+        .strip_prefix("& ")
+        .and_then(|rest| rest.strip_suffix("; exit $LASTEXITCODE"))
+        .is_some_and(owns_hook)
 }
 
 /// Whether `hook`, one item of a matcher group's `hooks`, is hgs's answer
@@ -153,6 +516,9 @@ pub(super) fn resolved_target(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Allow scheduling/journal contention without losing native hook acceptance.
+const HOOK_TIMEOUT: u64 = 15;
+
 /// The hook entry hgs adds to a JSON hook configuration (Claude Code's
 /// `settings.json`, Codex's `hooks.json`) for each event without one.
 ///
@@ -170,6 +536,8 @@ struct Entry {
     args: Option<Vec<String>>,
     /// Codex's command for Windows, which Codex prefers there.
     command_windows: Option<String>,
+    /// The shell the agent runs `command` with: Qwen Code's `powershell`.
+    shell: Option<String>,
 }
 
 impl Entry {
@@ -178,17 +546,29 @@ impl Entry {
             command,
             args: None,
             command_windows: None,
+            shell: None,
         }
+    }
+
+    /// Qwen Code's Windows entry: the PowerShell form, which it runs with
+    /// `powershell -Command` when the hook asks for that shell. Its default,
+    /// `cmd /d /s /c`, gets the command from Node.js with its quotes escaped
+    /// as `\"`, so no quoted hgs path runs there (verified with 0.27.4).
+    fn powershell(command: String) -> Self {
+        Self { shell: Some("powershell".into()), ..Self::shell(command) }
     }
 
     /// A matcher group holding this entry, as hgs writes it for one event.
     fn group(&self) -> Value {
-        let mut hook = json!({"type": "command", "command": self.command, "timeout": 5});
+        let mut hook = json!({"type": "command", "command": self.command, "timeout": HOOK_TIMEOUT});
         if let Some(args) = &self.args {
             hook["args"] = json!(args);
         }
         if let Some(command) = &self.command_windows {
             hook["commandWindows"] = json!(command);
+        }
+        if let Some(shell) = &self.shell {
+            hook["shell"] = json!(shell);
         }
         json!({"hooks": [hook]})
     }
@@ -200,6 +580,7 @@ impl Entry {
             return args.iter().map(String::as_str).eq(HOOK_ARGS).then(|| Self {
                 args: Some(CHANNEL_ARGS.map(str::to_owned).to_vec()),
                 command_windows: None,
+                shell: None,
                 ..self.clone()
             });
         }
@@ -228,6 +609,9 @@ impl Entry {
     fn owned(hook: &Value, windows: bool) -> Option<Self> {
         let command = hook.get("command").and_then(Value::as_str)?;
         let text = |key: &str| hook.get(key).and_then(Value::as_str).map(str::to_owned);
+        if windows && text("shell").as_deref() == Some("powershell") && owns_powershell_hook(command) {
+            return Some(Self::powershell(command.to_owned()));
+        }
         if owns_hook(command) {
             return Some(if windows {
                 Self {
@@ -255,10 +639,12 @@ impl Entry {
 const HOOK_ARGS: [&str; 2] = ["__state", "hook"];
 
 /// Whether `program` names hgs: `hgs` or `hgs.exe` (any case) after its last
-/// `/` or `\`.
+/// `/` or `\`, or exactly the program the running installation writes, which
+/// an `HGS_EXECUTABLE` wrapper may name otherwise. A look-alike for any other
+/// program stays the user's.
 fn names_hgs(program: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    name == "hgs" || name.eq_ignore_ascii_case("hgs.exe")
+    name == "hgs" || name.eq_ignore_ascii_case("hgs.exe") || own_program(program)
 }
 
 /// The Kimi hook block's markers. On Windows each line may also end with CR LF
@@ -285,8 +671,93 @@ fn marker_line(text: &str, marker: &str, crlf: bool) -> Option<(usize, usize)> {
     None
 }
 
+/// Replace only parsed old timeout values, leaving all other bytes intact.
+fn upgraded_timeouts(original: &str, mut spans: Vec<std::ops::Range<usize>>) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_unstable_by_key(|span| span.start);
+    let mut content = original.to_owned();
+    for span in spans.into_iter().rev() {
+        content.replace_range(span, &HOOK_TIMEOUT.to_string());
+    }
+    Some(content)
+}
+
+/// JSON refresh must not reformat personal/foreign entries just to raise an
+/// owned tracking timeout. RawValue borrows each value from this input, so its
+/// byte range names precisely the old integer, not its containing hook/group.
+fn upgraded_json_timeouts(original: &str, windows: bool) -> Option<String> {
+    use serde_json::value::RawValue;
+    type Object<'a> = std::collections::BTreeMap<String, &'a RawValue>;
+    let document: Object<'_> = serde_json::from_str(original).ok()?;
+    let hooks: Object<'_> = serde_json::from_str(document.get("hooks")?.get()).ok()?;
+    let mut spans = Vec::new();
+    for groups in hooks.values() {
+        let Ok(groups) = serde_json::from_str::<Vec<&RawValue>>(groups.get()) else {
+            continue;
+        };
+        for group in groups {
+            let Ok(group) = serde_json::from_str::<Object<'_>>(group.get()) else {
+                continue;
+            };
+            let Some(entries) = group.get("hooks") else {
+                continue;
+            };
+            let Ok(entries) = serde_json::from_str::<Vec<&RawValue>>(entries.get()) else {
+                continue;
+            };
+            for raw in entries {
+                let hook: Value = serde_json::from_str(raw.get()).ok()?;
+                if hook["type"] != "command" || Entry::owned(&hook, windows).is_none() {
+                    continue;
+                }
+                let fields: Object<'_> = serde_json::from_str(raw.get()).ok()?;
+                if let Some(timeout) = fields.get("timeout").filter(|timeout| timeout.get() == "5")
+                {
+                    let start = timeout.get().as_ptr() as usize - original.as_ptr() as usize;
+                    spans.push(start..start + timeout.get().len());
+                }
+            }
+        }
+    }
+    upgraded_timeouts(original, spans)
+}
+
+/// TOML spans retain comments, line endings and personal settings even when a
+/// complete managed block or a legacy registration needs its timeout raised.
+fn upgraded_kimi_timeouts(original: &str, path: &Path) -> Result<Option<String>> {
+    let document = toml_edit::Document::parse(original)
+        .map_err(|e| format!("cannot merge tracking hooks into {}: {e}", path.display()))?;
+    let mut spans = Vec::new();
+    if let Some(tables) = document
+        .get("hooks")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    {
+        for table in tables {
+            if !table
+                .get("command")
+                .and_then(toml_edit::Item::as_str)
+                .is_some_and(owns_hook)
+            {
+                continue;
+            }
+            if let Some(timeout) = table
+                .get("timeout")
+                .filter(|timeout| timeout.as_integer() == Some(5))
+            {
+                if let Some(span) = timeout.span() {
+                    spans.push(span);
+                }
+            }
+        }
+    }
+    Ok(upgraded_timeouts(original, spans))
+}
+
 /// The Kimi `config.toml` text `original` with hgs's block of hooks, or `None`
-/// when its block already has every event: then its bytes are kept. A block
+/// when its block already has every event and no old own timeout remains.
+/// Timeout-only upgrades keep every other byte. A block
 /// that misses events is written again, with the hgs command it holds when it
 /// holds one and else the command `fresh` gives.
 fn merge_kimi(
@@ -295,6 +766,8 @@ fn merge_kimi(
     crlf: bool,
     fresh: &mut dyn FnMut() -> Result<String>,
 ) -> Result<Option<String>> {
+    let upgraded = upgraded_kimi_timeouts(original, path)?;
+    let original = upgraded.as_deref().unwrap_or(original);
     let mut command = None;
     let mut content_without = original.to_owned();
     if let Some((start, begin)) = marker_line(original, KIMI_BEGIN, crlf) {
@@ -351,7 +824,7 @@ fn merge_kimi(
                 original
                     .parse::<toml_edit::DocumentMut>()
                     .map_err(|e| e.to_string())?;
-                return Ok(None);
+                return Ok(upgraded);
             }
         }
         content_without = format!("{}{}", &original[..start], &rest[finish + end..]);
@@ -359,7 +832,7 @@ fn merge_kimi(
     let document = original.parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("cannot merge tracking hooks into {}: {e}", path.display()))?;
     if kimi_complete(&document) {
-        return Ok(None);
+        return Ok(upgraded);
     }
     let command = match command {
         Some(command) => command,
@@ -368,7 +841,7 @@ fn merge_kimi(
     let mut block = format!("{KIMI_BEGIN}\n");
     for event in events("kimi") {
         block.push_str(&format!(
-            "[[hooks]]\nevent = {}\ncommand = {}\ntimeout = 5\n",
+            "[[hooks]]\nevent = {}\ncommand = {}\ntimeout = {HOOK_TIMEOUT}\n",
             json!(event),
             json!(command)
         ));
@@ -397,8 +870,9 @@ fn kimi_complete(document: &toml_edit::DocumentMut) -> bool {
 }
 
 /// The JSON hook configuration text `original` of `agent` with an hgs entry
-/// for each of its events, or `None` when every event has one: then nothing
-/// is written. New events repeat the hgs entry already there, exactly;
+/// for each of its events, or `None` when every event has one and no old own
+/// timeout remains. Timeout-only upgrades keep every other byte. New events
+/// repeat the hgs entry already there, exactly;
 /// only without one is `fresh` asked for the entry to write. An event of
 /// `versioned_events` without an entry asks `version` for the agent's version
 /// and is added only when that version has it.
@@ -422,6 +896,8 @@ fn merge_json_mode(
     version: &mut dyn FnMut() -> Option<Version>,
     channels: bool,
 ) -> Result<Option<String>> {
+    let upgraded = upgraded_json_timeouts(original, windows);
+    let original = upgraded.as_deref().unwrap_or(original);
     let mut document: Value = if original.trim().is_empty() {
         json!({})
     } else {
@@ -436,6 +912,33 @@ fn merge_json_mode(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or("hooks must be an object")?;
+    // Earlier launches that did not recognise their own entries (zerus-s3wax)
+    // left exact copies of hgs's groups: each delivered every event again.
+    // Keep the first; a group with any personal hook is never touched.
+    let mut changed = false;
+    for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
+        let mut kept: Vec<Value> = Vec::new();
+        let before = groups.len();
+        groups.retain(|group| {
+            let hgs_only = group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    !hooks.is_empty()
+                        && hooks
+                            .iter()
+                            .all(|hook| Entry::owned(hook, windows).is_some() || owns_channel(hook))
+                });
+            if hgs_only && kept.contains(group) {
+                return false;
+            }
+            if hgs_only {
+                kept.push(group.clone());
+            }
+            true
+        });
+        changed |= groups.len() != before;
+    }
     let mut entry = hooks
         .values()
         .filter_map(Value::as_array)
@@ -443,7 +946,6 @@ fn merge_json_mode(
         .filter_map(|group| group.get("hooks").and_then(Value::as_array))
         .flatten()
         .find_map(|hook| Entry::owned(hook, windows));
-    let mut changed = false;
     // One version reading serves every versioned entry.
     let mut known = None;
     let mut version = || *known.get_or_insert_with(&mut *version);
@@ -542,7 +1044,7 @@ fn merge_json_mode(
         }
     }
     if !changed {
-        return Ok(None);
+        return Ok(upgraded);
     }
     Ok(Some(format!(
         "{}\n",
@@ -643,7 +1145,7 @@ fn hook_config(agent: &str) -> Result<PathBuf> {
         });
     resolved_target(&directory.join(match agent {
         "kimi" => "config.toml",
-        "claude" => "settings.json",
+        "claude" | "qwen" => "settings.json",
         _ => "hooks.json",
     }))
 }
@@ -673,6 +1175,9 @@ pub(super) fn claude_version(program: &str) -> Option<(u64, u64, u64)> {
 /// Install hgs's tracking hooks into the configuration of `agent`, whose
 /// executable is `program` (spec D12 on Windows).
 pub(super) fn install_hooks(agent: &str, program: &str) -> Result<()> {
+    if agent == hermes::AGENT {
+        return hermes::prepare(&runner_executable()?);
+    }
     let path = hook_config(agent)?;
     let lock_path = path.with_file_name(format!(
         "{}.hgs.lock",
@@ -685,24 +1190,27 @@ pub(super) fn install_hooks(agent: &str, program: &str) -> Result<()> {
         Err(error) => return Err(error.to_string()),
     };
     let executable = runner_executable()?;
+    let _own = OwnProgram::for_config(Some(&executable), &path);
     let installed = Installed {
         program,
-        agent: if agent == "claude" { "Claude Code" } else { agent },
+        agent: match agent { "claude" => "Claude Code", "qwen" => "Qwen Code", _ => agent },
         version: std::cell::OnceCell::new(),
         seen: seen_version(&path),
     };
+    let migrated = migrate_recorded(&original, &path, agent, &executable, cfg!(windows))?;
+    let source = migrated.as_deref().unwrap_or(&original);
     let merged = if agent == "kimi" {
-        merge_kimi(&original, &path, cfg!(windows), &mut || {
+        merge_kimi(source, &path, cfg!(windows), &mut || {
             fresh_command(&executable)
         })?
     } else {
         // An older version run with this configuration later would stop at
         // hgs's entry for an event it lacks: the entry goes before it starts.
-        let pruned = prune_json(&original, agent, cfg!(windows), &mut || {
+        let pruned = prune_json(source, agent, cfg!(windows), &mut || {
             installed.registered_version(agent)
         });
         merge_json(
-            pruned.as_deref().unwrap_or(&original),
+            pruned.as_deref().unwrap_or(source),
             &path,
             agent,
             cfg!(windows),
@@ -710,8 +1218,10 @@ pub(super) fn install_hooks(agent: &str, program: &str) -> Result<()> {
             &mut || installed.native_version(agent),
         )?
         .or(pruned)
-    };
+    }
+    .or(migrated);
     let Some(content) = merged else {
+        record_written(&path, agent, &original);
         return Ok(());
     };
     if content != original {
@@ -724,6 +1234,7 @@ pub(super) fn install_hooks(agent: &str, program: &str) -> Result<()> {
         }
         atomic(&path, &content)?;
     }
+    record_written(&path, agent, &content);
     Ok(())
 }
 
@@ -792,7 +1303,15 @@ pub(super) fn health_events(agent: &str) -> Vec<&'static str> {
 }
 
 /// Content-free registration inventory. Native trust/policy is deliberately not inferred.
-pub(super) fn health_document(original: &str, agent: &str, known: Option<(u64, u64, u64)>) -> Result<Value> {
+/// `config` is the settings file the text came from: programs recorded for it
+/// stay hgs's from any environment.
+pub(super) fn health_document(
+    original: &str,
+    config: &Path,
+    agent: &str,
+    known: Option<(u64, u64, u64)>,
+) -> Result<Value> {
+    let _own = OwnProgram::for_config(runner_executable().ok().as_deref(), config);
     health_document_mode(original, agent, known, cfg!(windows))
 }
 
@@ -802,12 +1321,16 @@ fn health_document_mode(original: &str, agent: &str, known: Option<Version>, win
     let mut channel_shell = false;
     let mut counts = std::collections::BTreeMap::<String,usize>::new();
     let mut conditional = false;
+    // An hgs-like command for a program that is not hgs's in this scope.
+    let mut unrecognised = false;
     if agent == "kimi" {
         let document = original.parse::<toml_edit::DocumentMut>().map_err(|_| "Invalid hook configuration")?;
         if let Some(item) = document.get("hooks") {
             let tables = item.as_array_of_tables().ok_or("Invalid hook configuration")?;
             for table in tables {
-                if table.get("command").and_then(toml_edit::Item::as_str).is_some_and(owns_hook) {
+                let command = table.get("command").and_then(toml_edit::Item::as_str);
+                unrecognised |= command.is_some_and(|command| unrecognised_program(command, None));
+                if command.is_some_and(owns_hook) {
                     if let Some(event) = table.get("event").and_then(toml_edit::Item::as_str) {
                         if events(agent).contains(&event) { present.insert(event.to_owned()); *counts.entry(event.to_owned()).or_default() += 1; }
                     }
@@ -821,6 +1344,17 @@ fn health_document_mode(original: &str, agent: &str, known: Option<Version>, win
         let object = document.as_object().ok_or("Invalid hook configuration")?;
         if let Some(hooks) = object.get("hooks") {
             let hooks = hooks.as_object().ok_or("Invalid hook configuration")?;
+            unrecognised = hooks
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .any(|hook| {
+                    hook.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| unrecognised_program(command, hook.get("args")))
+                });
             // Only the bounded event names hgs itself knows may be returned.
             let names = events(agent).into_iter().chain(versioned_events(agent).iter().map(|(event, _)| *event));
             for event in names {
@@ -852,36 +1386,72 @@ fn health_document_mode(original: &str, agent: &str, known: Option<Version>, win
     let channel_incompatible = channel && (windows && channel_shell || agent != "claude" || known.is_some_and(|v| v < CLAUDE_ANSWER_CHANNEL));
     Ok(json!({"state":if missing.is_empty(){"configured"}else if present.is_empty(){"missing"}else{"partial"},
         "expected_events":expected,"registered_events":present,"missing_events":missing,"duplicate_events":duplicates,"conditional_matchers":conditional,
-        "answer_channel_registered":channel,"compatibility":{"state":if !incompatible.is_empty() || channel_incompatible {"incompatible"}else if known.is_some(){"compatible"}else{"unknown"},
+        "answer_channel_registered":channel,"unrecognised_tracking":unrecognised,"compatibility":{"state":if !incompatible.is_empty() || channel_incompatible {"incompatible"}else if known.is_some(){"compatible"}else{"unknown"},
         "basis":"Cached executable identity and known HGS versioned entries only",
         "native_version":known.map(|(a,b,c)|format!("{a}.{b}.{c}")),"unsupported_registered_events":incompatible}}))
 }
 
 /// Explicit repair uses only a previously verified version. It never probes a provider.
 pub(super) fn repair_document(original: &str, path: &Path, agent: &str, known: (u64,u64,u64)) -> Result<Option<String>> {
-    let executable = runner_executable()?;
+    repair_with(original, path, agent, known, &runner_executable()?)
+}
+
+/// The repair `executable` would write. Health is read in the same scope, so
+/// the program it writes and the programs it owns are one set (zerus-b64dl).
+fn repair_with(
+    original: &str,
+    path: &Path,
+    agent: &str,
+    known: (u64, u64, u64),
+    executable: &str,
+) -> Result<Option<String>> {
+    let _own = OwnProgram::for_config(Some(executable), path);
+    let migrated = migrate_recorded(original, path, agent, executable, cfg!(windows))?;
+    repair_owned(
+        migrated.as_deref().unwrap_or(original),
+        path,
+        agent,
+        known,
+        executable,
+    )
+    .map(|merged| merged.or(migrated))
+}
+
+fn repair_owned(
+    original: &str,
+    path: &Path,
+    agent: &str,
+    known: Version,
+    executable: &str,
+) -> Result<Option<String>> {
     if agent == "kimi" {
-        let health=health_document(original,agent,Some(known))?;
+        let health = health_document_mode(original, agent, Some(known), cfg!(windows))?;
+        if health["unrecognised_tracking"] == true {
+            return Err(UNRECOGNISED_TRACKING.into());
+        }
         if health["state"]=="configured" {
             if health["duplicate_events"].as_array().is_none_or(Vec::is_empty) { return Ok(None); }
-            return merge_kimi(original, path, cfg!(windows), &mut || fresh_command(&executable));
+            return merge_kimi(original, path, cfg!(windows), &mut || fresh_command(executable));
         }
         // Rewriting an existing Kimi block can discard custom fields/personal
         // entries within it. Explicit repair refuses that lossy transformation.
         if health["state"]=="partial" || original.contains(KIMI_BEGIN) || original.contains(KIMI_END) {
             return Err("Partial Kimi hooks require a supervised launch or manual review; explicit repair preserved the existing block".into());
         }
-        return merge_kimi(original, path, cfg!(windows), &mut || fresh_command(&executable));
+        return merge_kimi(original, path, cfg!(windows), &mut || fresh_command(executable));
     }
-    // Existing owned entries (including trusted legacy commands) remain exact.
+    // Trusted legacy commands and personal fields remain exact.
     // Version-incompatible registrations are not removed by explicit repair.
-    let health = health_document(original, agent, Some(known))?;
+    let health = health_document_mode(original, agent, Some(known), cfg!(windows))?;
+    if health["unrecognised_tracking"] == true {
+        return Err(UNRECOGNISED_TRACKING.into());
+    }
     if health["compatibility"]["state"] != "compatible" { return Err("Hook configuration is incompatible; use a qualified supervised launch".into()); }
     merge_json_mode(original, path, agent, cfg!(windows), &mut || {
         #[cfg(windows)]
-        { if agent=="claude" { windows::claude_entry(&executable, known, windows::git_bash().is_some()) } else { windows::codex_entry(&executable) } }
+        { if agent=="claude" { windows::claude_entry(executable, known, windows::git_bash().is_some()) } else if agent=="qwen" { windows::qwen_entry(executable) } else { windows::codex_entry(executable) } }
         #[cfg(unix)]
-        { Ok(Entry::shell(fresh_command(&executable)?)) }
+        { Ok(Entry::shell(fresh_command(executable)?)) }
     }, &mut || Some(known), false)
 }
 
@@ -909,6 +1479,8 @@ fn fresh_command(executable: &str) -> Result<String> {
 fn fresh_entry(agent: &str, executable: &str, installed: &Installed) -> Result<Entry> {
     if agent == "claude" {
         windows::claude_entry(executable, installed.version()?, windows::git_bash().is_some())
+    } else if agent == "qwen" {
+        windows::qwen_entry(executable)
     } else {
         windows::codex_entry(executable)
     }
@@ -960,6 +1532,7 @@ mod version {
         command
             .env_remove("HGS_RUN_ID")
             .env_remove("HGS_SESSION")
+            .env_remove("HGS_SESSION_ID")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(output.try_clone().map_err(|e| fail(e.to_string()))?);
@@ -1126,6 +1699,7 @@ mod windows {
                 command: path(stable)?,
                 args: Some(HOOK_ARGS.map(str::to_owned).to_vec()),
                 command_windows: None,
+                shell: None,
             });
         }
         if !git_bash {
@@ -1163,12 +1737,27 @@ mod windows {
         ))
     }
 
+    /// Qwen Code's entry. It runs a hook with `cmd /d /s /c`, and Node.js
+    /// hands cmd a quoted program as `\"…\"`, which never runs; an unquoted
+    /// path does (verified with Qwen Code 0.27.4). A path with a space or a
+    /// character cmd reads gets the PowerShell form with `"shell":
+    /// "powershell"`, which Qwen Code runs as `powershell -Command` (and so
+    /// with the user's profile).
+    pub(super) fn qwen_entry(stable: &str) -> Result<Entry> {
+        let path = path(stable)?;
+        if !path.chars().any(|c| c.is_whitespace() || "&|<>^()%!,;=\"'`$".contains(c)) {
+            return Ok(Entry::shell(format!("{path} {} {}", HOOK_ARGS[0], HOOK_ARGS[1])));
+        }
+        powershell_command(stable).map(Entry::powershell)
+    }
+
     /// Codex's entry: the shell form as `command`, and the PowerShell form as
     /// `commandWindows`, which Codex prefers on Windows and runs with the
     /// session's shell, PowerShell there (`-NoProfile -Command`, Codex 0.140 to
     /// 0.162: `build_hooks_config`, `default_user_shell`). `cmd.exe` runs it
     /// only for a session without one local environment, which hgs never
     /// starts, or on a computer without PowerShell.
+
     pub(super) fn codex_entry(stable: &str) -> Result<Entry> {
         Ok(Entry {
             command_windows: Some(powershell_command(stable)?),
@@ -1259,61 +1848,274 @@ mod command_guard_tests {
 }
 
 pub(super) fn hook() -> Result<i32> {
+    // WhiteWh fork: a Hermes hook runs in Hermes's shared runtime, whose
+    // environment may be another session's: its session is found by the
+    // title hgs gave it, never by `HGS_SESSION`.
+    if nonempty_env("HGS_AGENT").as_deref() == Some(hermes::AGENT) || nonempty_env("HERMES_MANAGED_DIR").is_some() {
+        let event = stdin_json()?;
+        if event.get("extra").is_some() && string(&event, "hook_event_name").starts_with(|c: char| c.is_ascii_lowercase()) {
+            let Some((name, token)) = hermes::owner(string(&event, "session_id")) else {
+                return Ok(0);
+            };
+            let Some(event) = hermes::translate(&event)? else {
+                return Ok(0);
+            };
+            let stdout = io::stdout();
+            return track(name, token, event, &mut stdout.lock());
+        }
+        let (Some(name), Some(token)) = (nonempty_env("HGS_SESSION"), nonempty_env("HGS_RUN_ID")) else {
+            return Ok(0);
+        };
+        let stdout = io::stdout();
+        return track(name, token, event, &mut stdout.lock());
+    }
     let (Some(name), Some(token)) = (nonempty_env("HGS_SESSION"), nonempty_env("HGS_RUN_ID"))
     else {
         return Ok(0);
     };
     let event = stdin_json()?;
-    let mut started = false;
-    let code = track(name, token, event, &mut started)?;
-    // The project's task commands, in the agent's context from its first turn on
-    // (docs/superpowers/specs/2026-10-13-project-task-queue-design.md); only a
-    // start this run recorded as its own conversation's, never a nested CLI's.
-    if code == 0 && started {
-        if let Some(context) =
-            nonempty_env("HGS_AGENT").and_then(|agent| crate::tasks::session_context(&agent))
-        {
-            println!("{context}");
-        }
-    }
-    Ok(code)
+    let stdout = io::stdout();
+    track(name, token, event, &mut stdout.lock())
 }
 
-/// Records one hook event of the session `name`'s run `token`; `started` says
-/// that it was the start of the run's own conversation.
-fn track(name: String, token: String, mut event: Value, started: &mut bool) -> Result<i32> {
+/// Claude Code 2.1.312 refuses a hook output of two JSON objects: the agent
+/// hint and the task commands go out as one SessionStart additionalContext.
+/// Task 135 (docs/lore.md 6.2 and 11.12): the start context of a team member's
+/// session after a compaction or a clear gets the handoff brief in recall form,
+/// at most `RECALL_UNITS`, and never so much that the whole start context passes
+/// `MAX_START_CONTEXT` (the iron rules and the hint keep their room: a recall
+/// that would not leave 600 units is left out). It reads the team's record only
+/// and writes nothing.
+fn with_team_recall(hint: Option<String>, tasks: Option<&Value>, record: &Value, event: &Value) -> Option<String> {
+    if string(event, "hook_event_name") != "SessionStart"
+        || !string(event, "agent_id").is_empty()
+        || !matches!(string(event, "source"), "compact" | "clear")
+    {
+        return hint;
+    }
+    let used = hint.as_deref().map_or(0, |text| text.encode_utf16().count())
+        + tasks
+            .and_then(|context| context["hookSpecificOutput"]["additionalContext"].as_str())
+            .map_or(0, |text| text.encode_utf16().count())
+        + 4;
+    let room = super::iron_rules::MAX_START_CONTEXT.saturating_sub(used).min(teams::handoff::RECALL_UNITS);
+    if room < 600 {
+        return hint;
+    }
+    let Some(recall) = team_recall(record, room) else { return hint };
+    Some(match hint {
+        Some(hint) if !hint.is_empty() => format!("{hint}\n\n{recall}"),
+        _ => recall,
+    })
+}
+
+/// docs/lore.md 6.2 (RogueDOD, 2026-11-11): every own session start (startup,
+/// clear, compact; team or not) gets the titles of the project's faults and
+/// decisions in force from `lore digest`, at most 2000 bytes and only in the
+/// room the start context has left, so the iron rules, the hint and a team's
+/// recall come first. The store is the repository's (its git root's lore.toml
+/// with real areas) unless its own hooks give the digest, else the project's
+/// Zerus store when its memory is on. A slow or missing lore adds nothing.
+fn with_lore_digest(hint: Option<String>, tasks: Option<&Value>, record: &Value, event: &Value, project: &str) -> Option<String> {
+    if string(event, "hook_event_name") != "SessionStart"
+        || !string(event, "agent_id").is_empty()
+        || !matches!(string(event, "source"), "startup" | "clear" | "compact")
+    {
+        return hint;
+    }
+    let used = hint.as_deref().map_or(0, |text| text.encode_utf16().count())
+        + tasks
+            .and_then(|context| context["hookSpecificOutput"]["additionalContext"].as_str())
+            .map_or(0, |text| text.encode_utf16().count())
+        + 4;
+    // UTF-8 bytes are never fewer than UTF-16 units: a digest of N bytes fits N units.
+    let room = super::iron_rules::MAX_START_CONTEXT.saturating_sub(used).min(2000 + 200);
+    if room < 600 {
+        return hint;
+    }
+    let project = lore_project(record, project);
+    let Some(digest) = super::project_memory::session_digest(Path::new(string(record, "launch_dir")), &project, room - 200) else { return hint };
+    Some(match hint {
+        Some(hint) if !hint.is_empty() => format!("{hint}
+
+{digest}"),
+        _ => digest,
+    })
+}
+
+/// The project a session's lore hooks read: the iron rules' project, else
+/// its team's.
+fn lore_project(record: &Value, project: &str) -> String {
+    if !project.is_empty() {
+        return project.to_owned();
+    }
+    let team = || -> Option<String> {
+        if !teams::store::path().exists() {
+            return None;
+        }
+        let (team, _) = teams::store::Store::open(false).ok()?.rules_member(record).ok()??;
+        Some(team.project_id)
+    };
+    team().unwrap_or_default()
+}
+
+/// CodeLore 92a1c04 (2026-11-11): the store `lore hook pre-edit` reads for a
+/// Claude session, chosen once at its own start and kept in its record, so an
+/// edit costs no project lookup; none when the repository's own hooks run it.
+fn remember_edit_store(record: &mut Value, project: &str) {
+    let project = lore_project(record, project);
+    let store = super::project_memory::session_store(Path::new(string(record, "launch_dir")), &project, &super::project_memory::EDIT_HOOKS);
+    match store {
+        Some(store) => record["lore_edit_store"] = json!(store.display().to_string()),
+        None => {
+            if let Some(map) = record.as_object_mut() {
+                map.remove("lore_edit_store");
+            }
+        }
+    }
+}
+
+/// The store whose `lore hook pre-edit` this event asks: a Claude Edit, Write,
+/// MultiEdit or NotebookEdit in a session that has one.
+fn edit_store(record: &Value, event: &Value, agent: &str) -> Option<PathBuf> {
+    (agent == "claude"
+        && string(event, "hook_event_name") == "PreToolUse"
+        && super::project_memory::EDIT_TOOLS.contains(&string(event, "tool_name")))
+    .then(|| string(record, "lore_edit_store"))
+    .filter(|store| !store.is_empty())
+    .map(PathBuf::from)
+}
+
+fn team_recall(record: &Value, room: usize) -> Option<String> {
+    let store = teams::store::Store::open(false).ok()?;
+    let (team, member) = store.rules_member(record).ok()??;
+    let items = store.events(&team.id, None, 60).ok().and_then(|page| page["items"].as_array().cloned()).unwrap_or_default();
+    let pulses = teams::handoff::pulse_lines(&team, &member, &items, now());
+    Some(teams::handoff::build(&team, &member, teams::handoff::Why::Compaction, &pulses, room).text)
+}
+
+fn start_context(hint: Option<String>, tasks: Option<Value>) -> Option<String> {
+    let tasks = tasks.and_then(|context| context["hookSpecificOutput"]["additionalContext"].as_str().map(str::to_owned));
+    let parts: Vec<String> = hint.into_iter().chain(tasks).collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// DCB-svn report (2026-11-12): Claude Code cancels a hook that runs past its
+/// 5 s timeout. On a busy computer a new session's SessionStart was cancelled
+/// before it bound the conversation, every later event was dropped as another
+/// conversation's, and the team member never showed Ready. The first main
+/// event of a new Claude session that has no conversation yet binds it as
+/// that start would have; a resume, a fork or a fresh session that expects a
+/// conversation still waits for its own start.
+fn late_start(record: &Value, event: &Value, agent: &str) -> bool {
+    let sid = string(event, "session_id");
+    agent == "claude"
+        && string(event, "hook_event_name") != "SessionStart"
+        && string(event, "agent_id").is_empty()
+        && !sid.is_empty()
+        && string(record, "conversation_id").is_empty()
+        && string(record, "expected_id").is_empty()
+        && string(record, "fork_parent_id").is_empty()
+        && string(record, "restore_archive_id").is_empty()
+        && string(&record["fresh_from"], "conversation_id") != sid
+        && string(record, "startup_kind") == "new"
+}
+
+fn clear_rules_proof(record: &mut Value, event: &Value) -> bool {
+    if string(event,"hook_event_name") != "SessionStart" || !string(event,"agent_id").is_empty() { return false; }
+    record["iron_rules_start_supported"] = json!(false);
+    for key in ["iron_rules_start_project","iron_rules_start_digest","iron_rules_start_run","iron_rules_start_conversation"] {
+        record.as_object_mut().unwrap().remove(key);
+    }
+    true
+}
+
+fn startup_rules(record: &Value, event: &Value) -> Option<(String,String)> {
+    match iron_rules_start(record,event) {
+        Ok(Some((project,text))) if text.encode_utf16().count() <= super::iron_rules::MAX_START_RULES => Some((project,text)),
+        Ok(_) => None,
+        Err(error) => { eprintln!("hgs: {error}; iron rules keep per-send delivery"); None }
+    }
+}
+
+fn iron_rules_start(record: &Value, event: &Value) -> Result<Option<(String, String)>> {
+    if string(record, "agent") != "claude"
+        || string(event, "hook_event_name") != "SessionStart"
+        || !string(event, "agent_id").is_empty()
+    {
+        return Ok(None);
+    }
+    let context = super::iron_rules::record_context(record)
+        .map_err(|error| format!("Iron rules could not be read: {error}"))?;
+    Ok(Some(context))
+}
+
+/// Records one hook event of this exact run. A main start publishes its
+/// confirmed binding only after its combined context was delivered.
+/// The agent whose hint shape the start context takes: the decided record's,
+/// else the environment's.
+fn format_agent(record: &str, environment: Option<String>) -> String {
+    if record.is_empty() {
+        environment.unwrap_or_default()
+    } else {
+        record.to_owned()
+    }
+}
+
+fn track(name: String, token: String, mut event: Value, output: &mut impl std::io::Write) -> Result<i32> {
     if nonempty_env("HGS_AGENT").as_deref() == Some("claude") {
         if let std::borrow::Cow::Owned(prompt) = journal::pasted_text(string(&event, "prompt")) {
             event["prompt"] = json!(prompt);
         }
     }
-    let sid = event
+    let session = event
         .get("session_id")
         .and_then(Value::as_str)
         .filter(|sid| !sid.is_empty() && !sid.chars().any(char::is_whitespace))
-        .ok_or("hook did not supply a valid session_id")?;
-    let kind = string(&event, "hook_event_name");
+        .ok_or("hook did not supply a valid session_id")?.to_owned();
+    let sid = session.as_str();
+    let kind_value = string(&event, "hook_event_name").to_owned();
+    let kind = kind_value.as_str();
+    if kind == "SessionHeartbeat" {
+        // Task 121: the heartbeat's whole effect is the session's last activity;
+        // it is a fast append that never waits on the state lock (Kimi stops a
+        // hook after 5 s, and a slow store under a delivery's lock outlived it).
+        super::heartbeat::observed(&token);
+        return Ok(0);
+    }
     if let Some(refusal) = command_refusal(&event, &home().to_string_lossy()) {
         eprintln!("{} [{}]", refusal.message, refusal.rule);
         return Ok(2);
     }
     let _guard = lock(None)?;
     let panes = live()?;
-    let own = read_run(&name, &token)?;
-    let record = if continuations::foreign(own.as_ref(), sid) {
+    let own = read_own_run(&name, &token)?;
+    let admitted = if continuations::foreign(own.as_ref(), sid) {
         continuations::owner(&event, sid, &panes)?
     } else {
-        own
+        own.map(|record| hook_caller::admit(&record).map(|caller| (record, caller))).transpose()?
     };
-    let Some(mut record) = record else {
+    let Some((mut record, _caller)) = admitted else {
         return Ok(0);
     };
-    if !matches(&record, panes.get(string(&record, "name"))) {
+    if !matches(&record, panes_of(&panes, &record)) {
         return Ok(0);
     }
+    if !terminating::completion_hook(&record, kind) {
+        eprintln!("hgs is terminating this session; no new work or binding was admitted");
+        return Ok(2);
+    }
+    if codex_tasks::recover_main(&mut record, &event)? {
+        write(&mut record)?;
+        // Only exact accepted text in the held original native transcript can
+        // credit the old request; this different fresh prompt cannot do so.
+        input::acceptance::reconcile_locked(&mut record)?;
+    }
     if let Some(scoped) = external_agents::route(&mut record, &event) {
+        if scoped["hgs_retired_external_hook"] == true { return Ok(0); }
         processes::observe(&mut record, &scoped);
         journal::update_activity(&mut record, &scoped);
+        subagent_lifecycle::reconcile(&mut record);
         if kind == "PermissionRequest" {
             let child = &mut record["subagents"][string(&scoped, "agent_id")];
             child["display_state"] = json!("approval");
@@ -1333,6 +2135,10 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
         && !external_agents::main_start(&record, &event) {
         return Ok(0);
     }
+    // Only an accepted main start may invalidate this record's proof. A
+    // foreign or child start must not alter its parent's startup delivery.
+    // Clear before later work can fail, including rules resolution.
+    if clear_rules_proof(&mut record, &event) { write(&mut record)?; }
     let agent = string(&record, "agent").to_owned();
     if !events(&agent).contains(&kind)
         && !versioned_events(&agent).iter().any(|(event, _)| *event == kind)
@@ -1363,9 +2169,19 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
         eprintln!("hgs is pausing this session; retry after resuming");
         return Ok(2);
     }
-    let changed_conversation = kind == "SessionStart" && string(&event, "agent_id").is_empty()
-        && sid != string(&record, "conversation_id");
-    if kind == "SessionStart" && string(&event, "agent_id").is_empty() {
+    let successor = codex_clear_recovery::observe(&record, &event)
+        .or_else(|| codex_clear_recovery::terminal_start(&record, &event));
+    let main_start = (kind == "SessionStart" && string(&event, "agent_id").is_empty())
+        || successor.is_some()
+        || late_start(&record, &event, &agent);
+    let changed_conversation = main_start && sid != string(&record, "conversation_id");
+    if main_start {
+        // A previous accepted restore/clear hook may have synced the identity but
+        // failed archive cleanup. Finish that transaction before a later start
+        // can replace its durable boundary; this never resends native input.
+        if clear_context::cleanup_pending(&record) || (!string(&record,"restore_archive_id").is_empty() && string(&record,"expected_id").is_empty()) {
+            archive::confirm_restore(&mut record)?;
+        }
         if !string(&record, "fork_parent_id").is_empty() && sid == string(&record, "fork_parent_id")
         {
             record["error"] =
@@ -1384,10 +2200,10 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
             return Ok(0);
         }
         if !string(&record, "expected_id").is_empty() && sid != string(&record, "expected_id")
-            && !clear_context::resumed_start(&record, &event)
+            && !clear_context::resumed_start(&record, &event) && successor.is_none()
             && !clear_context::resumed_session(&event)
         {
-            record["error"] = json!("agent resumed a different conversation");
+            record["error"] = json!(codex_clear_recovery::MISMATCH);
             record["activity"] = json!("unknown");
             write(&mut record)?;
             return Ok(0);
@@ -1396,12 +2212,15 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
             // The agent's own id wins: a resume or compaction may continue in a
             // new transcript, and the record follows it (H7).
             clear_context::follow(&mut record, &event);
+            codex_tasks::main_changed(&mut record, sid);
             for key in [
                 "clear_context_request",
                 "compact_context_request",
                 "prompt",
                 "last_message",
                 "subagents",
+                "subagent_retirements",
+                "subagents_ended_pruned",
                 "active_tools",
                 "last_error",
                 "subagent_groups",
@@ -1418,11 +2237,14 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
                 "model_source_path",
                 "model_source_offset",
             ] {
-                record.as_object_mut().unwrap().remove(key);
+                if key != "clear_context_request" || !clear_context::cleanup_pending(&record) {
+                    record.as_object_mut().unwrap().remove(key);
+                }
             }
         }
         record.as_object_mut().unwrap().remove("expected_id");
         record.as_object_mut().unwrap().remove("session_end");
+        if successor.is_some() { record.as_object_mut().unwrap().remove("error"); }
         record
             .as_object_mut()
             .unwrap()
@@ -1435,14 +2257,22 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
         if !string(&event, "cwd").is_empty() {
             record["cwd"] = event["cwd"].clone();
         }
-        record["transcript"] = event["transcript_path"].clone();
+        record["transcript"] = successor.as_ref().map_or_else(|| event["transcript_path"].clone(),
+            |proof| json!(proof.transcript));
     } else if sid != string(&record, "conversation_id") {
         return Ok(0);
     }
+    let resumed_clear_end = kind == "SessionEnd" && string(&event, "agent_id").is_empty()
+        && clear_context::ending_resume(&record);
+    let terminal_resume_end = kind == "SessionEnd" && string(&event,"agent_id").is_empty()
+        && clear_context::ending_terminal_resume(&record) && external_agents::main_codex_hook(&record);
+    let terminal_clear_at = if terminal_resume_end && clear_context::awaiting_start(&record)
+        && record["session_clear"]["source"] == "native_terminal" { record["session_clear"]["at"].clone() } else { Value::Null };
     if kind == "SessionEnd" && string(&event, "agent_id").is_empty() {
         record["session_end"] = json!({"reason": string(&event, "reason"), "at": now(),
             "run_id": record["run_id"], "conversation_id": sid});
     }
+    kimi_messages::bind_stop_turn(&record, &mut event);
     // Claude's suggested next message is no subagent and no Activity event.
     if prompt_suggestion::observe(&mut record, &event) {
         write(&mut record)?;
@@ -1452,11 +2282,52 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
     telemetry::observe(&mut record, &event);
     tasks::observe(&mut record, &event);
     processes::observe(&mut record, &event);
+    keep_warm::observe(&mut record, &mut event, now());
+    if external_agents::main_codex_hook(&record) && codex_tasks::observe(&mut record, &event) {
+        // A newly created task can emit its own SessionStart immediately.
+        // Do not let a busy activity journal lose the main/task distinction.
+        write(&mut record)?;
+    }
+    let seen_before = record["input_seen_at"].clone();
+    let acceptance_allowed = input::acceptance::allows_hook(&record, &event);
     journal::update_activity(&mut record, &event);
+    if !acceptance_allowed {
+        record["input_seen_at"] = seen_before.clone();
+    }
+    keep_warm::settle(&mut record, &event, now());
+    // Native acceptance is gate evidence, not a by-product of Activity or
+    // analytics. Persist it after the existing caller/conversation checks and
+    // keep-warm classification, before a busy journal can exhaust the hook's
+    // native timeout. A later journal failure must not lose this acceptance.
+    let first_context = input::acceptance::first_native_context(&mut record, &event);
+    if record["input_seen_at"] != seen_before {
+        input::acceptance::record_native_context(&mut record, &event);
+    }
+    if record["input_seen_at"] != seen_before || first_context {
+        write(&mut record)?;
+    }
+    if resumed_clear_end {
+        // The real main hook ended this requested clear, not its supervised
+        // process. Keep the exact deferred-start fence, never fabricate Ready.
+        record["session_end"]["clear_request_id"] = record["clear_context_request"]["request_id"].clone();
+        record["session_end"]["clear_event_at"] = record["last_event_at"].clone();
+    }
+    if terminal_resume_end {
+        record["session_end"]["terminal_resume"] = json!({"event_at":record["last_event_at"],
+            "pid":record["pid"],"process_start":record["process_start"],"supervisor":record["supervisor"],
+            "transcript":record["transcript"],"clear_at":terminal_clear_at});
+    }
     compact_context::observe(&mut record, &event);
     questions::observe(&mut record, &event);
+    let clear_boundary = changed_conversation && record["session_clear"]["journaled"] != true;
+    if clear_boundary && successor.is_some() {
+        if let Some(mut clear) = clear_context::event(&record) {
+            clear["hook_event_name"] = json!("SessionCleared");
+            journal::log_event(&record, &clear)?;
+        }
+    }
     journal::log_event(&record, &event)?;
-    if changed_conversation && record["session_clear"]["journaled"] != true {
+    if clear_boundary && successor.is_none() {
         if let Some(mut clear) = clear_context::event(&record) {
             clear["hook_event_name"] = json!("SessionCleared");
             journal::log_event(&record, &clear)?;
@@ -1472,14 +2343,73 @@ fn track(name: String, token: String, mut event: Value, started: &mut bool) -> R
         }
     }
     let hint = agent_hint::start(&mut record, &event);
-    write(&mut record)?;
-    if kind == "SessionStart" && string(&event, "agent_id").is_empty() {
-        archive::confirm_restore(&mut record)?;
-        *started = true;
+    if changed_conversation && clear_context::cleanup_pending(&record) {
+        archive::reserve_clear_source(&record)?;
     }
-    if let Some(hint) = hint {
-        let stdout = io::stdout();
-        agent_hint::output(&mut stdout.lock(), hint)?;
+    let own_start = kind == "SessionStart" && string(&event, "agent_id").is_empty();
+    let rules = startup_rules(&record, &event);
+    let parts: Vec<_> = hint.map(str::to_owned)
+        .into_iter()
+        .chain(rules.as_ref().map(|(_, text)| text.clone()))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let hint = (!parts.is_empty()).then(|| parts.join("\n\n"));
+    let tasks = own_start
+        .then(|| nonempty_env("HGS_AGENT").and_then(|agent| crate::tasks::session_context(&agent)))
+        .flatten();
+    // Task 135: a team session whose context was compacted or cleared starts
+    // with the team's recall, the handoff brief built from its own record.
+    let hint = with_team_recall(hint, tasks.as_ref(), &record, &event);
+    // docs/lore.md 6.2: the project's lore digest, after the recall.
+    let hint = with_lore_digest(hint, tasks.as_ref(), &record, &event, rules.as_ref().map_or("", |(project, _)| project.as_str()));
+    if own_start && agent == "claude" {
+        remember_edit_store(&mut record, rules.as_ref().map_or("", |(project, _)| project.as_str()));
+    }
+    if let Some(context) = start_context(hint, tasks) {
+        // A failed write or flush leaves only the early invalidation persisted.
+        // Never expose a fresh conversation as started before this succeeds.
+        // Kimi reads its start context from its own shape (upstream, `output_for`).
+        agent_hint::output_for(&format_agent(&agent, nonempty_env("HGS_AGENT")), output, &context)?;
+        if let Some((project, text)) = rules.filter(|_| context.encode_utf16().count() <= super::iron_rules::MAX_START_CONTEXT) {
+            record["iron_rules_start_supported"] = json!(true);
+            record["iron_rules_start_project"] = json!(project);
+            record["iron_rules_start_digest"] = json!(teams::store::digest(&json!(text)));
+            record["iron_rules_start_run"] = record["run_id"].clone();
+            record["iron_rules_start_conversation"] = record["conversation_id"].clone();
+        }
+    }
+    // Task 134: a team member's unread messages go into this turn as the
+    // turn-start hook's added context (the agent reads it; nothing is typed).
+    // They stay unread until the member reads them with hgs team inbox.
+    if kind == "UserPromptSubmit" && string(&event, "agent_id").is_empty() && teams::doorbell::turn_hook(&agent) {
+        if let Some(context) = teams::working::turn_context_for(string(&record, "name"), string(&record, "run_id")) {
+            agent_hint::output_event(output, &context, "UserPromptSubmit")?;
+        }
+    }
+    // Task 186 (docs/lore.md 11.11): a tool boundary is a safe point for an
+    // urgent team message: Claude Code's PostToolUse hook returns it as added
+    // context, never typed into the working composer. One file check per
+    // tool call until such a message waits.
+    if kind == "PostToolUse" && string(&event, "agent_id").is_empty() && agent == "claude" {
+        if let Some(context) = teams::working::tool_context_for(string(&record, "name"), string(&record, "run_id")) {
+            agent_hint::output_event(output, &context, "PostToolUse")?;
+        }
+    }
+    let edit_store = edit_store(&record, &event, &agent);
+    // The ready conversation and its proof become visible in the same atomic
+    // record update; hook() performs no later proof-only binding write.
+    write(&mut record)?;
+    if own_start {
+        archive::confirm_restore(&mut record)?;
+    }
+    // CodeLore's pre-edit hook: what lore knows in force about the file about
+    // to change, once per file and session. It runs after the state lock is
+    // released, so a slow lore (2 seconds at most) holds no other session.
+    if let Some(store) = edit_store {
+        drop(_guard);
+        if let Some(context) = super::project_memory::pre_edit_context(&store, &event) {
+            agent_hint::output_event(output, &context, "PreToolUse")?;
+        }
     }
     Ok(0)
 }
@@ -1489,24 +2419,462 @@ mod tests {
     use super::windows::{self as forms, CLAUDE_EXEC_FORM};
     use super::*;
 
+    struct StartupBackend;
+    impl crate::state::backend::TerminalBackend for StartupBackend {
+        fn panes(&self) -> Result<Vec<crate::state::backend::PaneRow>> {
+            Ok(vec![crate::state::backend::PaneRow {
+                session: "claude/hooks/parent".into(), session_id: "$1".into(),
+                pane: "%1".into(), dead: "0".into(), run_marker: "parent-run".into(),
+            }])
+        }
+    }
+
+    struct StartupOutput {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        visible: Vec<Value>,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for StartupOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.visible.push(serde_json::from_slice(&fs::read(&self.path)?).unwrap());
+            if self.fail_write { return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture write")); }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.visible.push(serde_json::from_slice(&fs::read(&self.path)?).unwrap());
+            if self.fail_flush { return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture flush")); }
+            Ok(())
+        }
+    }
+
+    fn pending_rules_start() -> Value {
+        json!({"version":1,"name":"claude/hooks/parent","run_id":"parent-run","pane":"%1",
+            "agent":"claude","pid":0,"conversation_id":"","activity":"unknown","phase":"unknown",
+            "iron_rules":["Keep this session rule"],"iron_rules_start_supported":true,
+            "iron_rules_start_project":"old-project","iron_rules_start_digest":"old-digest",
+            "iron_rules_start_run":"old-run","iron_rules_start_conversation":"old-conversation"})
+    }
+
+    #[test]
+    fn startup_proof_is_published_in_the_first_confirmed_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        super::super::with_test_state_root(directory.path(), || {
+            let mut record = pending_rules_start();
+            write(&mut record).unwrap();
+            let mut output = StartupOutput { path: record_path("claude/hooks/parent"), bytes: Vec::new(),
+                visible: Vec::new(), fail_write: false, fail_flush: false };
+            let event = json!({"hook_event_name":"SessionStart","source":"startup","session_id":"new-conversation"});
+            crate::state::backend::with_fake(&StartupBackend, || {
+                assert_eq!(track("claude/hooks/parent".into(), "parent-run".into(), event, &mut output).unwrap(), 0);
+            });
+            assert!(!output.visible.is_empty(), "the real hook emitted its context");
+            for visible in &output.visible {
+                assert_eq!(string(visible, "conversation_id"), "", "start became visible before output finished: {visible}");
+                assert_eq!(visible["iron_rules_start_supported"], false);
+            }
+            let published: Value = serde_json::from_slice(&fs::read(&output.path).unwrap()).unwrap();
+            assert_eq!(published["conversation_id"], "new-conversation");
+            assert_eq!(published["activity"], "idle");
+            assert_eq!(published["iron_rules_start_supported"], true);
+            assert_eq!(published["iron_rules_start_run"], published["run_id"]);
+            assert_eq!(published["iron_rules_start_conversation"], published["conversation_id"]);
+            let expected = teams::store::digest(&json!(startup_rules(&published,
+                &json!({"hook_event_name":"SessionStart"})).unwrap().1));
+            assert_eq!(published["iron_rules_start_digest"], expected);
+            let sent: Value = serde_json::from_slice(&output.bytes).unwrap();
+            assert!(sent["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Keep this session rule"));
+        });
+    }
+
+    #[test]
+    fn a_new_claude_session_whose_start_hook_was_cancelled_binds_on_its_next_event() {
+        // DCB-svn report (2026-11-12): Claude Code cancelled the SessionStart
+        // hook after 5 s; the prompt and the Stop that followed were dropped and
+        // the member never showed Ready.
+        for (key, value, binds) in [
+            ("startup_kind", json!("new"), true),
+            ("expected_id", json!("resumed-conversation"), false),
+            ("fork_parent_id", json!("source-conversation"), false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            super::super::with_test_state_root(directory.path(), || {
+                let mut record = pending_rules_start();
+                record["startup_kind"] = json!("new");
+                record[key] = value.clone();
+                write(&mut record).unwrap();
+                let prompt = json!({"hook_event_name":"UserPromptSubmit","session_id":"late-conversation","prompt":"You are Tester",
+                    "transcript_path":"C:/fixture/late-conversation.jsonl"});
+                crate::state::backend::with_fake(&StartupBackend, || {
+                    assert_eq!(track("claude/hooks/parent".into(), "parent-run".into(), prompt, &mut Vec::new()).unwrap(), 0);
+                    let stop = json!({"hook_event_name":"Stop","session_id":"late-conversation","last_assistant_message":"Ready."});
+                    assert_eq!(track("claude/hooks/parent".into(), "parent-run".into(), stop, &mut Vec::new()).unwrap(), 0);
+                });
+                let saved: Value = serde_json::from_slice(&fs::read(record_path("claude/hooks/parent")).unwrap()).unwrap();
+                if binds {
+                    assert_eq!(saved["conversation_id"], "late-conversation", "{key}");
+                    assert_eq!(saved["activity"], "idle", "{key}: {saved}");
+                    assert_eq!(saved["transcript"], "C:/fixture/late-conversation.jsonl");
+                } else {
+                    assert_eq!(saved["conversation_id"], "", "{key}");
+                    assert_eq!(saved["activity"], "unknown", "{key}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn broken_startup_output_never_publishes_a_proof_or_confirmed_binding() {
+        for fail_flush in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            super::super::with_test_state_root(directory.path(), || {
+                let mut record = pending_rules_start();
+                write(&mut record).unwrap();
+                let mut output = StartupOutput { path: record_path("claude/hooks/parent"), bytes: Vec::new(),
+                    visible: Vec::new(), fail_write: !fail_flush, fail_flush };
+                crate::state::backend::with_fake(&StartupBackend, || {
+                    let event = json!({"hook_event_name":"SessionStart","session_id":"new-conversation"});
+                    assert!(track("claude/hooks/parent".into(), "parent-run".into(), event, &mut output).is_err());
+                });
+                let saved: Value = serde_json::from_slice(&fs::read(&output.path).unwrap()).unwrap();
+                assert_eq!(saved["conversation_id"], "");
+                assert_eq!(saved["activity"], "unknown");
+                assert_eq!(saved["iron_rules_start_supported"], false);
+                for key in ["iron_rules_start_project", "iron_rules_start_digest", "iron_rules_start_run", "iron_rules_start_conversation"] {
+                    assert!(saved.get(key).is_none(), "old proof survived failed output: {key}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_foreign_session_start_leaves_the_record_and_rules_proof_byte_for_byte_unchanged() {
+        struct Backend;
+        impl crate::state::backend::TerminalBackend for Backend {
+            fn panes(&self) -> Result<Vec<crate::state::backend::PaneRow>> {
+                Ok(vec![crate::state::backend::PaneRow {
+                    session: "claude/hooks/parent".into(),
+                    session_id: "$1".into(),
+                    pane: "%1".into(),
+                    dead: "0".into(),
+                    run_marker: "parent-run".into(),
+                }])
+            }
+        }
+        for has_proof in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            super::super::with_test_state_root(directory.path(), || {
+                let name = "claude/hooks/parent";
+                let mut record = json!({"version":1,"name":name,"run_id":"parent-run","pane":"%1",
+                    "agent":"claude","pid":0,"conversation_id":"11111111-1111-4111-8111-111111111111",
+                    "model":"parent-model","iron_rules":["Keep the session rule"]});
+                if has_proof {
+                    record["iron_rules_start_supported"] = json!(true);
+                    record["iron_rules_start_project"] = json!("project");
+                    record["iron_rules_start_digest"] = json!("digest");
+                    record["iron_rules_start_run"] = json!("parent-run");
+                    record["iron_rules_start_conversation"] = record["conversation_id"].clone();
+                }
+                write(&mut record).unwrap();
+                let path = record_path(name);
+                let before = fs::read(&path).unwrap();
+                let mut output = Vec::new();
+                crate::state::backend::with_fake(&Backend, || {
+                    let event = json!({"hook_event_name":"SessionStart",
+                        "session_id":"22222222-2222-4222-8222-222222222222","model":"foreign-model"});
+                    assert_eq!(track(name.into(), "parent-run".into(), event,
+                        &mut output).unwrap(), 0);
+                });
+                assert_eq!(fs::read(path).unwrap(), before, "foreign start changed the record (proof={has_proof})");
+                assert!(output.is_empty(), "foreign starts emit no main-session context");
+            });
+        }
+    }
+
+    #[test]
+    fn failed_or_oversized_start_rules_leave_hint_tasks_and_no_old_proof() {
+        let dir=tempfile::tempdir().unwrap();
+        super::super::with_test_state_root(dir.path(),|| {
+            let mut record=json!({"agent":"claude","name":"claude/x/one","run_id":"r1","conversation_id":"c1",
+                "iron_rules_start_supported":true,"iron_rules_start_digest":"old","iron_rules_start_run":"old-run","iron_rules":["Own"]});
+            let event=json!({"hook_event_name":"SessionStart","source":"compact"});
+            assert!(clear_rules_proof(&mut record,&event));
+            // A malformed authoritative list forces a real resolution error.
+            record["iron_rules"]=json!([5]);
+            assert!(startup_rules(&record,&event).is_none());
+            assert_eq!(record["iron_rules_start_supported"],false); assert!(record.get("iron_rules_start_run").is_none());
+            let context=start_context(Some("Agent hint".into()),crate::tasks::session_context("claude")).unwrap();
+            assert!(context.contains("Agent hint") && context.contains("Zerus tasks"));
+            record["iron_rules"]=json!((0..20).map(|_|"\u{1f600}".repeat(150)).collect::<Vec<_>>());
+            assert!(startup_rules(&record,&event).is_none(),"UTF-16 expansion must keep the fallback");
+            record["iron_rules"]=json!(["Small"]);
+            assert!(startup_rules(&record,&event).is_some());
+        });
+    }
+
+    #[test]
+    fn iron_rules_follow_claude_start_resume_clear_and_compact_but_not_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::with_test_state_root(dir.path(), || {
+            let record = json!({"agent":"claude","name":"claude/example/one","iron_rules":["Session requirement"]});
+            for source in ["startup", "resume", "clear", "compact"] {
+                let (_, text) = iron_rules_start(
+                    &record,
+                    &json!({"hook_event_name":"SessionStart","source":source}),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(text.matches("Session requirement").count(), 1);
+                let mut out = Vec::new();
+                agent_hint::output(&mut out, &start_context(Some(text), None).unwrap()).unwrap();
+                let value: Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
+            }
+            for event in [
+                json!({"hook_event_name":"UserPromptSubmit"}),
+                json!({"hook_event_name":"PreToolUse"}),
+                json!({"hook_event_name":"SessionStart","agent_id":"child"}),
+            ] {
+                assert!(iron_rules_start(&record, &event).unwrap().is_none());
+            }
+            for agent in ["codex", "kimi", "dsh", "opencode"] {
+                let mut record = record.clone();
+                record["agent"] = json!(agent);
+                assert!(
+                    iron_rules_start(&record, &json!({"hook_event_name":"SessionStart"}))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn session_start_writes_one_json_object_with_the_hint_and_the_task_commands() {
+        let tasks = crate::tasks::session_context("claude");
+        let context = start_context(Some("Hint for this agent.".into()), tasks).unwrap();
+        let mut out = Vec::new();
+        agent_hint::output(&mut out, &context).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // One object, parseable as a whole, as Claude Code 2.1.312 requires.
+        let value: Value = serde_json::from_str(text.trim()).unwrap();
+        let joined = value["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(joined.starts_with("Hint for this agent.") && joined.contains("Zerus tasks are this project's shared task list"));
+        assert_eq!(start_context(None, None), None);
+        assert_eq!(start_context(Some("Only a hint.".into()), None).as_deref(), Some("Only a hint."));
+    }
+
+    #[test]
+    fn tracking_timeout_new_writes_are_fifteen_seconds_in_every_hook_form() {
+        for (agent, windows, entry) in [
+            ("claude", false, Entry::shell(UNIX.into())),
+            ("codex", false, Entry::shell(UNIX.into())),
+            (
+                "claude",
+                true,
+                forms::claude_entry(STABLE, CLAUDE_EXEC_FORM, false).unwrap(),
+            ),
+            ("claude", true, Entry::shell(SHELL.into())),
+            ("codex", true, forms::codex_entry(STABLE).unwrap()),
+        ] {
+            let (written, _) =
+                versioned_merge("", agent, windows, entry, Some(CLAUDE_ANSWER_CHANNEL));
+            let written = written.unwrap();
+            for event in events(agent) {
+                let hooks = journal_entries(&written, event);
+                assert_eq!(hooks.len(), 1, "{agent}/{windows}/{event}");
+                assert_eq!(hooks[0]["timeout"], 15, "{agent}/{windows}/{event}");
+            }
+            for group in channel_groups(&written) {
+                assert_eq!(group["hooks"][0]["timeout"], 86_400);
+            }
+        }
+        for crlf in [false, true] {
+            let written = kimi_merge("default_model = \"synthetic\"\n", crlf, UNIX).unwrap();
+            let document = written.parse::<toml_edit::DocumentMut>().unwrap();
+            let hooks = document["hooks"].as_array_of_tables().unwrap();
+            assert_eq!(hooks.len(), events("kimi").len());
+            for hook in hooks {
+                assert_eq!(hook["timeout"].as_integer(), Some(15));
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_timeout_json_refresh_upgrades_own_five_but_keeps_other_entries() {
+        for (agent, windows, entry) in [
+            ("claude", false, Entry::shell(UNIX.into())),
+            ("codex", false, Entry::shell(UNIX.into())),
+            (
+                "claude",
+                true,
+                forms::claude_entry(STABLE, CLAUDE_EXEC_FORM, false).unwrap(),
+            ),
+            ("codex", true, forms::codex_entry(STABLE).unwrap()),
+            (
+                "claude",
+                false,
+                Entry::shell("python3 /synthetic/hgs_state.py hook".into()),
+            ),
+        ] {
+            // Product-written rows, with explicit old-version/custom-timeout
+            // metadata seams. Foreign commands below are deliberate controls.
+            let written = json_merge("", agent, windows, entry).unwrap();
+            let mut old: Value = serde_json::from_str(&written).unwrap();
+            for event in events(agent) {
+                old["hooks"][event][0]["hooks"][0]["timeout"] = json!(5);
+            }
+            old["hooks"]["Stop"][0]["hooks"][0]["timeout"] = json!(6);
+            old["hooks"]["Stop"][0]["hooks"][0]["statusMessage"] = json!("person's setting");
+            let personal = old["hooks"]["Stop"][0]["hooks"][0].clone();
+            let foreign =
+                json!({"type":"command","command":"/synthetic/other __state hook","timeout":5});
+            let look_alike = json!({"type":"command","command":"/synthetic/hgs-wrapper __state hook","timeout":5});
+            let exec_look_alike = json!({"type":"command","command":"C:/synthetic/hgs-wrapper.exe","args":HOOK_ARGS,"timeout":5});
+            old["hooks"]["Stop"][0]["hooks"]
+                .as_array_mut()
+                .unwrap()
+                .extend([foreign.clone(), look_alike.clone(), exec_look_alike.clone()]);
+            let foreign_bytes = r#"{ "command" : "/synthetic/other __state hook", "timeout" : 5, "type" : "command" }"#;
+            let original = old.to_string().replace(&foreign.to_string(), foreign_bytes);
+            let refreshed =
+                json_reuse(&original, agent, windows).expect("old owned timeouts need refresh");
+            assert!(refreshed.contains(foreign_bytes));
+            for event in events(agent) {
+                assert_eq!(
+                    hook_entries(&refreshed, event)[0]["timeout"],
+                    if event == "Stop" { 6 } else { 15 }
+                );
+            }
+            assert_eq!(
+                hook_entries(&refreshed, "Stop"),
+                [personal, foreign, look_alike, exec_look_alike]
+            );
+            assert_eq!(json_reuse(&refreshed, agent, windows), None);
+        }
+    }
+
+    #[test]
+    fn tracking_timeout_json_keeps_person_timeouts_and_the_answer_channel_byte_stable() {
+        for timeout in [
+            json!(6),
+            json!(30),
+            json!(0),
+            json!(null),
+            json!("5"),
+            json!(5.0),
+        ] {
+            let (written, _) = versioned_merge(
+                "",
+                "claude",
+                false,
+                Entry::shell(UNIX.into()),
+                Some(CLAUDE_ANSWER_CHANNEL),
+            );
+            let written = written.unwrap();
+            let channels = channel_groups(&written);
+            let mut custom: Value = serde_json::from_str(&written).unwrap();
+            for event in events("claude").into_iter().chain(["PostModelSwitch"]) {
+                custom["hooks"][event][0]["hooks"][0]["timeout"] = timeout.clone();
+            }
+            let original = format!("{}\n", serde_json::to_string_pretty(&custom).unwrap());
+            let (refreshed, _) = versioned_merge(
+                &original,
+                "claude",
+                false,
+                Entry::shell("unused".into()),
+                Some(CLAUDE_ANSWER_CHANNEL),
+            );
+            assert_eq!(refreshed, None, "person timeout {timeout}");
+            assert_eq!(channel_groups(&original), channels);
+        }
+        // Preserve the answer channel even if a person independently changed it
+        // to five seconds; it is not a tracking hook to migrate.
+        let (written, _) = versioned_merge(
+            "",
+            "claude",
+            false,
+            Entry::shell(UNIX.into()),
+            Some(CLAUDE_ANSWER_CHANNEL),
+        );
+        let written = written.unwrap();
+        let original = written.replace("86400", "5");
+        assert_eq!(
+            versioned_merge(
+                &original,
+                "claude",
+                false,
+                Entry::shell("unused".into()),
+                Some(CLAUDE_ANSWER_CHANNEL)
+            )
+            .0,
+            None
+        );
+    }
+
+    #[test]
+    fn tracking_timeout_kimi_refresh_changes_only_old_owned_values_and_keeps_bytes() {
+        let seed = kimi_merge(
+            "# Personal settings\ndefault_model = \"synthetic\"\n",
+            false,
+            UNIX,
+        )
+        .unwrap();
+        // Product-written rows with explicit historical/custom timeout metadata.
+        let old = seed.replace("timeout = 15", "timeout = 5");
+        let old = old.replacen("timeout = 5", "timeout  =  5 # keep comment", 1);
+        let stop = format!("event = \"Stop\"\ncommand = {}\ntimeout = 5", json!(UNIX));
+        let custom = old.replace(&stop, &stop.replace("timeout = 5", "timeout = 6"));
+        let foreign = "\n# Personal hooks stay byte-identical\n[[hooks]]\nevent = 'Stop'\ncommand = '/synthetic/other __state hook'\ntimeout = 5\n[[hooks]]\nevent = 'Stop'\ncommand = '/synthetic/hgs-wrapper __state hook'\ntimeout = 5\n";
+        let expected = custom
+            .replace("timeout = 5", "timeout = 15")
+            .replace("timeout  =  5 #", "timeout  =  15 #");
+        for (crlf, newline) in [(false, "\n"), (true, "\r\n"), (false, "\r\n")] {
+            let original = format!("{custom}{foreign}").replace('\n', newline);
+            let expected = format!("{expected}{foreign}").replace('\n', newline);
+            let refreshed =
+                kimi_merge(&original, crlf, "unused").expect("old owned timeouts need refresh");
+            assert_eq!(refreshed, expected);
+            assert_eq!(kimi_merge(&refreshed, crlf, "unused"), None);
+        }
+        let custom = seed
+            .replace("timeout = 15", "timeout = 6")
+            .replace("timeout = 5", "timeout = 6");
+        assert_eq!(
+            kimi_merge(&format!("{custom}{foreign}"), false, "unused"),
+            None
+        );
+    }
+
+    #[test]
+    fn hint_output_format_comes_from_the_decided_record_not_the_environment() {
+        assert_eq!(format_agent("kimi", Some("claude".into())), "kimi");
+        assert_eq!(format_agent("", Some("kimi".into())), "kimi");
+        assert_eq!(format_agent("", None), "");
+    }
+
     #[test]
     fn health_registration_preserves_personal_and_legacy_hooks_and_never_grants_trust() {
         let personal=json!({"type":"command","command":"personal-hook --secret example"});
         let legacy=json!({"type":"command","command":"python3 /opt/old/hgs_state.py hook","timeout":5});
         let original=json!({"apiKey":"never disclose", "hooks":{"Stop":[{"hooks":[personal.clone(),legacy.clone()]}]}}).to_string();
-        let health=health_document(&original,"claude",None).unwrap();
+        let health=health_document(&original,&path(),"claude",None).unwrap();
         assert_eq!(health["state"],"partial");assert_eq!(health["compatibility"]["state"],"unknown");
         assert!(!health.to_string().contains("secret"));assert!(!health.to_string().contains("apiKey"));
         let merged=merge_json(&original,Path::new("/config"),"claude",false,&mut ||panic!("must retain legacy command"),&mut ||Some((2,1,296))).unwrap().unwrap();
         let doc:Value=serde_json::from_str(&merged).unwrap();
-        assert_eq!(doc["hooks"]["Stop"][0]["hooks"],json!([personal,legacy]));
-        assert_eq!(health_document(&merged,"claude",Some((2,1,296))).unwrap()["state"],"configured");
+        let mut expected_legacy = legacy; expected_legacy["timeout"] = json!(15);
+        assert_eq!(doc["hooks"]["Stop"][0]["hooks"],json!([personal,expected_legacy]));
+        assert_eq!(health_document(&merged,&path(),"claude",Some((2,1,296))).unwrap()["state"],"configured");
         assert!(merge_json(&merged,Path::new("/config"),"claude",false,&mut ||panic!(),&mut ||Some((2,1,296))).unwrap().is_none());
     }
     #[test]
     fn tracking_repair_does_not_enable_or_widen_answer_channels() {
         let empty=merge_json_mode("{}",Path::new("/config"),"claude",false,&mut ||Ok(Entry::shell("hgs __state hook".into())),&mut ||Some((2,1,296)),false).unwrap().unwrap();
-        assert!(!health_document(&empty,"claude",Some((2,1,296))).unwrap()["answer_channel_registered"].as_bool().unwrap());
+        assert!(!health_document(&empty,&path(),"claude",Some((2,1,296))).unwrap()["answer_channel_registered"].as_bool().unwrap());
         let original=json!({"hooks":{"PermissionRequest":[{"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"hgs __state answer-channel"}]}]}});
         let merged=merge_json_mode(&original.to_string(),Path::new("/config"),"claude",false,&mut ||Ok(Entry::shell("hgs __state hook".into())),&mut ||Some((2,1,296)),false).unwrap().unwrap();
         let value:Value=serde_json::from_str(&merged).unwrap();assert_eq!(value["hooks"]["PermissionRequest"][0],original["hooks"]["PermissionRequest"][0]);
@@ -1538,7 +2906,7 @@ mod tests {
     #[test]
     fn health_exposes_duplicates_and_partial_kimi_repair_preserves_every_entry() {
         let text=json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"hgs __state hook"},{"type":"command","command":"hgs __state hook"}]}]}}).to_string();
-        assert_eq!(health_document(&text,"claude",None).unwrap()["duplicate_events"],json!(["Stop"]));
+        assert_eq!(health_document(&text,&path(),"claude",None).unwrap()["duplicate_events"],json!(["Stop"]));
         let kimi="# BEGIN hgs session tracking\n[[hooks]]\nevent = \"Stop\"\ncommand = \"hgs __state hook\"\ntimeout = 7\n[[hooks]]\nevent = \"Stop\"\ncommand = \"personal-hook\"\n# END hgs session tracking\n";
         assert!(repair_document(kimi,Path::new("/config"),"kimi",(2,1,1)).is_err());
     }
@@ -1546,10 +2914,10 @@ mod tests {
     #[test]
     fn health_reports_version_drift_and_rejects_malformed_owned_handlers() {
         let future=json!({"hooks":{"PostModelSwitch":[{"hooks":[{"type":"command","command":"hgs __state hook"}]}]}}).to_string();
-        assert_eq!(health_document(&future,"claude",Some((2,1,200))).unwrap()["compatibility"]["state"],"incompatible");
-        assert_eq!(health_document(&future,"claude",None).unwrap()["compatibility"]["state"],"unknown");
+        assert_eq!(health_document(&future,&path(),"claude",Some((2,1,200))).unwrap()["compatibility"]["state"],"incompatible");
+        assert_eq!(health_document(&future,&path(),"claude",None).unwrap()["compatibility"]["state"],"unknown");
         for text in ["[]","{",r#"{"hooks":{"Stop":"invalid"}}"#,r#"{"hooks":{"Stop":[{"hooks":[{"type":"prompt","command":"hgs __state hook"}]}]}}"#] {
-            assert!(health_document(text,"claude",Some((2,1,296))).is_err(),"{text}");
+            assert!(health_document(text,&path(),"claude",Some((2,1,296))).is_err(),"{text}");
         }
     }
 
@@ -1603,7 +2971,7 @@ mod tests {
                 .any(|entry| owns_hook(string(entry, "command")));
             if !installed {
                 entries.push(
-                    json!({"hooks": [{"type": "command", "command": command, "timeout": 5}]}),
+                    json!({"hooks": [{"type": "command", "command": command, "timeout": HOOK_TIMEOUT}]}),
                 );
                 changed = true;
             }
@@ -1654,7 +3022,7 @@ mod tests {
         let mut block = begin.to_owned();
         for event in events("kimi") {
             block.push_str(&format!(
-                "[[hooks]]\nevent = {}\ncommand = {}\ntimeout = 5\n",
+                "[[hooks]]\nevent = {}\ncommand = {}\ntimeout = {HOOK_TIMEOUT}\n",
                 json!(event),
                 json!(command)
             ));
@@ -1701,6 +3069,462 @@ mod tests {
 
     fn kimi_merge(original: &str, crlf: bool, fresh: &str) -> Option<String> {
         merge_kimi(original, &path(), crlf, &mut || Ok(fresh.to_owned())).unwrap()
+    }
+
+    /// zerus-s3wax: a wrapper-named HGS_EXECUTABLE writes entries hgs must own.
+    #[cfg(unix)]
+    const WRAPPER: &str = "/opt/tools/hgs-wrapper";
+
+    #[cfg(unix)]
+    fn wrapper_entry() -> Entry {
+        Entry::shell(fresh_command(WRAPPER).unwrap())
+    }
+
+    /// Repeated launches: a merge that changes nothing returns `None`.
+    #[cfg(unix)]
+    fn launches(agent: &str, times: usize) -> (String, Vec<bool>) {
+        let _own = OwnProgram::scoped(WRAPPER);
+        let mut text = String::new();
+        let mut writes = Vec::new();
+        for _ in 0..times {
+            let merged = merge_json(
+                &text,
+                &path(),
+                agent,
+                false,
+                &mut || Ok(wrapper_entry()),
+                &mut || Some(CLAUDE_ANSWER_CHANNEL),
+            )
+            .unwrap();
+            writes.push(merged.is_some());
+            if let Some(merged) = merged {
+                text = merged;
+            }
+        }
+        (text, writes)
+    }
+
+    #[cfg(unix)]
+    fn wrapper_groups(text: &str, event: &str) -> usize {
+        let document: Value = serde_json::from_str(text).unwrap();
+        document["hooks"][event].as_array().map_or(0, |groups| {
+            groups
+                .iter()
+                .filter(|g| {
+                    g["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(|c| c.contains(WRAPPER)))
+                    })
+                })
+                .count()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_named_executable_owns_its_claude_and_codex_entries_across_launches() {
+        for agent in ["claude", "codex"] {
+            let (text, writes) = launches(agent, 3);
+            assert_eq!(
+                writes,
+                [true, false, false],
+                "{agent}: only the first launch writes"
+            );
+            for event in events(agent) {
+                assert_eq!(
+                    wrapper_groups(&text, event),
+                    if event == "PermissionRequest" && agent == "claude" {
+                        2
+                    } else {
+                        1
+                    },
+                    "{agent} {event}"
+                );
+            }
+            if agent == "claude" {
+                assert_eq!(wrapper_groups(&text, "PostModelSwitch"), 1);
+                let _own = OwnProgram::scoped(WRAPPER);
+                let channels = hook_entries(&text, "PermissionRequest")
+                    .iter()
+                    .filter(|h| owns_channel(h))
+                    .count();
+                assert_eq!(channels, 1, "one answer channel");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_named_executable_owns_its_kimi_block_across_launches() {
+        let _own = OwnProgram::scoped(WRAPPER);
+        let first = kimi_merge("model = \"k\"\n", false, &fresh_command(WRAPPER).unwrap()).unwrap();
+        assert!(first.contains(WRAPPER));
+        assert_eq!(
+            kimi_merge(&first, false, "unused"),
+            None,
+            "a later launch keeps every byte"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_groups_hgs_wrote_collapse_and_personal_hooks_stay() {
+        let _own = OwnProgram::scoped(WRAPPER);
+        let ours = wrapper_entry().group();
+        let personal = json!({"hooks": [{"type": "command", "command": "notify-send done"}]});
+        let shared = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "audit"}, ours["hooks"][0].clone()]});
+        let foreign = json!({"hooks": [{"type": "command", "command": "/srv/other-tool __state hook", "timeout": 5}]});
+        let original = json!({"model": "keep", "hooks": {
+            "SessionStart": [ours.clone(), personal.clone(), ours.clone(), ours.clone(), foreign.clone(), foreign.clone()],
+            "Stop": [shared.clone(), ours.clone(), ours.clone()],
+        }}).to_string();
+        let merged = merge_json(
+            &original,
+            &path(),
+            "codex",
+            false,
+            &mut || Ok(wrapper_entry()),
+            &mut || None,
+        )
+        .unwrap()
+        .unwrap();
+        let document: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(document["model"], "keep");
+        // Later copies of hgs's own group go; the personal group, a group that
+        // also holds a personal hook, and a look-alike for another program stay.
+        assert_eq!(
+            document["hooks"]["SessionStart"],
+            json!([ours, personal, foreign, foreign])
+        );
+        assert_eq!(document["hooks"]["Stop"], json!([shared, ours]));
+        for event in events("codex") {
+            assert!(wrapper_groups(&merged, event) >= 1, "{event}");
+        }
+        assert!(merge_json(
+            &merged,
+            &path(),
+            "codex",
+            false,
+            &mut || panic!("reuses its entry"),
+            &mut || None
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_programs_state_hook_is_never_adopted_without_its_identity() {
+        // Not the current executable and not named hgs: a personal hook.
+        let foreign = json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/srv/other-tool __state hook", "timeout": 5}]}]}}).to_string();
+        let _own = OwnProgram::scoped(WRAPPER);
+        let merged = json_merge(&foreign, "codex", false, wrapper_entry()).unwrap();
+        let start = hook_entries(&merged, "SessionStart");
+        assert_eq!(start.len(), 2);
+        assert_eq!(start[0]["command"], "/srv/other-tool __state hook");
+        assert!(start[1]["command"].as_str().unwrap().contains(WRAPPER));
+        drop(_own);
+        // Outside an installation's scope the wrapper is not hgs either.
+        assert!(!owns_hook(&fresh_command(WRAPPER).unwrap()));
+    }
+
+    #[test]
+    fn migration_preserves_windows_forms_channels_and_personal_fields() {
+        let old = "C:/old path/runner.exe";
+        let current = "C:/new path/runner.exe";
+        let mut codex = windows::codex_entry(old).unwrap().group();
+        codex["matcher"] = json!("personal matcher");
+        codex["hooks"][0]["custom"] = json!({"keep": true});
+        let mut exec = windows::claude_entry(old, (2, 1, 296), false)
+            .unwrap()
+            .group();
+        exec["hooks"][0]["args"] = json!(CHANNEL_ARGS);
+        let foreign = json!({"hooks": [{"type": "command", "command": "C:/other/tool.exe", "args": HOOK_ARGS, "timeout": 23}]});
+        let mut personal_override = windows::codex_entry(old).unwrap().group();
+        personal_override["hooks"][0]["commandWindows"] = json!("personal override");
+        let original = json!({"permissions": {"keep": true}, "hooks": {"Stop": [codex.clone(), exec.clone(), foreign.clone(), personal_override]}});
+        let merged = migrate_programs(
+            &original.to_string(),
+            "codex",
+            current,
+            true,
+            vec![old.into()],
+        )
+        .unwrap()
+        .unwrap();
+        let result: Value = serde_json::from_str(&merged).unwrap();
+        let hooks = &result["hooks"]["Stop"];
+        assert_eq!(
+            hooks[0]["hooks"][0]["command"],
+            windows::shell_command(current).unwrap()
+        );
+        assert_eq!(
+            hooks[0]["hooks"][0]["commandWindows"],
+            windows::powershell_command(current).unwrap()
+        );
+        assert_eq!(hooks[0]["matcher"], codex["matcher"]);
+        assert_eq!(hooks[0]["hooks"][0]["custom"], codex["hooks"][0]["custom"]);
+        assert_eq!(hooks[1]["hooks"][0]["command"], current);
+        assert_eq!(hooks[1]["hooks"][0]["args"], json!(CHANNEL_ARGS));
+        assert_eq!(hooks[2], foreign);
+        assert_eq!(hooks[3]["hooks"][0]["commandWindows"], "personal override");
+        assert_eq!(result["permissions"], original["permissions"]);
+        assert!(migrate_programs(
+            &merged,
+            "codex",
+            current,
+            true,
+            vec![old.into(), current.into()]
+        )
+        .unwrap()
+        .is_none());
+        // Basename ownership alone is not a reason to migrate a command; a
+        // legacy shim and an unrecorded wrapper likewise keep their bytes.
+        let unrecorded = json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "/usr/bin/hgs __state hook"},
+            {"type": "command", "command": "/old/hgs-wrapper __state hook"},
+            {"type": "command", "command": "python3 /old/hgs_state.py hook"},
+            {"type": "command", "command": old, "args": ["notify"]}
+        ]}]}})
+        .to_string();
+        assert!(
+            migrate_programs(&unrecorded, "claude", current, true, vec![old.into()])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// zerus-b64dl: the exact programs hgs recorded for one settings file.
+    #[test]
+    fn owner_records_keep_the_newest_exact_programs_within_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("hook-owners").join("file.json");
+        assert!(recorded_at(&record).is_empty());
+        for index in 0..10 {
+            record_at(&record, &format!("/opt/hgs-{index}")).unwrap();
+        }
+        let newest: Vec<String> = (2..10).rev().map(|i| format!("/opt/hgs-{i}")).collect();
+        assert_eq!(recorded_at(&record), newest);
+        let written: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            json!({"schema": 1, "programs": newest}),
+            "the file itself keeps 8"
+        );
+        // A program recorded again moves first; it is never kept twice.
+        record_at(&record, "/opt/hgs-5").unwrap();
+        let programs = recorded_at(&record);
+        assert_eq!(programs[0], "/opt/hgs-5");
+        assert_eq!(programs.len(), RECORDED_PROGRAMS);
+        assert_eq!(programs.iter().filter(|p| *p == "/opt/hgs-5").count(), 1);
+        // An empty, oversized or control-character program is never written.
+        let before = fs::read(&record).unwrap();
+        for program in [
+            String::new(),
+            "x".repeat(RECORDED_PROGRAM_BYTES + 1),
+            "/opt/a\nb".into(),
+        ] {
+            record_at(&record, &program).unwrap();
+            assert_eq!(fs::read(&record).unwrap(), before);
+        }
+        record_at(&record, &"y".repeat(RECORDED_PROGRAM_BYTES)).unwrap();
+        assert_eq!(recorded_at(&record)[0].len(), RECORDED_PROGRAM_BYTES);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o077;
+            assert_eq!(mode(&record), 0, "the record is private");
+            assert_eq!(mode(record.parent().unwrap()), 0, "its folder is private");
+        }
+        // Replaced atomically: no temporary file stays beside the record.
+        assert_eq!(fs::read_dir(record.parent().unwrap()).unwrap().count(), 1);
+        // A damaged, foreign, oversized or hostile record grants only valid programs.
+        let many: Vec<String> = (0..12).map(|i| format!("/opt/many-{i}")).collect();
+        for (text, granted) in [
+            ("not json".to_owned(), vec![]),
+            (
+                json!({"schema": 2, "programs": ["/opt/x"]}).to_string(),
+                vec![],
+            ),
+            (json!({"programs": ["/opt/x"]}).to_string(), vec![]),
+            (
+                json!({"schema": 1, "programs": ["", "/opt/a\u{7}b", 5, "/opt/ok"]}).to_string(),
+                vec!["/opt/ok".to_owned()],
+            ),
+            (
+                json!({"schema": 1, "programs": ["/opt/x"], "pad": "p".repeat(64 * 1024)})
+                    .to_string(),
+                vec![],
+            ),
+            (
+                json!({"schema": 1, "programs": many}).to_string(),
+                many[..RECORDED_PROGRAMS].to_vec(),
+            ),
+        ] {
+            fs::write(&record, &text).unwrap();
+            assert_eq!(
+                recorded_at(&record),
+                granted,
+                "{}",
+                &text[..text.len().min(80)]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_programs_stay_hgs_and_unrecorded_look_alikes_are_flagged() {
+        for agent in ["claude", "codex"] {
+            let (text, _) = launches(agent, 1);
+            // A plain environment that recorded nothing: the wrapper's entries
+            // are not hgs's, and the report says so without naming them.
+            let plain =
+                health_document_mode(&text, agent, Some(CLAUDE_ANSWER_CHANNEL), false).unwrap();
+            assert_ne!(plain["state"], "configured", "{agent}");
+            assert_eq!(plain["unrecognised_tracking"], true, "{agent}");
+            assert!(!plain.to_string().contains(WRAPPER), "{agent}");
+            // The same text once the wrapper is recorded for this file.
+            let _own = OwnProgram::set(vec!["/usr/local/bin/hgs".into(), WRAPPER.into()]);
+            let recorded =
+                health_document_mode(&text, agent, Some(CLAUDE_ANSWER_CHANNEL), false).unwrap();
+            assert_eq!(recorded["state"], "configured", "{agent}");
+            assert_eq!(recorded["unrecognised_tracking"], false, "{agent}");
+            assert!(
+                json_reuse(&text, agent, false).is_none(),
+                "{agent}: a recorded entry is reused"
+            );
+        }
+        let kimi = {
+            let _own = OwnProgram::scoped(WRAPPER);
+            kimi_merge("model = \"k\"\n", false, &fresh_command(WRAPPER).unwrap()).unwrap()
+        };
+        let plain = health_document_mode(&kimi, "kimi", None, false).unwrap();
+        assert_eq!(plain["unrecognised_tracking"], true);
+        assert!(!plain.to_string().contains(WRAPPER));
+        let _own = OwnProgram::set(vec![WRAPPER.into()]);
+        let recorded = health_document_mode(&kimi, "kimi", None, false).unwrap();
+        assert_eq!(recorded["state"], "configured");
+        assert_eq!(recorded["unrecognised_tracking"], false);
+    }
+
+    #[test]
+    fn personal_hooks_and_hgs_named_entries_are_never_flagged() {
+        let hooks = [
+            "/opt/old/hgs-wrapper --notify done",
+            "/opt/old/hgs-wrapper __state hooks",
+            "__state hook",
+            "/opt/other-tool __state hook",
+            "/opt/other-tool __state answer-channel",
+            "/usr/local/bin/hgs __state hook",
+            "'/opt/hgs dir/hgs' __state answer-channel",
+            "python3 /opt/old/hgs_state.py hook",
+        ];
+        let document = json!({"hooks": {"Stop": [{"hooks": hooks.map(|command| json!({"type": "command", "command": command}))}]}}).to_string();
+        assert_eq!(
+            health_document_mode(&document, "claude", None, false).unwrap()
+                ["unrecognised_tracking"],
+            false
+        );
+        let kimi: String = hooks
+            .iter()
+            .map(|command| {
+                format!(
+                    "[[hooks]]\nevent = \"Stop\"\ncommand = {}\n",
+                    toml_edit::Value::from(*command)
+                )
+            })
+            .collect();
+        assert_eq!(
+            health_document_mode(&kimi, "kimi", None, false).unwrap()["unrecognised_tracking"],
+            false
+        );
+        // Either form of an hgs-like command for another program is flagged.
+        for hook in [
+            json!({"type": "command", "command": "/opt/old/hgs-wrapper __state hook"}),
+            json!({"type": "command", "command": "/opt/old/hgs-wrapper __state answer-channel"}),
+            json!({"type": "command", "command": "/opt/old/hgs-wrapper", "args": ["__state", "hook"]}),
+            json!({"type": "command", "command": "/opt/tools/myhgs __state hook"}),
+        ] {
+            let document = json!({"hooks": {"Stop": [{"hooks": [hook.clone()]}]}}).to_string();
+            assert_eq!(
+                health_document_mode(&document, "claude", None, false).unwrap()
+                    ["unrecognised_tracking"],
+                true,
+                "{hook}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_an_owned_entry_running_the_exact_program_is_recorded() {
+        let (text, _) = launches("claude", 1);
+        let kimi = {
+            let _own = OwnProgram::scoped(WRAPPER);
+            kimi_merge("", false, &fresh_command(WRAPPER).unwrap()).unwrap()
+        };
+        let personal = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": format!("{WRAPPER} --notify done")}]}]}}).to_string();
+        let personal_kimi =
+            format!("[[hooks]]\nevent = \"Stop\"\ncommand = \"{WRAPPER} notify\"\n");
+        {
+            let _own = OwnProgram::scoped(WRAPPER);
+            assert!(holds_program(&text, "claude", WRAPPER));
+            assert!(holds_program(&kimi, "kimi", WRAPPER));
+            assert!(!holds_program(&text, "claude", "/opt/tools/other"));
+            assert!(!holds_program(&kimi, "kimi", "/opt/tools/other"));
+            assert!(
+                !holds_program(&personal, "claude", WRAPPER),
+                "a personal hook is never recorded"
+            );
+            assert!(!holds_program(&personal_kimi, "kimi", WRAPPER));
+            assert!(!holds_program("not json", "claude", WRAPPER));
+        }
+        // Outside the scope that owns it the program is not hgs's: nothing to record.
+        assert!(!holds_program(&text, "claude", WRAPPER));
+        assert!(!holds_program(&kimi, "kimi", WRAPPER));
+    }
+
+    #[test]
+    fn explicit_repair_refuses_beside_an_unrecorded_look_alike_without_writing() {
+        // An explicit runner: a Windows test host has no installed stable CLI.
+        let runner = if cfg!(windows) {
+            r"C:\Tools\hgs.exe"
+        } else {
+            "/usr/local/bin/hgs"
+        };
+        let look_alike = json!({"model": "keep", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/opt/old/hgs-wrapper __state hook", "timeout": 5}]}]}}).to_string();
+        let error = repair_with(&look_alike, &path(), "claude", (2, 1, 296), runner).unwrap_err();
+        assert!(error.contains("HGS_EXECUTABLE"), "{error}");
+        assert!(!error.contains("/opt/old"), "{error}");
+        let kimi = "[[hooks]]\nevent = \"Stop\"\ncommand = \"/opt/old/hgs-wrapper __state hook\"\n";
+        let error = repair_with(kimi, &path(), "kimi", (2, 3, 1), runner).unwrap_err();
+        assert!(error.contains("HGS_EXECUTABLE"), "{error}");
+        // Without the look-alike the same repair goes ahead.
+        assert!(repair_with(
+            r#"{"model":"keep"}"#,
+            &path(),
+            "claude",
+            (2, 1, 296),
+            runner
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    /// Repair reads health in its own scope: the entries the program it
+    /// writes wrote are hgs's, whatever runs the test.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_repair_owns_the_program_it_writes() {
+        for agent in ["claude", "codex"] {
+            let (text, _) = launches(agent, 1);
+            assert_eq!(
+                repair_with(&text, &path(), agent, CLAUDE_ANSWER_CHANNEL, WRAPPER),
+                Ok(None),
+                "{agent}"
+            );
+        }
     }
 
     fn hook_entries(text: &str, event: &str) -> Vec<Value> {
@@ -1819,8 +3643,18 @@ mod tests {
     #[test]
     fn complete_legacy_kimi_hooks_do_not_receive_another_managed_block() {
         let original = legacy_kimi_document();
-        assert_eq!(merge_kimi(&original, &path(), false, &mut || panic!("existing hooks are complete")).unwrap(), None);
-        let conditional = original.replace("event = \"TurnStarted\"", "event = \"TurnStarted\"\nmatcher = \"restricted-origin\"");
+        let upgraded = merge_kimi(&original, &path(), false, &mut || {
+            panic!("existing hooks are complete")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(upgraded, original.replace("timeout = 5", "timeout = 15"));
+        assert!(!upgraded.contains(KIMI_BEGIN));
+        assert_eq!(kimi_merge(&upgraded, false, "unused"), None);
+        let conditional = original.replace(
+            "event = \"TurnStarted\"",
+            "event = \"TurnStarted\"\nmatcher = \"restricted-origin\"",
+        );
         assert!(kimi_merge(&conditional, false, UNIX).is_some());
     }
 
@@ -1830,15 +3664,16 @@ mod tests {
         let block = reference_kimi("", UNIX).unwrap().unwrap();
         let duplicate = format!("{original}{block}");
         let merged = kimi_merge(&duplicate, false, UNIX).unwrap();
-        assert_eq!(merged, format!("{original}\n\n"));
-        let health = health_document(&merged, "kimi", Some((2, 3, 1))).unwrap();
+        let upgraded = original.replace("timeout = 5", "timeout = 15");
+        assert_eq!(merged, format!("{upgraded}\n\n"));
+        let health = health_document(&merged, &path(), "kimi", Some((2, 3, 1))).unwrap();
         assert_eq!(health["duplicate_events"], json!([]));
         assert!(merged.contains("# Personal memory hook"));
         assert_eq!(kimi_merge(&merged, false, UNIX), None);
         // A personal entry or different callback parameters forbid block removal.
-        for protected in [block.replace("timeout = 5", "timeout = 6"),
+        for protected in [block.replace("timeout = 15", "timeout = 6"),
             block.replace(KIMI_END, &format!("[[hooks]]\nevent = \"Stop\"\ncommand = \"personal-hook\"\n{KIMI_END}"))] {
-            assert_eq!(kimi_merge(&format!("{original}{protected}"), false, UNIX), None);
+            assert_eq!(kimi_merge(&format!("{original}{protected}"), false, UNIX), Some(format!("{upgraded}{protected}")));
         }
     }
 
@@ -1890,6 +3725,7 @@ mod tests {
             command: forms::path(STABLE).unwrap(),
             args: Some(vec!["__state".into(), "hook".into()]),
             command_windows: None,
+            shell: None,
         };
         for version in [CLAUDE_EXEC_FORM, (2, 1, 300), (2, 2, 0), (3, 0, 0)] {
             for git_bash in [false, true] {
@@ -1918,7 +3754,18 @@ mod tests {
                 command: SHELL.into(),
                 args: None,
                 command_windows: Some(POWERSHELL.into()),
+                shell: None,
             }
+        );
+        // A plain path runs unquoted in cmd; one with a space gets PowerShell.
+        assert_eq!(
+            forms::qwen_entry(r"C:\Profiles\example\.local\bin\hgs.exe").unwrap(),
+            Entry::shell("C:/Profiles/example/.local/bin/hgs.exe __state hook".into())
+        );
+        let spaced = r"C:\Profiles\example user\.local\bin\hgs.exe";
+        assert_eq!(
+            forms::qwen_entry(spaced).unwrap(),
+            Entry { shell: Some("powershell".into()), ..Entry::shell(forms::powershell_command(spaced).unwrap()) }
         );
     }
 
@@ -1976,7 +3823,7 @@ mod tests {
             assert_eq!(
                 hook_entries(&settings, event),
                 [json!({"type": "command", "command": exec.command,
-                    "args": ["__state", "hook"], "timeout": 5})],
+                    "args": ["__state", "hook"], "timeout": HOOK_TIMEOUT})],
                 "{event}"
             );
         }
@@ -1984,7 +3831,7 @@ mod tests {
         let stop = "    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \
             \"args\": [\n              \"__state\",\n              \"hook\"\n            ],\n            \
             \"command\": \"C:/Profiles/Иван Петров/.local/bin/hgs.exe\",\n            \
-            \"timeout\": 5,\n            \"type\": \"command\"\n          }\n        ]\n      }\n    ],\n";
+            \"timeout\": 15,\n            \"type\": \"command\"\n          }\n        ]\n      }\n    ],\n";
         assert!(settings.contains(stop), "{settings}");
         assert_eq!(json_reuse(&settings, "claude", true), None);
         // A missing event gets the same exec form, never a new decision.
@@ -2005,7 +3852,7 @@ mod tests {
         let merged = json_reuse(&document.to_string(), "claude", true).unwrap();
         assert_eq!(
             hook_entries(&merged, "Notification"),
-            [json!({"type": "command", "command": SHELL, "timeout": 5})]
+            [json!({"type": "command", "command": SHELL, "timeout": HOOK_TIMEOUT})]
         );
         // Unix never reads an exec form as an hgs hook.
         assert_eq!(
@@ -2033,7 +3880,7 @@ mod tests {
                 hook_entries(&hooks, event),
                 [
                     json!({"type": "command", "command": SHELL, "commandWindows": POWERSHELL,
-                    "timeout": 5})
+                    "timeout": HOOK_TIMEOUT})
                 ]
             );
         }
@@ -2167,7 +4014,7 @@ mod tests {
         for event in events("claude").into_iter().chain(["PostModelSwitch"]) {
             assert_eq!(
                 journal_entries(&fresh, event),
-                [json!({"type": "command", "command": UNIX, "timeout": 5})]
+                [json!({"type": "command", "command": UNIX, "timeout": HOOK_TIMEOUT})]
             );
         }
         // The user's own PostModelSwitch hook stays, beside hgs's.
@@ -2257,7 +4104,7 @@ mod tests {
         );
         // The journaling entry keeps its own group and short timeout.
         assert!(hook_entries(&merged, "PermissionRequest")
-            .contains(&json!({"type": "command", "command": UNIX, "timeout": 5})));
+            .contains(&json!({"type": "command", "command": UNIX, "timeout": HOOK_TIMEOUT})));
         assert_eq!(versioned_merge(&merged, "claude", false, unix.clone(), None), (None, 0));
         // Claude's exec form derives the channel's arguments.
         let exec = forms::claude_entry(STABLE, CLAUDE_EXEC_FORM, false).unwrap();
@@ -2287,7 +4134,7 @@ mod tests {
             assert_eq!(channel_groups(&merged), std::slice::from_ref(&channel));
             // The journaling entry keeps its own group and short timeout.
             assert!(hook_entries(&merged, "PermissionRequest").contains(&json!({"type": "command",
-                "command": exec.command, "args": ["__state", "hook"], "timeout": 5})));
+                "command": exec.command, "args": ["__state", "hook"], "timeout": HOOK_TIMEOUT})));
             assert_eq!(versioned_merge(&merged, "claude", true, exec.clone(), None), (None, 0));
             // An older version loses it before it starts.
             let (pruned, _) = versioned_prune(&merged, "claude", true, Some((2, 1, 295)));
@@ -2593,5 +4440,119 @@ mod tests {
         fs::remove_file(&claude).unwrap();
         assert_eq!(launch().registered_version(&program), None);
         assert_eq!(asked(), 4);
+    }
+
+    /// CodeLore's pre-edit hook runs only for a Claude file edit in a session
+    /// whose start chose a store.
+    #[test]
+    fn only_a_claude_file_edit_asks_lores_pre_edit_hook() {
+        let record = json!({"lore_edit_store":"D:/repo"});
+        let edit = json!({"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"D:/repo/a.rs"}});
+        assert_eq!(edit_store(&record, &edit, "claude"), Some(PathBuf::from("D:/repo")));
+        for tool in ["Write", "MultiEdit", "NotebookEdit"] {
+            assert!(edit_store(&record, &json!({"hook_event_name":"PreToolUse","tool_name":tool}), "claude").is_some(), "{tool}");
+        }
+        assert_eq!(edit_store(&record, &json!({"hook_event_name":"PreToolUse","tool_name":"Bash"}), "claude"), None);
+        assert_eq!(edit_store(&record, &json!({"hook_event_name":"PostToolUse","tool_name":"Edit"}), "claude"), None);
+        assert_eq!(edit_store(&record, &edit, "codex"), None);
+        assert_eq!(edit_store(&json!({}), &edit, "claude"), None);
+    }
+
+    /// Task 135: a team member's session that starts after a compaction or a
+    /// clear gets the handoff brief in recall form, within what the start
+    /// context leaves; a plain start, a subagent's start and a full context get
+    /// none, and a session outside every team gets none.
+    #[test]
+    fn a_compacted_team_session_starts_with_the_teams_recall() {
+        use crate::state::teams::{model::Team, ops, store::Store};
+        let dir = tempfile::tempdir().unwrap();
+        super::super::with_test_state_root(dir.path(), || {
+            let (mut team, _) = ops::create(
+                "t",
+                &json!({"name":"Recall","goal":"Ship the recall","lead":{"id":"lead","agent":"claude","session":{"name":"claude/x/lead","run_id":"r0","conversation_id":"c0"}}}),
+            )
+            .unwrap();
+            let mut events = Vec::new();
+            ops::apply(
+                &mut team,
+                "plan",
+                &json!({"members":[{"id":"dev","role":"Backend","agent":"claude","session":{"name":"claude/x/dev","run_id":"run-dev","conversation_id":"c1"}}],
+                    "tasks":[{"id":1,"title":"Recall task","assignee":"dev","pipeline":"none","description":"Make the recall work"}]}),
+                &ops::Actor::Human,
+                &std::collections::BTreeSet::new(),
+                &mut events,
+            )
+            .unwrap();
+            ops::apply(&mut team, "approve", &json!({}), &ops::Actor::Human, &std::collections::BTreeSet::new(), &mut events).unwrap();
+            let team: Team = team;
+            let mut store = Store::open(true).unwrap();
+            store.create("11111111-1111-4111-8111-111111111136", &json!({}), team, vec![]).unwrap();
+            let record = json!({"agent":"claude","name":"claude/x/dev","run_id":"run-dev","conversation_id":"c1"});
+            let compact = json!({"hook_event_name":"SessionStart","source":"compact"});
+            let context = with_team_recall(None, None, &record, &compact).expect("a compacted team session gets the recall");
+            for wanted in ["handoff brief", "You are Backend in the team Recall", "your context was compacted or cleared", "Goal: Ship the recall", "Your work: #1 Recall task", "Make the recall work", "hgs team current"] {
+                assert!(context.contains(wanted), "{wanted:?} missing in\n{context}");
+            }
+            assert!(context.encode_utf16().count() <= crate::state::teams::handoff::RECALL_UNITS);
+            // Joined with what the start context already holds, never replacing it.
+            let joined = with_team_recall(Some("Agent hint".into()), None, &record, &json!({"hook_event_name":"SessionStart","source":"clear"})).unwrap();
+            assert!(joined.starts_with("Agent hint\n\n") && joined.contains("handoff brief"), "{joined}");
+            // A plain start, a resume, a subagent and another event get none.
+            for event in [
+                json!({"hook_event_name":"SessionStart","source":"startup"}),
+                json!({"hook_event_name":"SessionStart","source":"resume"}),
+                json!({"hook_event_name":"SessionStart","source":"compact","agent_id":"child"}),
+                json!({"hook_event_name":"UserPromptSubmit","source":"compact"}),
+            ] {
+                assert_eq!(with_team_recall(Some("keep".into()), None, &record, &event).as_deref(), Some("keep"), "{event}");
+            }
+            // A full start context leaves no room: the rules keep theirs.
+            let full = "x".repeat(super::super::iron_rules::MAX_START_CONTEXT - 200);
+            assert_eq!(with_team_recall(Some(full.clone()), None, &record, &compact), Some(full));
+            // A session that belongs to no team gets none.
+            let stranger = json!({"agent":"claude","name":"claude/x/other","run_id":"run-other","conversation_id":"c9"});
+            assert_eq!(with_team_recall(None, None, &stranger, &compact), None);
+        });
+    }
+
+    /// Task 121: the heartbeat hook is a fast append. While another delivery
+    /// holds the state lock (a slow store), the heartbeat still finishes at
+    /// once and its time reaches the record on the next read.
+    #[test]
+    fn a_heartbeat_never_waits_on_the_state_lock() {
+        let _env = super::super::ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!("hgs-heartbeat-hook-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HGS_STATE_DIR", &dir);
+        std::env::set_var("HGS_SESSION", "kimi/p/lead");
+        std::env::set_var("HGS_RUN_ID", "run-heartbeat");
+        super::super::storage::set_test_root(None);
+        let held = lock(None).unwrap();
+        let started = std::time::Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let event = json!({"hook_event_name":"SessionHeartbeat","session_id":"s","agent_id":"main"});
+            let result = track("kimi/p/lead".into(), "run-heartbeat".into(), event, &mut output);
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the heartbeat hook waited on the state lock");
+        assert_eq!(result, Ok(0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
+        let beat = super::super::storage::root().join("heartbeats").join("run-heartbeat.json");
+        let beat: Value = serde_json::from_slice(&fs::read(&beat).unwrap()).unwrap();
+        assert_eq!(beat["run_id"], "run-heartbeat");
+        // The next read folds it into the run's record, as the old write did.
+        let mut record = json!({"run_id":"run-heartbeat","last_event_at":1.0});
+        super::super::heartbeat::apply(&mut record);
+        assert!(record["last_event_at"].as_f64().unwrap() > 1.0);
+        std::env::remove_var("HGS_STATE_DIR");
+        std::env::remove_var("HGS_SESSION");
+        std::env::remove_var("HGS_RUN_ID");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

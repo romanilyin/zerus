@@ -181,9 +181,16 @@ public struct OutgoingMessage: Codable, Hashable, Sendable {
     public var submittedAt: Double
     public var submittedText: String
     public var error: String
+    public var deliveryDismissed: Bool
+    public var sendIntent: SendIntent?
+    public var sendReceiptProof: SendReceiptProof?
+    public var sendCorrelation: SendCorrelation?
+    public var coverage: OutgoingCoverage?
+    public var nativeSendIntent: NativeSendIntent?
+    public var nativeSendProof: NativeSendProof?
 
     public init(requestId: String, target: Target, text: String, attachments: [Attachment], createdAt: Double, status: String = "sending",
-                submittedAt: Double = 0, submittedText: String = "", error: String = "") {
+                submittedAt: Double = 0, submittedText: String = "", error: String = "", deliveryDismissed: Bool = false, sendIntent: SendIntent? = nil, sendReceiptProof: SendReceiptProof? = nil, sendCorrelation: SendCorrelation? = nil, coverage: OutgoingCoverage? = nil, nativeSendIntent: NativeSendIntent? = nil, nativeSendProof: NativeSendProof? = nil) {
         self.requestId = requestId
         self.target = target
         self.text = text
@@ -193,10 +200,41 @@ public struct OutgoingMessage: Codable, Hashable, Sendable {
         self.submittedAt = submittedAt
         self.submittedText = submittedText
         self.error = error
+        self.deliveryDismissed = deliveryDismissed
+        self.sendIntent = sendIntent
+        self.sendReceiptProof = sendReceiptProof
+        self.sendCorrelation = sendCorrelation
+        self.coverage = coverage
+        self.nativeSendIntent = nativeSendIntent
+        self.nativeSendProof = nativeSendProof
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case requestId, target, text, attachments, createdAt, status, submittedAt, submittedText, error, deliveryDismissed, sendIntent, sendReceiptProof, sendCorrelation, coverage, nativeSendIntent, nativeSendProof
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        requestId = try values.decode(String.self, forKey: .requestId)
+        target = try values.decode(Target.self, forKey: .target)
+        text = try values.decode(String.self, forKey: .text)
+        attachments = try values.decode([Attachment].self, forKey: .attachments)
+        createdAt = try values.decode(Double.self, forKey: .createdAt)
+        status = try values.decode(String.self, forKey: .status)
+        submittedAt = try values.decode(Double.self, forKey: .submittedAt)
+        submittedText = try values.decode(String.self, forKey: .submittedText)
+        error = try values.decode(String.self, forKey: .error)
+        deliveryDismissed = try values.decodeIfPresent(Bool.self, forKey: .deliveryDismissed) ?? false
+        sendIntent = try values.decodeIfPresent(SendIntent.self, forKey: .sendIntent)
+        sendReceiptProof = try values.decodeIfPresent(SendReceiptProof.self, forKey: .sendReceiptProof)
+        sendCorrelation = try values.decodeIfPresent(SendCorrelation.self, forKey: .sendCorrelation)
+        coverage = try values.decodeIfPresent(OutgoingCoverage.self, forKey: .coverage)
+        nativeSendIntent = try values.decodeIfPresent(NativeSendIntent.self, forKey: .nativeSendIntent)
+        nativeSendProof = try values.decodeIfPresent(NativeSendProof.self, forKey: .nativeSendProof)
     }
 
     public func recover() -> OutgoingMessage {
-        guard status == "sending" else { return self }
+        guard status == "sending" || nativeSendIntent != nil && ["submitted", "recorded"].contains(status) && !NativeSendOutcome.confirmed(self) else { return self }
         var copy = self
         copy.status = "uncertain"
         copy.error = "Delivery was interrupted. Check its receipt before sending again."
@@ -204,7 +242,7 @@ public struct OutgoingMessage: Codable, Hashable, Sendable {
     }
 
     public func belongs(to current: Target) -> Bool { target == current || target.resolves(to: current) }
-    public var blocksSending: Bool { status == "sending" || status == "uncertain" }
+    public var blocksSending: Bool { status == "sending" || status == "uncertain" && !deliveryDismissed }
     /// Its delivery needs review: the message offers Review, and Check delivery while uncertain.
     public var recoverable: Bool { status == "failed" || status == "uncertain" }
 }
@@ -473,7 +511,7 @@ public struct MessageState: Codable, Hashable, Sendable {
         return copy
     }
 
-    public func enqueue(_ draft: Draft, requestId: String, at: Double) throws -> MessageState {
+    public func enqueue(_ draft: Draft, requestId: String, at: Double, sendIntent: SendIntent? = nil, nativeSendIntent: NativeSendIntent? = nil) throws -> MessageState {
         guard draft.target.archiveId.isEmpty else { throw ZerusError.invalid("Archived conversations are read-only.") }
         guard draft.detachedId.isEmpty, draft.questionId.isEmpty, draft.status == "editing" else {
             throw ZerusError.invalid("Review this draft before sending.")
@@ -497,7 +535,9 @@ public struct MessageState: Codable, Hashable, Sendable {
             throw ZerusError.invalid("The draft changed. Review it before sending.")
         }
         try AttachmentPolicy.selection(draft.attachments)
-        let message = OutgoingMessage(requestId: requestId, target: draft.target, text: draft.text, attachments: draft.attachments, createdAt: at)
+        let message = OutgoingMessage(requestId: requestId, target: draft.target, text: draft.text, attachments: draft.attachments, createdAt: at, sendIntent: sendIntent, nativeSendIntent: nativeSendIntent)
+        guard sendIntent == nil || SendReceiptRecovery.matches(message, sendIntent!) else { throw ZerusError.invalid("The saved message details changed before sending.") }
+        guard nativeSendIntent == nil || sendIntent == nil && nativeSendIntent!.matches(message) else { throw ZerusError.invalid("The saved message details changed before sending.") }
         var cleared = draft
         cleared.text = ""
         cleared.attachments = []

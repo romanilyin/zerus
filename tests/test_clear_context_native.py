@@ -22,7 +22,9 @@ class NativeClearContext(unittest.TestCase):
             command = 'env ' + ' '.join(shlex.quote(k+'='+v) for k,v in env.items()) + ' ' + shlex.quote(str(test_input.HGS)) + ' __state hook'
             path = self.root / '.claude/settings.json'
             config = json.loads(path.read_text())
-            config['hooks'] = {event: [{'hooks': [{'type':'command', 'command':command}]}] for event in getattr(self,'hook_events',['SessionStart'])}
+            # Retain common setup's async caller alongside the native hooks.
+            for event in getattr(self,'hook_events',['SessionStart']):
+                config.setdefault('hooks', {}).setdefault(event, []).append({'hooks': [{'type':'command', 'command':command}]})
             path.write_text(json.dumps(config))
         return test_input.InputTransport.tmux(self, *args, **kwargs)
 
@@ -55,7 +57,7 @@ class NativeInterruptedClear(unittest.TestCase):
     import test_claude_approval_native as approval
     import test_questions as questions
     tool_name = 'Bash'
-    tool_input = {'command': 'sleep 30; printf done > slept.txt', 'description': 'Wait for the fixture'}
+    native_tool_input = approval.NativeClaudeInterrupt.native_tool_input
     setUp = native.NativeClaudeQuestions.setUp
     tmux = NativeClearContext.tmux
     script = native.NativeClaudeQuestions.script
@@ -136,7 +138,7 @@ class NativeCodexClear(unittest.TestCase):
         self.assertIn(self.animations, ('true', 'false'))
         # Plugins stay off (see assert_plugin_sync_off). Suites reusing this
         # fixture may serve a localhost provider and enable more features.
-        (native_home / 'config.toml').write_text('''model="gpt-6.1-sol"
+        (native_home / 'config.toml').write_text('model=' + json.dumps(getattr(self, 'native_model', 'gpt-6.1-sol')) + '''
 model_provider="fixture"
 check_for_update_on_startup=false
 [features]
@@ -145,7 +147,7 @@ plugins=false
 name="Fixture"
 base_url="''' + getattr(self, 'provider_url', 'http://127.0.0.1:1/v1') + '''"
 wire_api="responses"
-''')
+''' + '[projects.' + json.dumps(str(self.root.resolve())) + ']\ntrust_level="trusted"\n')
         NativeCodexClear.assert_plugin_sync_off(self, native_home)
         path = native_home / 'sessions/2026/10/09' / ('rollout-fixture-' + self.conversation_id + '.jsonl')
         path.parent.mkdir(parents=True)
@@ -166,9 +168,18 @@ wire_api="responses"
                 type='agent_message', message='Previous fixture answer'))])
         path.write_text('\n'.join([json.dumps(metadata), *map(json.dumps, messages), events[1]]) + '\n')
         self.native_home = native_home
+        prepare = getattr(self, 'prepare_native_hooks', None)
+        if prepare:
+            prepare()
         # Suites reusing this setUp are not subclasses: call this class's launch.
         NativeCodexClear.launch(self, self.root, 'resume', self.conversation_id)
-        self.wait_for(lambda: 'Previous fixture answer' in self.tmux('capture-pane', '-p', '-t', self.pane))
+        # Resume is a native event a loaded runner reaches late; wait_for's
+        # 100 polls (about 2 s plus tmux time) are too short a budget for it.
+        # Called through the class: suites reusing this setUp borrow methods
+        # rather than inherit InputTransport.
+        test_input.InputTransport.wait_until(
+            self, lambda: 'Previous fixture answer' in self.tmux('capture-pane', '-p', '-t', self.pane),
+            30, lambda: 'native resume did not show the previous answer')
         self.record.update(transcript=str(path), last_message='Previous fixture answer')
         self.write_record()
 
@@ -239,6 +250,69 @@ wire_api="responses"
         self.assertEqual(test_clear_context.ClearContext.clear(self)['status'],'confirmed')
         self.assertEqual(json.loads(self.record_path.read_text())['pid'],self.record['pid'])
         self.assertEqual((self.native_home/'config.toml').read_bytes(),before,'Session choices never save account defaults')
+
+    def test_id_settings_unknown_initial_effort_preserves_shared_defaults(self):
+        import native_effort_id as identity
+        import native_settings_id as settings_contract
+        models = [dict(slug='gpt-6.1-sol', display_name='GPT-6.1-Sol', default_reasoning_level='medium',
+                       supported_reasoning_levels=[dict(effort=e) for e in ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']])]
+        (self.native_home / 'models_cache.json').write_text(json.dumps(dict(models=models)))
+        self.record.update(model='gpt-6.1-sol', phase='idle', activity='idle', active_tools={})
+        self.write_record()
+        before = (self.native_home / 'config.toml').read_bytes()
+        record, path, legacy = identity.moved_record(self, self.name, self.record)
+        self.record, self.record_path = record, path
+        attempts = identity.key_log(self)
+        settings_contract.change_and_replay(self, self.name, record, path, 'gpt-6.1-sol', 'high', attempts)
+        self.assertRegex(self.tmux('capture-pane', '-p', '-t', self.pane), r'(?m)^\s*GPT-6\.1-Sol\s+high\s+·')
+        self.assertEqual((self.native_home / 'config.toml').read_bytes(), before)
+        self.assertFalse(legacy.exists())
+
+    def test_id_effort_preserves_raw_request_identity_and_shared_defaults(self):
+        import native_effort_id as contract
+        import test_clear_context
+        models = [dict(slug='gpt-6.1-sol', display_name='GPT-6.1-Sol',
+                       default_reasoning_level='medium',
+                       supported_reasoning_levels=[dict(effort=e) for e in
+                                                   ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']])]
+        (self.native_home / 'models_cache.json').write_text(json.dumps(dict(models=models)))
+        self.record.update(model='gpt-6.1-sol', phase='idle', activity='idle', active_tools={})
+        self.write_record()
+        before = (self.native_home / 'config.toml').read_bytes()
+        # A resumed fixture can initially report the provider's literal
+        # "default", with no known reasoning level in its history. Establish
+        # the native condition through the real existing settings picker.
+        request = dict(request_id=str(uuid.uuid4()), expected_run_id=self.run_id,
+                       expected_conversation_id=self.conversation_id,
+                       model='gpt-6.1-sol', effort='high')
+        initial = subprocess.run([str(test_input.HGS), 'settings', self.name, '--json'],
+                                 input=json.dumps(request), env=self.env, text=True,
+                                 capture_output=True, timeout=30)
+        self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
+        self.assertEqual(json.loads(initial.stdout)['status'], 'applied')
+        self.assertRegex(self.tmux('capture-pane', '-p', '-t', self.pane),
+                         r'(?m)^\s*GPT-6\.1-Sol\s+high\s+·')
+        self.record = json.loads(self.record_path.read_bytes())
+        self.assertEqual(test_clear_context.ClearContext.inspect(self)['effort'], 'high')
+        record, path, legacy = contract.moved_record(self, self.name, self.record)
+        self.record, self.record_path = record, path
+        attempts = contract.key_log(self)
+        observed = contract.inspect(self, self.name, record['session_id'])
+        self.assertTrue(observed['effort_change_supported'], observed['effort_change_reason'])
+        choices = ('low', 'high') if observed['effort'] == 'high' else ('high', 'low')
+        for wanted in choices:
+            self.assertIn(wanted, observed['effort_options'])
+            record = contract.change_and_replay(self, self.name, record, path, wanted, attempts)
+            screen = self.tmux('capture-pane', '-p', '-t', self.pane)
+            self.assertRegex(screen.lower(), r'\b' + wanted + r'\b')
+            cursor = self.tmux('display-message', '-p', '-t', self.pane,
+                               '#{cursor_y}:#{cursor_x}').strip()
+            row, column = map(int, cursor.split(':'))
+            self.assertEqual(screen.splitlines()[row].rstrip(), '› Ask Codex to do anything')
+            self.assertEqual(column, 2, 'the native composer is not empty')
+            self.assertEqual(contract.inspect(self, self.name, record['session_id'])['effort'], wanted)
+        self.assertEqual((self.native_home / 'config.toml').read_bytes(), before)
+        self.assertFalse(legacy.exists(), 'a native update recreated the retired legacy record')
 
     def test_clear_is_visible_before_the_deferred_native_hook(self):
         import test_clear_context
@@ -425,7 +499,7 @@ wire_api="responses"
             time.sleep(.2)
         return value
 
-    def resumed(self):
+    def resumed(self, hook=None):
         """Relaunch the saved conversation as `hgs resume` leaves it: Codex defers
         SessionStart to the next turn, so the binding still expects the saved
         conversation. A localhost provider answers that turn and the native hooks
@@ -441,7 +515,7 @@ wire_api="responses"
         env = dict(HGS_SESSION=self.name, HGS_RUN_ID=self.run_id, HGS_STATE_DIR=str(self.state),
                    HGS_CONFIG_DIR=str(self.root / 'config'), PATH=self.env['PATH'])
         command = ('env ' + ' '.join(shlex.quote(k + '=' + v) for k, v in env.items()) + ' '
-                   + shlex.quote(str(test_input.HGS)) + ' __state hook')
+                   + (hook or shlex.quote(str(test_input.HGS)) + ' __state hook'))
         (self.native_home / 'hooks.json').write_text(json.dumps(dict(hooks={kind: [dict(hooks=[
             dict(type='command', command=command)])] for kind in ('SessionStart', 'SessionEnd', 'UserPromptSubmit', 'Stop')})))
         previous = self.record['pid']
@@ -486,6 +560,67 @@ wire_api="responses"
         test_input.InputTransport.send(self, test_input.InputTransport.payload(self, text='First fixture message'))
         self.assert_new_conversation(fresh['session_clear']['at'])
 
+    def test_a_confirmed_clear_then_old_session_end_accepts_the_first_new_message(self):
+        import test_clear_context
+        self.resumed()
+        test_input.InputTransport.send(self, test_input.InputTransport.payload(self, text='Confirm the fixture conversation'))
+        def initial_idle():
+            record = json.loads(self.record_path.read_text())
+            return record.get('phase') == 'idle' and not record.get('expected_id')
+        self.settle(initial_idle, 'Initial native turn did not settle')
+        self.assertEqual(test_clear_context.ClearContext.clear(self)['status'], 'confirmed')
+        self.assert_reset_decoration()
+        # Only this ordering is modeled; the following real clear SessionStart,
+        # prompt submission, response and Stop all come from the native Codex.
+        test_clear_context.ClearContext.hook(self, dict(hook_event_name='SessionEnd',
+            session_id=self.conversation_id, reason='other'))
+        ended = json.loads(self.record_path.read_text())
+        self.assertTrue(ended['session_clear']['awaiting_session_start'])
+        self.assertEqual(ended['conversation_id'], self.conversation_id)
+        self.assertEqual(ended['conversation_state'], 'ended')
+        message = 'First fixture message after the old conversation ended'
+        receipt = test_input.InputTransport.send(self, test_input.InputTransport.payload(self, text=message))
+        self.assertEqual(receipt['status'], 'submitted')
+        fresh = self.settle(lambda: (value if (value := test_clear_context.ClearContext.inspect(self)).get('conversation_id') != self.conversation_id
+                            and value.get('phase') == 'idle' and value.get('prompt') == message else None),
+                            'The native successor did not finish its first turn')
+        self.assertEqual(fresh['conversation_state'], 'active')
+        self.assertEqual(fresh['run_id'], self.run_id)
+        self.assertEqual(fresh['prompt'], message)
+        rollout = next((self.native_home / 'sessions').rglob('*' + fresh['conversation_id'] + '.jsonl'))
+        def submitted_messages():
+            rows = [json.loads(line) for line in rollout.read_text().splitlines()]
+            return [row for row in rows if row.get('type') == 'response_item'
+                    and row.get('payload', {}).get('role') == 'user'
+                    and row['payload'].get('content') == [dict(type='input_text', text=message)]]
+        # The successor's retained-message rollout need not have legacy event_msg rows.
+        self.assertEqual(len(self.settle(submitted_messages, 'Native rollout did not record the submitted prompt')), 1)
+
+    def test_archive_restored_conversation_clears_and_settles_on_its_real_start(self):
+        import test_clear_context
+        test_clear_context.ResumedClearContext.restored(self)
+        info = test_clear_context.ClearContext.inspect(self)
+        self.assertTrue(info['resume_message_can_send'], info.get('resume_message_reason'))
+        self.assertTrue(info['clear_context_supported'], info.get('clear_context_reason'))
+        self.assertFalse(info['compact_context_supported'])
+        self.assertFalse(info['fork_supported'])
+        self.assertNotIn('pause', info['allowed_actions'])
+        receipt = test_clear_context.ClearContext.clear(self)
+        self.assertEqual(receipt['status'], 'confirmed')
+        current = json.loads(self.record_path.read_text())
+        self.assertEqual(self.archive_path.read_bytes(), self.archive_bytes)
+        self.assertEqual((current['conversation_id'], current['expected_id']),
+                         (self.conversation_id, self.conversation_id))
+        self.assertTrue(current['session_clear']['awaiting_session_start'])
+        self.assertNotIn('resume_pending', current)
+        fresh = test_clear_context.ClearContext.inspect(self)
+        test_input.InputTransport.send(self, test_input.InputTransport.payload(self, text='First restored fixture message'))
+        self.assert_new_conversation(fresh['session_clear']['at'])
+        current = json.loads(self.record_path.read_text())
+        self.assertFalse(self.archive_path.exists())
+        self.assertNotIn('restore_archive_id', current)
+        self.assertNotIn('resume_pending', current)
+
     def test_resumed_terminal_clear_is_confirmed_by_its_deferred_session_start(self):
         self.resumed()
         self.tmux('send-keys', '-t', self.pane, '-l', '/clear')
@@ -499,6 +634,106 @@ wire_api="responses"
         self.wait_for(lambda: message in self.tmux('capture-pane', '-p', '-t', self.pane))
         self.tmux('send-keys', '-t', self.pane, 'Enter')
         self.assert_new_conversation(None)
+
+    def test_resumed_terminal_clear_accepts_its_real_start_after_a_modeled_main_end(self):
+        import sys
+        hook = self.root / 'terminal-clear-end.py'
+        events = self.root / 'terminal-clear-events.jsonl'
+        hook.write_text('''import json,pathlib,subprocess,sys
+data=sys.stdin.buffer.read(1024*1024+1)
+if len(data)>1024*1024:raise SystemExit(2)
+event=json.loads(data)
+def deliver(value,raw,kind):
+ result=subprocess.run([HGS,'__state','hook'],input=raw,timeout=10)
+ with pathlib.Path(EVENTS).open('a') as out:
+  out.write(json.dumps({'kind':kind,'event':value['hook_event_name'],'id':value['session_id'],
+   'source':value.get('source'),'status':result.returncode})+'\\n')
+ return result.returncode
+if event.get('hook_event_name')=='SessionStart' and event.get('source')=='clear' and event.get('session_id')!=OLD:
+ # Model only the missing end ordering; preserve a native end if one arrived.
+ # forward the actual clear SessionStart bytes without inventing or replaying it.
+ previous=[json.loads(line) for line in pathlib.Path(EVENTS).read_text().splitlines()] if pathlib.Path(EVENTS).exists() else []
+ if not any(row['event']=='SessionEnd' and row['id']==OLD for row in previous):
+  end={'hook_event_name':'SessionEnd','session_id':OLD,'cwd':event['cwd'],
+   'transcript_path':TRANSCRIPT,'reason':'other'}
+  deliver(end,json.dumps(end).encode(),'modeled_end')
+raise SystemExit(deliver(event,data,'native'))
+'''.replace('HGS', repr(str(test_input.HGS))).replace('EVENTS', repr(str(events)))
+            .replace('OLD', repr(self.conversation_id)).replace('TRANSCRIPT', repr(self.record['transcript'])))
+        self.resumed(shlex.quote(sys.executable) + ' ' + shlex.quote(str(hook)))
+        self.tmux('send-keys', '-t', self.pane, '-l', '/clear')
+        self.wait_for(lambda: '/clear' in self.tmux('capture-pane', '-p', '-t', self.pane))
+        self.tmux('send-keys', '-t', self.pane, 'Enter')
+        self.settle(lambda: 'Previous fixture answer' not in self.tmux('capture-pane', '-p', '-t', self.pane),
+                    'Codex did not clear the resumed conversation')
+        self.assertNotIn('clear_context_request', json.loads(self.record_path.read_text()))
+        message = 'First fixture message after Terminal clear'
+        self.tmux('send-keys', '-t', self.pane, '-l', message)
+        self.wait_for(lambda: message in self.tmux('capture-pane', '-p', '-t', self.pane))
+        self.tmux('send-keys', '-t', self.pane, 'Enter')
+        self.settle(lambda: events.exists() and any(json.loads(line)['event'] == 'Stop'
+                    for line in events.read_text().splitlines()), 'Codex did not finish the first cleared turn')
+        order = [json.loads(line) for line in events.read_text().splitlines()]
+        print('ZERUS_CODEX_CLEAR_ORDER=' + json.dumps(order), flush=True)
+        self.assertIn(order[0]['kind'], ('modeled_end', 'native'))
+        self.assertEqual([(row['kind'], row['event']) for row in order[1:]],
+                         [('native', 'SessionStart'),
+                          ('native', 'UserPromptSubmit'), ('native', 'Stop')])
+        self.assertEqual(order[0]['event'], 'SessionEnd')
+        self.assertTrue(all(row['status'] == 0 for row in order), order)
+        self.assertEqual(order[0]['id'], self.conversation_id)
+        self.assertEqual(order[1]['source'], 'clear')
+        current = json.loads(self.record_path.read_text())
+        self.assertFalse(current.get('error'), current.get('error'))
+        self.assertEqual(current['conversation_id'], order[1]['id'])
+        self.assert_new_conversation(None)
+
+    def test_already_rejected_resumed_clear_recovers_from_a_real_hook_after_the_lost_start(self):
+        import sys
+        hook = self.root / 'skip-rejected-start.py'
+        rejected = self.root / 'rejected-start.json'
+        hook.write_text('''import json,pathlib,subprocess,sys
+data=sys.stdin.buffer.read(1024*1024+1)
+if len(data)>1024*1024:raise SystemExit(2)
+event=json.loads(data)
+if event.get('hook_event_name')=='SessionStart' and event.get('session_id')!=OLD:
+ pathlib.Path(REJECTED).write_text(json.dumps({'session_id':event['session_id']}))
+else:
+ result=subprocess.run([HGS,'__state','hook'],input=data,timeout=10)
+ raise SystemExit(result.returncode)
+'''.replace('OLD', repr(self.conversation_id)).replace('REJECTED', repr(str(rejected)))
+            .replace('HGS', repr(str(test_input.HGS))))
+        self.resumed(shlex.quote(sys.executable) + ' ' + shlex.quote(str(hook)))
+        import test_clear_context
+        self.record['clear_context_request'] = dict(request_id=str(uuid.uuid4()),
+                                                  conversation_id=self.conversation_id, at=time.time())
+        self.write_record()
+        self.tmux('send-keys', '-t', self.pane, '-l', '/clear')
+        self.wait_for(lambda: '/clear' in self.tmux('capture-pane', '-p', '-t', self.pane))
+        self.tmux('send-keys', '-t', self.pane, 'Enter')
+        self.settle(lambda: 'Previous fixture answer' not in self.tmux('capture-pane', '-p', '-t', self.pane),
+                    'The original fixture clear did not finish')
+        # Recreate the precise older binding after its rejected start. The
+        # native successor's real SessionStart is deliberately discarded, not
+        # replayed. A later real hook must prove and publish the current ID.
+        self.record = json.loads(self.record_path.read_text())
+        self.assertNotIn('session_clear', self.record)
+        self.record.update(error='agent resumed a different conversation', activity='unknown', phase='unknown',
+                           conversation_state='ended', last_event_at=time.time(),
+                           session_end=dict(run_id=self.run_id, conversation_id=self.conversation_id, at=time.time()))
+        self.write_record()
+        message = 'First fixture message after the rejected start'
+        self.tmux('send-keys', '-t', self.pane, '-l', message)
+        self.wait_for(lambda: message in self.tmux('capture-pane', '-p', '-t', self.pane))
+        self.tmux('send-keys', '-t', self.pane, 'Enter')
+        self.assert_new_conversation(None)
+        current = json.loads(self.record_path.read_text())
+        self.assertEqual(current['conversation_id'], json.loads(rejected.read_text())['session_id'])
+        self.assertEqual(current['pid'], self.record['pid'])
+        events = test_clear_context.ClearContext.inspect(self)['events']
+        self.assertEqual(sum(event['type'] == 'SessionCleared' for event in events), 1)
+        self.assertFalse(any(event['type'] == 'SessionStart' and event['conversation_id'] == current['conversation_id']
+                             for event in events))
 
     def assert_new_conversation(self, cleared_at):
         import test_clear_context

@@ -22,7 +22,7 @@ PowerShell, gets the PowerShell form.
 `TrackedHooks` enables local sessions in a temporary profile whose folder has
 spaces, Cyrillic and parentheses and, with an isolated state directory and private
 agent homes, launches tracked sessions of native fake agents named `claude`,
-`codex` and `kimi`. hgs installs its hooks into
+`codex`, `kimi` and `qwen`. hgs installs its hooks into
 their homes (Claude Code's exec form, with its answer channel beside the
 PermissionRequest hook, Codex's shell form as `command` and PowerShell form as
 `commandWindows`, Kimi's block); each fake reads them and runs
@@ -35,6 +35,7 @@ cannot be read gets no hooks, as a form chosen without it would be kept.
 HGS_TEST_BIN and HGS_TEST_FAKE_AGENT name the builds, as for
 test_windows_lifecycle.py, whose hermetic rules apply.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,9 +51,9 @@ from test_windows_lifecycle import LifecycleCase, deny_execute, read_events, rea
 
 # What `hgs __state hook` answers a payload without a session ID.
 NO_SESSION = "hook did not supply a valid session_id"
-HOMES = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "kimi": "KIMI_CODE_HOME"}
+HOMES = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "kimi": "KIMI_CODE_HOME", "qwen": "QWEN_HOME"}
 # The answers to the capability probes hgs runs before a tracked agent starts.
-PROBES = {"claude": "2.1.296 (Claude Code)", "codex": "codex-cli 0.162.0", "kimi": "kimi 2.1.1"}
+PROBES = {"claude": "2.1.296 (Claude Code)", "codex": "codex-cli 0.162.0", "kimi": "kimi 2.1.1", "qwen": "0.27.4"}
 
 
 def git_bash():
@@ -243,6 +244,12 @@ class TrackedHooks(LifecycleCase):
         for event, groups in hooks["hooks"].items():
             self.assertEqual(groups, [{"hooks": [{"type": "command", "command": shell,
                                                   "commandWindows": powershell, "timeout": 5}]}], event)
+        # Qwen Code gets the PowerShell form and runs it with that shell: its
+        # default `cmd /d /s /c` receives the quotes escaped.
+        qwen = json.loads((self.homes["qwen"] / "settings.json").read_text(encoding="utf-8"))
+        for event, groups in qwen["hooks"].items():
+            self.assertEqual(groups, [{"hooks": [{"type": "command", "command": powershell, "timeout": 5,
+                                                  "shell": "powershell"}]}], event)
         kimi = (self.homes["kimi"] / "config.toml").read_text(encoding="utf-8")
         self.assertEqual(kimi.count("# BEGIN hgs session tracking"), 1)
         self.assertEqual({hook["command"] for hook in tomllib.loads(kimi)["hooks"]}, {shell})
@@ -266,6 +273,50 @@ class TrackedHooks(LifecycleCase):
         self.check_hooks(record)
         self.hgs("kill", name)
         self.wait_for_exit(again)
+
+    def test_native_codex_child_hooks_preserve_the_parent_conversation(self):
+        name, log, ready = self.launch_tracked("codex", "children")
+        self.converse(name, log, ready, "Parent request before spawning")
+        digest = hashlib.sha256(name.encode()).hexdigest() + ".json"
+        binding = self.state / "bindings" / digest
+        if not binding.exists():
+            binding = self.state / digest
+        parent = read_json(binding)
+        self.assertEqual(parent["conversation_id"], ready["session_id"])
+        env = dict(self.env, HGS_SESSION=name, HGS_RUN_ID=parent["run_id"], HGS_AGENT="codex")
+
+        def hook(kind, sid, **fields):
+            result = subprocess.run([str(HGS), "__state", "hook"],
+                                    input=json.dumps(dict(hook_event_name=kind, session_id=sid, **fields)),
+                                    env=env, cwd=self.work, capture_output=True, encoding="utf-8",
+                                    timeout=LIMIT, creationflags=HIDDEN)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        folder = self.homes["codex"] / "sessions"
+        folder.mkdir()
+        for source in ({"subagent": {"thread_spawn": {"parent_thread_id": parent["conversation_id"], "depth": 1}}},
+                       {"subagent": {"other": "guardian"}}):
+            with self.subTest(source=source):
+                sid = str(uuid.uuid4())
+                path = folder / f"rollout-{sid}.jsonl"
+                path.write_text(json.dumps(dict(type="session_meta", payload=dict(
+                    id=sid, parent_thread_id=parent["conversation_id"], source=source))) + "\n", encoding="utf-8")
+                hook("SessionStart", sid, transcript_path=str(path), model="child-model", cwd=str(folder))
+                after = read_json(binding)
+                for key in ("conversation_id", "transcript", "cwd", "model", "prompt", "last_message", "run_id"):
+                    self.assertEqual(after.get(key), parent.get(key), key)
+                self.assertIn(sid, after["subagents"])
+                hook("PreToolUse", sid, tool_name="shell", tool_use_id="child-tool")
+                hook("Stop", sid, last_assistant_message="Child result")
+                state = self.inspect(name)
+                self.assertEqual(state["conversation_id"], parent["conversation_id"])
+                self.assertEqual(state["subagents"][sid]["state"], "finished")
+                self.assertEqual(state["last_message"], parent["last_message"])
+                child = json.loads(self.hgs("inspect", name, "--agent", sid).stdout)
+                self.assertTrue(any(event.get("detail") == "Child result" for event in child["events"]))
+        # Native parent hooks are still accepted after its children finish.
+        self.converse(name, log, ready, "Parent request after spawning")
+        self.assertEqual(self.inspect(name)["conversation_id"], parent["conversation_id"])
 
     def test_a_claude_whose_version_cannot_be_read_gets_no_hooks(self):
         # The hook form depends on the version and is kept once written (D12),

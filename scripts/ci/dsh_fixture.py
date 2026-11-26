@@ -8,6 +8,7 @@ recorded. No global installation, old lock fallback or native version probe.
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -21,6 +22,8 @@ import unittest
 import urllib.request
 
 PACKAGE = '@deepseek-ai/dsh'
+SECURITY_OVERRIDES = {'@modelcontextprotocol/client': '2.3.0', 'fflate': '0.8.3'}
+SECURITY_MINIMUMS = {'@modelcontextprotocol/client': (2, 3, 0), 'fflate': (0, 8, 3)}
 REGISTRY = 'https://registry.npmjs.org'
 LATEST = REGISTRY + '/' + PACKAGE + '/latest'
 RECEIPT_ENV = 'ZERUS_TEST_DSH_RECEIPT'
@@ -99,19 +102,19 @@ def json_new(path, value, end=None):
     sync_directory(path.parent, end)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError('Official npm discovery must not redirect')
+discovery_spec = importlib.util.spec_from_file_location(
+    'zerus_native_discovery', Path(__file__).with_name('native_discovery.py'))
+discovery = importlib.util.module_from_spec(discovery_spec)
+discovery_spec.loader.exec_module(discovery)
+
+NoRedirect = discovery.NoRedirect
 
 
 def discover(end):
     before(end)
-    request = urllib.request.Request(LATEST, headers={'Accept': 'application/json', 'User-Agent': 'Zerus-DeepSeek-CI'})
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=min(30, end - time.monotonic())) as response:
-        before(end)
-        raw = read_bytes(response, MAX_METADATA, end)
+    raw, _ = discovery.fetch_metadata(LATEST, MAX_METADATA, policy='no-redirect',
+                                      deadline=end, stage='official DeepSeek latest')
     before(end)
-    require(len(raw) <= MAX_METADATA, 'Latest npm metadata exceeds its byte bound')
     return raw
 
 
@@ -149,6 +152,19 @@ def selection(raw):
             and all(p not in ('', '.', '..') for p in entry.split('/')) and '\\' not in entry,
             'Latest package must name one contained dsh entry')
     return dict(name=PACKAGE, version=data['version'], url=dist['tarball'], integrity=dist['integrity'], entry=entry)
+
+
+def validate_security_pins(raw):
+    packages = json.loads(raw)['packages']
+    for path, item in packages.items():
+        for package, minimum in SECURITY_MINIMUMS.items():
+            if not path.endswith('node_modules/' + package):
+                continue
+            version = item.get('version')
+            require(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version) is not None,
+                    f'{package} security version is not a reviewed release')
+            require(tuple(map(int, version.split('.'))) >= minimum,
+                    f'{package} security fix regressed: {version}')
 
 
 def validate_lock(raw, chosen):
@@ -339,11 +355,12 @@ def install(prefix, evidence, *, end=None):
     chosen = selection(raw)
     before(work_end)
     manifest = (json.dumps(dict(name='zerus-dsh-latest-fixture', private=True,
-                               dependencies={PACKAGE: chosen['version']}), indent=2) + '\n').encode()
+                               dependencies={PACKAGE: chosen['version']}, overrides=SECURITY_OVERRIDES), indent=2) + '\n').encode()
     write_new(prefix / 'package.json', manifest, work_end)
     run_npm(npm, ['install', '--package-lock-only', '--ignore-scripts'], prefix, env, evidence, 'resolve', end)
     lock = bounded(prefix / 'package-lock.json', MAX_LOCK, work_end)
     count = validate_lock(lock, chosen)
+    validate_security_pins(lock)
     require(bounded(prefix / 'package.json', MAX_METADATA, work_end) == manifest, 'Resolution changed the exact manifest')
     write_new(evidence / 'package.json', manifest, work_end)
     write_new(evidence / 'package-lock.json', lock, work_end)

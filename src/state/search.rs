@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::time::Duration;
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -17,15 +18,26 @@ const MAX_SESSIONS: usize = 500;
 const MAX_JOURNAL_ROWS: usize = 50_000;
 
 pub(super) fn dispatch(args: &[String]) -> Result<i32> {
+    if let Some(result) = search_index::dispatch(args) {
+        return result;
+    }
     let mut query = None;
     let mut limit = 80;
+    let mut indexed = false;
+    let mut cursor = None;
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--indexed" && !indexed {
+            indexed = true;
+            index += 1;
+            continue;
+        }
         let value = args
             .get(index + 1)
             .ok_or("usage: hgs search --query <text> [--limit 1..200]")?;
         match args[index].as_str() {
             "--query" if query.is_none() => query = Some(value.as_str()),
+            "--cursor" if cursor.is_none() => cursor = Some(value.as_str()),
             "--limit" => limit = value.parse::<usize>().map_err(|_| "invalid search limit")?,
             _ => return Err("usage: hgs search --query <text> [--limit 1..200]".into()),
         }
@@ -38,19 +50,35 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
     if !(1..=200).contains(&limit) {
         return Err("search limit must be between 1 and 200".into());
     }
-    let mut bindings = records()?;
-    let archives = archive::records()?;
-    bindings.retain(|record| !archive::equivalent(record, &archives));
-    bindings.extend(archives);
-    for mut record in dsh::binding_records() {
-        record["agent"] = json!("dsh");
-        record["updated"] = record["created"].clone();
-        bindings.push(record);
+    search_index::request_worker(&root());
+    if cursor.is_none() {
+        search_index::wait_small(&root());
     }
-    // Prefer recent sessions when the explicit scan budget is exhausted.
-    bindings.sort_by(|a, b| number(b, "updated").total_cmp(&number(a, "updated")));
-    println!("{}", search(&root(), bindings, query, limit)?);
+    if indexed {
+        println!("{}", search_index::indexed(query, limit, cursor)?);
+    } else {
+        if cursor.is_some() {
+            return Err("search cursors require --indexed".into());
+        }
+        println!("{}", legacy(query, limit)?);
+    }
     Ok(0)
+}
+
+pub(super) fn legacy(query: &str, limit: usize) -> Result<Value> {
+    let sources = search_index::legacy_sources(&root())?;
+    let mut reply = search_with_bytes(
+        &root(),
+        sources.records,
+        query,
+        limit,
+        MAX_TOTAL_BYTES.saturating_sub((sources.bytes + sources.metadata_io) as u64),
+    )?;
+    if !sources.complete {
+        reply["truncated"] = json!(true);
+    }
+    reply["discovery"] = json!({"bytes":sources.bytes,"metadata_io":sources.metadata_io,"directory_entries":sources.entries,"complete":sources.complete});
+    Ok(reply)
 }
 
 fn number(value: &Value, key: &str) -> f64 {
@@ -129,7 +157,8 @@ impl Search {
                 "name":record["name"],"cmd":record["agent"],"project":string(record,"name").split('/').nth(1),
                 "tag":string(record,"name").splitn(3,'/').nth(2),"run_id":record["run_id"],"conversation_id":record["conversation_id"],
                 "archive_id":record["archive_id"],"archived_at":record["archived_at"],"state":"archived","tracked":true,
-                "resumable":!string(record,"conversation_id").is_empty(),"cwd":record["cwd"]})},
+                "resumable":!string(record,"conversation_id").is_empty(),"cwd":record["cwd"],
+                "account_id":account_binding(record)["id"],"account_home":account_binding(record)["home"]})},
             "source":event["source"],"message_id":id,"seq":event.get("seq").cloned().unwrap_or(json!(0)),
             "content":content,"content_truncated":content_truncated,"snippet":snippet,"event":event});
         self.results.push(result);
@@ -268,7 +297,18 @@ impl Search {
     }
 }
 
-fn search(directory: &Path, mut bindings: Vec<Value>, query: &str, limit: usize) -> Result<Value> {
+#[cfg(test)]
+fn search(directory: &Path, bindings: Vec<Value>, query: &str, limit: usize) -> Result<Value> {
+    search_with_bytes(directory, bindings, query, limit, MAX_TOTAL_BYTES)
+}
+
+fn search_with_bytes(
+    directory: &Path,
+    mut bindings: Vec<Value>,
+    query: &str,
+    limit: usize,
+    bytes: u64,
+) -> Result<Value> {
     let pattern = RegexBuilder::new(&regex::escape(query))
         .case_insensitive(true)
         .build()
@@ -277,7 +317,7 @@ fn search(directory: &Path, mut bindings: Vec<Value>, query: &str, limit: usize)
         pattern,
         results: Vec::new(),
         limit,
-        bytes_left: MAX_TOTAL_BYTES,
+        bytes_left: bytes,
         rows_left: MAX_JOURNAL_ROWS,
         truncated: bindings.len() > MAX_SESSIONS,
         unavailable: BTreeSet::new(),
@@ -297,7 +337,7 @@ fn search(directory: &Path, mut bindings: Vec<Value>, query: &str, limit: usize)
     let native = if native.is_empty() { BTreeMap::new() } else { dsh::history_search(&native, query, limit.min(20)) };
     for record in &bindings {
         if record["backend"] == "dsh" {
-            match native.get(string(record, "name")) {
+            match native.get(&storage::owner_key(record)) {
                 Some(Some((events, truncated))) => {
                     search.truncated |= *truncated;
                     for event in events {
@@ -342,7 +382,7 @@ fn search(directory: &Path, mut bindings: Vec<Value>, query: &str, limit: usize)
             let text = if field == "prompt" {
                 journal::user_prompt(record).as_str().unwrap_or("")
             } else {
-                string(record, field)
+                journal::last_message(record)
             };
             if text.is_empty() {
                 continue;
@@ -368,11 +408,117 @@ fn search(directory: &Path, mut bindings: Vec<Value>, query: &str, limit: usize)
             );
         }
     }
+    search.truncated |= enrich_archive_results(&mut search.results);
     Ok(
         json!({"query":query,"results":search.results,"truncated":search.truncated,
         "scanned_sessions":bindings.len(),"unavailable_sessions":search.unavailable.len(),
         "scope":"public_messages_and_recorded_activity"}),
     )
+}
+
+/// Reuse the legacy excerpt and archive navigation shape for typed index data.
+pub(super) fn indexed_hit(pattern: Regex, hit: zerus_content_search::Hit, record: &Value) -> Option<Value> {
+    let partial = hit.part.as_ref().is_some_and(|part|
+        part.offset > 0 || hit.message.text.len() < part.total);
+    let message = hit.message;
+    let role = match message.role {
+        zerus_content_search::Role::User => "user",
+        zerus_content_search::Role::Assistant => "assistant",
+        zerus_content_search::Role::Tool => "tool",
+        zerus_content_search::Role::Event => "event",
+    };
+    let mut formatter = Search {
+        pattern, results: Vec::new(), limit: 1, bytes_left: 0,
+        rows_left: 0, truncated: false, unavailable: BTreeSet::new(),
+    };
+    formatter.accept(
+        record,
+        json!({"type":message.kind,"source":message.source,"message_id":message.id,
+            "seq":message.seq,"at":message.at,"detail":message.text}),
+        role,
+    );
+    let mut result = formatter.results.pop()?;
+    if partial { result["content_truncated"] = json!(true); }
+    Some(result)
+}
+
+/// Same folder scopes as archive pages, with no writes or catalog enumeration.
+/// One returned window shares a 250 ms deadline and at most 200 folder reads.
+pub(super) struct ArchiveScopes {
+    folders: std::collections::BTreeMap<String, Option<Value>>,
+    deadline: std::time::Instant,
+    pub incomplete: bool,
+}
+impl ArchiveScopes {
+    pub fn new() -> Self {
+        let folders = std::collections::BTreeMap::new();
+        #[cfg(test)]
+        let folders = scope_fixture::prepared().unwrap_or(folders);
+        Self { folders, deadline: std::time::Instant::now() + Duration::from_millis(250), incomplete: false }
+    }
+    pub fn enrich(&mut self, hit: &mut Value) {
+        let Some(row) = hit.get_mut("session").and_then(Value::as_object_mut) else { return; };
+        let cwd = row.get("cwd").and_then(Value::as_str).unwrap_or("").to_owned();
+        if !self.folders.contains_key(&cwd) && self.folders.len() >= 200 { self.incomplete = true; return; }
+        let fields = self.folders.entry(cwd.clone()).or_insert_with(|| workspace::search_scopes(&cwd, self.deadline));
+        if let Some(fields) = fields { row.extend(fields.as_object().unwrap().clone()); }
+        else { self.incomplete = true; }
+    }
+}
+// Query fixtures prepare folder scopes independently of the index. Keep the
+// override thread-local and scoped so real Git startup latency cannot decide a
+// pagination assertion, or leak prepared metadata into another test.
+#[cfg(test)]
+pub(super) mod scope_fixture {
+    use super::*;
+    use std::cell::RefCell;
+    type Folders = std::collections::BTreeMap<String, Option<Value>>;
+    thread_local! {
+        static PREPARED: RefCell<Option<Folders>> = const { RefCell::new(None) };
+    }
+    pub(super) fn prepared() -> Option<Folders> {
+        PREPARED.with(|folders| folders.borrow().clone())
+    }
+    pub(in crate::state) fn with<R>(
+        cwd: &str,
+        fields: Option<Value>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<Folders>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PREPARED.with(|folders| *folders.borrow_mut() = self.0.take());
+            }
+        }
+        let folders = [(cwd.to_owned(), fields)].into_iter().collect();
+        let _restore = Restore(PREPARED.with(|slot| slot.replace(Some(folders))));
+        run()
+    }
+
+    #[test]
+    fn prepared_scopes_restore_after_unwinding_and_stay_on_the_current_thread() {
+        let cwd = "/srv/example/archive";
+        let fields = json!({"cwd_canonical":cwd,"git_root":""});
+        assert!(prepared().is_none());
+        with(cwd, Some(fields.clone()), || {
+            std::thread::spawn(|| assert!(prepared().is_none()))
+                .join()
+                .unwrap();
+            let panic = std::panic::catch_unwind(|| {
+                with("/srv/example/other", None, || {
+                    panic!("fixture cleanup control")
+                });
+            });
+            assert!(panic.is_err());
+            assert_eq!(prepared().unwrap()[cwd], Some(fields));
+        });
+        assert!(prepared().is_none());
+    }
+}
+pub(super) fn enrich_archive_results(results: &mut [Value]) -> bool {
+    let mut scopes = ArchiveScopes::new();
+    for hit in results.iter_mut().take(200) { scopes.enrich(hit); }
+    scopes.incomplete
 }
 
 fn equivalent_excerpt(left: &str, right: &str) -> bool {
@@ -383,7 +529,7 @@ fn equivalent_excerpt(left: &str, right: &str) -> bool {
         || (right.ends_with('…') && left.starts_with(right.trim_end_matches('…')))
 }
 
-fn journal_role(event: &Value) -> &'static str {
+pub(super) fn journal_role(event: &Value) -> &'static str {
     if string(event, "agent_id").is_empty() && !event["origin"].is_string() {
         match string(event, "type") {
             "UserPromptSubmit" | "UserPromptQueued" | "TurnStarted" | "QuestionAnswered" => {
@@ -537,7 +683,8 @@ pub(super) fn provider_event(agent: &str, event: &Value) -> Option<(Value, &'sta
                 "kimi_wire",
             )
         }
-        "claude" => {
+        // WhiteWh fork: hgs writes a Hermes session's turns in Claude's format.
+        "claude" | "hermes" => {
             // A compaction summary is Claude's own context, written as a user turn.
             if event["isMeta"] == true || event["isSidechain"] == true || event["isCompactSummary"] == true {
                 return None;
@@ -610,6 +757,17 @@ pub(super) fn provider_event(agent: &str, event: &Value) -> Option<(Value, &'sta
                 )
             } else if string(event, "type") == "response_item"
                 && string(payload, "type") == "message"
+                && string(payload, "role") == "user"
+            {
+                (
+                    "user",
+                    text_parts(&payload["content"], &["input_text", "text"]),
+                    string(payload, "id"),
+                    timestamp(&event["timestamp"]),
+                    "codex_transcript",
+                )
+            } else if string(event, "type") == "response_item"
+                && string(payload, "type") == "message"
                 && string(payload, "role") == "assistant"
                 && ["", "final", "commentary"].contains(&string(payload, "channel"))
                 && ["", "final", "final_answer", "commentary"].contains(&string(payload, "phase"))
@@ -624,6 +782,21 @@ pub(super) fn provider_event(agent: &str, event: &Value) -> Option<(Value, &'sta
             } else {
                 return None;
             }
+        }
+        // Qwen Code 0.27.4's chat log: the person's prompt (`real_user`) and
+        // the model's reply, without its thoughts or tool calls.
+        "qwen" => {
+            let role = match (string(event, "type"), string(event, "provenance")) {
+                ("user", "real_user") => "user",
+                ("assistant", _) => "assistant",
+                _ => return None,
+            };
+            let parts = event["message"]["parts"].as_array().cloned().unwrap_or_default();
+            let texts = parts.iter().filter(|part| part["thought"] != true).filter_map(|part| part["text"].as_str());
+            // The person's prompt is its first part: Qwen Code appends the
+            // contents of @-referenced files as further parts.
+            let text = if role == "user" { texts.take(1).collect::<String>() } else { texts.collect::<Vec<_>>().join("") };
+            (role, text, string(event, "uuid"), timestamp(&event["timestamp"]), "qwen_transcript")
         }
         _ => return None,
     };
@@ -739,6 +912,16 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn expired_scope_budget_is_explicit_and_does_not_guess_folder_metadata() {
+        let mut scopes = ArchiveScopes { folders: Default::default(), deadline: std::time::Instant::now() - Duration::from_secs(1), incomplete: false };
+        let mut hit = json!({"session":{"cwd":"/srv/example/app"}});
+        scopes.enrich(&mut hit);
+        assert!(scopes.incomplete);
+        assert!(hit["session"].get("cwd_canonical").is_none());
+        assert!(hit["session"].get("git_root").is_none());
+    }
+
     fn record(path: &Path) -> Value {
         json!({"version":1,"name":"codex/docs","agent":"codex","run_id":"run",
             "conversation_id":"conversation","cwd":"/work/docs","transcript":path,"updated":42})
@@ -792,6 +975,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn qwen_codes_chat_log_gives_the_prompt_and_the_reply_without_thoughts() {
+        // Lines of Qwen Code 0.27.4's `chats/<id>.jsonl` (2026-11-16).
+        let user = json!({"uuid":"u1","sessionId":"s","timestamp":"2026-11-16T17:15:10.693Z","type":"user","provenance":"real_user",
+            "message":{"role":"user","parts":[{"text":"Run echo hi and reply DONE"}]}});
+        let (message, role) = provider_event("qwen", &user).unwrap();
+        assert_eq!((role, message["type"].as_str(), message["source"].as_str()), ("user", Some("UserPromptSubmit"), Some("qwen_transcript")));
+        assert_eq!(message["detail"], "Run echo hi and reply DONE");
+        let reply = json!({"uuid":"a1","sessionId":"s","timestamp":"2026-11-16T17:15:21.150Z","type":"assistant","provenance":"assistant_output",
+            "message":{"role":"model","parts":[{"text":"The user asked for DONE.","thought":true},{"text":"DONE"},
+                {"functionCall":{"name":"run_shell_command","args":{"command":"echo hi"}}}]}});
+        let (message, role) = provider_event("qwen", &reply).unwrap();
+        assert_eq!((role, message["detail"].as_str(), message["message_id"].as_str()), ("assistant", Some("DONE"), Some("a1")));
+        // Only thoughts and tool calls: nothing to show.
+        let thinking = json!({"uuid":"a2","type":"assistant","message":{"role":"model","parts":[{"text":"Thinking.","thought":true},{"functionCall":{"name":"x"}}]}});
+        assert!(provider_event("qwen", &thinking).is_none());
+        // Memory snapshots, tool results and telemetry are not the person's words.
+        for (kind, provenance) in [("system", "system"), ("tool_result", "tool_result"), ("user", "system")] {
+            let other = json!({"type":kind,"provenance":provenance,"message":{"role":"user","parts":[{"text":"context"}]}});
+            assert!(provider_event("qwen", &other).is_none(), "{kind} {provenance}");
+        }
     }
 
     #[test]

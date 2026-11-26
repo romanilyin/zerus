@@ -19,6 +19,8 @@
 pub(crate) mod host;
 #[cfg(unix)]
 mod tmux;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::state) use tmux::{input_state_using, pane_info_args};
 
 use super::Result;
 use crate::cli::{Error, Result as CliResult};
@@ -29,6 +31,37 @@ use crate::cli::{Error, Result as CliResult};
 const UNSUPPORTED: &str = crate::platform::LOCAL_SESSIONS_UNSUPPORTED;
 /// What `hgs a --existing --run-id` reports when the session runs another run.
 pub(crate) const RUN_CHANGED: &str = "session run changed; refresh before reconnecting";
+/// Variables an agent sets for the commands it runs (zerus-01sz8). They name
+/// that agent's own session, process or tool call, or switch its command
+/// terminal to plain text. A launch from such a command must not pass them on:
+/// tmux keeps the environment of the client that starts its server for every
+/// pane, so they reached every agent started afterwards. Claude Code's list of
+/// its own (`CLAUDECODE` through `TRACEPARENT`), its messaging channel and
+/// entry point, Codex's thread and tool call, and the native session IDs of
+/// DeepSeek and OpenCode, which `hgs self` reads as a claim. `NO_COLOR` makes
+/// Claude Code draw its prompt placeholder and caret without the styles that
+/// tell them from a draft, so `hgs send` refuses every message while one shows.
+pub(crate) const AGENT_COMMAND_CONTEXT: &[&str] = &[
+    "CLAUDECODE",
+    "AI_AGENT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_INVOKED_SKILLS",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "TRACEPARENT",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CODEX_THREAD_ID",
+    "CODEX_TOOL_CALL_ID",
+    "DSH_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+    "QWEN_CODE_SESSION_ID",
+    "NO_COLOR",
+];
 
 /// User-visible text that names the session terminal. Where tmux hosts the
 /// sessions (Unix) it keeps tmux's words byte for byte; on Windows it says the
@@ -110,6 +143,16 @@ pub(crate) struct SessionRow {
     pub launch_id: String,
 }
 
+/// Task #14 (P2.4): what changed in the terminal, as counters a reader
+/// compares with the last ones it saw: `structure` moves when a session
+/// starts, ends or is renamed, `output` per session name when its pane wrote
+/// output or its process exited.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Counters {
+    pub(crate) structure: u64,
+    pub(crate) output: std::collections::BTreeMap<String, u64>,
+}
+
 /// The `hgs ls --json` view of the terminal: clients, then sessions.
 pub(crate) struct Listing {
     pub clients: Vec<ClientRow>,
@@ -137,11 +180,50 @@ pub(crate) struct PanePath {
     pub path: String,
 }
 
+/// What one bounded observation proves of the terminal a launch created
+/// ([`Launched`], zerus-5sl7r). Only an answer of the server that created it,
+/// about that pane, says the pane is gone or its command ended; a failed,
+/// refused or late observation, or an answer of another server, is
+/// [`Self::Unknown`], never absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalState {
+    /// It exists and its command still runs.
+    Alive,
+    /// It exists and its command ended (a dead pane kept).
+    DeadPane,
+    /// The server that created the pane runs and has no such pane.
+    Absent,
+    /// The pane runs another process than the one the launch started (tmux
+    /// `respawn-pane`): the launched command ended, its pane remains.
+    Replaced,
+    Unknown,
+}
+
+/// The terminal a launch created, as its server answered the launch: the
+/// server's identity (tmux: its pid and start time; the session host: its
+/// pid and creation time), the pane's (`%N`, which a server never reuses
+/// while it runs) and the process the launch started in it (its pid, and its
+/// kernel birth where it could be read). Observations are bound to all three
+/// (zerus-5sl7r): a pane respawned with another process is not the launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Launched {
+    pub(crate) server: String,
+    pub(crate) pane: String,
+    pub(crate) process: u32,
+    pub(crate) birth: Option<String>,
+}
+
 /// One fact about a pane, as the terminal reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneField {
     SessionId,
     SessionName,
+    SocketPath,
+    SessionCreated,
+    SessionWindows,
+    SessionGrouped,
+    WindowPanes,
+    WindowLinked,
     PaneId,
     /// The terminal server's process ID.
     ServerPid,
@@ -244,6 +326,29 @@ pub(crate) struct LaunchSpec {
     pub detached: bool,
 }
 
+/// Environment variables whose value is a secret: `--dry-run` prints the name
+/// and `***`, never the value, even if a caller puts one in a `LaunchSpec`
+/// (U60 #658 N3).
+pub(crate) const SECRET_ENV: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "HGS_MODEL_SERVER_KEY",
+    "OPENCODE_CONFIG_CONTENT",
+    "KIMI_API_KEY",
+    "MOONSHOT_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+/// One `KEY=VALUE` for a dry-run: a secret's value is masked.
+pub(crate) fn masked(value: &str) -> String {
+    match value.split_once('=') {
+        Some((key, _)) if SECRET_ENV.contains(&key) => format!("{key}=***"),
+        _ => value.to_owned(),
+    }
+}
+
 /// How an interactive client ended: its exit code, and whether the terminal
 /// server died (the terminal is then already restored and the user told).
 pub(crate) struct ClientExit {
@@ -307,9 +412,22 @@ pub(crate) trait TerminalBackend: Sync {
             sessions: Vec::new(),
         })
     }
+    /// Task #14 (P2.4): the terminal's change counters in one round trip;
+    /// None where it has none (tmux, a session host that predates them).
+    fn counters(&self) -> Result<Option<Counters>> {
+        Ok(None)
+    }
     /// `(name, attached clients)` for `hgs ls`; None without sessions.
     fn attached_counts(&self) -> Result<Option<Vec<(String, String)>>> {
         Ok(None)
+    }
+    /// When a client attached to terminal `name` last had input, in seconds
+    /// since the epoch: `Some(None)` with no client attached, None unknown.
+    /// A backend that cannot report input times knows only that a terminal
+    /// with no attached client has none; any attached client is unknown.
+    fn last_client_input(&self, name: &str) -> Option<Option<f64>> {
+        let counts = self.attached_counts().ok()??;
+        counts.iter().find(|(session, _)| session == name).filter(|(_, count)| count == "0").map(|_| None)
     }
     fn panes(&self) -> Result<Vec<PaneRow>> {
         Err(UNSUPPORTED.into())
@@ -320,6 +438,12 @@ pub(crate) trait TerminalBackend: Sync {
 
     fn session_exists(&self, _name: &str) -> bool {
         false
+    }
+    /// What an observation of the terminal `launched` names within `wait`
+    /// proves ([`TerminalState`]); a backend without exact answers knows
+    /// nothing.
+    fn terminal_state(&self, _launched: &Launched, _wait: std::time::Duration) -> TerminalState {
+        TerminalState::Unknown
     }
     /// The current name of session `$N`, None when it no longer exists.
     fn session_name(&self, _id: &str) -> Result<Option<String>> {
@@ -336,6 +460,12 @@ pub(crate) trait TerminalBackend: Sync {
     /// Start a detached session.
     fn start(&self, _spec: &LaunchSpec) -> Result<()> {
         Err(UNSUPPORTED.into())
+    }
+    /// [`Self::start`], with the terminal it created as its server answered
+    /// the launch; None when the answer names none, which leaves every later
+    /// observation of it unknown.
+    fn start_observed(&self, spec: &LaunchSpec) -> Result<Option<Launched>> {
+        self.start(spec).map(|()| None)
     }
     /// Mark session `name` with the run ID of the supervisor in its pane.
     fn set_run_marker(&self, _name: &str, _run_id: &str) -> Result<()> {
@@ -426,6 +556,13 @@ pub(crate) trait TerminalBackend: Sync {
     /// The viewing peer recorded by `set_client`, as stored.
     fn viewer(&self, _name: &str) -> String {
         String::new()
+    }
+    /// A variable of the named terminal session's own environment, as its
+    /// launch set it. `Ok(None)` only when that environment was read and lacks
+    /// it; an error when it could not be read, which is never absence (#1445
+    /// review).
+    fn session_variable(&self, _name: &str, _key: &str) -> Result<Option<String>> {
+        Err("this terminal cannot read a session's environment".into())
     }
     /// Show a short message on a client terminal.
     fn notify(&self, _client: &str, _text: &str) {}
@@ -577,6 +714,24 @@ mod tests {
             assert!(workspace::pane_cwds().is_empty());
             assert!(!current().session_exists("claude/p/a"));
         });
+    }
+
+    #[test]
+    fn without_input_times_only_an_unattached_terminal_counts_as_unused() {
+        struct Counted;
+        impl TerminalBackend for Counted {
+            fn attached_counts(&self) -> Result<Option<Vec<(String, String)>>> {
+                Ok(Some(vec![("claude/p/idle".into(), "0".into()), ("claude/p/watched".into(), "1".into()),
+                    ("claude/p/odd".into(), "?".into())]))
+            }
+        }
+        assert_eq!(Counted.last_client_input("claude/p/idle"), Some(None));
+        for name in ["claude/p/watched", "claude/p/odd", "claude/p/missing"] {
+            assert_eq!(Counted.last_client_input(name), None, "{name}");
+        }
+        struct Empty;
+        impl TerminalBackend for Empty {}
+        assert_eq!(Empty.last_client_input("claude/p/idle"), None);
     }
 }
 

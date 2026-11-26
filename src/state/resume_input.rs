@@ -10,8 +10,11 @@ pub(super) fn fork_pending(record: &Value) -> bool {
         && record["startup_kind"] == "new"
         && uuid::Uuid::parse_str(string(record, "fork_parent_id")).is_ok()
         && record["base"].as_array().is_some_and(|args| {
-            args.get(1).is_some_and(|arg| arg == "fork")
-                && args.get(2) == record.get("fork_parent_id")
+            let words = args.iter().map(|arg| arg.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>();
+            let Some(words) = words else { return false; };
+            let program = crate::project_launcher::program_words(&words);
+            args.get(program).is_some_and(|arg| arg == "fork")
+                && args.get(program + 1) == record.get("fork_parent_id")
         })
         && string(record, "conversation_id").is_empty()
         && string(record, "expected_id").is_empty()
@@ -47,7 +50,7 @@ fn fork_directory(record: &Value) -> Result<PathBuf> {
     let launch = Path::new(string(record, "launch_dir"));
     let mut cwd = launch.to_path_buf();
     let args = recipes::argv(record)?;
-    let mut index = 3;
+    let mut index = crate::project_launcher::program_words(&args) + 2;
     while index < args.len() && args[index] != "--" {
         let (key, value) = args[index]
             .split_once('=')
@@ -71,6 +74,16 @@ fn fork_directory(record: &Value) -> Result<PathBuf> {
 }
 
 pub(super) fn pending(record: &Value) -> bool {
+    pending_binding(record)
+        && ((record.get("session_end").is_none()
+            && record["last_event_at"].as_f64().unwrap_or(0.0) == 0.0)
+            || clear_context::ended_resume(record)
+            || clear_context::observed_terminal_resume(record))
+}
+
+/// Binding shape only, never process/composer verification or input permission.
+/// A real clear SessionStart may finish an older run's unmarked SessionEnd.
+pub(super) fn pending_binding(record: &Value) -> bool {
     record["agent"] == "codex"
         && record["run_identity_version"] == 1
         && record["startup_kind"] == "resume"
@@ -79,8 +92,6 @@ pub(super) fn pending(record: &Value) -> bool {
         && record["expected_id"] == record["conversation_id"]
         && string(record, "requested_id").is_empty()
         && string(record, "error").is_empty()
-        && record.get("session_end").is_none()
-        && record["last_event_at"].as_f64().unwrap_or(0.0) == 0.0
         && ["", "unknown"].contains(&string(record, "activity"))
         && ["", "unknown"].contains(&string(record, "phase"))
 }
@@ -96,14 +107,23 @@ fn owns_rollout(record: &Value) -> Result<()> {
         return Err("Saved conversation history has a different identity".into());
     }
     let pid = record["pid"].as_u64().ok_or("Missing agent process")?;
-    if !crate::platform::holds_open(agent_pid(pid)?, &path).map_err(open_files_error)? {
-        return Err("Codex has not opened the saved conversation yet".into());
+    match crate::platform::holds_open(agent_pid(pid)?, &path).map_err(open_files_error)? {
+        crate::platform::OpenFiles::Held => {}
+        crate::platform::OpenFiles::NotHeld => {
+            return Err("Codex has not opened the saved conversation yet".into());
+        }
+        crate::platform::OpenFiles::Unknown(reason) => {
+            // The host cannot read the file's holders. Assume the agent may hold
+            // it and continue, saying why, instead of refusing a resume on a
+            // check this host cannot make.
+            eprintln!("assuming Codex may hold {}: {reason}", path.display());
+        }
     }
     Ok(())
 }
 
-fn checked_process(record: &Value) -> Result<u64> {
-    if !process_alive(record) || !matches(record, live()?.get(string(record, "name"))) {
+pub(super) fn checked_process(record: &Value) -> Result<u64> {
+    if !process_alive(record) || !matches(record, panes_of(&live()?, record)) {
         return Err("The tracked agent is no longer running".into());
     }
     let supervisor = &record["supervisor"];
@@ -193,6 +213,13 @@ fn history_directory(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+#[cfg(all(unix, test))]
+fn history_candidate_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    crate::platform::no_follow(&mut options);
+    options
+}
+
 #[cfg(any(windows, test))]
 struct ForkScan<'a, H, E> {
     record: &'a Value,
@@ -210,7 +237,7 @@ struct ForkScan<'a, H, E> {
 #[cfg(any(windows, test))]
 impl<H, E> ForkScan<'_, H, E>
 where
-    H: FnMut(u32, &Path) -> std::result::Result<bool, crate::platform::RunError>,
+    H: FnMut(u32, &Path) -> std::result::Result<crate::platform::OpenFiles, crate::platform::RunError>,
     E: FnMut() -> std::time::Duration,
 {
     fn within_end(&mut self) -> Result<()> {
@@ -282,9 +309,14 @@ where
             return Err("Fork history candidate escaped the selected account".into());
         }
         let path = canonical.as_path();
+        #[cfg(unix)]
+        let mut options = history_candidate_options();
+        #[cfg(windows)]
         let mut options = fs::OpenOptions::new();
         options.read(true);
+        #[cfg(windows)]
         crate::platform::refuse_link(&mut options);
+        #[cfg(windows)]
         crate::platform::never_block(&mut options);
         #[cfg(windows)]
         {
@@ -338,7 +370,12 @@ where
                 .is_ok_and(|path| path == self.cwd)
         {
             self.within_end()?;
-            let owned = (self.holds)(self.pid, path).map_err(open_files_error)?;
+            let owned = match (self.holds)(self.pid, path).map_err(open_files_error)? {
+                crate::platform::OpenFiles::Held => true,
+                crate::platform::OpenFiles::NotHeld => false,
+                // The host cannot read the holders: assume the file may be held.
+                crate::platform::OpenFiles::Unknown(_) => true,
+            };
             self.within_end()?;
             if !same_file(path) {
                 return Err("Fork history file changed during ownership verification".into());
@@ -367,7 +404,7 @@ fn windows_fork_children<H, E>(
     limits: ForkScanLimits,
 ) -> Result<std::collections::BTreeSet<(PathBuf, String)>>
 where
-    H: FnMut(u32, &Path) -> std::result::Result<bool, crate::platform::RunError>,
+    H: FnMut(u32, &Path) -> std::result::Result<crate::platform::OpenFiles, crate::platform::RunError>,
     E: FnMut() -> std::time::Duration,
 {
     let _account = history_directory(sessions.parent().ok_or("Missing fork history account")?)?;
@@ -395,7 +432,7 @@ fn complete_fork_scan<'a, H, E>(
     discover: impl FnOnce(&mut ForkScan<'a, H, E>) -> Result<()>,
 ) -> Result<std::collections::BTreeSet<(PathBuf, String)>>
 where
-    H: FnMut(u32, &Path) -> std::result::Result<bool, crate::platform::RunError>,
+    H: FnMut(u32, &Path) -> std::result::Result<crate::platform::OpenFiles, crate::platform::RunError>,
     E: FnMut() -> std::time::Duration,
 {
     // A matching held candidate never turns a partial/error enumeration into
@@ -510,8 +547,8 @@ pub(super) fn ready(record: &Value) -> Result<()> {
 
 /// A pending resume that may also clear or pause before its deferred
 /// SessionStart once `idle` verifies it. A sent message may already have
-/// started a turn, and an archive restore commits only on the hook that names
-/// its exact conversation (archive::confirm_restore).
+/// started a turn. The shared pause path excludes archive restores; Clear has
+/// a separately scoped restore transaction in clear_context.
 pub(super) fn clearable(record: &Value) -> bool {
     pending(record)
         && string(record, "restore_archive_id").is_empty()
@@ -564,6 +601,32 @@ mod tests {
             "expected_id":"saved","activity":"unknown","phase":"unknown","last_event_at":0})
     }
 
+    #[test]
+    fn an_unknown_file_holder_takes_the_conservative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("rollout.jsonl");
+        std::fs::write(&transcript, b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"c1\"}}\n").unwrap();
+        let record = json!({
+            "transcript": transcript.display().to_string(),
+            "expected_id": "c1",
+            "pid": std::process::id(),
+        });
+        crate::platform::set_forced_open_files_unknown(Some("the Restart Manager did not start: test"));
+        let found = owns_rollout(&record);
+        crate::platform::set_forced_open_files_unknown(None);
+        assert!(found.is_ok(), "the conservative path does not refuse: {found:?}");
+    }
+
+    #[test]
+    fn powershell_fork_selector_remains_bound_to_the_original_parent() {
+        let parent="c561923a-7958-40f7-a996-e6981ac19a62";
+        let prefix=[r"C:\PowerShell\pwsh.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", r"C:\p\run_codex.ps1"].map(str::to_owned).to_vec();
+        let base=[prefix,vec!["fork".into(),parent.into()]].concat();
+        let mut record=json!({"agent":"codex","startup_kind":"new","fork_parent_id":parent,"base":base});
+        assert!(fork_pending(&record));
+        record["fork_parent_id"]=json!("82b251e5-36fa-44d2-b90d-41ea86f7b696");
+        assert!(!fork_pending(&record));
+    }
     #[test]
     fn only_a_resume_without_a_sent_message_or_archive_restore_may_clear_or_pause() {
         assert!(clearable(&resumed()));
@@ -633,7 +696,7 @@ mod tests {
             limits: ForkScanLimits,
         ) -> Result<std::collections::BTreeSet<(PathBuf, String)>>
         where
-            H: FnMut(u32, &Path) -> std::result::Result<bool, crate::platform::RunError>,
+            H: FnMut(u32, &Path) -> std::result::Result<crate::platform::OpenFiles, crate::platform::RunError>,
         {
             windows_fork_children(
                 &self.record,
@@ -663,7 +726,7 @@ mod tests {
             .prove(
                 |pid, path| {
                     observed.push((pid, path.to_owned()));
-                    Ok(true)
+                    Ok(crate::platform::OpenFiles::Held)
                 },
                 FORK_SCAN_LIMITS,
             )
@@ -679,7 +742,7 @@ mod tests {
                 FORK_CHILD.into()
             )])
         );
-        assert!(fixture.prove(|_, _| Ok(false), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::NotHeld), FORK_SCAN_LIMITS).is_err());
         assert!(fixture
             .prove(
                 |_, _| Err(crate::platform::RunError::Unsupported),
@@ -703,10 +766,14 @@ mod tests {
         let mut second = fixture.header();
         second["payload"]["id"] = json!("33333333-3333-4333-8333-333333333333");
         fixture.write_header(&neighbor, &second);
-        assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
         let child = fixture
             .prove(
-                |_, path| Ok(path == crate::platform::canonical(&fixture.rollout).unwrap()),
+                |_, path| Ok(if path == crate::platform::canonical(&fixture.rollout).unwrap() {
+                    crate::platform::OpenFiles::Held
+                } else {
+                    crate::platform::OpenFiles::NotHeld
+                }),
                 FORK_SCAN_LIMITS,
             )
             .unwrap();
@@ -718,7 +785,11 @@ mod tests {
         fixture.write_header(&fixture.rollout, &parent);
         assert!(fixture
             .prove(
-                |_, path| Ok(path != crate::platform::canonical(&neighbor).unwrap()),
+                |_, path| Ok(if path != crate::platform::canonical(&neighbor).unwrap() {
+                    crate::platform::OpenFiles::Held
+                } else {
+                    crate::platform::OpenFiles::NotHeld
+                }),
                 FORK_SCAN_LIMITS
             )
             .is_err());
@@ -742,7 +813,7 @@ mod tests {
                 .prove(
                     |_, _| {
                         queried = true;
-                        Ok(true)
+                        Ok(crate::platform::OpenFiles::Held)
                     },
                     FORK_SCAN_LIMITS
                 )
@@ -763,7 +834,7 @@ mod tests {
             entries: 0,
             bytes: 0,
             children: std::collections::BTreeSet::new(),
-            holds: |_, _: &Path| Ok(true),
+            holds: |_, _: &Path| Ok(crate::platform::OpenFiles::Held),
             elapsed: || std::time::Duration::ZERO,
         };
         let result = complete_fork_scan(&mut scan, |scan| {
@@ -801,7 +872,7 @@ mod tests {
             children: std::collections::BTreeSet::new(),
             holds: |_, _: &Path| {
                 queried = true;
-                Ok(true)
+                Ok(crate::platform::OpenFiles::Held)
             },
             elapsed: || std::time::Duration::ZERO,
         };
@@ -815,7 +886,7 @@ mod tests {
         let exact = fs::read(&fixture.rollout).unwrap().len();
         assert!(fixture
             .prove(
-                |_, _| Ok(true),
+                |_, _| Ok(crate::platform::OpenFiles::Held),
                 ForkScanLimits {
                     entries: 0,
                     ..FORK_SCAN_LIMITS
@@ -824,7 +895,7 @@ mod tests {
             .is_err());
         assert!(fixture
             .prove(
-                |_, _| Ok(true),
+                |_, _| Ok(crate::platform::OpenFiles::Held),
                 ForkScanLimits {
                     bytes: exact - 1,
                     ..FORK_SCAN_LIMITS
@@ -833,7 +904,7 @@ mod tests {
             .is_err());
         assert!(fixture
             .prove(
-                |_, _| Ok(true),
+                |_, _| Ok(crate::platform::OpenFiles::Held),
                 ForkScanLimits {
                     bytes: exact,
                     ..FORK_SCAN_LIMITS
@@ -844,7 +915,11 @@ mod tests {
         fixture.write_header(&neighbor, &fixture.header());
         assert!(fixture
             .prove(
-                |_, path| Ok(path == crate::platform::canonical(&fixture.rollout).unwrap()),
+                |_, path| Ok(if path == crate::platform::canonical(&fixture.rollout).unwrap() {
+                    crate::platform::OpenFiles::Held
+                } else {
+                    crate::platform::OpenFiles::NotHeld
+                }),
                 ForkScanLimits {
                     bytes: exact,
                     ..FORK_SCAN_LIMITS
@@ -853,7 +928,11 @@ mod tests {
             .is_err());
         assert!(fixture
             .prove(
-                |_, path| Ok(path == crate::platform::canonical(&fixture.rollout).unwrap()),
+                |_, path| Ok(if path == crate::platform::canonical(&fixture.rollout).unwrap() {
+                    crate::platform::OpenFiles::Held
+                } else {
+                    crate::platform::OpenFiles::NotHeld
+                }),
                 ForkScanLimits {
                     bytes: exact * 2,
                     ..FORK_SCAN_LIMITS
@@ -865,7 +944,7 @@ mod tests {
         fs::create_dir(&nested).unwrap();
         assert!(fixture
             .prove(
-                |_, _| Ok(true),
+                |_, _| Ok(crate::platform::OpenFiles::Held),
                 ForkScanLimits {
                     depth: 0,
                     ..FORK_SCAN_LIMITS
@@ -876,7 +955,7 @@ mod tests {
         let mut oversized = fixture.header();
         oversized["payload"]["padding"] = json!("x".repeat(256 * 1024));
         fixture.write_header(&fixture.rollout, &oversized);
-        assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
     }
 
     #[test]
@@ -888,11 +967,11 @@ mod tests {
             b"{\"type\":\"session_meta\"}\n".as_slice(),
         ] {
             fs::write(&fixture.rollout, raw).unwrap();
-            assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+            assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
         }
         fs::remove_file(&fixture.rollout).unwrap();
         fs::remove_dir(&fixture.sessions).unwrap();
-        assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
     }
 
     #[test]
@@ -906,7 +985,7 @@ mod tests {
             &fixture.cwd,
             |_, _| {
                 late.set(true);
-                Ok(true)
+                Ok(crate::platform::OpenFiles::Held)
             },
             || {
                 if late.get() {
@@ -926,7 +1005,7 @@ mod tests {
             &fixture.cwd,
             |_, _| {
                 queried = true;
-                Ok(true)
+                Ok(crate::platform::OpenFiles::Held)
             },
             || FORK_SCAN_LIMITS.elapsed,
             FORK_SCAN_LIMITS,
@@ -937,16 +1016,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fork_history_verification_open_refuses_a_candidate_replaced_by_a_symlink() {
+        use std::os::{fd::AsRawFd, unix::fs::symlink};
+        let fixture = ForkHistory::new();
+        let canonical = crate::platform::canonical(&fixture.rollout).unwrap();
+        assert!(canonical.starts_with(&fixture.sessions));
+        let mut options = history_candidate_options();
+        options.read(true);
+        let file = options.open(&canonical).unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        drop(file);
+        // Replace the already checked path before the actual verification open.
+        let target = fixture.temporary.path().join("outside-history.jsonl");
+        fs::rename(&fixture.rollout, &target).unwrap();
+        symlink(&target, &fixture.rollout).unwrap();
+        assert!(options.open(&canonical).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn windows_fork_candidate_scan_refuses_symlinks_including_an_unrelated_entry() {
         use std::os::unix::fs::symlink;
         let fixture = ForkHistory::new();
         let alias = fixture.sessions.join("unrelated-link");
         symlink(&fixture.cwd, &alias).unwrap();
-        assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
         fs::remove_file(alias).unwrap();
         fs::remove_file(&fixture.rollout).unwrap();
         fs::remove_dir(&fixture.sessions).unwrap();
         symlink(&fixture.cwd, &fixture.sessions).unwrap();
-        assert!(fixture.prove(|_, _| Ok(true), FORK_SCAN_LIMITS).is_err());
+        assert!(fixture.prove(|_, _| Ok(crate::platform::OpenFiles::Held), FORK_SCAN_LIMITS).is_err());
     }
 }

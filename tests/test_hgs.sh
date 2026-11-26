@@ -200,6 +200,23 @@ check "@peer new folder session -> quoted path and name" 0 "--client testhost co
 check "@peer archive -> noninteractive ssh" 0 "^ssh -o BatchMode=yes -o ConnectTimeout=3 nowhere ~/.local/bin/hgs archive claude/p/one --dry-run\$" --dry-run @nowhere archive claude/p/one
 check "@peer rename -> noninteractive ssh" 0 "^ssh -o BatchMode=yes -o ConnectTimeout=3 nowhere ~/.local/bin/hgs rename claude/p/one claude/p/review --dry-run\$" --dry-run @nowhere rename claude/p/one claude/p/review
 check "@peer archived rename forwards identity" 0 "^ssh -o BatchMode=yes -o ConnectTimeout=3 nowhere ~/.local/bin/hgs rename claude/p/one claude/p/review --archive $conversation_id --dry-run\$" --dry-run @nowhere rename claude/p/one claude/p/review --archive "$conversation_id"
+# zerus-sa9qn.39: a pasted peer dry-run line reads the alias back as one word and runs nothing.
+alias_paste() {   # $1 = alias
+  local line got dir="$tmp/alias-paste"
+  line="$("$HGS" "@$1" ls --dry-run 2>&1)"
+  rm -rf "${dir:?}"; mkdir -p "$dir"
+  got="$(cd "$dir" && env -i PATH=/usr/bin:/bin HOME="$dir" sh -c 'ssh() { printf "%s" "$5"; }
+'"$line" 2>&1)"
+  if [ "$got" = "$1" ] && [ ! -e "$dir/pwned" ]; then
+    pass=$((pass+1)); echo "ok   @peer dry-run alias reads back: $1"
+  else
+    fail=$((fail+1)); echo "FAIL @peer dry-run alias reads back: $1"; printf '     line: %s\n     read: %s\n' "$line" "$got"
+    [ -e "$dir/pwned" ] && echo "     the pasted line ran a payload"
+  fi
+}
+for alias in 'x;>pwned' '$(>pwned)' '`>pwned`' "it's" 'a"b;>pwned' "x\\';>pwned;#" "x'\$(>pwned)'\`>pwned\`\"" '~root'; do
+  alias_paste "$alias"
+done
 check_not "@peer rename never decorates calling terminal" "^tab " --dry-run @nowhere rename claude/p/one claude/p/review
 check "rename requires source and destination" 1 "." rename
 check "rename requires destination" 1 "." rename claude/p/one
@@ -222,6 +239,7 @@ if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; then
   # then the link died: exit 255 with no teardown.
   cat > "$tmp/fakebin/ssh" <<'EOF'
 #!/bin/sh
+case "$*" in *hgs-remote-v2*) echo "hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"; exit 0 ;; esac
 for a; do case "$a" in LocalCommand=*) "${SHELL:-/bin/sh}" -c "${a#LocalCommand=}" ;; esac; done
 printf '\033[?1049h\033[?1h\033[?1003h\033[?1006h\033[?2004h'
 exit 255
@@ -540,7 +558,13 @@ PATH="$tmp/fakebin:$PATH" json_ok "json: SSH failure preserves the connection re
 assert d['ok'] is False and d['error'] == 'offline', d
 assert 'Connection refused' in d['error_detail'], d
 " @nowhere ls --json
-printf '#!/bin/sh\necho "  claude/legacy-session   0 client(s)"\nexit 0\n' > "$tmp/fakebin/ssh"; chmod +x "$tmp/fakebin/ssh"
+cat > "$tmp/fakebin/ssh" <<'EOF'
+#!/bin/sh
+case "$*" in *hgs-remote-v2*) echo "hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"; exit 0 ;; esac
+echo "  claude/legacy-session   0 client(s)"
+exit 0
+EOF
+chmod +x "$tmp/fakebin/ssh"
 PATH="$tmp/fakebin:$PATH" json_ok "json: пир отвечает не-JSON -> ok:false, error:bad_response" "
 assert d['host'] == 'nowhere', d
 assert d['ok'] is False and d['error'] == 'bad_response', d
@@ -763,6 +787,7 @@ exit 0
 EOF
 cat > "$tmp/fakebin/ssh" <<EOF
 #!/bin/sh
+case "\$*" in *hgs-remote-v2*) echo "hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot"; exit 0 ;; esac
 echo "ssh \$*" >> "$tmp/paste.log"
 case "\$FAKE_CLIP" in
   png)    printf 'PNGDATA'; exit 0 ;;
@@ -892,7 +917,11 @@ fi
 
 # --- guards ---
 out="$(TMUX=/tmp/fake,1,0 "$HGS" claude sample-project 2>&1)"; rc=$?
-if [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -q "inside tmux"; then pass=$((pass+1)); echo "ok   nested tmux refused"; else fail=$((fail+1)); echo "FAIL nested tmux refused (rc=$rc)"; printf '%s\n' "$out"; fi
+if [ "$rc" = 2 ] && printf '%s\n' "$out" | grep -q "inside tmux.*; use --new -d or open a new tab"; then pass=$((pass+1)); echo "ok   nested tmux refused"; else fail=$((fail+1)); echo "FAIL nested tmux refused (rc=$rc)"; printf '%s\n' "$out"; fi
+# A detached launch from inside a session starts beside it: no tab, no attach.
+out="$(TMUX=/tmp/fake,1,0 "$HGS" --dry-run claude sample-project --new -n nested -d 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -q -- "^tmux -u new-session -d .* -s claude/sample-project/nested " \
+   && ! printf '%s\n' "$out" | grep -qE "^tab |attach-session"; then pass=$((pass+1)); echo "ok   nested detached launch"; else fail=$((fail+1)); echo "FAIL nested detached launch (rc=$rc)"; printf '%s\n' "$out"; fi
 check "no args -> usage rc 1"         1 "^usage:"
 check "help"                          0 "^usage:" -h
 check "ls with no server"             0 "no sessions" ls
@@ -912,7 +941,8 @@ check "launch token requires new session" 1 "requires --new" --dry-run sh "$P" -
 check "launch token validates UUID" 1 "needs a UUID" --dry-run sh "$P" --new --launch-id invalid
 check "launch token forwards over interactive SSH" 0 "ssh -t.*--launch-id $launch_id" --dry-run @nowhere sh "$P" --new -n group-test --launch-id "$launch_id"
 # New sessions accept the same tags as rename and fork, so the GUI can create them.
-check "new session accepts inner spaces" 0 "-s sh/sample-project/my plan -c " --dry-run sh "$P" --new -n 'my plan'
+# The dry-run line quotes the name as one shell word (zerus-sa9qn.38).
+check "new session accepts inner spaces" 0 "-s 'sh/sample-project/my plan' -c " --dry-run sh "$P" --new -n 'my plan'
 check "@peer new session quotes a spaced name" 0 "--new -n 'my plan' -d --dry-run\$" --dry-run @nowhere sh "$P" --new -n 'my plan' -d
 for bad in ' plan' 'plan ' 'a/b' 'a.b' 'a:b' "$(printf 'a\tb')"; do
   check "new session rejects tag '$bad'" 1 "new session name" --dry-run sh "$P" --new -n "$bad"
@@ -956,7 +986,7 @@ while True:
         break
     time.sleep(0.1)
 assert ended.get(sys.argv[2]) == {'launch_id': sys.argv[2], 'name': 'sh/sample-project/gone', 'code': None,
-                                  'output': ''}, box
+                                  'output': '', 'diagnostic_code': 'launch_supervisor_report_missing'}, box
 assert sys.argv[3] not in ended, box
 assert all(session['name'] != 'sh/sample-project/gone' for session in box['sessions']), box
 PY

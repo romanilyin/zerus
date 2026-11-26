@@ -19,12 +19,59 @@ from tests import test_tasks
 REPO = Path(__file__).resolve().parents[1]
 HGS = Path(os.environ.get("HGS_TEST_BIN", REPO / "target/debug/hgs")).resolve()
 TMUX = shutil.which("tmux")
+# A real peer is not a descendant of the local SSH client's agent. Give the
+# stand-in the same boundary, rather than only clearing the child's markers.
+SSH_TRANSPORT = r'''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, tempfile, time
+root = pathlib.Path(os.environ['ROUTING_ROOT'])
+env = {k: v for k, v in os.environ.items() if not k.startswith(('HGS_', 'TMUX'))}
+env['HGS_SSH'] = str(root / 'ssh')
+env['HGS_TAB'] = '0'
+with tempfile.TemporaryDirectory(prefix='peer-', dir=root) as temporary:
+    call = pathlib.Path(temporary)
+    (call / 'request').write_text(json.dumps(dict(args=sys.argv[1:], text=sys.stdin.read())))
+    # The worker waits for this short-lived launcher to exit before executing.
+    subprocess.run(['sh', '-c', '"$@" "$$" </dev/null >/dev/null 2>&1 &',
+                    'peer-fixture', sys.executable, str(root / 'peer.py'), str(call)],
+                   env=env, check=True, timeout=5)
+    until = time.monotonic() + 55
+    while not (call / 'result').exists():
+        if time.monotonic() > until:
+            raise TimeoutError('private peer command did not settle')
+        time.sleep(.005)
+    result = json.loads((call / 'result').read_text())
+    sys.stdout.write(result['stdout']); sys.stderr.write(result['stderr'])
+    sys.exit(result['code'])
+'''
+PEER = r'''
+import json, os, pathlib, subprocess, sys, time
+call = pathlib.Path(sys.argv[1]); launcher = int(sys.argv[2])
+try:
+    until = time.monotonic() + 3
+    while os.getppid() == launcher and time.monotonic() < until:
+        time.sleep(.002)
+    if os.getppid() == launcher:
+        raise TimeoutError('private peer launcher did not exit')
+    for marker in ('HGS_SESSION', 'HGS_RUN_ID', 'HGS_SESSION_ID', 'HGS_AGENT'):
+        assert marker not in os.environ, marker
+    request = json.loads((call / 'request').read_text())
+    result = subprocess.run([sys.executable, str(pathlib.Path(os.environ['ROUTING_ROOT']) / 'ssh-command'),
+                             *request['args']], input=request['text'],
+                            text=True, capture_output=True, timeout=45)
+    reply = dict(code=result.returncode, stdout=result.stdout, stderr=result.stderr)
+except Exception as error:
+    reply = dict(code=255, stdout='', stderr=str(error))
+(call / 'result.tmp').write_text(json.dumps(reply))
+os.replace(call / 'result.tmp', call / 'result')
+'''
 SSH = '''#!/usr/bin/env python3
 import json, os, pathlib, shlex, subprocess, sys
 root = pathlib.Path(os.environ['ROUTING_ROOT'])
 alias = sys.argv[-2]
 if (root / ('offline-' + alias)).exists():
     print('ssh: connect to host ' + alias + ': Connection timed out', file=sys.stderr); sys.exit(255)
+if sys.argv[-1] == 'echo "hgs-remote-v2|%OS%|%SystemRoot%|$env:OS|$env:SystemRoot"':
+    print('hgs-remote-v2|%OS%|%SystemRoot%|:OS|:SystemRoot'); sys.exit(0)
 node = root / alias
 env = dict(os.environ, HOME=str(node / 'profile'), HGS_CONFIG_DIR=str(node / 'config'),
            HGS_STATE_DIR=str(node / 'state'), TASK_FIXTURE=str(node))
@@ -32,7 +79,9 @@ for name in ('HGS_SESSION', 'HGS_RUN_ID'):
     env.pop(name, None)  # an SSH login is no agent
 args = shlex.split(sys.argv[-1])[1:]
 with (root / 'calls').open('a') as file: file.write(alias + ' ' + ' '.join(args) + '\\n')
-if (root / ('dropafter-' + alias)).exists() and args[:2] == ['task', 'send']:
+if (root / ('oldcancel-' + alias)).exists() and args[:2] == ['task', 'cancel-execution']:
+    print('hgs: usage: hgs task cancel REF', file=sys.stderr); sys.exit(1)
+if (root / ('dropafter-' + alias)).exists() and args[:2] in (['task', 'send'], ['task', 'cancel-execution'], ['task', 'start-deliver']):
     # The connection drops after that computer pasted and answered.
     subprocess.run([os.environ['ROUTING_HGS'], *args], input=sys.stdin.read(), env=env, text=True, capture_output=True)
     print('Connection reset by peer', file=sys.stderr); sys.exit(255)
@@ -54,7 +103,9 @@ class TaskRouting(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(prefix="hgs-routing-")
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
-        ssh = self.root / "ssh"; ssh.write_text(SSH); ssh.chmod(0o755)
+        ssh = self.root / "ssh"; ssh.write_text(SSH_TRANSPORT); ssh.chmod(0o755)
+        (self.root / "ssh-command").write_text(SSH)
+        (self.root / "peer.py").write_text(PEER)
         self.base = dict(os.environ, ROUTING_ROOT=str(self.root), ROUTING_HGS=str(HGS), HGS_SSH=str(ssh), HGS_TAB="0")
         for name in ("TMUX", "TMUX_PANE", "HGS_RUN_ID", "HGS_SESSION", "HGS_EXECUTABLE", "HGS_SELF", "HGS_PEERS"):
             self.base.pop(name, None)
@@ -63,7 +114,7 @@ class TaskRouting(unittest.TestCase):
             (self.root / node / "state").mkdir()
             socket = self.root / node / "socket"
             # hgs puts $HOME/.local/bin first on PATH: each node's tmux stays private.
-            shim = home / "tmux"; shim.write_text(f'#!/bin/sh\nexec {TMUX} -S "{socket}" -f /dev/null "$@"\n'); shim.chmod(0o755)
+            shim = home / "tmux"; shim.write_text(f'#!/bin/sh\n[ -d "{socket.parent}" ] || {{ echo "private tmux socket directory is gone" >&2; exit 97; }}\nexec {TMUX} -S "{socket}" -f /dev/null "$@"\n'); shim.chmod(0o755)
             self.addCleanup(lambda socket=socket: subprocess.run([TMUX, "-S", str(socket), "kill-server"], capture_output=True))
             config = self.root / node / "config"; config.mkdir()
             (config / "config").write_text(f'HGS_SELF="{node}"\nHGS_PEERS="{peer}"\n')
@@ -132,6 +183,8 @@ class TaskRouting(unittest.TestCase):
         # The agent's next hook event confirms the pasted input.
         record = json.loads(self.record.read_text())
         record["last_event_at"] = record.get("input_pending_at", time.time()) + 1
+        # An input-acceptance event, as UserPromptSubmit records it (zerus-iitw8).
+        record["input_seen_at"] = record["last_event_at"]
         self.record.write_text(json.dumps(record))
 
     def received(self):
@@ -164,6 +217,10 @@ class TaskRouting(unittest.TestCase):
         self.assertEqual((there["stage"], there["session"]["host"]), ("active", ""))
         entry = next(e for e in there["log"] if e["kind"] == "sent")
         self.assertEqual(entry["actor"]["kind"], "person")
+        # C3 activation: b has not seen a's replica yet, so its bootstrap
+        # gate is positively open: the legacy route, no floor, no attempt.
+        execution = there["execution"]
+        self.assertEqual((execution["attempts"], execution["current"]["legacy"]), (0, True), execution)
         calls = (self.root / "calls").read_text()
         self.assertIn("b task send " + task["uuid"] + " --project project-1", calls)
 
@@ -223,6 +280,63 @@ class TaskRouting(unittest.TestCase):
             view = self.get(node, task)
             self.assertEqual(view["stage"], "review", node)
             self.assertIn("Wrong approach", [e.get("text") for e in view["log"]], node)
+
+    def test_start_plan_and_readonly_recovery_route_the_original_identity(self):
+        task = self.add("A routed guarded start", "--target", "codex/remote", "--host", "b")
+        current = self.get("a", task)
+        record = json.loads(self.record.read_text())
+        request = dict(schema=1, id=str(uuid.uuid4()), stage_at=current["stage_at"], target=current["target"],
+                       selection=dict(host="b", name="codex/remote", session_id="run_id:" + record["run_id"],
+                                      run_id=record["run_id"], conversation_id=record["conversation_id"]))
+        plan = self.task("a", "start-plan", task["id"], "--project", "project-1", text=json.dumps(request))["plan"]
+        self.assertEqual(plan["selection"]["host"], "")
+        self.assertEqual(self.received(), "")
+        (self.root / "dropafter-b").touch()
+        self.assertIn("Connection reset", self.task("a", "start-deliver", task["id"], "--project", "project-1", text=json.dumps(plan), ok=False))
+        self.wait_received("A routed guarded start")
+        (self.root / "dropafter-b").unlink()
+        settled = self.task("a", "start-deliver", task["id"], "--project", "project-1", "--recover-only", text=json.dumps(plan))
+        self.assertEqual((settled["state"], settled["id"]), ("submitted", request["id"]))
+        self.assertEqual(self.received().count("A routed guarded start"), 1)
+        self.assertEqual(self.get("a", task)["stage"], "active")
+
+    def test_guarded_cancellation_routes_exact_payload_and_refuses_unknown_replay(self):
+        task = self.add("Check pinned cancellation", "--target", "codex/remote", "--host", "b")
+        self.task("a", "send", task["id"], "--project", "project-1")
+        self.wait_received("Check pinned cancellation")
+        self.confirm()
+        sent = self.get("a", task)
+        request = dict(schema=1, dispatch_id=sent["dispatch_id"], stage_at=sent["stage_at"], machine=sent["session"]["machine"],
+                       session_id=sent["session"]["session_id"], reason="--agent")
+        (self.root / "oldcancel-b").touch()
+        self.assertIn("usage", self.task("a", "cancel-execution", task["id"], "--project", "project-1", text=json.dumps(request), ok=False))
+        self.assertEqual(self.get("a", task)["stage"], "active")
+        self.assertNotIn("cancelled]", self.received())
+        (self.root / "oldcancel-b").unlink()
+        (self.root / "dropafter-b").touch()
+        error = self.task("a", "cancel-execution", task["id"], "--project", "project-1", text=json.dumps(request), ok=False)
+        self.assertIn("Connection reset", error)
+        self.wait_received(" cancelled]")
+        self.assertEqual(self.get("b", task)["stage"], "review")
+        (self.root / "dropafter-b").unlink()
+        self.assertIn("changed", self.task("a", "cancel-execution", task["id"], "--project", "project-1", text=json.dumps(request), ok=False))
+        self.assertEqual(self.received().count(" cancelled]"), 1)
+        self.assertNotIn("--agent", self.received())
+        self.assertIn("--agent", [e.get("text") for e in self.get("b", task)["log"]])
+
+    def test_guarded_cancellation_offline_fallback_checks_same_execution(self):
+        task = self.add("Offline cancellation", "--target", "codex/remote", "--host", "b")
+        self.task("a", "send", task["id"], "--project", "project-1")
+        self.wait_received("Offline cancellation")
+        sent = self.get("a", task)
+        request = dict(schema=1, dispatch_id=sent["dispatch_id"], stage_at=sent["stage_at"], machine=sent["session"]["machine"],
+                       session_id=sent["session"]["session_id"], reason="No longer needed")
+        (self.root / "offline-b").touch()
+        out = self.task("a", "cancel-execution", task["id"], "--project", "project-1", text=json.dumps(request))
+        self.assertEqual(out["task"]["stage"], "review")
+        self.assertNotIn("log", out["task"])
+        self.assertFalse(out["cancel_message"]["sent"])
+        self.assertNotIn("cancelled]", self.received())
 
     def test_an_unreachable_computer_refuses_a_send_and_records_nothing(self):
         task = self.add("Add rate limiting", "--target", "codex/remote", "--host", "b")

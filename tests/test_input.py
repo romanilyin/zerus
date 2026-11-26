@@ -2,6 +2,8 @@
 """Message transport tests. Private tmux socket + scripted raw-terminal agent only."""
 import base64
 import hashlib
+import hook_caller_fixtures
+import codex_refusal_artifacts
 import json
 import os
 from pathlib import Path
@@ -34,13 +36,16 @@ def read_input(fd):
 '''
 
 FAKE_AGENT = SIGNAL_SAFE_READ + r'''
-import json, os, pathlib, signal, subprocess, sys, termios, time, tty
+import json, os, pathlib, signal, subprocess, sys, termios, threading, time, tty
 root = pathlib.Path(os.environ['INPUT_FIXTURE'])
 fd = sys.stdin.fileno()
 original = termios.tcgetattr(fd)
 tty.setraw(fd)
 os.write(1, b'\x1b[?2004h\x1b[2J\x1b[H' + '\u203a '.encode())
 def screen(*args):
+    if (root / 'unreadable-environment').exists() and sys.platform.startswith('linux'):
+        import ctypes
+        assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE
     os.write(1, (root / 'screen').read_bytes())
 signal.signal(signal.SIGUSR1, screen)
 children = []
@@ -51,11 +56,59 @@ def launch(*args):
             stdin=subprocess.DEVNULL, stdout=log, stderr=log))
 signal.signal(signal.SIGUSR2, launch)
 (root / 'agent-pid').write_text(str(os.getpid()))
+# zerus-iitw8: with root/'claude-composer' (its transcript path) a bracketed
+# paste shows in a Claude composer and Enter records it as Claude does.
+# 'claude-pasting' holds its Pasting… footer and empty composer for the
+# milliseconds it names (empty: forever), and an Enter meanwhile is swallowed
+# and logged to 'claude-swallowed', as Claude 2.1.322 does with pasted
+# images; 'claude-swallow' ignores every Enter.
+composer, pasting, processing = '', None, False
+def claude(text):
+    rule = '\u2500' * 40
+    shown = text if '\n' not in text.strip() else '[Pasted text #1 +%d lines]' % text.strip().count('\n')
+    footer = 'Pasting\u2026' if (root / 'claude-pasting').exists() else 'paste again to expand'
+    os.write(1, ('\x1b[2J\x1b[H\u25cf done\r\n' + rule + '\r\n\u276f ' + shown + '\r\n' + rule + '\r\n  ' + footer
+                 + '\x1b[3;%dH' % (3 + len(shown))).encode())
 try:
     while True:
         value = read_input(fd)
         if not value: break
         with (root / 'received').open('ab') as file: file.write(value)
+        if (root / 'claude-composer').exists():
+            if pasting is not None or value.startswith(b'\x1b[200~'):
+                pasting = (pasting or b'') + value
+                if b'\x1b[201~' in pasting:
+                    composer = pasting.split(b'\x1b[200~', 1)[1].split(b'\x1b[201~', 1)[0].decode()
+                    pasting = None
+                    delay = (root / 'claude-pasting').read_text().strip() if (root / 'claude-pasting').exists() else '0'
+                    if delay != '0':
+                        processing = True
+                        claude('')
+                        if delay:
+                            def settled(text=composer, wait=int(delay) / 1000):
+                                global processing
+                                time.sleep(wait)
+                                processing = False
+                                (root / 'claude-pasting').unlink(missing_ok=True)
+                                claude(text)
+                            threading.Thread(target=settled, daemon=True).start()
+                    else:
+                        claude(composer)
+                continue
+            if value == b'\r' and processing:
+                with (root / 'claude-swallowed').open('a') as file: file.write('enter while pasting\n')
+                continue
+            if value == b'\r' and composer.strip() and not (root / 'claude-swallow').exists():
+                transcript = pathlib.Path((root / 'claude-composer').read_text())
+                # Typed and stamped as Claude records it (zerus-iitw8.4).
+                now = time.time()
+                stamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)) + '.%03dZ' % int(now % 1 * 1000)
+                with transcript.open('a') as file:
+                    file.write(json.dumps({'type': 'user', 'promptSource': 'typed', 'timestamp': stamp,
+                                           'message': {'role': 'user', 'content': composer}}) + '\n')
+                composer = ''
+                claude('')
+                continue
         # Optionally redraw like an agent that stops its turn on Escape.
         if value == b'\x1b' and (root / 'on-escape').exists(): os.write(1, (root / 'on-escape').read_bytes())
         # Or answer scripted keys in order, one redraw each: [[key hex, output], ...].
@@ -86,6 +139,9 @@ class InputTransport(unittest.TestCase):
                         PATH=str(self.bin) + ":" + os.environ["PATH"])
         for variable in ("TMUX", "TMUX_PANE", "HGS_RUN_ID", "HGS_SESSION", "HGS_EXECUTABLE"):
             self.env.pop(variable, None)
+        self.env.pop('NO_COLOR', None)
+        if self._testMethodName.startswith('test_no_color_'):
+            self.env['NO_COLOR'] = '1'
         (self.bin / "hgs").symlink_to(HGS)
         self.script("tmux", '#!/bin/sh\nexec ' + TMUX + ' -S "' + str(self.socket) + '" -f /dev/null "$@"\n')
         (self.root / "agent.py").write_text(FAKE_AGENT)
@@ -110,6 +166,11 @@ class InputTransport(unittest.TestCase):
         self.write_record()
 
     def tearDown(self):
+        hook_error = None
+        if path := getattr(self, "native_hook_socket", None):
+            import hook_caller_fixtures
+            try: hook_caller_fixtures.stop(path)
+            except (OSError, TimeoutError) as error: hook_error = error
         pids = {pid for pid in self.tmux('list-panes', '-a', '-F', '#{pane_pid}', check=False).splitlines()
                 if pid.isdigit()}
         self.tmux("kill-server", check=False)
@@ -126,7 +187,9 @@ class InputTransport(unittest.TestCase):
                 break
             time.sleep(.02)
         self.assertFalse(pids, 'owned fixture panes survived tmux shutdown')
+        codex_refusal_artifacts.preserve(self.root, self.id(), REPO / "artifacts/test-results/python")
         self.temp.cleanup()
+        if hook_error: raise hook_error
 
     def script(self, name, value):
         path = self.bin / name
@@ -137,6 +200,7 @@ class InputTransport(unittest.TestCase):
         self.record_path.write_text(json.dumps(self.record))
 
     def tmux(self, *args, check=True):
+        assert self.socket.parent.is_dir(), "the private tmux socket directory is gone"
         result = subprocess.run([str(self.bin / "tmux"), *args], env=self.env,
                                 capture_output=True, text=True, timeout=5)
         if check: self.assertEqual(result.returncode, 0, result.stderr)
@@ -147,6 +211,16 @@ class InputTransport(unittest.TestCase):
             if callback(): return
             time.sleep(.02)
         self.fail("fixture timed out")
+
+    def wait_until(self, callback, timeout, describe=lambda: ""):
+        """Polls `callback` until it holds or `timeout` seconds of wall clock
+        pass. For an event a loaded runner reaches far later than a quiet one
+        (zerus-eubyp); `describe` says what the fixture saw when it gave up."""
+        deadline = time.monotonic() + timeout
+        while not callback():
+            if time.monotonic() >= deadline:
+                self.fail(f"fixture timed out after {timeout} s: {describe()}")
+            time.sleep(.02)
 
     def payload(self, **updates):
         value = dict(request_id=str(uuid.uuid4()), text="hello", attachments=[],
@@ -168,6 +242,19 @@ class InputTransport(unittest.TestCase):
     def received(self):
         path = self.root / "received"
         return path.read_bytes() if path.exists() else b""
+
+    def claude_composer(self):
+        """The fake agent shows pastes in a Claude composer and records Enter in the transcript (zerus-iitw8)."""
+        if not self.record.get('transcript'):
+            self.record['transcript'] = str(self.root / 'claude-transcript.jsonl')
+            self.write_record()
+        (self.root / 'claude-composer').write_text(self.record['transcript'])
+
+    def composer_for(self, agent):
+        if agent == 'claude':
+            self.claude_composer()
+        else:
+            (self.root / 'claude-composer').unlink(missing_ok=True)
 
     def screen(self, value, cursor):
         import signal
@@ -560,6 +647,127 @@ for kind in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'S
                 self.assertTrue(any(e.get('detail') == 'Child review result' for e in view['events']))
                 self.assertEqual(self.received(), b'')
 
+    def test_killed_external_child_without_stop_is_not_working_and_can_be_retired(self):
+        import signal
+        self.script('codex', '''#!/usr/bin/env python3
+import json, os, pathlib, signal, subprocess
+root = pathlib.Path(os.environ['INPUT_FIXTURE'])
+for kind in ['SessionStart', 'UserPromptSubmit']:
+    event = dict(hook_event_name=kind, session_id=os.environ['CHILD_CONVERSATION'], cwd=str(root))
+    subprocess.run(['hgs', '__state', 'hook'], input=json.dumps(event), text=True, check=True)
+def pending(*args):
+    event = dict(hook_event_name='PermissionRequest', session_id=os.environ['CHILD_CONVERSATION'], tool_name='Bash', tool_use_id='pending', tool_input=dict(command='fixture'))
+    subprocess.run(['hgs', '__state', 'hook'], input=json.dumps(event), text=True, check=True)
+    (root / 'child-hook-finished').write_text('finished')
+signal.signal(signal.SIGUSR1, pending)
+def progressed(*args):
+    event = dict(hook_event_name='PostToolUse', session_id=os.environ['CHILD_CONVERSATION'], tool_name='Bash', tool_use_id='pending')
+    subprocess.run(['hgs', '__state', 'hook'], input=json.dumps(event), text=True, check=True)
+    (root / 'child-hook-progressed').write_text('finished')
+signal.signal(signal.SIGUSR2, progressed)
+(root / 'child-pid').write_text(str(os.getpid()))
+while True: signal.pause()
+''')
+        sid = str(uuid.uuid4())
+        self.record.update(agent='claude', main_done=True, activity='idle', phase='idle', active_tools={})
+        self.write_record()
+        env = dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id,
+                   CHILD_CONVERSATION=sid, CODEX_HOME=str(self.root / '.codex'))
+        launch = dict(argv=[str(self.bin / 'codex'), 'exec', '--ephemeral'], env=env)
+        (self.root / 'nested-launch.json').write_text(json.dumps(launch))
+        os.kill(self.record['pid'], signal.SIGUSR2)
+        self.wait_for(lambda: (self.root / 'child-pid').exists() and (self.root / 'child-pid').read_text().strip())
+        pid = int((self.root / 'child-pid').read_text())
+        before = self.inspect()
+        self.assertEqual(before['subagent_active_count'], 1)
+        child_id, child = next(iter(before['subagents'].items()))
+        raw = json.loads(self.record_path.read_text())
+        self.assertEqual(raw['subagents'][child_id]['original_process']['pid'], pid)
+        self.assertTrue(raw['subagents'][child_id]['original_process']['birth'])
+        request = dict(request_id=str(uuid.uuid4()), expected_run_id=self.run_id,
+                       expected_conversation_id=self.conversation_id, agent_id=child_id,
+                       expected_updated=child['updated'])
+        def retire(payload):
+            return subprocess.run([str(HGS), 'subagent', 'retire', self.name, '--json'],
+                                  input=json.dumps(payload), env=self.env, text=True,
+                                  capture_output=True, timeout=5)
+        preserved = self.record_path.read_bytes()
+        refused = retire(request)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('still live', refused.stderr)
+        self.assertEqual(self.record_path.read_bytes(), preserved)
+        # Model a legacy/unbound record: explicit retirement can mark it Ended,
+        # but a genuine hook with fresh process evidence must recover it without
+        # SessionStart. A different recorded birth must not be adopted that way.
+        raw['subagents'][child_id].pop('original_process')
+        self.record_path.write_text(json.dumps(raw))
+        self.assertEqual(retire(request).returncode, 0)
+        retired = json.loads(self.record_path.read_text())
+        retired['subagents'][child_id]['original_process'] = dict(
+            json.loads(preserved)['subagents'][child_id]['original_process'], birth='different original birth')
+        self.record_path.write_text(json.dumps(retired))
+        wrong_birth = self.record_path.read_bytes()
+        os.kill(pid, signal.SIGUSR1)
+        self.wait_for(lambda: (self.root / 'child-hook-finished').exists())
+        self.assertEqual(self.record_path.read_bytes(), wrong_birth)
+        (self.root / 'child-hook-finished').unlink()
+        retired['subagents'][child_id].pop('original_process')
+        self.record_path.write_text(json.dumps(retired))
+        os.kill(pid, signal.SIGUSR1)
+        self.wait_for(lambda: (self.root / 'child-hook-finished').exists())
+        resumed = self.inspect()['subagents'][child_id]
+        self.assertEqual(resumed['display_state'], 'approval')
+        self.assertEqual(resumed['attention_id'], 'pending')
+        self.assertEqual(json.loads(self.record_path.read_text())['subagents'][child_id]['original_process']['pid'], pid)
+        self.assertEqual(retire(request).returncode, 0, 'original receipt must not retire the recovered child')
+        request = dict(request, request_id=str(uuid.uuid4()), expected_updated=resumed['updated'])
+        # Finish the explicit attention before testing loss of Working. Unknown
+        # process evidence must not hide an outstanding approval or input.
+        os.kill(pid, signal.SIGUSR2)
+        self.wait_for(lambda: (self.root / 'child-hook-progressed').exists())
+        self.assertIsNone(self.inspect()['subagents'][child_id].get('display_state'))
+        from test_watch import Stream
+        stream = Stream(self)
+        snapshot = stream.next(lambda frame: frame['t'] == 'snapshot' and frame['topic'] == 'catalog' and frame['last'])
+        listed = next(item['row'] for item in snapshot['items'] if item['row'].get('name') == self.name)
+        self.assertEqual(listed['subagent_active_count'], 1)
+        unchanged = self.record_path.read_bytes()
+        # Kill ONLY the private fake child, with no Stop/SessionEnd hook.
+        os.kill(pid, signal.SIGKILL)
+        delta = stream.next(lambda frame: frame['t'] == 'delta' and frame['topic'] == 'catalog' and any(
+            item['row'].get('name') == self.name and item['row'].get('subagent_active_count') == 0
+            for item in frame['upsert']))
+        self.assertTrue(delta['upsert'])
+        self.assertEqual(self.record_path.read_bytes(), unchanged, 'watch must observe exit without a new hook or write')
+        self.assertEqual(stream.close(), 0)
+        self.wait_for(lambda: self.inspect()['subagent_active_count'] == 0)
+        ended = self.inspect()
+        self.assertEqual(ended['activity'], 'idle')
+        self.assertIn(ended['subagents'][child_id].get('display_state'), ('ended', 'unknown'))
+        request['expected_updated'] = ended['subagents'][child_id]['updated']
+        result = retire(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt['state'], 'ended')
+        self.assertIs(receipt['native_completion'], False)
+        preserved = self.record_path.read_bytes()
+        again = retire(request)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout), receipt)
+        self.assertEqual(self.record_path.read_bytes(), preserved)
+        # A fresh, genuinely observed SessionStart can resume this conversation;
+        # replaying the old retirement only reads its receipt, never re-retires it.
+        (self.root / 'child-pid').unlink()
+        os.kill(self.record['pid'], signal.SIGUSR2)
+        self.wait_for(lambda: (self.root / 'child-pid').exists() and (self.root / 'child-pid').read_text().strip())
+        self.assertEqual(self.inspect()['subagent_active_count'], 1)
+        self.assertEqual(retire(request).returncode, 0)
+        self.assertEqual(self.inspect()['subagent_active_count'], 1)
+        view = subprocess.run([str(HGS), 'inspect', self.name, '--agent', child_id],
+                              env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(view.returncode, 0, view.stderr)
+        self.assertFalse(any(event.get('type') in ('Stop', 'SubagentStop') for event in json.loads(view.stdout)['events']))
+
     def test_unknown_foreign_session_start_cannot_rebind_parent(self):
         env = dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id)
         event = dict(hook_event_name='SessionStart', session_id=str(uuid.uuid4()), model='foreign-model')
@@ -567,6 +775,33 @@ for kind in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'S
             input=json.dumps(event), capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.record_path.read_text()), self.record)
+
+    def test_subagent_retirement_checks_exact_guards_and_finite_input_and_record(self):
+        self.record.update(agent='claude', main_done=True, activity='idle', phase='idle', active_tools={},
+                           subagents={'stale': dict(external=True, state='working', updated=2.0)})
+        self.write_record()
+        request = dict(request_id=str(uuid.uuid4()), expected_run_id=self.run_id,
+                       expected_conversation_id=self.conversation_id, agent_id='stale', expected_updated=2.0)
+        def refused(payload, reason):
+            before = self.record_path.read_bytes()
+            result = subprocess.run([str(HGS), 'subagent', 'retire', self.name, '--json'],
+                                    input=json.dumps(payload), env=self.env, text=True,
+                                    capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(reason, result.stderr)
+            self.assertEqual(self.record_path.read_bytes(), before)
+        refused(dict(request, expected_run_id='changed'), 'generation changed')
+        refused(dict(request, expected_conversation_id='changed'), 'generation changed')
+        refused(dict(request, agent_id='missing'), 'not in the selected conversation')
+        refused(dict(request, expected_updated=3.0), 'changed; inspect it again')
+        refused(dict(request, extra=True), 'Invalid subagent retirement request')
+        refused(dict(request, extra='x' * 8192), 'exceeds 8 KiB')
+        self.record['subagents']['stale']['group'] = True
+        self.write_record()
+        refused(request, 'profile group')
+        self.record['retirement_padding'] = 'x' * (16 * 1024 * 1024)
+        self.write_record()
+        refused(request, 'exceeds retirement bound')
 
     def test_login_delay_cannot_receive_first_prompt_until_native_composer(self):
         self.fresh_unconfirmed()
@@ -614,18 +849,406 @@ for kind in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'S
         self.assertIn("input mode", self.send(success=False))
         self.assertEqual(self.received(), b"")
 
+    def test_public_preinput_refusal_is_durable_and_an_exact_retry_rechecks_the_composer(self):
+        self.screen("\x1b[2J\x1b[H› existing draft", "16:0")
+        request = self.payload(text="type only after the draft is gone")
+        self.assertIn("draft", self.send(request, success=False))
+        self.assert_refusal(request)
+        path = self.state / "input_receipts" / (request["request_id"] + ".json")
+        self.assertIn("draft", self.send(request, success=False))
+        self.assert_refusal(request)
+        self.assertEqual(self.received(), b"")
+        self.screen("\x1b[2J\x1b[H› \x1b[?2004h", "2:0")
+        self.assertEqual(self.send(request)["status"], "submitted")
+        receipt = json.loads(path.read_bytes())
+        self.assertEqual(receipt["status"], "submitted")
+        self.assertNotIn("refusal_schema", receipt)
+        self.wait_for(lambda: self.received().endswith(b"\r"))
+
+    # zerus-ucck P3b: input goes to the session's own terminal, named apart
+    # from its label as a resume beside an untracked terminal names it; the
+    # input claim checks that terminal's name, never the label's.
+    def test_send_reaches_a_terminal_named_apart_from_its_label(self):
+        own = self.name + "~3f2a9c1d"
+        self.tmux("rename-session", "-t", "=" + self.name, own)
+        self.record["terminal_name"] = own
+        self.write_record()
+        self.screen("\x1b[2J\x1b[H› \x1b[?2004h", "2:0")
+        self.send()
+        self.wait_for(lambda: self.received().endswith(b"\r"))
+
+    def test_a_refusal_retry_retires_its_negative_before_pending_settings(self):
+        self.screen("\x1b[2J\x1b[H› existing draft", "16:0")
+        request = self.payload()
+        self.send(request, success=False)
+        self.assert_refusal(request)
+        self.screen("\x1b[2J\x1b[H› \x1b[?2004h", "2:0")
+        self.record["pending_settings"] = dict(run_id="other-run", conversation_id=self.conversation_id)
+        self.write_record()
+        self.assertIn("pending settings belong to a different session", self.send(request, success=False))
+        receipt = self.receipt_file(request)
+        self.assertEqual(receipt["status"], "preparing")
+        self.assertNotIn("refusal_schema", receipt)
+        self.assertIn("delivery uncertain", self.send(request, success=False))
+        self.assertEqual(self.received(), b"")
+
     def test_empty_claude_prompt_is_supported(self):
         self.record["agent"] = "claude"
         self.write_record()
+        self.claude_composer()
         self.screen("\x1b[2J\x1b[H❯ ", "2:0")
         self.send()
         self.wait_for(lambda: self.received().endswith(b"\r"))
+
+    def claude_ready(self):
+        self.record["agent"] = "claude"
+        self.write_record()
+        self.claude_composer()
+        self.screen("\x1b[2J\x1b[H❯ ", "2:0")
+
+    def slow_send(self, payload):
+        """hgs send with room for the whole settle and proof window (8 s)."""
+        return subprocess.run([str(HGS), "send", self.name, "--json"], input=json.dumps(payload), text=True,
+                              capture_output=True, env=self.env, timeout=30)
+
+    def receipt_file(self, payload):
+        return json.loads((self.state / "input_receipts" / (payload["request_id"] + ".json")).read_text())
+
+    def assert_refusal(self, payload, reason=None):
+        path = self.state / "input_receipts" / (payload["request_id"] + ".json")
+        self.assertTrue(path.is_file(), "the same public send must retain its pre-input refusal")
+        raw = path.read_bytes()
+        self.assertLessEqual(len(raw), 8192)
+        value = json.loads(raw)
+        self.assertEqual(value["refusal_schema"], 1)
+        self.assertEqual(value["status"], "refused_before_input")
+        self.assertEqual(value["request_id"], payload["request_id"])
+        self.assertEqual(value["name"], self.name)
+        self.assertEqual(value["run_id"], payload["expected_run_id"])
+        self.assertEqual(value["conversation_id"], payload["expected_conversation_id"])
+        self.assertEqual(value["digest"], hashlib.sha256(json.dumps(payload).encode()).hexdigest())
+        self.assertEqual(value["transport"], "terminal")
+        self.assertTrue(value["reason"])
+        self.assertLessEqual(len(value["reason"].encode()), 1024)
+        self.assertNotIn("\n", value["reason"])
+        self.assertNotIn("text", value)
+        self.assertNotIn("attachments", value)
+        if reason is not None:
+            self.assertEqual(value["reason"], reason)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def claude_rows(self):
+        path = Path(self.record["transcript"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_claude_enters_once_its_pasted_images_settle_and_proves_it(self):
+        # zerus-iitw8: Claude shows an empty composer with Pasting… while it
+        # processes pasted image paths and swallows an Enter meanwhile.
+        self.claude_ready()
+        (self.root / "claude-pasting").write_text("900")
+        payload = self.payload(text="Report:\n/srv/peer/target/shot.png\nDone.")
+        receipt = self.send(payload)
+        self.assertEqual((receipt["status"], receipt["native"]), ("submitted", "transcript"))
+        self.assertFalse((self.root / "claude-swallowed").exists(), "Enter was pressed while Claude was pasting")
+        self.assertEqual(self.received().count(b"\r"), 1)
+        self.assertEqual([row["message"]["content"] for row in self.claude_rows()], [receipt["submitted_text"]])
+        self.assertEqual(self.send(payload), receipt)
+        self.assertEqual(self.received().count(b"\r"), 1)
+
+    def test_claude_paste_that_never_settles_is_uncertain_without_an_enter(self):
+        self.claude_ready()
+        (self.root / "claude-pasting").write_text("")
+        payload = self.payload(text="Report with an image:\n/srv/peer/target/shot.png")
+        result = self.slow_send(payload)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("delivery uncertain: Claude's composer never showed the pasted message settled; no Enter was pressed", result.stderr)
+        self.assertNotIn(b"\r", self.received())
+        receipt = self.receipt_file(payload)
+        self.assertEqual((receipt["status"], receipt["delivery"]), ("in_progress", "uncertain"))
+        self.assertIsNone(receipt["composer"])
+        # Never offered again, never NotOffered.
+        before = self.received()
+        replay = self.slow_send(payload)
+        self.assertIn("do not resend automatically", replay.stderr)
+        self.assertEqual(self.received(), before)
+
+    def test_a_swallowed_claude_enter_is_uncertain_with_the_composer_residue(self):
+        self.claude_ready()
+        (self.root / "claude-swallow").write_text("")
+        text = "Peer report\nwith two lines"
+        payload = self.payload(text=text)
+        result = self.slow_send(payload)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("delivery uncertain: Claude recorded no submission of this message; the composer holds: [Pasted text #1 +1 lines]", result.stderr)
+        receipt = self.receipt_file(payload)
+        self.assertEqual((receipt["status"], receipt["delivery"], receipt["composer"]), ("in_progress", "uncertain", "[Pasted text #1 +1 lines]"))
+        self.assertEqual(self.received().count(b"\r"), 1, "exactly one Enter, never a blind second one")
+        self.assertEqual(self.claude_rows(), [])
+        # The unconfirmed input, and the residue behind it, keep every later message out.
+        self.assertIn("previous input has not been confirmed", self.send(self.payload(text="next"), success=False))
+        self.assertEqual(self.received().count(b"\x1b[200~"), 1)
+
+    def test_a_busy_agents_tool_events_do_not_confirm_the_previous_input(self):
+        self.record.update(activity="busy", phase="tool", active_tools={"one": {}})
+        self.write_record()
+        self.screen("\x1b[2J\x1b[H› ", "2:0")
+        self.send(self.payload(text="first queued message"))
+        def hook(kind):
+            event = dict(hook_event_name=kind, session_id=self.conversation_id, tool_name="Bash", tool_use_id="t2")
+            result = subprocess.run([str(HGS), "__state", "hook"], env=dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id),
+                                    input=json.dumps(event), capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        hook("PreToolUse")
+        hook("PostToolUse")
+        self.screen("\x1b[2J\x1b[H› ", "2:0")
+        refused = self.send(self.payload(text="second"), success=False)
+        self.assertIn("previous input has not been confirmed", refused)
+        # zerus-iitw8.6: a busy agent may hold it in its own queue until it takes it.
+        self.assertIn("a busy agent may keep it queued until it accepts it", refused)
+        hook("UserPromptSubmit")
+        self.screen("\x1b[2J\x1b[H› ", "2:0")
+        self.assertEqual(self.send(self.payload(text="second"))["status"], "submitted")
+
+    def background_send(self, payload):
+        """hgs send running while the test acts; communicate() collects it."""
+        proc = subprocess.Popen([str(HGS), "send", self.name, "--json"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        proc.stdin.write(json.dumps(payload))
+        proc.stdin.close()
+        # Python before 3.13 flushes a closed stdin in communicate(); the
+        # payload is already written, so communicate() must not touch it.
+        proc.stdin = None
+        return proc
+
+    def state_lock_free(self):
+        import fcntl
+        with (self.state / ".lock").open("rb") as file:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(file, fcntl.LOCK_UN)
+            return True
+
+    def claude_hook(self, kind, **fields):
+        event = dict(hook_event_name=kind, session_id=self.conversation_id, **fields)
+        # The controller is a sibling of the pinned agent. Have that actual
+        # agent spawn the hook; copied routing markers alone grant no authority.
+        result = hook_caller_fixtures.run(self, event,
+            dict(self.env, HGS_TEST_BIN=str(HGS), HGS_SESSION=self.name, HGS_RUN_ID=self.run_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def terminal_request(self, **values):
+        payload = dict(request_id=str(uuid.uuid4()), expected_run_id=self.run_id,
+                       expected_conversation_id=self.conversation_id, **values)
+        result = subprocess.run([str(HGS), "terminal", self.name, "--json"], input=json.dumps(payload), text=True,
+                                capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_a_settling_claude_paste_holds_no_lock_and_keeps_other_input_out(self):
+        # zerus-iitw8.5: the settle wait holds no state lock, so hooks run
+        # meanwhile; this send's marker keeps every other input out even when
+        # an acceptance event (here an earlier queued prompt taken now) opens
+        # the unconfirmed-input gate.
+        self.claude_ready()
+        (self.root / "claude-pasting").write_text("3000")
+        proc = self.background_send(self.payload(text="First message"))
+        self.wait_for(lambda: b"\x1b[201~" in self.received())
+        self.wait_until(self.state_lock_free, 2, lambda: "the settle holds the state lock")
+        self.assertTrue((self.root / "claude-pasting").exists(), "Claude is still pasting")
+        self.claude_hook("UserPromptSubmit")
+        self.assertTrue((self.root / "claude-pasting").exists(), "the hook ran during the settle")
+        record = json.loads(self.record_path.read_text())
+        self.assertGreater(record["input_seen_at"], record["input_pending_at"], "the gate alone would let a send in")
+        self.assertIn("another message is being entered", self.send(self.payload(text="Second message"), success=False))
+        # Terminal input and Clear input check the same marker.
+        binding = self.terminal_request(action="snapshot")["terminal_binding_id"]
+        typed = self.terminal_request(action="input", terminal_binding_id=binding, expires_at=time.time() + 5, text="typed", enter=False)
+        self.assertEqual(typed["status"], "failed")
+        self.assertIn("A message is being entered", typed["error"])
+        self.assertTrue((self.root / "claude-pasting").exists(), "all of it ran during the settle")
+        self.assertEqual(self.received().count(b"\x1b[200~"), 1)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        receipt = json.loads(out)
+        self.assertEqual((receipt["status"], receipt["native"]), ("submitted", "transcript"))
+        self.assertEqual(self.received().count(b"\r"), 1)
+        self.assertNotIn("input_typing", json.loads(self.record_path.read_text()))
+
+    def enter_after_a_change_under_the_lock(self, change):
+        """Holds the state lock while the paste settles, applies `change`, then
+        lets the send take the lock for its Enter."""
+        import fcntl
+        self.claude_ready()
+        (self.root / "claude-pasting").write_text("500")
+        payload = self.payload(text="Settled message")
+        proc = self.background_send(payload)
+        self.wait_for(lambda: b"\x1b[201~" in self.received())
+        with (self.state / ".lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.wait_until(lambda: not (self.root / "claude-pasting").exists(), 5)
+            # The settled composer holds for its stable time; the send then waits here.
+            time.sleep(.6)
+            self.assertNotIn(b"\r", self.received())
+            change()
+        out, err = proc.communicate(timeout=30)
+        return proc, err, payload
+
+    def test_claude_enter_rechecks_the_composer_under_the_lock(self):
+        # zerus-iitw8.5: the composer changed between the settle and the lock.
+        proc, err, payload = self.enter_after_a_change_under_the_lock(lambda: self.screen("\x1b[2J\x1b[H❯ ", "2:0"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("delivery uncertain: Claude's composer never showed the pasted message settled; no Enter was pressed", err)
+        self.assertNotIn(b"\r", self.received())
+        self.assertEqual(self.claude_rows(), [])
+        record = json.loads(self.record_path.read_text())
+        self.assertNotIn("input_typing", record)
+        self.assertEqual(self.receipt_file(payload)["delivery"], "uncertain")
+
+    def test_claude_enter_needs_its_own_marker_under_the_lock(self):
+        # zerus-iitw8.5: without this send's marker other input may have typed.
+        def expire():
+            self.record = json.loads(self.record_path.read_text())
+            self.record.pop("input_typing")
+            self.write_record()
+        proc, err, payload = self.enter_after_a_change_under_the_lock(expire)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("delivery uncertain: the session changed while the message settled; no Enter was pressed", err)
+        self.assertNotIn(b"\r", self.received())
+        self.assertEqual(self.receipt_file(payload)["delivery"], "uncertain")
+
+    def test_claude_presses_no_enter_when_the_lock_outlasts_the_window(self):
+        # zerus-iitw8.5: the Enter waits for the lock only within the same window.
+        proc, err, payload = self.enter_after_a_change_under_the_lock(lambda: time.sleep(8))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("delivery uncertain: the state lock stayed busy until the window ended; no Enter was pressed", err)
+        self.assertNotIn(b"\r", self.received())
+        self.assertEqual(self.receipt_file(payload)["delivery"], "uncertain")
+        self.assertNotIn("input_typing", json.loads(self.record_path.read_text()))
+
+    def test_a_claude_proof_confirms_only_its_own_pending_input(self):
+        # zerus-iitw8.6: a later pending input (here written while this send
+        # waits for its proof) is never confirmed by this send's proof.
+        self.claude_ready()
+        (self.root / "claude-swallow").write_text("")
+        payload = self.payload(text="First message")
+        proc = self.background_send(payload)
+        self.wait_until(lambda: self.received().endswith(b"\r"), 5)
+        self.record = json.loads(self.record_path.read_text())
+        seen = self.record["input_seen_at"]
+        later = self.record["input_pending_at"] + 0.001
+        self.record["input_pending_at"] = later
+        self.write_record()
+        now = time.time()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".%03dZ" % int(now % 1 * 1000)
+        with Path(self.record["transcript"]).open("a") as file:
+            file.write(json.dumps({"type": "user", "promptSource": "typed", "timestamp": stamp,
+                                   "message": {"role": "user", "content": "First message"}}) + "\n")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(json.loads(out)["native"], "transcript")
+        record = json.loads(self.record_path.read_text())
+        self.assertEqual(record["input_pending_at"], later)
+        self.assertEqual(record["input_seen_at"], seen, "the later input stays unconfirmed")
+        self.assertNotIn("input_typing", record)
+
+    def test_a_claude_transcript_proof_confirms_the_input_without_its_hook(self):
+        # zerus-iitw8.6: this fixture runs no UserPromptSubmit hook.
+        self.claude_ready()
+        first = self.send(self.payload(text="First message"))
+        self.assertEqual((first["status"], first["native"]), ("submitted", "transcript"))
+        record = json.loads(self.record_path.read_text())
+        self.assertGreater(record["input_seen_at"], record["input_pending_at"])
+        self.assertNotIn("input_typing", record)
+        second = self.send(self.payload(text="Second message"))
+        self.assertEqual((second["status"], second["native"]), ("submitted", "transcript"))
+        self.assertEqual([row["message"]["content"] for row in self.claude_rows()], ["First message", "Second message"])
+
+    def test_an_emptied_claude_composer_alone_never_confirms_the_input(self):
+        # zerus-iitw8.8: with no transcript known yet (a new conversation's
+        # first message) the emptied composer proves the Enter, but only
+        # Claude's own record or its UserPromptSubmit hook confirms the input.
+        self.claude_ready()
+        self.record.pop("transcript")
+        self.write_record()
+        first = self.send(self.payload(text="First message"))
+        self.assertEqual((first["status"], first["native"]), ("submitted", "composer"))
+        record = json.loads(self.record_path.read_text())
+        self.assertLess(record["input_seen_at"], record["input_pending_at"])
+        self.assertNotIn("input_typing", record)
+        self.assertIn("previous input has not been confirmed by the agent",
+                      self.send(self.payload(text="Second message"), success=False))
+        self.claude_hook("UserPromptSubmit")
+        second = self.send(self.payload(text="Second message"))
+        self.assertEqual((second["status"], second["native"]), ("submitted", "composer"))
+        self.assertEqual(self.received().count(b"\r"), 2)
+
+    def test_a_slow_claude_paste_keeps_other_input_out_for_its_whole_window(self):
+        # zerus-iitw8.8: the window starts after the paste, and so does the
+        # marker's term. Here the paste takes 7 s, as under host load: a term
+        # counted from before it ended at most 5 s after it, and Terminal
+        # input could type into the composer for the rest of the window.
+        self.claude_ready()
+        slow = self.root / "slow-paste"
+        self.script("tmux", f'#!/bin/sh\nif [ "$1" = paste-buffer ] && rm "{slow}" 2>/dev/null; then sleep 7; fi\n'
+                            f'exec {TMUX} -S "{self.socket}" -f /dev/null "$@"\n')
+        slow.write_text("")
+        (self.root / "claude-pasting").write_text("")
+        payload = self.payload(text="Slow message")
+        proc = self.background_send(payload)
+        self.wait_until(lambda: b"\x1b[201~" in self.received(), 20)
+        pasted = time.monotonic()
+        binding = self.terminal_request(action="snapshot")["terminal_binding_id"]
+        time.sleep(max(0, pasted + 5.8 - time.monotonic()))
+        self.assertIsNone(proc.poll(), "the send still waits in its window")
+        typed = self.terminal_request(action="input", terminal_binding_id=binding, expires_at=time.time() + 5, text="typed", enter=False)
+        self.assertEqual(typed["status"], "failed", typed)
+        self.assertIn("A message is being entered", typed["error"])
+        out, err = proc.communicate(timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("delivery uncertain: Claude's composer never showed the pasted message settled; no Enter was pressed", err)
+        self.assertNotIn(b"typed", self.received())
+        self.assertNotIn(b"\r", self.received())
+        self.assertEqual(self.receipt_file(payload)["delivery"], "uncertain")
+        self.assertNotIn("input_typing", json.loads(self.record_path.read_text()))
+
+    def test_a_lost_claude_enter_is_never_proven_by_another_or_an_earlier_message(self):
+        # zerus-iitw8.4: this send's Enter is lost; meanwhile Claude records an
+        # earlier queued "continue" it takes now, a longer typed message that
+        # contains this one, and a row stamped before the paste.
+        self.claude_ready()
+        (self.root / "claude-swallow").write_text("")
+        payload = self.payload(text="continue")
+        proc = self.background_send(payload)
+        self.wait_until(lambda: self.received().endswith(b"\r"), 5)
+        earlier = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 60))
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.999Z", time.gmtime())
+        rows = [
+            {"type": "queue-operation", "operation": "remove", "content": "continue", "commandUuid": "c1", "reason": "absorbed_mid_turn", "timestamp": now},
+            {"type": "attachment", "timestamp": now, "attachment": {"type": "queued_command", "prompt": "continue", "source_uuid": "c1"}},
+            {"type": "queue-operation", "operation": "dequeue", "timestamp": now},
+            {"type": "user", "promptSource": "queued", "timestamp": now, "message": {"role": "user", "content": "continue"}},
+            {"type": "user", "promptSource": "typed", "timestamp": now, "message": {"role": "user", "content": "Please review the PR.\ncontinue"}},
+            {"type": "user", "promptSource": "typed", "timestamp": earlier, "message": {"role": "user", "content": "continue"}},
+        ]
+        with Path(self.record["transcript"]).open("a") as file:
+            file.write("".join(json.dumps(row) + "\n" for row in rows))
+        out, err = proc.communicate(timeout=30)
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("delivery uncertain: Claude recorded no submission of this message", err)
+        receipt = self.receipt_file(payload)
+        self.assertEqual((receipt["status"], receipt["delivery"]), ("in_progress", "uncertain"))
+        self.assertEqual(self.received().count(b"\r"), 1)
 
     def test_claude_nbsp_prompt_accepts_docx_without_overwriting_drafts(self):
         self.record['agent']='claude';self.write_record()
         self.screen('\x1b[2J\x1b[H❯\u00a0existing\r\n──────────────\x1b[1;3H','2:0')
         self.assertIn('draft',self.send(success=False));self.assertEqual(self.received(),b'')
         self.screen('\x1b[2J\x1b[H❯\u00a0\r\n──────────────\r\n auto mode on\x1b[1;3H','2:0')
+        self.claude_composer()
         data=b'fake docx test content'
         receipt=self.send(self.payload(text='[File #1] Изучи документ',attachments=[dict(name='review.docx',
             mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -686,6 +1309,7 @@ for kind in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'S
                 (self.root / "received").unlink(missing_ok=True)
                 self.record["agent"] = agent
                 self.write_record()
+                self.composer_for(agent)
                 self.screen(screen, cursor)
                 receipt = self.send(self.payload(text=text))
                 self.wait_for(lambda: self.received().endswith(b"\r"))
@@ -705,6 +1329,7 @@ for kind in ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'S
                     (self.root / 'received').unlink(missing_ok=True)
                     self.record['agent'] = agent
                     self.write_record()
+                    self.composer_for(agent)
                     self.screen(screen, cursor)
                     payload = self.payload(text=text)
                     receipt = self.send(payload)
@@ -912,6 +1537,73 @@ os.execv('/bin/sh',['sh','-c',sys.argv[-1]])
                 self.send(success=False)
                 self.assertEqual(self.received(), b"")
 
+    def test_busy_unknown_prompt_refuses_before_input_and_retains_only_bounded_private_diagnostics(self):
+        for agent, prompt in [('codex', '›'), ('claude', '❯')]:
+            self.record.update(agent=agent, activity='busy', phase='tool', active_tools={'one': {}})
+            self.write_record()
+            # Only the cursor row may be retained. In particular the rest of a
+            # multiline draft, queued text and output must never be copied.
+            for suffix in ['first', 'second']:
+                self.screen('\x1b[2J\x1b[Hprivate tool output\r\n' + prompt +
+                            ' cursor draft ' + suffix + '\r\n  secret continuation\r\n  secret queued message\x1b[2;3H', '2:1')
+                request = self.payload(text='private attempted send')
+                self.assertIn('agent busy:', self.send(request, success=False))
+                self.assertEqual(self.received(), b'')
+                self.assert_refusal(request)
+                path = self.state / 'input_diagnostics' / (agent + '.json')
+                raw = path.read_bytes()
+                self.assertLessEqual(len(raw), 16 * 1024)
+                sample = json.loads(raw)
+                self.assertIn('cursor draft ' + suffix, sample['cursor_row'])
+                for text in ['secret continuation', 'secret queued message', 'private tool output', 'private attempted send']:
+                    self.assertNotIn(text.encode(), raw)
+                self.assertLessEqual(len(sample['rows']), 8)
+                self.assertTrue(sample['cursor_stable'])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(p.name for p in (self.state / 'input_diagnostics').iterdir()), ['claude.json', 'codex.json'])
+
+    def test_redraw_between_cursor_and_capture_refuses_without_input(self):
+        self.record.update(activity='busy', phase='tool')
+        self.write_record()
+        # Capture the old empty frame, then let this fixture's native process
+        # move its own cursor before the capture returns to hgs.
+        (self.root / 'screen').write_text('\x1b[1;4H')
+        self.script('tmux', '#!/usr/bin/env python3\n' +
+            f'import os,signal,subprocess,sys,time\nargs=sys.argv[1:]\nbase={[TMUX,"-S",str(self.socket),"-f","/dev/null"]!r}\n' +
+            'r=subprocess.run(base+args,stdout=subprocess.PIPE)\n' +
+            'if args and args[0]=="capture-pane":\n' +
+            f' os.kill({self.record["pid"]},signal.SIGUSR1)\n' +
+            f' for _ in range(100):\n  if subprocess.check_output(base+["display-message","-p","-t",{self.pane!r},"#{{cursor_x}}"]).strip()==b"3":break\n  time.sleep(.01)\n' +
+            'sys.stdout.buffer.write(r.stdout)\nsys.exit(r.returncode)\n')
+        self.assertIn('agent busy:', self.send(success=False))
+        self.assertEqual(self.received(), b'')
+        sample = json.loads((self.state / 'input_diagnostics/codex.json').read_text())
+        self.assertFalse(sample['cursor_stable'])
+        self.assertEqual(sample['cursor_row'], '')
+
+    def test_no_color_refusal_names_the_verified_agents_environment_and_keeps_drafts(self):
+        self.record.update(agent='claude', activity='busy', phase='tool', active_tools={'one': {}})
+        self.write_record()
+        reason = 'This agent was started with NO_COLOR, so Zerus cannot tell a queued message from a draft. Restart the session to fix sending.'
+        for text in ['Press up to edit queued messages', 'keep my real draft', 'Press up to edit queued messages\r\n  real continuation']:
+            self.screen('\x1b[2J\x1b[H' + '─' * 40 + '\r\n❯\u00a0' + text + '\r\n' + '─' * 40 + '\x1b[2;3H', '2:1')
+            request = self.payload()
+            self.assertIn(reason, self.send(request, success=False))
+            self.assertEqual(self.received(), b'')
+            self.assert_refusal(request, reason)
+
+    @unittest.skipUnless(os.sys.platform.startswith('linux'), 'Linux native environment permissions')
+    def test_no_color_unreadable_environment_keeps_the_generic_refusal(self):
+        self.record.update(agent='claude', activity='busy', phase='tool')
+        self.write_record()
+        (self.root / 'unreadable-environment').touch()
+        self.screen('\x1b[2J\x1b[H' + '─' * 40 + '\r\n❯\u00a0Press up to edit queued messages\r\n' + '─' * 40 + '\x1b[2;3H', '2:1')
+        refused = self.send(success=False)
+        self.assertIn('agent busy:', refused)
+        self.assertNotIn('This agent was started with NO_COLOR', refused)
+        self.assertEqual(self.received(), b'')
+
     def test_working_agent_accepts_next_message_without_interrupting(self):
         self.record.update(activity="busy", phase="tool", active_tools={"one": {}},
                            subagents={"one": {"state": "working"}})
@@ -1019,13 +1711,9 @@ os.execv('/bin/sh',['sh','-c',sys.argv[-1]])
         else:
             self.record['agent'] = 'claude'
             self.write_record()
+            self.claude_composer()
             self.screen('\x1b[2J\x1b[H❯ ', '2:0')
-            event = dict(hook_event_name='StopFailure', session_id=self.conversation_id,
-                         error=message, error_type='model_capacity')
-            hook = subprocess.run([str(HGS), '__state', 'hook'],
-                                  env=dict(self.env, HGS_SESSION=self.name, HGS_RUN_ID=self.run_id),
-                                  input=json.dumps(event), capture_output=True, text=True, timeout=10)
-            self.assertEqual(hook.returncode, 0, hook.stderr)
+            self.claude_hook('StopFailure', error=message, error_type='model_capacity')
             self.record = json.loads(self.record_path.read_text())
 
     def interrupted_turn(self):
@@ -1086,6 +1774,14 @@ os.execv('/bin/sh',['sh','-c',sys.argv[-1]])
         self.assertEqual(receipt['status'], 'submitted')
         self.wait_for(lambda: self.received().endswith(b'\r'))
         self.assertEqual(self.received(), b'\x1b[200~' + 'повтори'.encode() + b'\x1b[201~\r')
+        if receipt.get('native'):
+            # zerus-iitw8.6: Claude's own transcript row confirms the retry even
+            # without its UserPromptSubmit hook, which this fixture never runs.
+            self.assertEqual(receipt['native'], 'transcript')
+            record = json.loads(self.record_path.read_text())
+            self.assertGreater(record['input_seen_at'], record['input_pending_at'])
+            self.assertNotIn('input_typing', record)
+            return
         self.assertFalse(self.inspect()['error_message_can_send'])
         self.send(success=False)
 
@@ -1131,7 +1827,7 @@ os.execv('/bin/sh',['sh','-c',sys.argv[-1]])
         self.assertEqual(self.received(), b"\x1b[200~" + "когда это завершится, то что потом?".encode() + b"\x1b[201~\r")
 
     def test_control_sequences_slash_commands_and_invalid_attachment_are_refused(self):
-        for text in ("\x1b[201~bad", "test\rnext", "\x00", " /exit", "!ls"):
+        for text in ("\x1b[201~bad", "test\rnext", "\x00", " /exit", "/help args", "/clear\n/tmp/file", "!ls"):
             self.send(self.payload(text=text), success=False)
         self.send(self.payload(attachments=[dict(name="img.png", mime="image/png", data_base64="bad===")]), success=False)
         self.assertEqual(self.received(), b"")

@@ -10,10 +10,15 @@ mod existing;
 #[cfg(unix)]
 pub(crate) use existing::bind_existing;
 mod forms;
+mod answers;
 mod history;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod providers;
 mod service;
+mod context_hint;
+pub(crate) use context_hint::lookup as hint_context;
+pub(super) fn note_hint(record: &Value) { context_hint::note(record); }
+pub(super) fn forget_hint(record: &Value) { context_hint::forget(record); }
 mod terminal;
 pub(crate) use terminal::attach;
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -33,11 +38,8 @@ use std::fs;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-fn bindings() -> PathBuf {
-    root().join("opencode/bindings")
-}
 fn binding_path(name: &str) -> PathBuf {
-    bindings().join(format!("{:x}.json", Sha256::digest(name.as_bytes())))
+    PROVIDER.label_path(name)
 }
 thread_local! {
     /// Whether this thread holds opencode/bindings.lock. Code running under
@@ -82,32 +84,15 @@ fn try_bindings_at(path: &Path, wait: Duration) -> Option<Bindings> {
     BINDINGS_HELD.with(|held| held.set(true));
     Some(Bindings(Some(guard), std::marker::PhantomData))
 }
-pub(crate) fn exists(name: &str) -> bool {
-    binding_path(name).is_file()
-}
-pub(super) fn binding(name: &str) -> Result<Value> {
-    let bytes = fs::read(binding_path(name)).map_err(|e| e.to_string())?;
-    if bytes.len() > 1_048_576 {
-        return Err("Invalid OpenCode binding".into());
-    }
-    let record: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if record["name"] != name
-        || record["backend"] != "opencode"
-        || !native_id(string(&record, "conversation_id"), "ses_")
-    {
-        return Err("Invalid OpenCode binding".into());
-    }
-    Ok(record)
-}
+const PROVIDER: provider_binding::Provider = provider_binding::Provider::OpenCode;
+pub(crate) fn exists(name: &str) -> bool { PROVIDER.exists(name) }
+pub(super) fn binding(name: &str) -> Result<Value> { PROVIDER.read(name) }
+pub(super) fn read_id(id: &str) -> Result<Value> { PROVIDER.read_id(id) }
+pub(super) fn save(record: &mut Value) -> Result<()> { PROVIDER.save(record) }
+pub(super) fn binding_records() -> Vec<Value> { PROVIDER.records() }
 pub(super) fn native_id(id: &str, prefix: &str) -> bool {
-    id.starts_with(prefix)
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-}
-fn save(record: &Value) -> Result<()> {
-    atomic(&binding_path(string(record, "name")), &record.to_string())
+    id.starts_with(prefix) && id.len() <= 128
+        && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 pub(crate) fn config_home() -> PathBuf {
     nonempty_env("OPENCODE_CONFIG_DIR")
@@ -139,6 +124,45 @@ fn session_path(record: &Value, suffix: &str) -> String {
     format!("/api/session/{}{suffix}", string(record, "conversation_id"))
 }
 use service::Response;
+
+fn attach_hint(native: &dyn Native, record: &mut Value) {
+    attach_hint_with(
+        native,
+        record,
+        agent_hint::for_account("native-opencode").is_some(),
+        save,
+    )
+}
+
+/// The instruction entry is an effective prompt update, not transcript history.
+/// OpenCode can repeat a retained entry after a lost answer, so persist the
+/// suppression mark first and never replay an uncertain attachment.
+fn attach_hint_with(
+    native: &dyn Native,
+    record: &mut Value,
+    enabled: bool,
+    persist: impl FnOnce(&mut Value) -> Result<()>,
+) {
+    if !enabled || !agent_hint::claim(record) || persist(record).is_err() {
+        return;
+    }
+    let path = format!(
+        "/api/experimental/session/{}/instructions/entries/zerus.agent-hint",
+        string(record, "conversation_id")
+    );
+    let _ = native.raw("PUT", &path, Some(&json!({"value":agent_hint::HINT})));
+}
+
+/// One newest message answers whether the native conversation has turns. The
+/// caller treats an unavailable or malformed answer as nonempty, never as
+/// permission to attach or as a reason to block the launch.
+fn empty_history(native: &dyn Native, record: &Value) -> Result<bool> {
+    let answer = get(native, &session_path(record, "/message?limit=1"))?;
+    answer["data"]
+        .as_array()
+        .map(|messages| messages.is_empty())
+        .ok_or_else(|| "Invalid OpenCode message history".into())
+}
 
 pub(crate) fn account_context(name: &str) -> Result<Value> {
     let record = binding(name)?;
@@ -251,7 +275,7 @@ fn legacy_decision(
 }
 /// `migration` is fetched at most once per caller and only when needed.
 fn legacy_state(
-    service: &service::Service,
+    service: &dyn Native,
     record: &Value,
     migration: &mut Option<Reply>,
 ) -> Result<(Legacy, bool)> {
@@ -335,7 +359,7 @@ fn adopt_binding(name: &str, conversation_id: &str) {
     if let Ok(mut record) = binding(name) {
         if record["conversation_id"] == conversation_id {
             modernize(&mut record);
-            let _ = save(&record);
+            let _ = save(&mut record);
         }
     }
 }
@@ -407,9 +431,10 @@ pub(crate) fn launch(
         println!("Create native OpenCode session {name} in {cwd}");
         return Ok(());
     }
+    let parent = parent_link::launcher_link()?;
     let _writer = lock(None)?;
     let _guard = lock_bindings()?;
-    if record_path(name).exists() || live()?.contains_key(name) {
+    if storage::label_taken(name) || live()?.contains_key(name) {
         return Err(
             "This name belongs to an existing terminal session; it was left untouched".into(),
         );
@@ -423,9 +448,18 @@ pub(crate) fn launch(
     if mode != "provider" {
         return Err("OpenCode uses its native permission configuration; select Provider settings for this account".into());
     }
-    let present = exists(name);
+    let existing = PROVIDER.existing_for_launch(name)?;
+    let present = existing.is_some();
+    if present && parent_link::claimed_launch() { return Err("--parent applies only to new sessions; use hgs parent adopt for an existing session".into()); }
     if present && new_only {
         return Err("This OpenCode session name already exists".into());
+    }
+    if !present {
+        if let Some(tag) = name.split('/').nth(2) {
+            if let Some(problem) = zerus_client_core::actions::tag_problem(tag) {
+                return Err(problem.into());
+            }
+        }
     }
     let cwd = if present {
         None
@@ -437,8 +471,7 @@ pub(crate) fn launch(
         Some(cwd)
     };
     let service = service::ensure_started()?;
-    if present {
-        let mut record = binding(name)?;
+    if let Some(mut record) = existing {
         if resumes_pending(&record) {
             return resume_pending(&service, record);
         }
@@ -456,7 +489,12 @@ pub(crate) fn launch(
         verify_session(&service, &record)?;
         if adopted {
             modernize(&mut record);
-            save(&record)?;
+            save(&mut record)?;
+        }
+        if empty_history(&service, &record).unwrap_or(false) {
+            attach_hint(&service, &mut record);
+        } else {
+            context_hint::configure(&service, &mut record);
         }
         return Ok(());
     }
@@ -465,6 +503,7 @@ pub(crate) fn launch(
         .map(|value| catalog::offered_model(&service, &cwd, value, effort.unwrap_or("")))
         .transpose()?;
     let mut record = json!({"backend":"opencode","service":"opencode2","agent":"opencode","name":name,"cwd":cwd,"launch_id":launch_id,"run_id":uuid::Uuid::new_v4().to_string(),"conversation_id":new_id("ses_"),"created":now(),"agent_home":config_home(),"creation_pending":true});
+    if let Some(parent) = parent { record["parent"] = parent; }
     let mut body = creation_body(&record);
     if let Some(model) = selected {
         body["model"] = model;
@@ -472,9 +511,28 @@ pub(crate) fn launch(
     // Persist the chosen native ID and exact body before the first creation
     // attempt so one launch never has two identities.
     record["creation_body"] = body;
-    save(&record)?;
+    placement::prepare(&mut record, &cwd);
+    save(&mut record)?;
+    // A child its proven parent launched starts in the parent's project,
+    // written after the state and bindings locks are released (zerus-d5twt).
+    let child = record
+        .get("parent")
+        .filter(|link| crate::swarm::placing_parent(link))
+        .map(|link| {
+            (
+                link.clone(),
+                string(&record, "run_id").to_owned(),
+                record["conversation_id"].clone(),
+            )
+        });
     finish_creation(&service, record, true)?;
-    if let Ok(config) = crate::config::Config::load() {
+    if let Some((parent, run, conversation)) = child {
+        drop(_guard);
+        drop(_writer);
+        if let Ok(config) = crate::config::Config::load() {
+            crate::swarm::place_child_session(&config, name, &cwd, &run, &conversation, &parent);
+        }
+    } else if let Ok(config) = crate::config::Config::load() {
         crate::swarm::infer_new_session(&config, name, &cwd);
     }
     Ok(())
@@ -517,10 +575,16 @@ fn finish_creation(service: &service::Service, mut record: Value, first: bool) -
             let map = record.as_object_mut().unwrap();
             map.remove("creation_pending");
             map.remove("creation_body");
-            save(&record)
+            save(&mut record)?;
+            if first || empty_history(service, &record).unwrap_or(false) {
+                attach_hint(service, &mut record);
+            } else {
+                context_hint::configure(service, &mut record);
+            }
+            Ok(())
         }
         Err(Refusal::Definite(reason)) => {
-            let _ = fs::remove_file(binding_path(string(&record, "name")));
+            let _ = PROVIDER.remove(&record);
             Err(reason)
         }
         Err(Refusal::Other(reason)) => Err(reason),
@@ -549,6 +613,7 @@ struct Observed {
     inbox: Value,
     forms: Value,
     permissions: Value,
+    native_questions: std::collections::HashMap<String, Value>,
     /// The Zerus request that sent each of the newest user messages, from the
     /// receipt index (message ID to request ID).
     requests: std::collections::HashMap<String, String>,
@@ -561,7 +626,17 @@ fn normalize(record: &Value, observed: Option<&Observed>) -> Value {
     let session = observed.map_or(&null, |o| &o.session);
     let active = observed.is_some_and(|o| o.active);
     let messages: &[Value] = observed.map_or(&[], |o| &o.page.messages);
-    let pending = observed.map_or_else(Vec::new, |o| forms::cards(record, &o.forms, &o.permissions));
+    let mut pending = observed.map_or_else(Vec::new, |o| forms::cards(record, &o.forms, &o.permissions));
+    if let Some(observed) = observed {
+        for card in &mut pending {
+            if card["kind"] == "opencode_form" && card["can_answer"] == true {
+                if let Some(proof) = observed.native_questions.get(string(card, "question_id")) {
+                    card["blocking"] = json!(true);
+                    card["native_question"] = proof.clone();
+                }
+            }
+        }
+    }
     let failure = history::last_error(messages);
     let phase = if !available {
         "unknown"
@@ -644,6 +719,14 @@ fn normalize(record: &Value, observed: Option<&Observed>) -> Value {
         "activity_detail":reply.map(|r|r["detail"].clone()),"prompt":prompt.map(|r|r["detail"].clone()),"reply_id":reply.map(|r|r["reply_id"].clone()),"reply_at":reply.map(|r|r["at"].clone()),
         "last_event_at":session["time"]["updated"].as_f64().unwrap_or(0.0)/1000.0,"turn_started":turn_started,"account_id":"native-opencode","account_home":record["agent_home"],
         "model":model["id"],"model_provider":model["providerID"],"settings_model":settings_model,"effort":effort});
+    if !string(record, "session_id").is_empty() {
+        value["session_id"] = record["session_id"].clone();
+    }
+    if record["agent_hint_context"].is_object() {
+        value["agent_hint_status"] = json!({"state":record["agent_hint_context"]["state"],
+            "reason":record["agent_hint_context"]["reason"]});
+    }
+    if let Some(parent) = parent_link::listed(record) { value["parent"] = parent; }
     let controls = json!({"send_available":idle,"send_supported":idle,"settings_change_supported":idle && !active,"interrupt_supported":available && active,
         "terminal_supported":false,"terminal_reason":backend::OPENCODE_TERMINAL_REASON.text(),
         "terminal_attach_supported":cfg!(unix) && available && record["service"] == "opencode2",
@@ -676,6 +759,14 @@ fn normalize(record: &Value, observed: Option<&Observed>) -> Value {
         );
         provider_errors::apply(&mut value, &error);
     }
+    // A permission card is a tool approval, the person's to answer.
+    let approval = value["pending_questions"].as_array().is_some_and(|cards| {
+        cards
+            .iter()
+            .any(|card| card["kind"] == "opencode_permission")
+    });
+    parent_link::mark_human_request(&mut value, None, approval);
+    telemetry::pending_input_summary(&mut value, !pending.is_empty());
     value
 }
 /// A row without a reading of the session: no events, so clients keep the
@@ -749,6 +840,11 @@ fn observe(
         return Err("Invalid OpenCode inbox".into());
     }
     let page = history()?;
+    let native_questions = if active.get(string(record, "conversation_id")).is_some() {
+        forms::qualify(native, record, &forms)
+    } else {
+        Default::default()
+    };
     // Only a full inspection shows events; listings and actions drop them.
     let requests = if requests {
         sent_requests(&Ledger::current(), record, &page.messages, &inbox)
@@ -762,6 +858,7 @@ fn observe(
         inbox,
         forms,
         permissions,
+        native_questions,
         requests,
     })
 }
@@ -824,7 +921,7 @@ fn processes() -> Value {
     json!({"items":[],"complete":false,"source":"opencode_native","reason":"Individual OpenCode shell process controls are not yet qualified"})
 }
 fn parent_view(
-    service: &service::Service,
+    service: &dyn Native,
     record: &Value,
     active: &Value,
     detail: Detail,
@@ -838,7 +935,7 @@ fn parent_view(
     )?;
     let mut result = normalize(record, Some(&observed));
     if detail != Detail::Listing {
-        result["attachment_messages"] = attachments::messages(record, "");
+        attachments::decorate(record, "", &mut result);
         result["voice_messages"] =
             conversation_history::inspected_voice_messages(record, &result, None);
     }
@@ -872,6 +969,53 @@ pub(super) fn notification_snapshot(record: &Value) -> Result<(Value, Option<Vec
     if record["service"] != "opencode2" { return Err("baseline_unavailable".into()); }
     let service = service::connect().map_err(|_| "baseline_unavailable")?;
     notification_snapshot_with(&service, record, || history::fetch(&service, record))
+}
+/// Every read of one observation ends by the same absolute deadline.
+struct Bounded<'a> {
+    service: &'a service::Service,
+    deadline: Instant,
+}
+impl Native for Bounded<'_> {
+    fn raw(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Response> {
+        service::request(&self.service.reg, method, path, body, self.deadline)
+    }
+    fn raw_until(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        deadline: Instant,
+    ) -> Result<Response> {
+        service::request(
+            &self.service.reg,
+            method,
+            path,
+            body,
+            deadline.min(self.deadline),
+        )
+    }
+}
+/// Whether a claimed parent runs now: the same observation as its status, every
+/// read ending within `limit` of the service connection. No service is a
+/// definite no; a service that has not answered by then is busy, never live.
+/// (Windows reports a refused loopback connection only after about two seconds
+/// of SYN retries, so a service that vanishes mid-check can read as busy there.)
+pub(super) fn claim_live(record: &Value, limit: Duration) -> Result<bool> {
+    if record["service"] != "opencode2" {
+        return Ok(false);
+    }
+    let Ok(service) = service::connect() else {
+        return Ok(false);
+    };
+    claim_live_on(&service, record, Instant::now() + limit)
+}
+fn claim_live_on(service: &service::Service, record: &Value, deadline: Instant) -> Result<bool> {
+    let bounded = Bounded { service, deadline };
+    match notification_snapshot_with(&bounded, record, || history::fetch(&bounded, record)) {
+        Ok((row, _)) => Ok(row["state"] == "running" && row["process_state"] == "running"),
+        Err(_) if Instant::now() >= deadline => Err(parent_link::CLAIM_BUSY.into()),
+        Err(_) => Ok(false),
+    }
 }
 fn notification_snapshot_with(native: &dyn Native, record: &Value, history: impl FnOnce() -> Result<history::Page>) -> Result<(Value, Option<Vec<Value>>)> {
     let active = active_sessions(native)?;
@@ -920,6 +1064,8 @@ struct Inspector {
     verdicts_changed: bool,
     /// The cached home short list; tests stand in for the cache.
     cached_options: CachedOptions,
+    deadline: Option<Instant>,
+    observe_only: bool,
 }
 impl Inspector {
     /// Never starts the service.
@@ -932,6 +1078,28 @@ impl Inspector {
             verdicts: None,
             verdicts_changed: false,
             cached_options: catalog::stopped_options,
+            deadline: None,
+            observe_only: false,
+        }
+    }
+    fn listing(deadline: Instant) -> Self {
+        let mut value = Self::connect_without_io();
+        value.service = service::connect_within(deadline);
+        value.deadline = Some(deadline);
+        value.observe_only = true;
+        value
+    }
+    fn connect_without_io() -> Self {
+        Self {
+            service: Err(service::Unavailable::NotRunning),
+            computer: None,
+            active: None,
+            migration: None,
+            verdicts: None,
+            verdicts_changed: false,
+            cached_options: catalog::stopped_options,
+            deadline: None,
+            observe_only: true,
         }
     }
     fn row(&mut self, record: &Value, detail: Detail) -> Value {
@@ -951,6 +1119,17 @@ impl Inspector {
             }
             Ok(service) => service,
         };
+        let bounded = Bounded {
+            service,
+            deadline: self
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(10)),
+        };
+        let native: &dyn Native = if self.deadline.is_some() {
+            &bounded
+        } else {
+            service
+        };
         let key = verdict_key(record, &service.reg);
         let known = record["service"] != "opencode2"
             && self
@@ -960,7 +1139,7 @@ impl Inspector {
         let state = if known {
             Ok((Legacy::Unsupported, false))
         } else {
-            legacy_state(service, record, &mut self.migration)
+            legacy_state(native, record, &mut self.migration)
         };
         let mut current = record.clone();
         // A failed read keeps the cached short list, like a stopped service.
@@ -982,16 +1161,18 @@ impl Inspector {
                 return legacy_row(record);
             }
             Ok((Legacy::Adopted, _)) => {
-                adopt_binding(string(record, "name"), string(record, "conversation_id"));
+                if !self.observe_only {
+                    adopt_binding(string(record, "name"), string(record, "conversation_id"));
+                }
                 modernize(&mut current);
             }
             Ok((Legacy::Current, _)) => {}
         }
-        let active = match self.active.get_or_insert_with(|| active_sessions(service)) {
+        let active = match self.active.get_or_insert_with(|| active_sessions(native)) {
             Ok(active) => active,
             Err(reason) => return failed(reason.clone()),
         };
-        parent_view(service, &current, active, detail).unwrap_or_else(failed)
+        parent_view(native, &current, active, detail).unwrap_or_else(failed)
     }
     fn finish(self) {
         if self.verdicts_changed {
@@ -1007,10 +1188,24 @@ pub(crate) fn inspect(name: &str, agent_id: Option<&str>) -> Result<Value> {
     let mut inspector = Inspector::connect();
     let mut value = inspector.row(&record, Detail::Full);
     notifications::enrich(&mut value, notifications::load().as_ref(), journal::journal_name(&record));
+    question_routing::enrich(&mut value, question_routing::load().as_ref());
     inspector.finish();
     waits::decorate(std::slice::from_mut(&mut value));
     session_state::decorate(std::slice::from_mut(&mut value));
     Ok(value)
+}
+/// `current_read` of an inspection (zerus-a4mub.24), from the same
+/// observation it shows, which is the view `hgs read` compares a mark with
+/// (`inspect`). Its questions are the forms and permissions it lists; its
+/// reply is the newest completed reply of the history it shows, so that
+/// reply's final text is shown. A row without an observation (no service, a
+/// failed read, an OpenCode 1 binding) has unknown attention and no reply.
+fn current_read_of(name: &str, view: &Value) -> Option<Value> {
+    let questions = view["pending_questions"]
+        .as_array()
+        .filter(|_| string(view, "phase") != "unknown")
+        .map(Vec::as_slice);
+    read_marks::native_current_read(name, view.clone(), questions)
 }
 /// The session's own state for delivery, answer, interrupt and lifecycle
 /// checks; unknown with its reason while the service is unavailable.
@@ -1022,25 +1217,22 @@ pub(crate) fn own_state(name: &str) -> Result<Value> {
     Ok(value)
 }
 pub(crate) fn snapshots() -> Result<Vec<Value>> {
-    let Ok(entries) = fs::read_dir(bindings()) else {
-        return Ok(Vec::new());
-    };
-    let records: Vec<Value> = entries
-        .flatten()
-        .take(5000)
-        .filter_map(|entry| fs::read(entry.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|record| record["backend"] == "opencode")
-        .collect();
+    // Task 234: where the OpenCode rows of a listing spend their time.
+    let mut phases = super::slow_calls::Phases::start();
+    let records = binding_records();
     if records.is_empty() {
         return Ok(Vec::new());
     }
+    phases.mark("bindings");
     let mut inspector = Inspector::connect();
+    phases.mark("connect");
     let mut rows = Vec::new();
     let preferences = notifications::load();
     for record in &records {
         let mut row = inspector.row(record, Detail::Listing);
+        phases.mark("row");
         notifications::enrich(&mut row, preferences.as_ref(), journal::journal_name(record));
+        phases.mark("notifications");
         if let Some(map) = row.as_object_mut() {
             for key in [
                 "events",
@@ -1056,9 +1248,60 @@ pub(crate) fn snapshots() -> Result<Vec<Value>> {
         rows.push(row);
     }
     inspector.finish();
+    phases.mark("finish");
+    phases.note("records", records.len() as u64);
+    phases.finish_at("ls-opencode", "", 100);
     Ok(rows)
 }
+/// Same row normalizer over bounded caller-supplied metadata, without inventories or adoption effects.
+pub(in crate::state) fn listing_records(
+    records: &[Value],
+    deadline: Instant,
+) -> Result<Vec<Value>> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut inspector = Inspector::listing(deadline);
+    let preferences = notifications::load();
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    for record in records {
+        let mut row = inspector.row(record, Detail::Listing);
+        notifications::enrich(
+            &mut row,
+            preferences.as_ref(),
+            journal::journal_name(record),
+        );
+        if let Some(map) = row.as_object_mut() {
+            for key in [
+                "events",
+                "voice_messages",
+                "attachment_messages",
+                "processes",
+                "model_options",
+                "model_options_truncated",
+            ] {
+                map.remove(key);
+            }
+        }
+        bytes += serde_json::to_vec(&row)
+            .map_err(|error| error.to_string())?
+            .len();
+        if bytes > 512 << 10 {
+            return Err("Native listing response budget exceeded; use a smaller page".into());
+        }
+        rows.push(row);
+    }
+    inspector.finish();
+    Ok(rows)
+}
+
 fn checked_request(record: &Value) -> Result<Value> {
+    let request = read_request()?;
+    check_request_identity(record, &request)?;
+    Ok(request)
+}
+fn read_request() -> Result<Value> {
     let mut bytes = Vec::new();
     io::stdin()
         .take(30 * 1024 * 1024 + 1)
@@ -1070,14 +1313,18 @@ fn checked_request(record: &Value) -> Result<Value> {
     let request: Value = serde_json::from_slice(crate::state::without_bom(&bytes)).map_err(|e| e.to_string())?;
     let id =
         uuid::Uuid::parse_str(string(&request, "request_id")).map_err(|_| "Invalid request ID")?;
-    if id.is_nil()
-        || id.to_string() != string(&request, "request_id")
-        || request["expected_run_id"] != record["run_id"]
+    if id.is_nil() || id.to_string() != string(&request, "request_id") {
+        return Err("Invalid request ID".into());
+    }
+    Ok(request)
+}
+fn check_request_identity(record: &Value, request: &Value) -> Result<()> {
+    if request["expected_run_id"] != record["run_id"]
         || request["expected_conversation_id"] != record["conversation_id"]
     {
         return Err("Session changed; refresh before trying again".into());
     }
-    Ok(request)
+    Ok(())
 }
 /// The native OpenCode 2 operations that delivery needs.
 trait Native {
@@ -1274,7 +1521,7 @@ fn refuse_removed(ledger: &Ledger, record: &Value, message_id: &str) -> Result<(
     }
     receipt["status"] = json!("refused");
     receipt["reason"] = json!(REMOVED);
-    atomic(&path, &receipt.to_string())
+    receipt_index::persist(&path, &receipt)
 }
 /// A receipt whose message was confirmed removed becomes that definite
 /// non-delivery before anything else is read; nothing is sent for it.
@@ -1290,7 +1537,7 @@ fn apply_removal(ledger: &Ledger, record: &Value, receipt: &mut Value, path: &Pa
     let _guard = ledger.lock()?;
     receipt["status"] = json!("refused");
     receipt["reason"] = json!(REMOVED);
-    atomic(path, &receipt.to_string())
+    receipt_index::persist(path, receipt)
 }
 /// Resolve one message ID exactly from native state. It is never posted
 /// again: OpenCode 2.0.32 forgets an ID once its queued message is removed,
@@ -1381,7 +1628,7 @@ fn settle(
             receipt["reason"] = json!(reason);
         }
     }
-    atomic(path, &receipt.to_string())?;
+    receipt_index::persist(path, receipt)?;
     Ok(outcome)
 }
 pub(super) fn reconcile_receipt(record: &Value, receipt: &mut Value) -> Result<bool> {
@@ -1504,6 +1751,7 @@ fn deliver(
     let message_id = new_id("msg_");
     let mut receipt = json!({"request_id":request["request_id"],"name":record["name"],"run_id":record["run_id"],"conversation_id":record["conversation_id"],"digest":digest,"native_message_id":message_id,"text":text,"submitted_text":text,"submitted_at":now(),"at":now(),"status":"pending","attachments":[],"transport":"native_opencode"});
     if let Some(target) = graph_target {
+        delivery::bind(&mut receipt, record, &target);
         receipt["graph_target"] = target;
     }
     let queued = session_active(native, record);
@@ -1514,7 +1762,7 @@ fn deliver(
         &json!({"request_id":request["request_id"],"conversation_id":record["conversation_id"]})
             .to_string(),
     )?;
-    atomic(path, &receipt.to_string())?;
+    receipt_index::persist(path, &receipt)?;
     let posted = native.raw(
         "POST",
         &session_path(record, "/prompt"),
@@ -1536,7 +1784,7 @@ fn deliver(
             // Keep the detailed first refusal local; a durable delivery
             // record needs only the confirmed HTTP status, not provider text.
             receipt["reason"] = json!(format!("HTTP {}", answer.status));
-            atomic(path, &receipt.to_string())?;
+            receipt_index::persist(path, &receipt)?;
             return Err(refused(&reason));
         }
         // A transport error or a 5xx leaves the admission unknown.
@@ -1550,7 +1798,7 @@ fn deliver(
     if queued {
         receipt["queued"] = json!(true);
     }
-    atomic(path, &receipt.to_string())?;
+    receipt_index::persist(path, &receipt)?;
     Ok(receipt)
 }
 fn verify_native(native: &dyn Native, record: &Value) -> Result<()> {
@@ -1586,6 +1834,13 @@ fn clip_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 fn answer(record: &Value, request: &Value) -> Result<Value> {
+    let path = root()
+        .join("opencode/answers")
+        .join(format!("{}.json", string(request, "request_id")));
+    if let Some(prior) = answers::prior(string(record, "name"), request, &path)? {
+        return Ok(prior);
+    }
+    check_request_identity(record, request)?;
     let current = own_state(string(record, "name"))?;
     let card = current["pending_questions"]
         .as_array()
@@ -1596,9 +1851,6 @@ fn answer(record: &Value, request: &Value) -> Result<Value> {
                 && q["question_hash"] == request["expected_question_hash"]
         })
         .ok_or(CHANGED)?;
-    let path = root()
-        .join("opencode/answers")
-        .join(format!("{}.json", string(request, "request_id")));
     answer_with(&running_service()?, record, request, card, &path)
 }
 /// Core of `answer`: the journal, the exact native request and the reply.
@@ -1609,8 +1861,8 @@ fn answer_with(
     card: &Value,
     path: &Path,
 ) -> Result<Value> {
-    if path.exists() {
-        return Err("This answer was already attempted; refresh its native acknowledgement".into());
+    if let Some(prior) = answers::prior(string(record, "name"), request, path)? {
+        return Ok(prior);
     }
     let raw = request["answers"]
         .as_array()
@@ -1639,7 +1891,7 @@ fn answer_with(
         return Err(CHANGED.into());
     }
     let (route, body) = reply_for(card, found, raw)?;
-    let mut receipt = json!({"request_id":request["request_id"],"name":record["name"],"run_id":record["run_id"],"conversation_id":record["conversation_id"],"question_id":request["question_id"],"question_hash":request["expected_question_hash"],"status":"pending"});
+    let mut receipt = json!({"request_id":request["request_id"],"name":record["name"],"run_id":record["run_id"],"conversation_id":record["conversation_id"],"question_id":request["question_id"],"question_hash":request["expected_question_hash"],"digest":answers::digest(string(record,"name"),request),"status":"pending"});
     atomic(path, &receipt.to_string())?;
     // A 4xx is a definite refusal; anything else leaves the delivery unknown
     // and the pending journal blocks a replay.
@@ -1679,23 +1931,31 @@ pub(crate) fn interrupt(record: &Value) -> Result<()> {
     interrupt_with(&running_service()?, &original)
 }
 /// Core of `interrupt`: success when OpenCode says it interrupted the turn or
-/// the session is no longer running.
+/// the session is no longer running. From the POST on, OpenCode may have
+/// stopped the turn, so every error says so (zerus-1wchz).
 fn interrupt_with(native: &dyn Native, record: &Value) -> Result<()> {
-    let reply = native.raw("POST", &session_path(record, "/interrupt"), Some(&json!({})))?;
-    let said = reply.body["interrupted"] == true || reply.body["data"]["interrupted"] == true;
-    if successful(&reply) && said {
-        return Ok(());
-    }
-    // A failed lookup never counts as "not running".
-    if let Ok(active) = active_sessions(native) {
-        if active.get(string(record, "conversation_id")).is_none() {
+    (|| {
+        let reply = native.raw(
+            "POST",
+            &session_path(record, "/interrupt"),
+            Some(&json!({})),
+        )?;
+        let said = reply.body["interrupted"] == true || reply.body["data"]["interrupted"] == true;
+        if successful(&reply) && said {
             return Ok(());
         }
-    }
-    Err(format!(
-        "OpenCode did not confirm the interruption ({})",
-        refusal_reason(&reply)
-    ))
+        // A failed lookup never counts as "not running".
+        if let Ok(active) = active_sessions(native) {
+            if active.get(string(record, "conversation_id")).is_none() {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "OpenCode did not confirm the interruption ({})",
+            refusal_reason(&reply)
+        ))
+    })()
+    .map_err(|error: String| format!("Interrupt delivery uncertain: {error}"))
 }
 const NOT_QUEUED: &str = "This message is no longer queued";
 /// The message a `remove_queued` request may name: `msg_` and 1-124 ASCII
@@ -1856,6 +2116,7 @@ fn validate_rename(old: &str, new: &str) -> Result<()> {
     {
         return Err("Rename must preserve provider and project".into());
     }
+    rename::validate_new_tag(new)?;
     Ok(())
 }
 
@@ -1903,7 +2164,7 @@ fn rename_with<N: Native>(
     new: &str,
     scope: Option<&session_action::Scope>,
     connect: impl FnOnce() -> Result<N>,
-    save: impl FnOnce(&Value) -> Result<()>,
+    save: impl FnOnce(&mut Value) -> Result<()>,
     marks: impl FnOnce(&str, &str) -> Result<()>,
     retire: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
@@ -1993,25 +2254,31 @@ fn action_in<N: Native>(
         if new != old && storage.rename_marks.is_none() {
             return Err("OpenCode rename requires the ordered shared read-mark writer".into());
         }
+        PROVIDER.prepare_label(record, new)?;
+        let by_id = storage::in_id_layout(record);
         return rename_with(
             record,
             new,
             scope,
             connect,
-            save,
+            |record| {
+                if by_id { recovery::rename_job_in_place(record, string(record, "name"))?; }
+                save(record)
+            },
             |old, new| {
+                if by_id { return Ok(()); }
                 storage
                     .rename_marks
                     .ok_or("Missing shared read-mark writer")?
                     .transfer(old, new)
             },
-            |old| archive::remove_synced(&binding_path(old)),
+            |old| if by_id { Ok(()) } else { archive::remove_synced(&binding_path(old)) },
         );
     } else if let Some(scope) = scope {
         scope.changing();
     }
     if action == "forget" {
-        archive::remove_synced(&binding_path(&old))?;
+        PROVIDER.remove(record)?;
         history::forget(record);
         return Ok(());
     }
@@ -2070,14 +2337,21 @@ pub(crate) fn dispatch(command: &str, args: &[String]) -> Result<i32> {
                 ),
                 None => None,
             };
-            println!("{}", inspect(name, agent)?);
+            let mut value = inspect(name, agent)?;
+            // Only a main inspection names what a read mark may acknowledge.
+            if agent.is_none() && args.iter().any(|v| v == "--current-read") {
+                if let Some(current) = current_read_of(name, &value) {
+                    value["current_read"] = current;
+                }
+            }
+            println!("{value}");
         }
         "send" => {
             let request = checked_request(&record)?;
             println!("{}", send(&record, &request)?);
         }
         "answer" => {
-            let request = checked_request(&record)?;
+            let request = read_request()?;
             println!("{}", answer(&record, &request)?);
         }
         "settings" => {
@@ -2149,6 +2423,98 @@ pub(crate) fn dispatch(command: &str, args: &[String]) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_session_tags_reject_shell_syntax() {
+        assert!(validate_rename("opencode/project/old$tag", "opencode/project/safe name").is_ok());
+        assert!(validate_rename("opencode/project/old.tag", "opencode/project/safe name").is_ok());
+        for tag in ["bad$tag", "bad;tag", "bad\u{200b}tag"] {
+            assert!(validate_rename("opencode/project/old", &format!("opencode/project/{tag}")).is_err());
+        }
+    }
+    #[test]
+    fn a_claim_check_never_waits_past_its_bound_or_counts_silence_as_live() {
+        // zerus-p24ce: a service that accepts and never answers is busy.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let service = |port| service::Service {
+            reg: service::Registration {
+                id: String::new(),
+                version: String::new(),
+                port,
+                pid: 0,
+                password: None,
+            },
+        };
+        let record =
+            json!({"service":"opencode2","conversation_id":"ses_claim","cwd":"/tmp/example"});
+        let started = Instant::now();
+        let busy = claim_live_on(
+            &service(port),
+            &record,
+            started + Duration::from_millis(300),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(busy, Err(parent_link::CLAIM_BUSY.to_owned()));
+        // A service that closes the connection unanswered: a definite no,
+        // before the bound, on every platform.
+        let quitting = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let quit = quitting.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in quitting.incoming() {
+                drop(stream);
+            }
+        });
+        let started = Instant::now();
+        assert_eq!(
+            claim_live_on(&service(quit), &record, started + Duration::from_secs(2)),
+            Ok(false)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Nothing listening. Linux and macOS refuse a loopback connection at
+        // once: a definite no. Windows retries a refused SYN for about two
+        // seconds, so its refusal can arrive only at the bound and read as
+        // busy; it is never live and never outlasts the bound.
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free = closed.local_addr().unwrap().port();
+        drop(closed);
+        let started = Instant::now();
+        let refused = claim_live_on(&service(free), &record, started + Duration::from_secs(2));
+        #[cfg(not(windows))]
+        {
+            assert_eq!(refused, Ok(false));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                refused == Ok(false) || refused == Err(parent_link::CLAIM_BUSY.to_owned()),
+                "{refused:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+    }
     use super::*;
     use std::collections::HashMap;
 
@@ -2611,6 +2977,122 @@ mod tests {
             "/api/session/ses_abc/prompt"
         );
     }
+    struct HintNative<'a> {
+        calls: std::cell::RefCell<Vec<(String, String, Value)>>,
+        saves: &'a std::cell::Cell<usize>,
+        reply: Option<Result<Response>>,
+    }
+    impl Native for HintNative<'_> {
+        fn raw(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Response> {
+            assert_eq!(
+                self.saves.get(),
+                1,
+                "the suppression mark was not saved first"
+            );
+            self.calls
+                .borrow_mut()
+                .push((method.into(), path.into(), body.unwrap().clone()));
+            self.reply.clone().unwrap_or(Ok(Response {
+                status: 204,
+                body: Value::Null,
+            }))
+        }
+    }
+    #[test]
+    fn instruction_hint_is_claimed_before_one_fail_soft_attachment() {
+        let record = || json!({"conversation_id":"ses_A"});
+        let saves = std::cell::Cell::new(0);
+        let native = HintNative {
+            calls: Default::default(),
+            saves: &saves,
+            reply: None,
+        };
+        let mut run = record();
+        let persist = |record: &mut Value| {
+            saves.set(saves.get() + 1);
+            assert_eq!(
+                record["agent_hint"],
+                json!({"conversation_id":"ses_A","revision":1})
+            );
+            Ok(())
+        };
+        attach_hint_with(&native, &mut run, true, persist);
+        assert_eq!(saves.get(), 1);
+        assert_eq!(
+            native.calls.borrow().as_slice(),
+            &[(
+                "PUT".into(),
+                "/api/experimental/session/ses_A/instructions/entries/zerus.agent-hint".into(),
+                json!({"value":agent_hint::HINT})
+            )]
+        );
+        for enabled in [true, false] {
+            attach_hint_with(&native, &mut run, enabled, |_| {
+                panic!("a claimed hint saves again")
+            });
+        }
+        assert_eq!(native.calls.borrow().len(), 1);
+        assert_eq!(saves.get(), 1);
+        run["agent_hint"]["conversation_id"] = json!("ses_other");
+        run["conversation_id"] = json!("");
+        attach_hint_with(&native, &mut run, true, |_| panic!("an empty ID writes"));
+        assert_eq!(native.calls.borrow().len(), 1);
+    }
+    #[test]
+    fn instruction_hint_opt_out_and_uncertain_failures_never_replay() {
+        let saves = std::cell::Cell::new(0);
+        let native = HintNative {
+            calls: Default::default(),
+            saves: &saves,
+            reply: Some(Err("connection lost".into())),
+        };
+        let mut opted_out = json!({"conversation_id":"ses_A"});
+        attach_hint_with(&native, &mut opted_out, false, |_| {
+            panic!("an opted-out hint saves")
+        });
+        assert!(opted_out.get("agent_hint").is_none());
+        assert!(native.calls.borrow().is_empty());
+        let mut unsaved = opted_out.clone();
+        attach_hint_with(&native, &mut unsaved, true, |_| {
+            Err("private state unavailable".into())
+        });
+        assert!(native.calls.borrow().is_empty());
+        for reply in [Some(Err("connection lost".into())), None] {
+            let saves = std::cell::Cell::new(0);
+            let native = HintNative {
+                calls: Default::default(),
+                saves: &saves,
+                reply,
+            };
+            let mut run = json!({"conversation_id":"ses_A"});
+            for _ in 0..2 {
+                attach_hint_with(&native, &mut run, true, |_| {
+                    saves.set(saves.get() + 1);
+                    Ok(())
+                });
+            }
+            assert_eq!(saves.get(), 1);
+            assert_eq!(native.calls.borrow().len(), 1);
+        }
+        let saves = std::cell::Cell::new(0);
+        let refused = HintNative {
+            calls: Default::default(),
+            saves: &saves,
+            reply: Some(Ok(Response {
+                status: 503,
+                body: json!({}),
+            })),
+        };
+        let mut run = json!({"conversation_id":"ses_A"});
+        attach_hint_with(&refused, &mut run, true, |_| {
+            saves.set(saves.get() + 1);
+            Ok(())
+        });
+        attach_hint_with(&refused, &mut run, true, |_| {
+            panic!("a refused hint saves again")
+        });
+        assert_eq!(refused.calls.borrow().len(), 1);
+    }
     struct Scripted(std::cell::RefCell<Vec<(String, u16, Value)>>);
     impl Native for Scripted {
         fn raw(&self, method: &str, path: &str, _: Option<&Value>) -> Result<Response> {
@@ -2618,6 +3100,24 @@ mod tests {
             let (expected, status, body) = script.remove(0);
             assert_eq!(expected, format!("{method} {path}"));
             Ok(Response { status, body })
+        }
+    }
+    #[test]
+    fn hint_emptiness_uses_one_bounded_history_read_and_rejects_bad_answers() {
+        let record = json!({"conversation_id":"ses_A"});
+        for (status, body, expected) in [
+            (200, json!({"data":[]}), Some(true)),
+            (200, json!({"data":[{"type":"user"}]}), Some(false)),
+            (200, json!({"data":null}), None),
+            (503, json!({}), None),
+        ] {
+            let native = Scripted(std::cell::RefCell::new(vec![(
+                "GET /api/session/ses_A/message?limit=1".into(),
+                status,
+                body,
+            )]));
+            assert_eq!(empty_history(&native, &record).ok(), expected);
+            assert!(native.0.borrow().is_empty());
         }
     }
     #[test]
@@ -3480,6 +3980,7 @@ mod tests {
             inbox,
             forms: json!([]),
             permissions: json!([]),
+            native_questions: Default::default(),
             requests: Default::default(),
         }
     }
@@ -3773,7 +4274,7 @@ mod tests {
     fn answering(reply: Result<Response>) -> (Answering, Value, Value) {
         let form = json!({"id":"frm_1","sessionID":"ses_A","title":"Q","fields":[{"key":"q0","title":"C","type":"string"}]});
         let card = forms::cards(&session_record(), &json!([form.clone()]), &json!([])).remove(0);
-        let request = json!({"request_id":"r1","question_id":"frm_1","expected_question_hash":card["question_hash"],
+        let request = json!({"request_id":"r1","expected_run_id":"r1","expected_conversation_id":"ses_A","question_id":"frm_1","expected_question_hash":card["question_hash"],
             "answers":[{"question_id":"q0","selected_option_ids":[],"text":"hi"}]});
         let native = Answering { forms: json!([form]).into(), reply, posted: Default::default() };
         (native, card, request)
@@ -3845,6 +4346,21 @@ mod tests {
         assert_eq!(native.posted.borrow()[0].1, json!({"answer":{"q0":"hi"}}));
     }
     #[test]
+    fn an_exact_duplicate_answer_returns_its_receipt_without_a_native_read_or_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r1.json");
+        let (native, card, request) = answering(status(204, json!({})));
+        let mut record = session_record();
+        let first = answer_with(&native, &record, &request, &card, &path).unwrap();
+        *native.forms.borrow_mut() = json!([]);
+        record["run_id"] = json!("new-run");
+        assert_eq!(answer_with(&native, &record, &request, &card, &path).unwrap(), first);
+        let mut changed = request.clone();
+        changed["answers"] = json!([]);
+        assert!(answer_with(&native, &record, &changed, &card, &path).is_err());
+        assert_eq!(native.posted.borrow().len(), 1);
+    }
+    #[test]
     fn pending_forms_or_permissions_need_attention_before_work() {
         let forms = opencode2("forms_question");
         let id = forms["data"][0]["sessionID"].as_str().unwrap();
@@ -3868,6 +4384,37 @@ mod tests {
         let value = normalize(&status_record(id), Some(&seen));
         assert_eq!(value["phase"], "input");
         assert_eq!(value["pending_questions"][0]["kind"], "opencode_permission");
+        assert!(
+            value.get("human_request").is_none(),
+            "only a supervised child carries it"
+        );
+        // zerus-lgr9s: a supervised child's permission request is the
+        // person's; its own question and its reply are its parent's.
+        let link = json!({"schema":1,"machine":"11111111-1111-4111-8111-111111111111","host":"arch",
+            "session_id":"22222222-2222-4222-8222-222222222222","name":"claude/p/lead",
+            "conversation_id":"c","run_id":"r","source":"launch","at":1});
+        let child = |id: &str| {
+            let mut record = status_record(id);
+            record["parent"] = link.clone();
+            record
+        };
+        assert_eq!(normalize(&child(id), Some(&seen))["human_request"], true);
+        let asked = opencode2("forms_question");
+        let mut questioned = observed("messages_question", true, no_inbox());
+        questioned.forms = asked["data"].clone();
+        let form = asked["data"][0]["sessionID"].as_str().unwrap();
+        let value = normalize(&child(form), Some(&questioned));
+        assert_eq!(
+            (&value["phase"], &value["human_request"]),
+            (&json!("input"), &json!(false)),
+            "{value}"
+        );
+        let value = normalize(&child("ses_A"), Some(&seen));
+        assert_eq!(
+            (&value["phase"], &value["human_request"]),
+            (&json!("idle"), &json!(false)),
+            "{value}"
+        );
         // Another session's request never needs this session's attention.
         let value = normalize(&status_record("ses_A"), Some(&seen));
         assert_eq!(value["phase"], "idle");
@@ -3890,6 +4437,78 @@ mod tests {
         let busy = normalize(&record, Some(&observed("messages_error", true, no_inbox())));
         assert_eq!(busy["phase"], "working");
         assert!(busy.get("provider_error").is_none());
+    }
+    /// The view `hgs read` compares a mark with: one observation, enriched as
+    /// `parent_view` does.
+    fn read_view(record: &Value, seen: &Observed) -> Value {
+        let mut view = normalize(record, Some(seen));
+        let questions = view["pending_questions"].as_array().cloned().unwrap_or_default();
+        read_marks::enrich(&mut view, &json!({}), string(record, "name"), Some(&questions));
+        view
+    }
+    fn questions(view: &Value) -> Option<Vec<Value>> {
+        view["pending_questions"].as_array().cloned()
+    }
+    /// zerus-a4mub.24: `current_read` names what the shown observation shows:
+    /// its newest settled reply in durable order and the requests it lists,
+    /// exactly what `hgs read` accepts on that observation.
+    #[test]
+    fn current_read_names_the_shown_settled_reply_and_listed_requests() {
+        let record = status_record("ses_A");
+        let name = string(&record, "name");
+        let mut seen = observed("messages", false, no_inbox());
+        // A newer reply still streams: it is shown, but never named.
+        seen.page.messages.push(json!({"id":"msg_9zzzzzzzzzzzzzzzzzzzzzzzzz","type":"assistant","time":{"created":1792271999000.0_f64},
+            "content":[{"type":"text","text":"Partial"}]}));
+        let view = read_view(&record, &seen);
+        let current = current_read_of(name, &view).unwrap();
+        let settled: Vec<&Value> = view["events"].as_array().unwrap().iter()
+            .filter(|row| row["type"] == "AgentMessage").collect();
+        assert_eq!(settled.last().unwrap()["streaming"], true);
+        let newest = settled.iter().rev().find(|row| row["streaming"] != true).unwrap();
+        assert_eq!(current["reply_id"], newest["reply_id"]);
+        assert_eq!(current["reply_id"], "msg_14bb2d63e001NhfRTKy4frROM8");
+        assert_eq!(current, json!({"schema":1,"run_id":"run","conversation_id":"ses_A","reply_id":newest["reply_id"],
+            "attention_signature":null,"attention_complete":true}));
+        assert_eq!(read_marks::accepts(&view, questions(&view).as_deref(), &current), (true, false));
+        // Once it completes, the earlier reply is no longer current.
+        seen.page.messages.last_mut().unwrap()["time"]["completed"] = json!(1792272000000.0_f64);
+        let settled = read_view(&record, &seen);
+        assert_eq!(settled["reply_id"], "msg_9zzzzzzzzzzzzzzzzzzzzzzzzz");
+        assert_eq!(read_marks::accepts(&settled, questions(&settled).as_deref(), &current), (false, false));
+
+        // A listed request is signed exactly as shown, and a newer one makes it stale.
+        let forms = opencode2("forms_question");
+        let record = status_record(forms["data"][0]["sessionID"].as_str().unwrap());
+        let mut seen = observed("messages_question", true, no_inbox());
+        seen.forms = forms["data"].clone();
+        let view = read_view(&record, &seen);
+        let current = current_read_of(string(&record, "name"), &view).unwrap();
+        assert_eq!(current["attention_complete"], true);
+        assert_eq!(current["attention_signature"], json!(read_marks::signature(&view, questions(&view).as_deref())));
+        assert_eq!(current["attention_signature"], view["attention_signature"]);
+        assert!(read_marks::accepts(&view, questions(&view).as_deref(), &current).1);
+        seen.permissions = opencode2("permissions")["data"].clone();
+        for permission in seen.permissions.as_array_mut().unwrap() {
+            permission["sessionID"] = record["conversation_id"].clone();
+        }
+        let newer = read_view(&record, &seen);
+        assert_ne!(newer["pending_questions"].as_array().unwrap().len(), view["pending_questions"].as_array().unwrap().len());
+        assert!(!read_marks::accepts(&newer, questions(&newer).as_deref(), &current).1);
+    }
+    /// Without an observation (no service, a failed read, an OpenCode 1
+    /// binding) nothing is known: no reply, attention never complete.
+    #[test]
+    fn current_read_of_an_unobserved_row_claims_nothing() {
+        let record = status_record("ses_A");
+        for row in [unavailable(&record, "OpenCode is not running on fixture".into()), legacy_row(&record)] {
+            let current = current_read_of("opencode/project/one", &row).unwrap();
+            assert_eq!((current["reply_id"].clone(), current["attention_complete"].clone()), (Value::Null, json!(false)));
+            assert_eq!(read_marks::accepts(&row, questions(&row).as_deref(), &current), (false, false));
+        }
+        let mut unbound = record.clone();
+        unbound["conversation_id"] = json!("");
+        assert!(current_read_of("opencode/project/one", &read_view(&unbound, &observed("messages", false, no_inbox()))).is_none());
     }
     #[test]
     fn an_unreadable_service_is_unknown_and_allows_only_forget() {
@@ -4146,12 +4765,32 @@ mod tests {
             ("POST /api/session/ses_A/interrupt", 200, json!({"interrupted": false})),
             ("GET /api/session/active", 200, json!({"data": {"ses_A": {}}})),
         ]);
-        assert!(interrupt_with(&running, &bound()).is_err());
+        // Every end after the POST may have stopped the turn (zerus-1wchz).
+        let error = interrupt_with(&running, &bound()).unwrap_err();
+        assert!(
+            error.starts_with("Interrupt delivery uncertain: OpenCode did not confirm"),
+            "{error}"
+        );
         let unknown = seen(vec![
             ("POST /api/session/ses_A/interrupt", 500, json!({"message": "down"})),
             ("GET /api/session/active", 500, json!({"message": "down"})),
         ]);
-        assert!(interrupt_with(&unknown, &bound()).is_err());
+        let error = interrupt_with(&unknown, &bound()).unwrap_err();
+        assert!(
+            error.starts_with("Interrupt delivery uncertain: "),
+            "{error}"
+        );
+        // A reply lost after the POST went out.
+        struct Lost;
+        impl Native for Lost {
+            fn raw(&self, _: &str, _: &str, _: Option<&Value>) -> Result<Response> {
+                Err("connection reset by peer".into())
+            }
+        }
+        assert_eq!(
+            interrupt_with(&Lost, &bound()).unwrap_err(),
+            "Interrupt delivery uncertain: connection reset by peer"
+        );
     }
     #[test]
     fn a_queued_message_is_removed_only_while_stopped_and_still_queued() {
@@ -4328,6 +4967,8 @@ mod tests {
             verdicts: Some(Vec::new()),
             verdicts_changed: false,
             cached_options: cached_stub,
+            deadline: None,
+            observe_only: false,
         }
     }
     /// A registered service that refuses every connection before a byte is sent.

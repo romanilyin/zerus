@@ -117,6 +117,34 @@ fn a_stream_delivers_frames_and_writes_controls() {
 }
 
 #[test]
+fn a_server_without_older_pages_answers_false_and_writes_nothing() {
+    let fake = FakeHgs::new(
+        "stream_older_old_server",
+        json!({"": {"runs": [[{"file": "basic.ndjson"}, {"serve": true}]]}}),
+    );
+    let (tx, rx) = channel();
+    let mut seen = Seen::new(rx);
+    let handle = stream::spawn(&fake.path(), &ComputerId::local(), quick(), tx);
+    // Before any hello nothing pages, followed or not.
+    assert!(!handle.older("run:run-draft-1", 50, 100).unwrap());
+    seen.until("live", live);
+    let session = SessionRef {
+        name: "claude/docs-site/draft".into(),
+        run_id: Some("run-draft-1".into()),
+        conversation_id: Some("conv-draft".into()),
+    };
+    handle.follow(session, None, 100).unwrap();
+    seen.until("activity", |event| {
+        matches!(change_of(event), Some(Change::Activity { update: ActivityUpdate::Events { .. }, .. }))
+    });
+    // The fixture's hello lacks `activity_older`: the caller reads the old way.
+    assert!(!handle.older("run:run-draft-1", 50, 100).unwrap());
+    assert!(!handle.older("run:unfollowed", 50, 100).unwrap());
+    assert_eq!(fake.stdin("").len(), 1, "only the follow's subscribe");
+    handle.stop();
+}
+
+#[test]
 fn a_stream_that_ends_reconnects_after_growing_delays_and_keeps_its_rows() {
     let fake = FakeHgs::new(
         "stream_reconnects",
@@ -163,8 +191,9 @@ fn a_stream_that_ends_reconnects_after_growing_delays_and_keeps_its_rows() {
             "restart {attempt} after {gap} s, before {delay} s"
         );
     }
-    assert_eq!(timing.restart_delay(4), Duration::from_millis(600));
-    assert_eq!(timing.restart_delay(9), Duration::from_millis(600));
+    // The default 10 s later delay, scaled by 0.002.
+    assert_eq!(timing.restart_delay(4), Duration::from_millis(20));
+    assert_eq!(timing.restart_delay(9), Duration::from_millis(20));
     // Each start probed the CLI again.
     assert!(fake.runs("", &["-h"]).len() >= 4);
 }
@@ -174,13 +203,18 @@ fn a_fatal_error_ends_the_stream_and_the_next_one_goes_live() {
     let fake = FakeHgs::new(
         "stream_fatal",
         json!({"": {"runs": [
-            [{"file": "fatal.ndjson"}, {"serve": true}],
+            [{"file": "fatal.ndjson"}, {"sleep": 0.6}, {"serve": true}],
             [{"lines": [hello("workstation"), catalog(&[("r2", "codex/sample-project/tests")])]}, {"serve": true}]
         ]}}),
     );
     let (tx, rx) = channel();
     let mut seen = Seen::new(rx);
-    let handle = stream::spawn(&fake.path(), &ComputerId::local(), quick(), tx);
+    let timing = Timing {
+        // The fake must see EOF before close may kill it, even on a loaded host.
+        stop_grace: common::WAIT + Duration::from_secs(1),
+        ..quick()
+    };
+    let handle = stream::spawn(&fake.path(), &ComputerId::local(), timing, tx);
     let failed = seen.until("reconnecting", |event| reconnecting(event, 1));
     // The client closed the failed stream itself.
     common::eventually("EOF of the failed stream", || fake.eofs("") >= 1);
@@ -192,6 +226,78 @@ fn a_fatal_error_ends_the_stream_and_the_next_one_goes_live() {
     });
     assert!(replaced);
     handle.stop();
+}
+
+/// zerus-5wmh.66.2.46: a server whose executable was replaced ends with a
+/// fatal `hgs_replaced` error. The new executable starts at once, without a
+/// failure and with the rows kept; a repeat within a minute (a broken install)
+/// waits like a failure, so a replaced stream never restarts in a tight loop.
+#[test]
+fn a_replaced_executable_restarts_at_once_and_only_once_a_minute() {
+    let replaced = json!({"t": "error", "code": "hgs_replaced", "fatal": true,
+        "message": "the hgs executable was replaced; start the stream again to run the new version"});
+    let row = [("r1", "claude/sample-project/review")];
+    let fake = FakeHgs::new(
+        "stream_replaced",
+        json!({"": {"runs": [
+            [{"lines": [hello("workstation"), catalog(&row), replaced.clone()]}, {"serve": true}],
+            [{"lines": [hello("workstation"), catalog(&row), replaced]}, {"serve": true}],
+            [{"lines": [hello("workstation"), catalog(&row)]}, {"serve": true}]
+        ]}}),
+    );
+    let (tx, rx) = channel();
+    let mut seen = Seen::new(rx);
+    let timing = Timing {
+        // A restart after a failure waits a visible 2 s; the first replaced
+        // stream's restart must not.
+        restart: [2, 2, 2, 2].map(Duration::from_secs).into(),
+        stop_grace: common::WAIT + Duration::from_secs(1),
+        ..quick()
+    };
+    let handle = stream::spawn(&fake.path(), &ComputerId::local(), timing, tx);
+    let first = seen.until("live", live);
+    let second = seen.until_from(first + 1, "live after the replacement", live);
+    let between = &seen.all[first..second];
+    assert!(
+        !between.iter().any(|event| reconnecting(event, 1)),
+        "the first replacement is no failure"
+    );
+    assert!(between.iter().any(|event| {
+        change_of(event).and_then(|change| status_of(change, &ComputerId::local()))
+            == Some(ComputerStatus::Probing)
+    }));
+    // The repeat within the minute counts as a failure and waits its delay.
+    let failed = seen.until_from(second, "the repeat reconnects", |event| {
+        reconnecting(event, 1)
+    });
+    seen.until_from(failed, "live after the delay", live);
+    // Only what arrived before the stop, whose own replacement is empty.
+    let before_stop = seen.all.len();
+    handle.stop();
+    let starts = fake.runs("", &["watch", "--json"]);
+    assert_eq!(starts.len(), 3, "{starts:?}");
+    assert!(
+        starts[1] - starts[0] < 1.5,
+        "the replaced stream restarted at once: {starts:?}"
+    );
+    assert!(
+        starts[2] - starts[1] >= 2.0,
+        "the repeat waited the delay: {starts:?}"
+    );
+    // Rows stay as last known throughout: once the row is known, no
+    // replacement drops it, an empty one included.
+    let mut known = false;
+    for event in &seen.all[..before_stop] {
+        match change_of(event) {
+            Some(Change::Replace { rows, .. }) => {
+                assert!(rows.len() == 1 || (!known && rows.is_empty()), "{rows:?}");
+                known |= rows.len() == 1;
+            }
+            Some(Change::Remove { .. }) => panic!("a removal across the restart"),
+            _ => {}
+        }
+    }
+    assert!(known, "the row was never live");
 }
 
 #[test]
@@ -279,4 +385,38 @@ fn probes_read_the_marker_of_the_selected_computer() {
         Probe::Failed(_)
     ));
     assert_eq!(fake.runs("studio", &["-h"]).len(), 1);
+}
+
+#[test]
+fn confirmed_notification_preferences_reach_the_row_before_the_next_listing() {
+    let preferences = |muted: bool, revision: i64| {
+        json!({"conversation_id": "conversation", "muted": muted, "revision": revision, "suppressed": {
+            "reply_id": null, "attention_signature": null, "optional_question_ids": [],
+            "main_attention": null, "child_attention": {}}})
+    };
+    let row = json!({"name": "codex/project/session", "cmd": "codex", "run_id": "run",
+        "conversation_id": "conversation", "tracked": true, "phase": "idle", "activity": "idle",
+        "notification_preferences": preferences(false, 2)});
+    let catalog = json!({"t": "snapshot", "topic": "catalog", "items": [{"key": "run:run", "row": row}],
+        "page": 0, "last": true, "cursor": 1});
+    let fake = FakeHgs::new(
+        "notifications_apply",
+        json!({"": {"runs": [[{"lines": [hello("workstation"), catalog]}, {"serve": true}]]}}),
+    );
+    let (tx, rx) = channel();
+    let mut seen = Seen::new(rx);
+    let handle = stream::spawn(&fake.path(), &ComputerId::local(), quick(), tx);
+    seen.until("live", live);
+    let target = zerus_client_core::Target {
+        computer: String::new(),
+        name: "codex/project/session".into(),
+        run_id: "run".into(),
+        conversation_id: "conversation".into(),
+    };
+    assert!(handle.apply_notifications(target, preferences(true, 3)));
+    seen.until("the muted row", |event| {
+        matches!(change_of(event), Some(Change::Upsert { key, row, .. })
+            if key == "run:run" && row.muted && row.notification_revision == Some(3))
+    });
+    handle.stop();
 }

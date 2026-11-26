@@ -245,7 +245,7 @@ pub(crate) fn bind_existing(config: &crate::config::Config, dry: bool) -> Result
     if record_path(&request.name).exists() || super::super::dsh::exists(&request.name) {
         return Err("This name belongs to an existing agent binding".into());
     }
-    let previous = existing_in(&bindings(), &request)?;
+    let previous = existing_in(&root().join("opencode/bindings"), &request)?;
     let receipt_path = root()
         .join("opencode/existing-receipts")
         .join(format!("{}.json", request.request_id));
@@ -297,7 +297,7 @@ pub(crate) fn bind_existing(config: &crate::config::Config, dry: bool) -> Result
     let mut receipt = json!({"selection":payload(&request),"run_id":run,"status":"reserved"});
     atomic(&receipt_path, &receipt.to_string())?;
     if previous.is_none() {
-        save(&record(
+        save(&mut record(
             &request,
             run.as_str().ok_or("Invalid run identity")?,
         ))?;

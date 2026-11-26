@@ -41,6 +41,9 @@ use std::{
 pub const EXECUTABLE: &str = "hgs.exe";
 /// The bundled ConPTY pair (D6), staged only together.
 pub const PAIR: [&str; 2] = ["conpty.dll", "OpenConsole.exe"];
+/// Team and project memory run crates/lore's binary; hgs looks for it beside
+/// its own executable (task 260), so a package's copy is staged the same way.
+pub const LORE: &str = if cfg!(windows) { "lore.exe" } else { "lore" };
 /// Below the images folder: the name of the image the next host starts from.
 pub const POINTER: &str = "current";
 /// In an image: the hgs version of its executable.
@@ -58,6 +61,11 @@ const NAME_LENGTH: usize = 16;
 /// How long an install waits for another one to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 
+/// The host images folder below `home`, where `Layout` keeps them.
+pub fn images_below(home: &str) -> PathBuf {
+    PathBuf::from(platform::below(home, ".local/share/hgs/host"))
+}
+
 /// Where enablement keeps its files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -73,7 +81,7 @@ impl Layout {
     pub fn new(home: &str, config_dir: &Path) -> Self {
         Self {
             cli: PathBuf::from(platform::below(home, ".local/bin")).join(EXECUTABLE),
-            images: PathBuf::from(platform::below(home, ".local/share/hgs/host")),
+            images: images_below(home),
             marker: config_dir.join(MARKER),
         }
     }
@@ -177,7 +185,7 @@ fn aside_name() -> String {
 }
 
 /// Whether `name` is one `aside_name` gave; nothing else is ever deleted.
-fn is_aside(name: &str) -> bool {
+pub(crate) fn is_aside(name: &str) -> bool {
     name.strip_prefix(ASIDE_PREFIX)
         .and_then(|rest| rest.split_once('-'))
         .is_some_and(|(seconds, random)| {
@@ -321,6 +329,189 @@ pub struct CliReport {
     pub removed: usize,
     /// Aside files left because a process still runs them.
     pub kept: Vec<PathBuf>,
+    /// Task #420: what staging lore did.
+    pub lore: LoreStage,
+}
+
+/// Task #420: what staging the lore sidecar did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoreStage {
+    /// The package carries no lore; whatever sits beside the CLI stays.
+    Absent,
+    /// The same build is already there.
+    Same,
+    /// The package's lore took the place; the one it replaced, if any, is
+    /// kept beside it as `lore.exe.bak`.
+    Installed { backup: Option<PathBuf> },
+    /// The installed lore is newer or richer than the package's: untouched.
+    Kept { reason: String },
+}
+
+/// Task #420: what a lore binary says about itself: `lore --version`
+/// ("lore 0.4.1 (6728c2f)") and whether `lore atlas --help` answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoreFacts {
+    pub version: Option<(u64, u64, u64)>,
+    pub commit: String,
+    pub atlas: bool,
+}
+
+/// `lore 0.4.1 (6728c2f)` or `lore 0.4.1`: the version and the commit.
+pub fn parse_lore_version(text: &str) -> Option<((u64, u64, u64), String)> {
+    let line = text.lines().find(|line| line.trim_start().starts_with("lore "))?.trim();
+    let mut words = line.split_whitespace().skip(1);
+    let version = words.next()?;
+    let mut numbers = version.trim_start_matches('v').split(['.', '-', '+']).map(|part| part.parse::<u64>());
+    let triple = (numbers.next()?.ok()?, numbers.next()?.ok()?, numbers.next().and_then(Result::ok).unwrap_or(0));
+    let commit = words
+        .next()
+        .map(|word| word.trim_matches(|c| c == '(' || c == ')').to_owned())
+        .filter(|commit| !commit.is_empty() && commit.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or_default();
+    Some((triple, commit))
+}
+
+/// Task #420 (owner, 2026-11-09): an install never replaces a lore that is
+/// newer or richer than the package's: the reason it stays, or None when the
+/// package's lore may replace it (an older, not richer build, or one that does
+/// not answer at all).
+pub fn keep_installed_lore(installed: &LoreFacts, package: &LoreFacts) -> Option<String> {
+    let installed_version = installed.version?;
+    if installed.atlas && !package.atlas {
+        return Some("it has Atlas (lore atlas), which the package's lore lacks".into());
+    }
+    let shown = |facts: &LoreFacts| match facts.version {
+        Some((a, b, c)) if facts.commit.is_empty() => format!("{a}.{b}.{c}"),
+        Some((a, b, c)) => format!("{a}.{b}.{c} ({})", facts.commit),
+        None => "an unknown version".into(),
+    };
+    match package.version {
+        None => Some(format!("the package's lore reports no version; the installed {} stays", shown(installed))),
+        Some(package_version) if installed_version > package_version => {
+            Some(format!("the installed {} is newer than the package's {}", shown(installed), shown(package)))
+        }
+        // The same version from another commit: which one is newer is
+        // unknown here, so the installed build stays.
+        Some(package_version)
+            if installed_version == package_version
+                && !installed.commit.is_empty()
+                && !package.commit.is_empty()
+                && !installed.commit.starts_with(&package.commit)
+                && !package.commit.starts_with(&installed.commit) =>
+        {
+            Some(format!(
+                "the installed {} and the package's {} are different commits of the same version; their order is unknown",
+                shown(installed),
+                shown(package)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// How a test describes a lore binary.
+#[cfg(test)]
+type LoreFactsFn = fn(&Path) -> LoreFacts;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests describe the lore binaries instead of running them.
+    static LORE_FACTS: std::cell::RefCell<Option<LoreFactsFn>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_lore_facts(facts: Option<fn(&Path) -> LoreFacts>) {
+    LORE_FACTS.with(|cell| *cell.borrow_mut() = facts);
+}
+
+/// Runs `lore --version` and `lore atlas --help` (each bounded).
+pub fn lore_facts(path: &Path) -> LoreFacts {
+    #[cfg(test)]
+    if let Some(facts) = LORE_FACTS.with(|cell| *cell.borrow()) {
+        return facts(path);
+    }
+    let run = |args: &[&str]| -> Option<(bool, String)> {
+        let mut command = std::process::Command::new(path);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().ok()?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut out = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = io::Read::read_to_string(&mut stdout, &mut out);
+                    }
+                    return Some((status.success(), out));
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+    };
+    let mut facts = LoreFacts::default();
+    if let Some((true, out)) = run(&["--version"]) {
+        if let Some((version, commit)) = parse_lore_version(&out) {
+            facts.version = Some(version);
+            facts.commit = commit;
+        }
+    }
+    facts.atlas = run(&["atlas", "--help"]).is_some_and(|(ok, _)| ok);
+    facts
+}
+
+/// Stage `source`'s lore sidecar beside the stable CLI `cli`, when the package
+/// carries one. A missing sidecar leaves whatever already sits there; the same
+/// build is not rewritten. The copy is verified like the CLI's own.
+/// Task #420: a newer or richer installed lore stays untouched; an older one
+/// is replaced and kept beside it as `lore.exe.bak`.
+fn stage_lore(source: &Path, cli: &Path) -> Result<LoreStage, StageError> {
+    let source = source.parent().unwrap_or(Path::new("")).join(LORE);
+    if !source.is_file() {
+        return Ok(LoreStage::Absent);
+    }
+    let target = cli.with_file_name(LORE);
+    let hash = sha256(&source).map_err(at(&source))?;
+    if sha256(&target).ok().as_deref() == Some(hash.as_str()) {
+        return Ok(LoreStage::Same);
+    }
+    if target.is_file() {
+        if let Some(reason) = keep_installed_lore(&lore_facts(&target), &lore_facts(&source)) {
+            eprintln!("hgs: kept {}: {reason}", target.display());
+            return Ok(LoreStage::Kept { reason });
+        }
+    }
+    let folder = cli
+        .parent()
+        .ok_or_else(|| StageError::Io(cli.to_owned(), io::ErrorKind::InvalidInput.into()))?;
+    fs::create_dir_all(folder).map_err(at(folder))?;
+    // The build being replaced stays beside it, so it can be put back.
+    let backup = if target.is_file() {
+        let backup = target.with_file_name(format!("{LORE}.bak"));
+        fs::copy(&target, &backup).map_err(at(&backup))?;
+        Some(backup)
+    } else {
+        None
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix(NEW_PREFIX)
+        .tempfile_in(folder)
+        .map_err(at(folder))?;
+    let path = temporary.path().to_owned();
+    copy_verified(&source, temporary.as_file_mut(), &path, &hash)?;
+    // lore is a short-lived child of hgs, so a plain replace is enough; a busy
+    // file is reported instead of guessed.
+    platform::persist(temporary, &target).map_err(|error| StageError::Io(target, error.error))?;
+    platform::sync_dir(folder).map_err(at(folder))?;
+    Ok(LoreStage::Installed { backup })
 }
 
 /// Stage `source` as the stable CLI at `target`.
@@ -361,6 +552,8 @@ pub fn stage_cli(source: &Path, target: &Path) -> Result<CliReport, StageError> 
         }
         let _ = platform::sync_dir(folder);
     }
+    // Task 260: the stable CLI runs the team worker, which runs lore.
+    let lore = stage_lore(source, target)?;
     let (removed, kept) = remove_aside(folder);
     Ok(CliReport {
         path: target.to_owned(),
@@ -368,6 +561,7 @@ pub fn stage_cli(source: &Path, target: &Path) -> Result<CliReport, StageError> 
         changed,
         removed,
         kept,
+        lore,
     })
 }
 
@@ -505,6 +699,16 @@ fn parts(source: &Path) -> Result<(Vec<Part>, Pair), StageError> {
                 source: path,
             });
         }
+    }
+    // Task 260: team and project memory run lore beside hgs; a package that
+    // carries it stages it into the image too, hash-checked like the rest.
+    let lore = folder.join(LORE);
+    if lore.is_file() {
+        parts.push(Part {
+            name: LORE,
+            sha256: hash(&lore)?,
+            source: lore,
+        });
     }
     Ok((parts, pair))
 }
@@ -682,22 +886,409 @@ pub struct InstallReport {
     pub image: ImageReport,
     /// Whether the marker was created now (it may have existed).
     pub enabled: bool,
+    /// The app bound to the staged CLI, when the source folder holds one.
+    pub frontend: Option<FrontendBinding>,
+}
+
+/// Install just the maintained CLI for another hgs service. Use the same lock
+/// and image-safe replacement as session-host installation, without enabling
+/// local sessions or changing their existing enablement choice.
+pub fn install_cli(layout: &Layout, source: &Path) -> Result<CliReport, StageError> {
+    fs::create_dir_all(&layout.images).map_err(at(&layout.images))?;
+    let _lock = lock(&layout.images)?;
+    stage_cli(source, &layout.cli)
 }
 
 /// Enable local sessions (D2): stage `source`, the running hgs of version
 /// `version`, as the stable CLI and as a host image, then write the marker.
-/// Idempotent; installs of one user run one at a time.
+/// Idempotent; installs of one user run one at a time. Removes any app
+/// binding: only the app's own install (`install_bound`) records one.
 pub fn install(layout: &Layout, source: &Path, version: &str) -> Result<InstallReport, StageError> {
-    fs::create_dir_all(&layout.images).map_err(at(&layout.images))?;
+    install_bound(layout, source, version, |_, _| Ok(None))
+}
+
+/// Create `path` and its missing parents; on Unix owner-only, like the other
+/// private records. Existing folders are never changed.
+fn create_private_dirs(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)
+}
+
+
+/// A folder of the chain, held like `private_directory`. `private` asks for an
+/// owner-only folder; otherwise (WhiteWh fork, an ancestor of the images
+/// folder) another principal may only read it: Codex grants its sandbox group
+/// read access on `~/.local`, and nobody but this user can change any folder.
+fn chain_directory(path: &Path, private: bool) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options.open(path)?;
+    let safe = if private {
+        platform::verify_private_directory(&file)?
+    } else {
+        platform::verify_guarded_directory(&file)?
+    };
+    if !safe {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            if private {
+                "the binding's folder is not private to this user"
+            } else {
+                "another account can change a folder above the binding"
+            },
+        ));
+    }
+    Ok(file)
+}
+
+/// The images folder and the three folders above it that hgs keeps below the
+/// home folder (`.local`, `share`, `hgs`, `host`), outermost first, held while
+/// a binding is published or read. The images folder is private; the folders
+/// above it may be readable by another account but changeable only by this
+/// user (WhiteWh fork: Codex's read grant on `~/.local` left every binding
+/// unwritable, so the portable app was never admitted). Unsafe folders are
+/// refused, never repaired here.
+fn private_chain(images: &Path) -> io::Result<Vec<fs::File>> {
+    let mut chain: Vec<&Path> = images.ancestors().take(4).collect();
+    chain.reverse();
+    let last = chain.len().saturating_sub(1);
+    chain
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| chain_directory(path, index == last))
+        .collect()
+}
+
+/// The binding file itself, opened without following a link and verified
+/// private: this user's, owner-only access, a single link, not a reparse
+/// point. On Windows nobody can write or delete it while it is held.
+fn private_record(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    platform::no_follow(&mut options);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
+    let file = options.open(path)?;
+    if !platform::verify_private_file(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the binding is not a private file of this user",
+        ));
+    }
+    Ok(file)
+}
+
+/// Publishes a binding: the candidate is prepared and verified first, then
+/// `commit`, the creator's own last check of the evidence it still holds, runs
+/// immediately before the namespace commit. `Ok(false)`: nothing was published.
+pub type Publish<'a> =
+    dyn FnMut(&FrontendBinding, &dyn Fn() -> bool) -> Result<bool, StageError> + 'a;
+
+/// `install`, then `bind` may record the app staged with this CLI. The old
+/// binding goes first, so a failure anywhere leaves none. `bind` runs only
+/// after the CLI, the image and the marker are complete, and publishes through
+/// the callback it is given, immediately after its last check of the evidence
+/// it still holds.
+pub fn install_bound(
+    layout: &Layout,
+    source: &Path,
+    version: &str,
+    bind: impl FnOnce(&Layout, &mut Publish<'_>) -> Result<Option<FrontendBinding>, StageError>,
+) -> Result<InstallReport, StageError> {
+    create_private_dirs(&layout.images).map_err(at(&layout.images))?;
     let _lock = lock(&layout.images)?;
+    unbind_frontend(layout)?;
     let cli = stage_cli(source, &layout.cli)?;
     let image = stage_image(source, &layout.images, version)?;
     let enabled = enable(&layout.marker).map_err(at(&layout.marker))?;
+    // WhiteWh fork: the images folder is hgs's own; one that only inherited too
+    // much access (Codex's read grant on `~/.local`) is made private in place,
+    // under the install lock, before a binding is published in it. Another
+    // owner, a link or a reparse point stays as it is and the binding is refused.
+    let _ = platform::repair_private(&layout.images, platform::Private::Directory);
+    let frontend = bind(layout, &mut |binding, commit| {
+        publish_frontend(layout, binding, commit)
+    })?;
     Ok(InstallReport {
         cli,
         image,
         enabled,
+        frontend,
     })
+}
+
+/// Below the images folder: which app was staged together with the stable CLI
+/// (docs/desktop-windows-mode.md). Only an install by that app writes it.
+pub const FRONTEND_BINDING: &str = "frontend.json";
+/// The app a portable zip keeps beside its `hgs.exe`.
+pub const FRONTEND_IMAGE: &str = "hgs-tray.exe";
+/// The largest binding read; a recorded one is well under a kilobyte.
+const FRONTEND_BYTES: u64 = 4096;
+pub const FRONTEND_SCHEMA: u32 = 1;
+
+/// One pinned object of a binding: its final path, the volume serial and file
+/// ID of the exact object (FileIdInfo, the ID as 32 hex digits) and its length.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundObject {
+    pub path: PathBuf,
+    pub volume: u64,
+    pub file_id: String,
+    pub length: u64,
+}
+
+/// The maintained binding of a portable zip's app to the stable CLI staged
+/// from the same folder: both objects as the app's own staging pinned them,
+/// and the app's digest read through that pin. A copied CLI never creates one,
+/// and neither identity nor this digest alone admits anything: each admitting
+/// process pins the pair again and checks the digest once.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendBinding {
+    pub schema: u32,
+    pub frontend: BoundObject,
+    pub frontend_sha256: String,
+    pub cli: BoundObject,
+}
+
+impl FrontendBinding {
+    pub fn valid(&self) -> bool {
+        let hex = |value: &str, digits: usize| {
+            value.len() == digits
+                && value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        let object = |object: &BoundObject| object.path.is_absolute() && hex(&object.file_id, 32);
+        self.schema == FRONTEND_SCHEMA
+            && object(&self.frontend)
+            && object(&self.cli)
+            && hex(&self.frontend_sha256, 64)
+            && self
+                .frontend
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(FRONTEND_IMAGE))
+    }
+}
+
+fn unbind_frontend(layout: &Layout) -> Result<(), StageError> {
+    let path = layout.images.join(FRONTEND_BINDING);
+    match fs::remove_file(&path) {
+        Ok(()) => platform::sync_dir(&layout.images).map_err(at(&layout.images)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StageError::Io(path, error)),
+    }
+}
+
+/// Publish `binding` as a private record. The candidate is written, synced and
+/// verified private (owner, access, single link, no reparse point) through its
+/// own handle, with the folder chain held private, before anything is visible
+/// at the record's name. `commit` runs last, immediately before the rename;
+/// afterwards the published name must be that same private object.
+fn publish_frontend(
+    layout: &Layout,
+    binding: &FrontendBinding,
+    commit: &dyn Fn() -> bool,
+) -> Result<bool, StageError> {
+    let path = layout.images.join(FRONTEND_BINDING);
+    let invalid = |path: &Path| StageError::Io(path.to_owned(), io::ErrorKind::InvalidData.into());
+    let bytes = serde_json::to_vec(binding)
+        .map_err(|error| StageError::Io(path.clone(), io::Error::other(error)))?;
+    if !binding.valid() || bytes.len() as u64 > FRONTEND_BYTES {
+        return Err(invalid(&path));
+    }
+    let _chain = private_chain(&layout.images).map_err(at(&layout.images))?;
+    let mut candidate = tempfile::Builder::new()
+        .prefix(&format!("{STAGING_PREFIX}frontend-"))
+        .tempfile_in(&layout.images)
+        .map_err(at(&layout.images))?;
+    let staged = candidate.path().to_owned();
+    candidate.write_all(&bytes).map_err(at(&staged))?;
+    candidate.as_file().sync_all().map_err(at(&staged))?;
+    // Refused, never repaired: an inherited ACE the folder check cannot see
+    // shows here, before the record's name exists.
+    if !platform::verify_private_file(candidate.as_file()).map_err(at(&staged))? {
+        return Err(StageError::Io(
+            staged,
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the binding candidate is not a private file of this user",
+            ),
+        ));
+    }
+    let object = platform::FileIdentity::of(candidate.as_file()).map_err(at(&staged))?;
+    if !commit() {
+        return Ok(false);
+    }
+    platform::persist(candidate, &path)
+        .map_err(|error| StageError::Io(path.clone(), error.error))?;
+    platform::sync_dir(&layout.images).map_err(at(&layout.images))?;
+    // The published name is the verified candidate, still private.
+    let same = private_record(&path)
+        .and_then(|file| platform::FileIdentity::of(&file))
+        .is_ok_and(|published| published == object);
+    if !same {
+        let _ = fs::remove_file(&path);
+        return Err(invalid(&path));
+    }
+    Ok(true)
+}
+
+/// The binding below `images`, read like the other private records: every
+/// folder of its chain and the file itself private to this user and held, no
+/// link or reparse point, a single link, at most `FRONTEND_BYTES`, the exact
+/// schema with absolute paths. Anything else is no binding.
+pub fn read_frontend(images: &Path) -> Option<FrontendBinding> {
+    frontend_binding(images).ok()
+}
+
+/// Task 180: the refusals a frontend admission prints for the portable
+/// binding; the desktop maps each exact line to its check.
+pub const FOLDERS_NOT_PRIVATE: &str = "frontend folders are not private";
+pub const BINDING_UNAVAILABLE: &str = "frontend binding unavailable";
+
+/// Task 180: the binding, or why there is none, for a refusal the desktop
+/// shows: the folders of its chain are not guarded (another account can
+/// change one, or the images folder is not private), or the record itself is
+/// missing, not private or not valid. Fixed words only.
+pub fn frontend_binding(images: &Path) -> Result<FrontendBinding, &'static str> {
+    let _chain = private_chain(images).map_err(|_| FOLDERS_NOT_PRIVATE)?;
+    let file = private_record(&images.join(FRONTEND_BINDING)).map_err(|_| BINDING_UNAVAILABLE)?;
+    let metadata = file.metadata().map_err(|_| BINDING_UNAVAILABLE)?;
+    if !metadata.is_file() || metadata.len() > FRONTEND_BYTES {
+        return Err(BINDING_UNAVAILABLE);
+    }
+    let mut bytes = Vec::new();
+    file.take(FRONTEND_BYTES + 1).read_to_end(&mut bytes).map_err(|_| BINDING_UNAVAILABLE)?;
+    if bytes.len() as u64 > FRONTEND_BYTES {
+        return Err(BINDING_UNAVAILABLE);
+    }
+    let binding: FrontendBinding = serde_json::from_slice(&bytes).map_err(|_| BINDING_UNAVAILABLE)?;
+    binding.valid().then_some(binding).ok_or(BINDING_UNAVAILABLE)
+}
+
+/// Task 180: a temporary root private to this user, so a test's folders never
+/// inherit the runner's access entries (a worktree on a data drive lets
+/// Authenticated Users change it; Codex's sandbox group reads `~/.local`). The
+/// binding's chain checks then see only what a test sets itself.
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> tempfile::TempDir {
+    private(tempfile::tempdir().unwrap())
+}
+
+/// Task #23 (team ede724c4): `private_tempdir` below `base` (a test that
+/// compares canonical paths makes its root in the canonical temporary folder).
+/// The cargo-test template's TEMP sits in the member's worktree, which a data
+/// drive lets Authenticated Users change; every store that checks its files
+/// are private refused the test's own files there.
+#[cfg(test)]
+pub(crate) fn private_tempdir_in(base: &Path) -> tempfile::TempDir {
+    private(tempfile::tempdir_in(base).unwrap())
+}
+
+#[cfg(test)]
+fn private(dir: tempfile::TempDir) -> tempfile::TempDir {
+    if let platform::PrivateRepair::Refused(why) = platform::repair_private(dir.path(), platform::Private::Directory).unwrap() {
+        panic!("the test's temporary root could not be made private: {why}");
+    }
+    dir
+}
+
+#[cfg(all(test, windows))]
+mod guarded_chain_tests {
+    use super::*;
+
+    fn icacls(path: &Path, args: &[&str]) {
+        let status = std::process::Command::new("icacls").arg(path).args(args).output().unwrap();
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stdout));
+    }
+
+    /// WhiteWh fork: Codex grants its sandbox group read access on `~/.local`.
+    /// An ancestor another account can only read keeps the binding usable; one
+    /// another account can change does not, and the images folder itself must
+    /// stay private.
+    #[test]
+    fn an_ancestor_others_can_only_read_is_guarded_and_one_they_can_change_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("ancestor");
+        std::fs::create_dir(&folder).unwrap();
+        let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap(), std::env::var("USERNAME").unwrap());
+        icacls(&folder, &["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F")]);
+        assert!(chain_directory(&folder, true).is_ok());
+        // BUILTIN\Users may read and traverse: guarded, no longer private.
+        icacls(&folder, &["/grant", "*S-1-5-32-545:(OI)(CI)RX"]);
+        assert!(chain_directory(&folder, false).is_ok());
+        assert!(chain_directory(&folder, true).is_err());
+        // BUILTIN\Users may change it: refused either way.
+        icacls(&folder, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+        assert!(chain_directory(&folder, false).is_err());
+        assert!(chain_directory(&folder, true).is_err());
+    }
+
+    /// The install makes its own images folder private in place when it only
+    /// inherited a read grant, so the binding can be published below it.
+    #[test]
+    fn the_install_repairs_an_images_folder_that_only_inherited_a_read_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let local = home.join(".local");
+        std::fs::create_dir_all(&local).unwrap();
+        let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap(), std::env::var("USERNAME").unwrap());
+        icacls(&home, &["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F")]);
+        icacls(&local, &["/grant", "*S-1-5-32-545:(OI)(CI)RX"]);
+        let layout = Layout::new(&home.to_string_lossy(), &home.join("config"));
+        std::fs::create_dir_all(&layout.images).unwrap();
+        assert!(private_chain(&layout.images).is_err(), "the images folder inherited the read grant");
+        let _ = platform::repair_private(&layout.images, platform::Private::Directory);
+        assert!(private_chain(&layout.images).is_ok());
+    }
+
+    /// Task 180: the refusal names the check that failed: a folder of the
+    /// chain another account can change, or a missing binding below private
+    /// folders. The desktop shows each with its next step.
+    #[test]
+    fn a_missing_binding_and_a_changeable_folder_are_named_apart() {
+        let dir = private_tempdir();
+        let home = dir.path().join("home");
+        let layout = Layout::new(&home.to_string_lossy(), &home.join("config"));
+        std::fs::create_dir_all(&layout.images).unwrap();
+        assert_eq!(frontend_binding(&layout.images).err(), Some(BINDING_UNAVAILABLE));
+        assert!(read_frontend(&layout.images).is_none());
+        // BUILTIN\Users may change a folder above the images folder.
+        icacls(&home.join(".local"), &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+        assert_eq!(frontend_binding(&layout.images).err(), Some(FOLDERS_NOT_PRIVATE));
+    }
 }
 
 #[cfg(test)]
@@ -746,7 +1337,7 @@ mod tests {
 
     #[test]
     fn hashes_and_names_are_fixed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("abc");
         fs::write(&path, b"abc").unwrap();
         assert_eq!(sha256(&path).unwrap(), ABC);
@@ -779,7 +1370,7 @@ mod tests {
 
     #[test]
     fn the_pointer_names_only_a_complete_image() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let images = dir.path();
         assert_eq!(current_image_in(images), None);
         let name = "0123456789abcdef";
@@ -801,7 +1392,7 @@ mod tests {
 
     #[test]
     fn the_cli_is_replaced_by_rename_and_never_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let one = source(dir.path(), "one", b"build one", &[]);
         let two = source(dir.path(), "two", b"build two", &[]);
         let target = dir.path().join("bin").join(EXECUTABLE);
@@ -846,9 +1437,142 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"build two");
     }
 
+    /// Task #420: a test lore "binary" is its own description: its first line
+    /// is what `lore --version` prints, and "atlas" on a later line means
+    /// `lore atlas --help` answers.
+    fn described(path: &Path) -> LoreFacts {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        let (version, commit) = parse_lore_version(&text).map_or((None, String::new()), |(v, c)| (Some(v), c));
+        LoreFacts { version, commit, atlas: text.lines().skip(1).any(|line| line.trim() == "atlas") }
+    }
+
+    #[test]
+    fn a_lore_version_names_its_version_and_commit() {
+        assert_eq!(parse_lore_version("lore 0.4.1 (6728c2f)
+"), Some(((0, 4, 1), "6728c2f".into())));
+        assert_eq!(parse_lore_version("lore 0.4.0"), Some(((0, 4, 0), String::new())));
+        assert_eq!(parse_lore_version("error: no such command"), None);
+    }
+
+    #[test]
+    fn an_installed_lore_that_is_newer_or_richer_stays() {
+        let facts = |version: (u64, u64, u64), commit: &str, atlas: bool| LoreFacts { version: Some(version), commit: commit.into(), atlas };
+        let package = facts((0, 4, 0), "8fdb66b", false);
+        // Newer.
+        assert!(keep_installed_lore(&facts((0, 4, 1), "6728c2f", false), &package).unwrap().contains("newer"));
+        // Richer: Atlas, even at an older version.
+        assert!(keep_installed_lore(&facts((0, 3, 9), "1234567", true), &package).unwrap().contains("Atlas"));
+        // The same version from another commit: its order is unknown, it stays.
+        assert!(keep_installed_lore(&facts((0, 4, 0), "abcdef1", false), &package).unwrap().contains("unknown"));
+        // Older and not richer, the same build, or one that does not answer: replaced.
+        assert_eq!(keep_installed_lore(&facts((0, 3, 9), "1234567", false), &package), None);
+        assert_eq!(keep_installed_lore(&facts((0, 4, 0), "8fdb66b", false), &package), None);
+        assert_eq!(keep_installed_lore(&LoreFacts::default(), &package), None);
+        // A package lore richer than the installed one replaces it.
+        assert_eq!(keep_installed_lore(&facts((0, 3, 9), "", false), &facts((0, 4, 0), "", true)), None);
+    }
+
+    /// Task #420 (owner, 2026-11-09): package 166 put a lore without Atlas over
+    /// the owner's newer build with Atlas. An install keeps a newer or richer
+    /// lore and replaces only an older one, kept as lore.exe.bak.
+    #[test]
+    fn an_install_keeps_a_newer_or_richer_lore_and_backs_up_an_older_one() {
+        set_lore_facts(Some(described));
+        let dir = private_tempdir();
+        let cli = dir.path().join("bin").join(EXECUTABLE);
+        let package = source(dir.path(), "pkg", b"build", &[]);
+        fs::write(package.with_file_name(LORE), "lore 0.4.0 (8fdb66b)
+").unwrap();
+        fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        let installed = cli.with_file_name(LORE);
+        let backup = cli.with_file_name(format!("{LORE}.bak"));
+        // A newer installed lore stays.
+        fs::write(&installed, "lore 0.4.1 (6728c2f)
+").unwrap();
+        let report = stage_cli(&package, &cli).unwrap();
+        assert!(matches!(&report.lore, LoreStage::Kept { reason } if reason.contains("newer")), "{:?}", report.lore);
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "lore 0.4.1 (6728c2f)
+");
+        assert!(!backup.exists());
+        // A richer one (Atlas) stays, even at an older version.
+        fs::write(&installed, "lore 0.3.9 (1234567)
+atlas
+").unwrap();
+        let report = stage_cli(&package, &cli).unwrap();
+        assert!(matches!(&report.lore, LoreStage::Kept { reason } if reason.contains("Atlas")), "{:?}", report.lore);
+        assert!(fs::read_to_string(&installed).unwrap().contains("atlas"));
+        // An older, poorer one is replaced and kept beside it as a .bak.
+        fs::write(&installed, "lore 0.3.9 (1234567)
+").unwrap();
+        let report = stage_cli(&package, &cli).unwrap();
+        assert_eq!(report.lore, LoreStage::Installed { backup: Some(backup.clone()) });
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "lore 0.4.0 (8fdb66b)
+");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "lore 0.3.9 (1234567)
+");
+        // The same build again changes nothing.
+        assert_eq!(stage_cli(&package, &cli).unwrap().lore, LoreStage::Same);
+        set_lore_facts(None);
+    }
+
+    #[test]
+    fn the_stable_cli_stages_lore_beside_it_when_the_package_carries_it() {
+        let dir = private_tempdir();
+        let cli = dir.path().join("bin").join(EXECUTABLE);
+        let one = source(dir.path(), "one", b"build one", &[]);
+
+        // A build without lore stages none.
+        stage_cli(&one, &cli).unwrap();
+        assert!(!cli.with_file_name(LORE).exists());
+
+        // A package's lore is copied beside the CLI and verified like the CLI.
+        fs::write(one.parent().unwrap().join(LORE), b"lore one").unwrap();
+        stage_cli(&one, &cli).unwrap();
+        assert_eq!(fs::read(cli.with_file_name(LORE)).unwrap(), b"lore one");
+        assert_eq!(fs::read(&cli).unwrap(), b"build one");
+
+        // A newer lore replaces it even while the CLI itself is unchanged.
+        fs::write(one.parent().unwrap().join(LORE), b"lore two").unwrap();
+        stage_cli(&one, &cli).unwrap();
+        assert_eq!(fs::read(cli.with_file_name(LORE)).unwrap(), b"lore two");
+    }
+
+    #[test]
+    fn an_image_carries_the_lore_beside_the_executable_it_stages() {
+        let dir = private_tempdir();
+        let images = dir.path().join("host");
+        let packaged = source(dir.path(), "packaged", b"build", &PAIR);
+        fs::write(packaged.parent().unwrap().join(LORE), b"lore one").unwrap();
+
+        let report = stage_image(&packaged, &images, "1.0.0").unwrap();
+        let image = &report.image.path;
+        assert_eq!(
+            names(image),
+            vec![
+                "OpenConsole.exe".to_owned(),
+                "conpty.dll".to_owned(),
+                EXECUTABLE.to_owned(),
+                LORE.to_owned(),
+                VERSION_FILE.to_owned(),
+            ]
+        );
+        assert_eq!(fs::read(image.join(LORE)).unwrap(), b"lore one");
+
+        // Changed lore alone rebuilds the content-addressed image.
+        fs::write(packaged.parent().unwrap().join(LORE), b"lore two").unwrap();
+        let again = stage_image(&packaged, &images, "1.0.0").unwrap();
+        assert!(again.changed);
+        assert_eq!(fs::read(again.image.path.join(LORE)).unwrap(), b"lore two");
+
+        // A build without lore stages none.
+        let plain = source(dir.path(), "plain", b"plain", &[]);
+        let plain_report = stage_image(&plain, &images, "1.0.0").unwrap();
+        assert!(!plain_report.image.path.join(LORE).exists());
+    }
+
     #[test]
     fn images_are_content_addressed_and_the_pointer_comes_last() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let images = dir.path().join("host");
         let one = source(dir.path(), "one", b"build one", &PAIR);
         let two = source(dir.path(), "two", b"build two", &[]);
@@ -918,7 +1642,7 @@ mod tests {
 
     #[test]
     fn a_copy_that_differs_from_its_source_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let from = dir.path().join("from");
         let to = dir.path().join("to");
         fs::write(&from, b"abd").unwrap();
@@ -934,7 +1658,7 @@ mod tests {
 
     #[test]
     fn an_altered_image_is_replaced_and_leftovers_are_cleared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let images = dir.path().join("host");
         let one = source(dir.path(), "one", b"build one", &PAIR);
         let name = image_name(&sha256(&one).unwrap()).to_owned();
@@ -962,8 +1686,292 @@ mod tests {
     }
 
     #[test]
+    fn service_cli_install_does_not_enable_or_disable_local_sessions() {
+        let dir = private_tempdir();
+        let layout = Layout::new(
+            &dir.path().join("home").to_string_lossy(),
+            &dir.path().join("config"),
+        );
+        let one = source(dir.path(), "one", b"build one", &[]);
+        assert!(install_cli(&layout, &one).unwrap().changed);
+        assert_eq!(fs::read(&layout.cli).unwrap(), b"build one");
+        assert!(!layout.enabled());
+        assert!(current_image_in(&layout.images).is_none());
+        assert!(!install_cli(&layout, &one).unwrap().changed);
+        enable(&layout.marker).unwrap();
+        let marker = fs::read(&layout.marker).unwrap();
+        let two = source(dir.path(), "two", b"build two", &[]);
+        assert!(install_cli(&layout, &two).unwrap().changed);
+        assert_eq!(fs::read(&layout.marker).unwrap(), marker);
+        assert!(layout.enabled());
+    }
+
+    fn sample_binding(root: &Path) -> FrontendBinding {
+        FrontendBinding {
+            schema: FRONTEND_SCHEMA,
+            frontend: BoundObject {
+                path: root.join("zip").join(FRONTEND_IMAGE),
+                volume: 7,
+                file_id: "0123456789abcdef0123456789abcdef".into(),
+                length: 42,
+            },
+            frontend_sha256: ABC.into(),
+            cli: BoundObject {
+                path: root.join("home/.local/bin").join(EXECUTABLE),
+                volume: 7,
+                file_id: "fedcba9876543210fedcba9876543210".into(),
+                length: 43,
+            },
+        }
+    }
+
+    /// A private images folder below a home in `root`, as an install creates it.
+    fn private_images(root: &Path) -> PathBuf {
+        let images = images_below(&root.join("home").to_string_lossy());
+        create_private_dirs(&images).unwrap();
+        images
+    }
+
+    /// A new owner-only file, as the publication creates it.
+    fn write_private(path: &Path, bytes: &[u8]) {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        platform::private_open(&mut options);
+        options.open(path).unwrap().write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn a_frontend_binding_is_read_only_in_its_exact_bounded_form() {
+        let dir = private_tempdir();
+        let images = private_images(dir.path());
+        let path = images.join(FRONTEND_BINDING);
+        assert_eq!(read_frontend(&images), None);
+        let binding = sample_binding(dir.path());
+        let good = serde_json::to_value(&binding).unwrap();
+        write_private(&path, &serde_json::to_vec(&good).unwrap());
+        assert_eq!(read_frontend(&images), Some(binding.clone()));
+
+        let refused = |bytes: Vec<u8>, why: &str| {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(read_frontend(&images), None, "{why}");
+        };
+        refused(b"{\"schema\":1".to_vec(), "corrupt");
+        refused(vec![b' '; FRONTEND_BYTES as usize + 1], "oversize");
+        let mut padded = serde_json::to_vec(&good).unwrap();
+        padded.resize(FRONTEND_BYTES as usize + 1, b' ');
+        refused(padded, "a valid record padded past the cap");
+        let mutate = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = good.clone();
+            change(&mut value);
+            serde_json::to_vec(&value).unwrap()
+        };
+        refused(mutate(&|v| v["extra"] = true.into()), "unknown field");
+        refused(
+            mutate(&|v| v["frontend"]["extra"] = 1.into()),
+            "unknown object field",
+        );
+        refused(mutate(&|v| v["schema"] = 2.into()), "another schema");
+        refused(
+            mutate(&|v| v["frontend"]["path"] = "zip/hgs-tray.exe".into()),
+            "relative app",
+        );
+        refused(
+            mutate(&|v| v["cli"]["path"] = "hgs.exe".into()),
+            "relative CLI",
+        );
+        let other = dir.path().join("zip/other.exe");
+        refused(
+            mutate(&|v| v["frontend"]["path"] = other.to_string_lossy().into()),
+            "another app name",
+        );
+        refused(
+            mutate(&|v| v["frontend"]["file_id"] = "0123".into()),
+            "short file ID",
+        );
+        refused(
+            mutate(&|v| v["cli"]["file_id"] = "0123456789ABCDEF0123456789ABCDEF".into()),
+            "upper-case ID",
+        );
+        refused(
+            mutate(&|v| v["frontend_sha256"] = "zz".into()),
+            "bad digest",
+        );
+        refused(
+            mutate(&|v| {
+                v.as_object_mut().unwrap().remove("cli");
+            }),
+            "missing CLI",
+        );
+
+        // Never through a link.
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("elsewhere.json");
+            write_private(&real, &serde_json::to_vec(&good).unwrap());
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&real, &path).unwrap();
+            assert_eq!(read_frontend(&images), None, "link");
+        }
+    }
+
+    /// Unix half of the private-record controls; Windows owner, ACL, hard-link
+    /// and junction controls are in desktop::portable_frontend::tests.
+    #[cfg(unix)]
+    #[test]
+    fn a_binding_that_is_not_a_private_record_of_this_user_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_tempdir();
+        let images = private_images(dir.path());
+        let path = images.join(FRONTEND_BINDING);
+        let bytes = serde_json::to_vec(&sample_binding(dir.path())).unwrap();
+        write_private(&path, &bytes);
+        assert!(read_frontend(&images).is_some());
+        let mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        // A record others may read or write.
+        for permissive in [0o640, 0o604, 0o620] {
+            mode(&path, permissive);
+            assert!(read_frontend(&images).is_none(), "{permissive:o}");
+        }
+        mode(&path, 0o600);
+        // A record with a second link.
+        let other = dir.path().join("second-link.json");
+        fs::hard_link(&path, &other).unwrap();
+        assert!(read_frontend(&images).is_none(), "hard link");
+        fs::remove_file(&other).unwrap();
+        assert!(read_frontend(&images).is_some());
+        // Any folder of the chain that others may use.
+        for folder in images.ancestors().take(4) {
+            mode(folder, 0o750);
+            assert!(read_frontend(&images).is_none(), "{}", folder.display());
+            mode(folder, 0o700);
+        }
+        assert!(read_frontend(&images).is_some());
+        // A link in place of a folder of the chain.
+        let hgs = images.parent().unwrap();
+        let moved = dir.path().join("real-hgs");
+        fs::rename(hgs, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, hgs).unwrap();
+        assert!(read_frontend(&images).is_none(), "linked ancestor");
+        fs::remove_file(hgs).unwrap();
+        fs::rename(&moved, hgs).unwrap();
+        assert!(read_frontend(&images).is_some());
+        // Publication refuses a folder that is not private, and leaves nothing.
+        fs::remove_file(&path).unwrap();
+        let layout = Layout::new(
+            &dir.path().join("home").to_string_lossy(),
+            &dir.path().join("config"),
+        );
+        mode(&images, 0o755);
+        assert!(publish_frontend(&layout, &sample_binding(dir.path()), &|| true).is_err());
+        assert!(!path.exists());
+        mode(&images, 0o700);
+        assert!(publish_frontend(&layout, &sample_binding(dir.path()), &|| true).unwrap());
+        assert!(read_frontend(&images).is_some());
+    }
+
+    #[test]
+    fn only_a_binder_records_the_app_after_staging_and_any_install_unbinds_first() {
+        let dir = private_tempdir();
+        let layout = Layout::new(
+            &dir.path().join("home").to_string_lossy(),
+            &dir.path().join("config"),
+        );
+        let one = source(dir.path(), "one", b"build one", &PAIR);
+        let binding = sample_binding(dir.path());
+        // The binder runs after the CLI, the image and the marker are complete.
+        let report = install_bound(&layout, &one, "1.0.0", |layout, publish| {
+            assert_eq!(fs::read(&layout.cli).unwrap(), b"build one");
+            assert!(current_image_in(&layout.images).is_some());
+            assert!(layout.enabled());
+            publish(&binding, &|| true)?;
+            Ok(Some(binding.clone()))
+        })
+        .unwrap();
+        assert_eq!(report.frontend, Some(binding.clone()));
+        assert_eq!(read_frontend(&layout.images), Some(binding.clone()));
+
+        // A plain install, which no app started, removes it.
+        let report = install(&layout, &one, "1.0.0").unwrap();
+        assert_eq!(report.frontend, None);
+        assert_eq!(read_frontend(&layout.images), None);
+        assert!(!layout.images.join(FRONTEND_BINDING).exists());
+
+        // The old binding goes before staging: a failing install leaves none.
+        install_bound(&layout, &one, "1.0.0", |_, publish| {
+            publish(&binding, &|| true)?;
+            Ok(Some(binding.clone()))
+        })
+        .unwrap();
+        assert!(install_bound(
+            &layout,
+            &dir.path().join("gone.exe"),
+            "1.1.0",
+            |_, publish| {
+                publish(&sample_binding(dir.path()), &|| true)?;
+                Ok(None)
+            }
+        )
+        .is_err());
+        assert_eq!(read_frontend(&layout.images), None);
+
+        // An invalid binding is never published.
+        let mut invalid = binding.clone();
+        invalid.frontend.file_id = "short".into();
+        assert!(install_bound(&layout, &one, "1.0.0", |_, publish| {
+            publish(&invalid, &|| true)?;
+            Ok(Some(invalid.clone()))
+        })
+        .is_err());
+        assert_eq!(read_frontend(&layout.images), None);
+
+        // A binder that declines records nothing.
+        install_bound(&layout, &one, "1.0.0", |_, publish| {
+            publish(&binding, &|| true)?;
+            Ok(Some(binding.clone()))
+        })
+        .unwrap();
+        let report = install_bound(&layout, &one, "1.0.0", |_, _| Ok(None)).unwrap();
+        assert_eq!(report.frontend, None);
+        assert_eq!(read_frontend(&layout.images), None);
+        // A stray temporary binding from an interrupted publish is not a binding.
+        assert!(names(&layout.images)
+            .iter()
+            .all(|name| name != FRONTEND_BINDING));
+    }
+
+    #[test]
+    fn a_refused_commit_publishes_nothing_and_leaves_no_candidate() {
+        let dir = private_tempdir();
+        let images = private_images(dir.path());
+        let layout = Layout::new(
+            &dir.path().join("home").to_string_lossy(),
+            &dir.path().join("config"),
+        );
+        let checked = std::cell::Cell::new(false);
+        let published = publish_frontend(&layout, &sample_binding(dir.path()), &|| {
+            // The candidate is complete and verified when the guard runs.
+            let candidate = names(&images)
+                .into_iter()
+                .find(|name| name.starts_with(&format!("{STAGING_PREFIX}frontend-")))
+                .expect("a prepared candidate");
+            assert!(
+                platform::verify_private(&images.join(candidate), platform::Private::File).unwrap()
+            );
+            assert!(!images.join(FRONTEND_BINDING).exists());
+            checked.set(true);
+            false
+        })
+        .unwrap();
+        assert!(checked.get() && !published);
+        assert_eq!(names(&images), Vec::<String>::new());
+        assert_eq!(read_frontend(&images), None);
+    }
+
+    #[test]
     fn install_stages_both_then_enables_and_uninstall_keeps_the_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let layout = Layout::new(
             &dir.path().join("home").to_string_lossy(),
             &dir.path().join("config"),
@@ -1047,7 +2055,7 @@ mod tests {
 
     #[test]
     fn the_marker_and_pointer_are_found_through_the_environment() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let home = dir.path().join("home");
         fs::create_dir(&home).unwrap();
         let text = home.to_string_lossy().into_owned();
@@ -1144,7 +2152,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_running_cli_is_renamed_aside_and_removed_once_it_ends() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let this = std::env::current_exe().unwrap();
         let other = other_build(dir.path());
         let target = dir.path().join("bin").join(EXECUTABLE);
@@ -1176,7 +2184,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_image_a_host_runs_from_stays_until_it_ends() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let images = dir.path().join("host");
         let this = std::env::current_exe().unwrap();
         let other = other_build(dir.path());
@@ -1209,7 +2217,7 @@ mod tests {
 
     #[test]
     fn installs_run_one_at_a_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let held = lock(dir.path()).unwrap();
         let waiting = {
             let dir = dir.path().to_owned();
@@ -1226,7 +2234,7 @@ mod tests {
 
     #[test]
     fn files_nobody_runs_are_not_in_use() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("file");
         fs::write(&path, b"x").unwrap();
         assert!(!in_use(&path));

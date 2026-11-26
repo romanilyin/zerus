@@ -253,6 +253,13 @@ fn card(record: &Value, panel: &Panel) -> Option<Value> {
     )
 }
 
+/// The card this producer writes for `record` at `screen`, its startup panel:
+/// the route the readers of these cards test with (zerus-63rru.60).
+#[cfg(test)]
+pub(super) fn produced(record: &Value, screen: &str) -> Option<Value> {
+    card(record, &parse(screen)?)
+}
+
 fn snapshot(record: &Value, screen: &str) -> Option<(Value, usize)> {
     let panel = parse(screen)?;
     Some((
@@ -287,7 +294,7 @@ pub(super) fn current(record: &Value) -> Option<Value> {
         return None;
     }
     let panel = parse(&kimi_tui_choice::capture(record).ok()?)?;
-    if !process_alive(record) || !matches(record, live().ok()?.get(string(record, "name"))) {
+    if !process_alive(record) || !matches(record, panes_of(&live().ok()?, record)) {
         return None;
     }
     input::checked_terminal(record, false).ok()?;

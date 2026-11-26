@@ -15,8 +15,8 @@ use std::{
 };
 use zerus_mobile_crypto::{
     self as crypto, EnrollmentCandidate, Identity, IdentityRecord, Invitation, MembershipAction,
-    MembershipState, MembershipStatement, Role, SignedEnrollment, SignedMembership,
-    SignedMembershipSnapshot,
+    MembershipState, MembershipStatement, Role, RoutePersonStatement, SignedEnrollment,
+    SignedMembership, SignedMembershipSnapshot,
 };
 
 const ACTIVE: &str = "active.json";
@@ -28,54 +28,7 @@ fn false_flag(value: &bool) -> bool {
 }
 const PAGE: usize = 100;
 
-/// Never Debug: bearer and private keys are intentionally absent from reports.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub server_url: String,
-    pub workspace_name: String,
-    pub computer_name: String,
-    pub node_token: String,
-    pub identity: IdentityRecord,
-    pub membership: MembershipState,
-    pub historical_heads: BTreeMap<u64, String>,
-    pub state_dir: PathBuf,
-}
-impl Profile {
-    fn validate_record(&self) -> Result<()> {
-        let identity = cc(Identity::from_record(&self.identity))?;
-        cc(self.membership.validate())?;
-        if identity.public().role != Role::Computer
-            || (self.membership.members.get(&identity.public().device_id)
-                != Some(identity.public())
-                && !self.retired())
-            || self.historical_heads.get(&self.membership.revision) != Some(&self.membership.head)
-            || !self.state_dir.is_absolute()
-            || self.node_token.is_empty()
-        {
-            return Err(fail("Workspace identity is unavailable or retired"));
-        }
-        if self.historical_heads.len() > 8192 {
-            return Err(fail("Workspace membership history exceeds its bound"));
-        }
-        Ok(())
-    }
-    pub fn validate(&self) -> Result<()> {
-        self.validate_record()?;
-        if self.retired() {
-            return Err(fail("Workspace identity is unavailable or retired"));
-        }
-        Ok(())
-    }
-    fn retired(&self) -> bool {
-        self.membership
-            .revoked_device_ids
-            .contains(&self.identity.device.device_id)
-    }
-    fn report(&self) -> Value {
-        json!({"state":if self.retired(){"retired"}else{"active"},"encrypted":true,"server_url":self.server_url,"workspace_id":self.membership.workspace_id,"workspace_name":self.workspace_name,"computer_name":self.computer_name,"node_id":self.identity.device.device_id,"membership_revision":self.membership.revision,"membership_head":self.membership.head})
-    }
-}
+pub use zerus_mobile_endpoint::Profile;
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
@@ -114,8 +67,21 @@ fn fail(message: &'static str) -> ConnectorError {
 fn cc<T>(result: crypto::Result<T>) -> Result<T> {
     result.map_err(|_| fail("Workspace authentication failed; private content was not accepted"))
 }
+const IN_USE: &str = "Private workspace state is unavailable or in use";
 fn io<T>(result: std::io::Result<T>) -> Result<T> {
-    result.map_err(|_| fail("Private workspace state is unavailable or in use"))
+    result.map_err(|_| fail(IN_USE))
+}
+/// A running connector holds this lock across each relay call, so with a slow relay a
+/// roster read that refused at once would say "in use" nearly every time. It is the one
+/// call here that waits, within one bound. Anything else still refuses at once.
+fn lock_for_roster(private_dir: &Path) -> Result<Store> {
+    let deadline = std::time::Instant::now() + crate::admission::ALLOWANCE;
+    io(crate::admission::acquire(
+        || Store::try_lock(private_dir, true),
+        || deadline.saturating_duration_since(std::time::Instant::now()),
+        std::thread::sleep,
+    ))?
+    .ok_or_else(|| fail(IN_USE))
 }
 fn parse<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
     serde_json::from_value(value.clone()).map_err(|_| fail("Invalid workspace protocol response"))
@@ -208,18 +174,9 @@ pub(crate) fn validate_config_profile_binding(
     private_dir: &Path,
     profile: &Profile,
 ) -> Result<()> {
-    validate_marker(config, private_dir)?;
-    profile.validate_record()?;
-    if config["server_url"].as_str() != Some(&profile.server_url)
-        || config["state_dir"] != json!(profile.state_dir)
-        || profile.state_dir
-            != private_dir.join(format!("receipts-{}", profile.identity.device.device_id))
-    {
-        return Err(fail(
-            "Encrypted workspace configuration does not match its private identity",
-        ));
-    }
-    Ok(())
+    profile
+        .check_configuration(config, private_dir)
+        .map_err(Into::into)
 }
 fn pending_activation_matches(config: &Value, revision: &str, private_dir: &Path) -> Result<bool> {
     let Some(bytes) = workspace_cli::read_private(private_dir, PENDING)? else {
@@ -438,7 +395,7 @@ pub fn public_status(config_path: &Path) -> Result<Value> {
 
 async fn synchronize(store: &Store, profile: &mut Profile, relay: &Relay) -> Result<()> {
     synchronize_record(store, profile, relay).await?;
-    profile.validate()
+    profile.validate().map_err(Into::into)
 }
 fn publish_membership(
     store: &Store,
@@ -450,6 +407,7 @@ fn publish_membership(
     let previous_heads = std::mem::replace(&mut profile.historical_heads, heads);
     let published = profile
         .validate_record()
+        .map_err(ConnectorError::from)
         .and_then(|()| save(store, ACTIVE, profile));
     if published.is_err() {
         let attempted_membership = std::mem::replace(&mut profile.membership, previous_membership);
@@ -639,6 +597,44 @@ async fn refresh_locked(store: &Store, mut profile: Profile, relay: &Relay) -> R
     Ok(profile)
 }
 
+/// The person's latch statement on a child's question route
+/// (zerus-sa9qn.50): signed by a current phone of this workspace, for this
+/// computer, and unexpired, verified against this computer's own verified
+/// membership head. It reads only; the desktop service applies the latch,
+/// at most once per request.
+fn verify_route_person(config_path: &Path, input: Value) -> Result<Value> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        statement: RoutePersonStatement,
+        signature: String,
+    }
+    let refused =
+        || fail("The question route statement is not a current phone's for this computer");
+    let input: Input = serde_json::from_value(input).map_err(|_| refused())?;
+    let (config, _) = workspace_cli::read_config(config_path)?;
+    if config.get("encrypted_workspace").is_none() {
+        return Err(fail("Create or join an encrypted workspace first"));
+    }
+    let private_dir = private_directory(config_path)?;
+    let profile = load_record(&private_dir)?;
+    validate_config_profile_binding(&config, &private_dir, &profile)?;
+    profile.validate()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| refused())?
+        .as_secs();
+    if input.statement.gateway_id != profile.identity.device.device_id
+        || input
+            .statement
+            .verify(&profile.membership, &input.signature, now)
+            .is_err()
+    {
+        return Err(refused());
+    }
+    Ok(json!({"ok": true, "verifier": "question-route-person-v1", "verified": input.statement}))
+}
+
 pub async fn manage(
     action: &str,
     config_path: &Path,
@@ -647,6 +643,9 @@ pub async fn manage(
 ) -> Result<Value> {
     if action == "status" {
         return public_status(config_path);
+    }
+    if action == "verify-question-route-person" {
+        return verify_route_person(config_path, input);
     }
     let (config, revision) = workspace_cli::read_config(config_path)?;
     if input["expected_revision"].as_str() != Some(&revision) {
@@ -705,7 +704,11 @@ pub async fn manage(
     if action == "stop" {
         return crate::workspace_lifecycle::manage_stop(config_path, &input).await;
     }
-    let store = io(Store::lock(&private_dir, true))?;
+    let store = if action == "list-devices" {
+        lock_for_roster(&private_dir)?
+    } else {
+        io(Store::lock(&private_dir, true))?
+    };
     // Another manager may have changed the config while this process was
     // waiting for the private-state lock. Never act on that earlier binding.
     if workspace_cli::read_config(config_path)?.1 != revision {
@@ -1657,6 +1660,200 @@ mod tests {
             destination
         );
     }
+    /// An active workspace whose relay address refuses at once, with nothing listening.
+    fn active(dir: &Path) -> (PathBuf, PathBuf, String) {
+        let config = dir.join("connector.json");
+        let private = private_directory(&config).unwrap();
+        let mut profile = ready(&config, String::new()).profile.unwrap();
+        profile.server_url = "http://127.0.0.1:9".into();
+        let store = Store::lock(&private, true).unwrap();
+        save(&store, ACTIVE, &profile).unwrap();
+        drop(store);
+        let revision = workspace_cli::replace_config(
+            &config,
+            "",
+            &json!({"server_url":profile.server_url,"state_dir":profile.state_dir,"encrypted_workspace":{"version":1,"state_dir":private}}),
+        )
+        .unwrap();
+        (config, private, revision)
+    }
+
+    /// zerus-sa9qn.50: a current phone's latch statement for this computer.
+    #[test]
+    fn only_a_current_phones_unexpired_statement_for_this_computer_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, private, _) = active(dir.path());
+        let store = Store::lock(&private, true).unwrap();
+        // The cross-platform reader: the Store's own one is Linux-only.
+        let mut profile = load_record(&private).unwrap();
+        let computer = Identity::from_record(&profile.identity).unwrap();
+        let phone = Identity::generate(uuid::Uuid::new_v4().to_string(), Role::Phone).unwrap();
+        let add = SignedMembership::sign(
+            MembershipStatement {
+                workspace_id: profile.membership.workspace_id.clone(),
+                revision: profile.membership.revision + 1,
+                previous_head: profile.membership.head.clone(),
+                issuer_device_id: computer.public().device_id.clone(),
+                issuer_key_generation: 1,
+                action: MembershipAction::Add,
+                device: Some(phone.public().clone()),
+                revoked_device_id: None,
+            },
+            &computer,
+        )
+        .unwrap();
+        profile.membership.apply_next(&add).unwrap();
+        profile
+            .historical_heads
+            .insert(profile.membership.revision, profile.membership.head.clone());
+        save(&store, ACTIVE, &profile).unwrap();
+        drop(store);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let statement = |signer: &Identity, gateway: &str, issued_at: u64| RoutePersonStatement {
+            workspace_id: profile.membership.workspace_id.clone(),
+            device_id: signer.public().device_id.clone(),
+            gateway_id: gateway.into(),
+            session_id: "00000000-0000-4000-8000-0000000000c1".into(),
+            run_id: "run-1".into(),
+            conversation_id: "conversation-1".into(),
+            person_off: false,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            issued_at,
+            expires_at: issued_at + 120,
+            expected_revision: None,
+        };
+        let verify = |statement: &RoutePersonStatement, signer: &Identity| {
+            let input =
+                json!({"statement": statement, "signature": statement.sign(signer).unwrap()});
+            block_on(manage(
+                "verify-question-route-person",
+                &config,
+                input,
+                false,
+            ))
+        };
+        let gateway = computer.public().device_id.clone();
+        let good = statement(&phone, &gateway, now - 10);
+        let verified = verify(&good, &phone).unwrap();
+        assert_eq!(
+            verified,
+            json!({"ok": true, "verifier": "question-route-person-v1", "verified": good})
+        );
+        // v2 carries the authenticated latch revision through the same
+        // current-membership and executing-gateway verifier.
+        let mut revisioned = good.clone();
+        revisioned.expected_revision = Some(7);
+        assert_eq!(
+            verify(&revisioned, &phone).unwrap()["verified"]["expected_revision"],
+            7
+        );
+        // Another computer, an expired statement, a computer's signature
+        // and an unknown phone are all refused.
+        let stranger = Identity::generate(uuid::Uuid::new_v4().to_string(), Role::Phone).unwrap();
+        for (statement, signer) in [
+            (
+                statement(&phone, "00000000-0000-4000-8000-000000000009", now - 10),
+                &phone,
+            ),
+            (statement(&phone, &gateway, now - 200), &phone),
+            (statement(&computer, &gateway, now - 10), &computer),
+            (statement(&stranger, &gateway, now - 10), &stranger),
+        ] {
+            assert!(verify(&statement, signer).is_err(), "{statement:?}");
+        }
+        // A signature over other fields, or an extra field, is refused.
+        let mut changed = good.clone();
+        changed.person_off = true;
+        let input = json!({"statement": changed, "signature": good.sign(&phone).unwrap()});
+        assert!(block_on(manage(
+            "verify-question-route-person",
+            &config,
+            input,
+            false
+        ))
+        .is_err());
+        let input = json!({"statement": good, "signature": good.sign(&phone).unwrap(), "extra": 1});
+        assert!(block_on(manage(
+            "verify-question-route-person",
+            &config,
+            input,
+            false
+        ))
+        .is_err());
+    }
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    // zerus-cz3t0: a running connector holds this lock across each relay call.
+    #[tokio::test]
+    async fn a_roster_read_waits_out_a_brief_holder_of_the_private_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, private, revision) = active(dir.path());
+        let holder = Store::lock(&private, false).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holder);
+        });
+        let error = manage(
+            "list-devices",
+            &config,
+            json!({"expected_revision":revision}),
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+        release.join().unwrap();
+        assert_eq!(
+            error.message(),
+            "Workspace relay is unavailable; the exact pending operation is retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_stays_is_still_reported_and_nothing_that_changes_state_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, private, revision) = active(dir.path());
+        let _holder = Store::lock(&private, false).unwrap();
+        let started = std::time::Instant::now();
+        let refused = manage(
+            "revoke-device",
+            &config,
+            json!({"expected_revision":revision,"device_id":"other"}),
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(refused.message(), IN_USE);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let roster = manage(
+            "list-devices",
+            &config,
+            json!({"expected_revision":revision}),
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(roster.message(), IN_USE);
+        let waited = started.elapsed();
+        assert!(waited >= crate::admission::ALLOWANCE, "{waited:?}");
+        assert!(
+            waited < crate::admission::ALLOWANCE + std::time::Duration::from_secs(2),
+            "{waited:?}"
+        );
+    }
+
     #[tokio::test]
     async fn committed_profile_before_config_resumes_without_new_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -1776,7 +1973,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn verified_retirement_blocks_start_but_cooperative_stop_drains_journal() {
+    async fn verified_retirement_does_not_authorize_unverified_process_stop() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("connector.json");
         let private = private_directory(&config).unwrap();
@@ -1827,21 +2024,13 @@ mod tests {
         assert!(crate::workspace_lifecycle::manage_start(&config, &input)
             .await
             .is_err());
-        let stopping = crate::runtime::Event::default();
-        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            tokio::join!(
-                crate::workspace_lifecycle::manage_stop(&config, &input),
-                async {
-                    crate::workspace_lifecycle::monitor(&stopping, &profile.state_dir, &generation)
-                        .await;
-                    drop(journal);
-                }
-            )
-        })
-        .await
-        .expect("retired generation must cooperatively drain");
-        assert_eq!(stopped.unwrap()["state"], "stopped");
-        assert!(stopping.is_set());
+        // No verified supervisor or exact connector process owns this fixture
+        // lock. Retirement proves neither; refusal must precede a Stop marker.
+        assert!(crate::workspace_lifecycle::manage_stop(&config, &input)
+            .await
+            .is_err());
+        assert!(!profile.state_dir.join("workspace-stop.json").exists());
+        drop(journal);
         // A corrupt pin is an error, never evidence allowing local shutdown
         // or an implicit reset. HTTP401 does not modify this private record.
         profile.historical_heads.clear();

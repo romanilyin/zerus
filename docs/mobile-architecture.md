@@ -233,6 +233,17 @@ with the expected UUID, rather than bypassing its guard. Copying a gateway
 configuration or resetting native machine identity must not execute a previously
 bound request on a different machine. Discovery may use a fixed private
 `swarm __mobile-peer-identity --json` helper returning only native UUID and name.
+Windows provides these target identity/local helpers with the same closed argv
+and native UUID checks. Its gateway discovery, peer forwarding and transport
+supervisor remain unsupported. After consuming the bounded JSON envelope to EOF,
+the target dispatches in the same process with an anonymous payload file as stdin.
+On Windows this is a one-way `STD_INPUT_HANDLE` handoff retained until process
+exit, matching Unix's `dup2`; it adds no helper child or custody keeper. Rust's
+shared stdin buffer is exhausted before the handoff, and its mutex is released
+before native dispatch. Unsupported native operations retain their own refusals.
+The [Rust 1.99.1 Windows stdin implementation](https://github.com/rust-lang/rust/blob/1.99.1/library/std/src/sys/stdio/windows.rs)
+reads the current [standard handle](https://learn.microsoft.com/en-us/windows/console/setstdhandle)
+for each raw read. Native Windows CI exercises payload reads after envelope EOF.
 Production connector calls use `hgs swarm mobile-peers --json` and
 `hgs swarm mobile-peer --json`. The existing `swarm` namespace rejects unknown
 subcommands on older binaries. This remains safe when a binary is downgraded
@@ -388,11 +399,38 @@ Read refreshes can issue new request IDs. Retrying an acknowledged result upload
 does not execute the native command again. The connector never restarts native
 agents, tmux servers or DeepSeek hosts.
 
+The Rust connector also selects the session of an explicit mutation by its
+durable ID (zerus-ucck P1c-2b). Phones never send the ID, and the relay, API v1,
+request identities and the journal are unchanged.
+- The ID is the listed `session_id` for the request's `expected_run_id`, and
+  the connector adds `--session-id ID` right after the name.
+- It applies to send, send now, answer, interrupt, model settings, clear and
+  compact, and the scoped actions pause, resume, rename, fork, archive, forget,
+  terminate and queued-message removal.
+- Restore, archived conversations, process stops, recovery, the delivery
+  setting and every read keep the name.
+- Each CLI on the call's path must list `session-id-selector-v1`. A call
+  through `swarm mobile-peer` or `__mobile-peer-local` also needs
+  `mobile-peer-session-id-v1` on each CLI it passes; those entry points accept
+  `[SESSION, --session-id, ID, --json]` only for those commands and live
+  actions. Without the markers the call keeps the name form.
+- Only the CLI's refusal of that exact ID while it resolves the ID, before the
+  command runs, is a definite failed receipt ("native session changed; refresh
+  before action"). That means another name, no session or several sessions for
+  the ID. Any other failure after the write began stays uncertain (step 6),
+  including a later read's "no longer names", which can follow an effect.
+- The legacy Python connector keeps the name form.
+
 The Android composer and outgoing messages have separate durable state. Sending
 atomically moves the current composition into an outgoing envelope before any
 network request. The conversation immediately shows its delivery status while a
 new composition can be edited. Completion never clears a later draft. Unknown
 delivery remains visible and cannot trigger an automatic resend.
+A send that settles Not sent before the mutation request is enqueued releases
+exactly that send's sealed reservation, so a prepared resend cannot accumulate
+retained copies, and the outbox shows its allowlisted local reason. Once the
+request may have been enqueued, the reservation stays as the unknown and
+no-replay evidence.
 
 Automatic read progress appears only after five seconds of continuous waiting.
 Explicit refresh shows progress immediately, including when it promotes an
@@ -549,7 +587,10 @@ attempt; a replacement pending ID cancels the old intent. This watcher does not
 promise execution after Android stops the application.
 
 Details presents the agent's task lists, goal and reported usage, subagent
-activity, and native process inventory. Completing a response is independent of
+activity, and native process inventory. When the computer reports it, Details
+also shows the session's Keep cache warm setting and status read only; the phone
+cannot change it yet. A running keep-warm ping reads **Warming cache**, not
+Working, and is not current work (docs/reference.md, Keep cache warm). Completing a response is independent of
 completing a goal. Historical or partial inventories are labeled accordingly.
 Opening a child preserves its parent's composition and viewport. Child input is
 available only when the native adapter explicitly supports continuing that child.
@@ -620,11 +661,30 @@ gateway's filesystem.
 Questions share one answer and page owner between the inline card and expanded
 form. Actions distinguish sending, submitted, known non-delivery and unknown
 delivery. An answer is saved before transport, with a bounded aggregate receipt
-wait and HTTP cancellation. A successful question receipt retains exact
+wait and HTTP cancellation. An expanded question keeps its exact id and hash: a
+verified projection that no longer resolves it shows an inline closed or
+replaced notice, while an unverified one is checking during a refresh and
+unavailable otherwise. Pending but unanswerable requests replace the native
+veto with a clear reason and the projection's check age. These notices keep the
+saved answer and submitted lock, never obscure an unrelated delivery review and
+never enable an answer; only a verified projection that still carries the exact
+question does. A successful question receipt retains exact
 target/question/hash/request/answer evidence before any inspection refresh; stale
 or failed reads cannot reopen it. Draft review and discard cannot bypass that
 submitted lock. Successful interrupts retain their separate cleanup behavior.
 Approval review accrues only in the visible, focused foreground disclosure.
+
+The expanded question resolves its exact ID and hash against the current
+projection into one presence: Answerable, Waiting, Checking, Closed, Replaced or
+Unavailable. Only a verified projection whose `pending_questions_complete` is
+true (absent from older CLIs counts as complete) can close or replace it; an
+incomplete one stays Checking while the agent indexes. Only a resolved card is
+modal. Every obsolete state is an inline notice with Refresh, Open new request
+or Close, so an unrelated unknown-delivery Review stays reachable, and the
+expanded identity, saved answer and submitted lock are kept. Presence shows the
+mapped native veto and the check age; cache, age, Working and a partial scan
+never enable an answer. Android and iOS check the same rows in
+`mobile/android/app/src/test/resources/question-presence-contract.json`.
 
 Ordinary agent messages and question disclosures from known agent-authored sources
 render Markdown with the desktop's CommonMark and GFM feature set: headings, emphasis, lists,
@@ -660,6 +720,46 @@ acknowledges only that loaded subset. Read all is enabled only when, for some
 conversation in its scope, the captured evidence would clear a phone-local
 reminder or advance past replies counted unread; the predicate follows the same
 skip rules as the ordered edit.
+
+When the computer's `hgs` offers `inspect <session> --current-read`, the
+connector asks for it on every main inspection, never for an archive or
+subagent. The answer's `current_read` names the reply and attention signature
+that `hgs read` would accept now, taken from that same inspection (see
+[Existing session snapshots](reference.md#existing-session-snapshots)). The connector
+keeps the field only when its run and conversation are the inspection's own and
+its values are ones a `mark_read` may carry. When the relay bound drops any of
+the newest rows, it removes the field, because a phone binds it to the newest
+row it displays. Older `hgs` versions and the legacy Python connector send no
+such field, so their phones keep the canonical-head requirement. DeepSeek and
+OpenCode inspections carry the same field under the same gate. A peer's
+inspections, and those routed to this computer by machine, pass the mobile-peer
+entry, which admits `--current-read` only for a main inspection.
+
+Android and iOS acknowledge those current values from the open conversation's
+verified inspection. This is separate from the canonical history that moves
+their private read position.
+- **Visible.** Both phones apply one rule to the canonical read and to these
+  values. After the settled dwell, an item counts as visible when its part
+  inside the viewport is at least the smallest of its height, its readable part
+  (48 dp on Android, 48 pt on iOS) and the viewport height. A short row must be
+  wholly visible; a taller row, or a questions pane of any height, needs its
+  readable part. The 1-unit tail sentinel counts when it starts inside the
+  viewport and ends at most 2 units past it (pixels on Android, points on iOS),
+  allowing for layout rounding.
+- **Reply.** It is sent after the same settled visibility dwell, with overlays
+  excluded, once the conversation shows its latest messages and either its tail
+  or its newest displayed row is visible.
+- **Attention signature.** It is sent only when `attention_complete` is true and
+  the listed questions were visible. Without questions, the same tail rule
+  applies, so a conversation that only asks a question is covered too.
+- **Source of values.** Values come only from that inspection, never from a
+  catalog row. An inspection with other values restarts the dwell.
+- **Mark read.** An explicit Mark read shares both values.
+- **What stays the same.** This never advances the private read position, the
+  unread divider or the counts. Read all still shares replies only. Both phones
+  share these rules, including partly visible layouts that pin the visibility
+  rule, through `mobile/fixtures/current-read.json`, and every
+  shared mark goes through one delivery path with the existing retries.
 
 Android Sessions publishes catalog rows with local read decoration in one
 background-prepared update and retains unchanged card identities. Its reply
@@ -802,6 +902,20 @@ never authorize a message,
 answer or interruption: those actions require a fresh verified inspection.
 An inspection already in flight is shared across navigation and refreshes;
 leaving the screen does not create a second queued native read on return.
+Recent Activity and explicit navigation to the latest messages use the bounded
+inspection projection. They do not wait for complete canonical history,
+unrelated receipt backfill or exact unread totals. Canonical pages are read for
+requested earlier history and actual saved older reading positions. A saved
+viewport records whether it followed the latest messages; legacy positions
+remain older reading positions. An incomplete earlier read preserves the
+recent transcript and exposes an explicit retry. Displaying recent messages
+never establishes a complete historical incoming watermark.
+Latest navigation supersedes the previous reading intent before awaiting I/O.
+Shared native reads keep their original identities, while cache, history and
+inspection publications must still belong to the selected reading intent.
+An empty bounded recent projection preserves an already readable older page
+and offers a retry of the latest inspection. Fresh recent inspections retire
+exact head authority when no canonical window proves their coverage.
 
 The Android history cache is private and encrypted, with atomic files outside
 Android backup. It retains at most twenty conversations and twenty MiB for seven
@@ -856,7 +970,8 @@ every stale conversation has been tried, rather than waiting for later refreshes
 Read positions are private to the phone and follow the canonical conversation
 across a verified resume. Incoming agent messages count; tool events and the
 user's own messages do not. Automatic read progress advances only after
-content is actually visible in the active conversation, with overlays excluded.
+content is actually visible in the active conversation, with overlays excluded;
+a row is visible under the shared rule described for current values above.
 For authenticated canonical rows, the visible message position acknowledges
 incoming replies before it in the window's server order. A tall own message or
 compaction summary can therefore advance that incoming prefix without counting
@@ -872,7 +987,13 @@ Exact counters require a complete current index; stale or partial history uses
 the larger of its loaded count and last known canonical count as a lower bound,
 or an unknown state when neither is available. The read watermark remains valid
 for retained rows in the same epoch while offline. A native incoming-sequence anchor locates the
-first unread message beyond the latest page. The unread divider stays attached
+first unread message beyond the latest page. Legacy inspection IDs gain canonical
+aliases without widening a partial mark: an alias keeps the exact reply's read
+identity, and the canonical watermark advances only along consecutive incoming
+sequences already captured in this epoch, stopping at the first unseen, missing
+or duplicated sequence. That alias proof never borrows the prefix authority of
+direct canonical visibility above, so a partial mark cannot acknowledge the
+uncaptured replies between its position and the watermark. The unread divider stays attached
 to that message when legacy inspection IDs gain canonical aliases. It retires
 when the phone confirms that the current complete head is read, and later replies
 do not resurrect that opening divider. Visible canonical epoch and incoming
@@ -887,6 +1008,47 @@ requires a successful atomic draft-to-outbox write before any network mutation.
 Receipt updates and delayed writes must preserve
 newer composition. Only unsent drafts and unresolved deliveries appear in Drafts;
 successful delivery status belongs to the message in its conversation.
+
+An unconfirmed outgoing message initially blocks another send to the same
+conversation. Dismiss warning explicitly saves a device-local choice to allow a
+new message while preserving the original request, unknown outcome, attachments
+and receipt lookup. It neither cancels nor reposts the original message, and it
+does not replace the current composition. This choice survives restart; a later
+exact receipt can still confirm the original. An active send cannot be dismissed.
+Prepare again is available only for a confirmed failed message.
+
+Android bounds ordinary send preparation and receipt acquisition to 45 seconds.
+Saving an acquired result finishes outside that transport deadline, so a slow
+accepted write cannot turn a confirmed delivery back into an unknown outcome.
+A timed-out manual receipt check reports that the original remains recoverable.
+
+Android and iOS retain a new text-only send's exact native payload and options
+inside its encrypted outbox row before transport, bounded by the existing 64 KiB
+text limit. The frozen intent records the original computer, physical machine,
+durable session, literal name, run/conversation, provider and transport encoding.
+Its canonical ASCII JSON `intent_sha256` and the producer's `native_digest` name
+different byte encodings; neither normalizes Unicode, line endings or whitespace.
+They are never compared as interchangeable hashes.
+
+Check delivery first reads the original connector journal UUID. When both gateway
+and selected computer advertise `send_receipt`, it may then submit a fresh READ
+UUID for that frozen original. Both stages share one 45-second campaign; a
+fallback or poll never renews it. Only exact positive original-receipt admission
+settles that original outbox row, preserving its dismissal choice, newer composer
+and other lanes. Read failures, missing/corrupt records and identity/digest
+mismatches leave delivery unknown. They never become Not sent or a resend.
+Legacy rows may reconstruct only the ordinary payload whose exact native digest
+matches the original; lost continuation/options remain unknown, with no text or
+time search. The original mutation journal and UUID stay unchanged.
+
+An uncertain send remains visible and unknown beside an ordinary provider echo.
+Delivery evidence comes from a receipt read or the existing exact receipt-backed
+native request/message IDs; text and time never settle uncertainty. Already submitted or recorded rows keep the existing presentation
+deduplication: exact receipt/native IDs come first, followed by the unique text
+and time match. This presentation match never proves delivery. A recovery proof
+whose durable update starts after its campaign deadline remains unknown, even
+if it arrived in time; the ordinary-send save rule above is unchanged.
+Confirmed admission does not mean the agent finished processing it.
 
 The multiline composer keeps one editor state for text, selection and IME
 composition across polling, expansion and sending. Sending brings the new local
@@ -1181,10 +1343,16 @@ after large result bodies expire.
 
 History selectors are mutually exclusive: newest, `before`, `after`, `around`,
 or `around_incoming_seq` together with an exact `history_epoch`. Pages contain at
-most 100 public rows. A bounded connector read can advance initial indexing
+most 100 public rows. A full-page newest connector read can advance initial indexing
 locally for up to two seconds and 32 native reads, avoiding a network roundtrip
-per index chunk. Cursored reads execute once. A partial resident adapter is
+per index chunk. Metadata-only head probes (`limit: 1`) and cursored reads execute
+one bounded native pass, so a background counter probe cannot occupy that full
+indexing budget ahead of a visible inspection. A partial resident adapter is
 reported as partial rather than a completed conversation.
+A fork's pages also carry its sources' history up to the fork point as
+additive `Inherited` rows (`inherited_type`, `inherited_from`), never counted as
+incoming; older apps drop the unknown type. See the public history section of
+`services/mobile/README.md`.
 
 `last_seen_at` and event `created_at` use Unix epoch seconds. `last_seen_at`
 is the selected route's last accepted heartbeat (the gateway's own heartbeat for
@@ -1207,6 +1375,35 @@ across rename and resume and applies on every device. Its exact run/conversation
 and expected revision are checked by the durable request; no client changes the
 setting optimistically. Archives and child sessions cannot change it. Missing
 metadata leaves the control unavailable rather than creating a phone-only mute.
+
+A live Claude child with a parent link offers Send questions to PARENT (or Stop
+sending questions to PARENT) when both relay and computer advertise
+`session_question_routing` and the row reports a valid `question_routing`
+(zerus-sa9qn.33). It changes the child's per-child switch of the owner-approved
+question route (`hgs question-routing`, marker `session-question-routing-v1`)
+through the Rust-only relay operation and the Rust connector; the legacy Python
+connector refuses it. The same exact run/conversation and expected revision
+apply, nothing changes optimistically, and only the computer's exact reply
+settles it: an unknown or uncertain result is never retried. The shared
+contract is `question-routing-contract.json` in the Android test resources.
+On an encrypted workspace whose relay and computer also offer
+`session_question_route_person`, the same entry sends the person's latch
+instead (zerus-sa9qn.50). The phone signs a statement for its gateway with
+its workspace signing key (`RoutePersonStatement`). The gateway's desktop
+service verifies it through its own connector and applies it once, so an
+agent on the computer cannot clear a phone's "off" with commands. The
+statement's shared vector is
+`services/mobile/crypto/tests/vectors/question-route-person-v1.json`.
+Where both ends additionally advertise `session_question_route_person_status`,
+phones read the exact child's service latch revision and sign it in a v2
+statement (`question-route-person-v2.json`). The computer compares that revision,
+advances it on every accepted decision including no-ops, and durably fences
+that latch against all legacy v1 statements after its first verified v2 request.
+Legacy latches keep the documented clock-ordering risk until then; see the
+person's latch section in `docs/reference.md`.
+Under marker `session-question-routing-v2` the row's `question_routing` also
+carries `person_off`, a display-only mirror of that latch; the phone then
+shows the child off and, without the person's statement, offers no "on".
 
 Muted conversations retain their native state, unread replies, pending requests
 and Needs attention/Active membership. Attention and unread styling becomes

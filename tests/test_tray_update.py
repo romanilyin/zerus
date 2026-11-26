@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop GUI live updates (tray/update-installed.py, tray/install.sh) with a fake GUI.
+"""Desktop GUI live updates (packaging/desktop/update-installed.py, packaging/desktop/install.sh) with a fake GUI.
 
 The fake GUI runs from the installed path inside an isolated home, so the
 updater never matches the developer's own Zerus. systemctl, D-Bus tools and
@@ -16,9 +16,10 @@ import time
 import unittest
 
 from tray_update_fixture import OwnedChildren, StartControl, cleanup
+from desktop_revoke_fixture import REVOCATION_CLI
 
 REPO = Path(__file__).resolve().parents[1]
-UPDATER = REPO / 'tray/update-installed.py'
+UPDATER = REPO / 'packaging/desktop/update-installed.py'
 
 # A GUI build: answers --build-info, holds the single-instance socket, records
 # activations, and (unless 'old') saves its queued draft when SIGTERM quits it.
@@ -27,8 +28,16 @@ import json, os, pathlib, signal, socket, sys
 VARIANT = {variant!r}
 root = pathlib.Path(os.environ['TRAY_FIXTURE'])
 if sys.argv[1:] == ['--build-info']:
-    print(json.dumps({{'version': '0.42.0', 'versionName': VARIANT, 'devBuildNumber': 0,
-                      'sourceCommit': VARIANT.ljust(40, '0'), 'sourceDirty': False}}))
+    # 'unverifiable' reports itself as a build, never once installed.
+    if VARIANT == 'unverifiable' and pathlib.Path(sys.argv[0]).parent.name == 'bin':
+        sys.exit(1)
+    if VARIANT == 'legacy-broken':
+        sys.exit(1)
+    info = {{'version': '0.42.0', 'versionName': VARIANT, 'devBuildNumber': int(VARIANT[4:]) if VARIANT.startswith('dev-') else 0,
+             'sourceCommit': VARIANT.ljust(40, '0'), 'sourceDirty': False}}
+    if not VARIANT.startswith('qt-'):
+        info.update(CFBundleIdentifier='com.hgdev.hgs-tray', ZerusGUI='tauri')
+    print(json.dumps(info))
     sys.exit(0)
 if VARIANT == 'broken':
     sys.exit(1)
@@ -87,13 +96,23 @@ elif sys.argv[1:] in (['--user', 'is-active', 'hgs-tray.service'],
                       ['--user', 'is-enabled', 'hgs-tray.service']):
     print('active' if sys.argv[2] == 'is-active' else 'enabled')
 '''
+NPM = r'''#!{python}
+import json, os, pathlib, shutil, sys
+root = pathlib.Path(os.environ['TRAY_FIXTURE'])
+with (root / 'npm.json').open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\n')
+if sys.argv[1:4] == ['exec', '--', 'tauri']:
+    output = root / 'client/src-tauri/target/release/hgs-tray'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(os.environ['TRAY_CLIENT_BUILD'], output)
+'''
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'the fake GUI is identified through /proc')
 class TrayUpdate(unittest.TestCase):
     def setUp(self):
         # Short even with macOS's canonical /private/tmp Unix socket prefix.
-        self.root = Path(tempfile.mkdtemp(prefix='ztu-', dir='/tmp'))
+        self.root = Path(tempfile.mkdtemp(prefix='ztu-', dir=os.environ.get('ZERUS_TEST_SHORT_TMPDIR', '/tmp')))
         self.owned = self.control = None
         self.addCleanup(self.stop_all)
         self.root = self.root.resolve()
@@ -104,13 +123,14 @@ class TrayUpdate(unittest.TestCase):
             path.mkdir(parents=True)
         self.installed = self.home / '.local/bin/hgs-tray'
         self.drafts = self.home / '.config/hgdev/hgs-tray.conf.drafts'
+        self.script(self.home / '.local/bin/hgs', REVOCATION_CLI.format(python=sys.executable))
         self.script(self.bin / 'systemctl', SYSTEMCTL.format(python=sys.executable))
         for tool in ('qdbus6', 'busctl'):
             self.script(self.bin / tool, '#!/bin/sh\nexit 1\n')
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.root / 'tmp'),
                         XDG_CONFIG_HOME=str(self.home / '.config'), TRAY_FIXTURE=str(self.root),
                         PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
-                        HGS_TRAY_QUIT_TIMEOUT='10', HGS_TRAY_START_TIMEOUT='4')
+                        HGS_TRAY_QUIT_TIMEOUT='10', HGS_TRAY_START_TIMEOUT='4', HGS_DESKTOP_REVOKE_TIMEOUT='1')
         self.owned = OwnedChildren(self.env)
         self.control = StartControl(self.root / 'start.sock', lambda: self.owned.start(self.installed))
         self.control.open()
@@ -183,13 +203,56 @@ class TrayUpdate(unittest.TestCase):
         self.assertEqual((record['guiVersionName'], record['preservedDrafts']), ('second', 2))
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(list((self.home / '.local/state/hgs/desktop-update').iterdir()), [])
-        self.assertIn('2 nonempty drafts kept', result.stdout)
+        self.assertIn('drafts kept: 2 with unsent input, 0 with saved form state only, '
+                      '0 with a held delivery identity;', result.stdout)
+        self.assertEqual(record['keptDrafts'], {'unsentInput': 2, 'formState': 0, 'heldIdentities': 0})
         # The next update keeps exactly one rollback copy: the GUI it replaced.
         result = self.update(self.build('third'))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([p.name for p in previous.parent.iterdir()], ['hgs-tray'])
         self.assertIn("'second'", previous.read_text())
         self.assertEqual([variant for variant, _ in self.running()], ['third'])
+
+    def test_unregistered_current_cli_next_update_never_installs_a_service(self):
+        # Next GUI-only updates leave the backend registration untouched. A
+        # current CLI can advertise its lifecycle ABI even without a service.
+        # Any optional registration probe must stay read-only; a helper that
+        # refuses install must never receive a mutating verb.
+        self.env['REVOCATION_LIFECYCLE'] = 'unavailable'
+        source = self.root / 'updater-source'
+        (source / 'packaging/desktop').mkdir(parents=True)
+        (source / 'scripts').mkdir()
+        updater = source / 'packaging/desktop/update-installed.py'
+        shutil.copy2(UPDATER, updater)
+        helper = source / 'scripts/install-linux-desktop-service.py'
+        self.script(helper, f'#!{sys.executable}\n'
+                    'import json, os, pathlib, sys\n'
+                    'root = pathlib.Path(os.environ["TRAY_FIXTURE"])\n'
+                    'with (root / "desktop-helper.calls").open("a") as out:\n'
+                    '    out.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                    'if sys.argv[1] != "status":\n'
+                    '    print("agent-descended frontend request refused", file=sys.stderr)\n'
+                    '    raise SystemExit(1)\n'
+                    'print(json.dumps({"schema":1,"operation":"status",'
+                    '"configuration":"fixture-configuration","registered":False,"selected_mode":"passive"}))\n')
+        self.build('first', self.installed)
+        built = self.build('second')
+        for image in (self.installed, built):
+            info = json.loads(subprocess.check_output([str(image), '--build-info'],
+                              env=self.env, text=True, timeout=5))
+            self.assertEqual(info.get('ZerusGUI'), 'tauri')
+        result = subprocess.run([sys.executable, str(updater), str(built), str(self.installed)],
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("'second'", self.installed.read_text())
+        call_log = self.root / 'desktop-helper.calls'
+        calls = [json.loads(line) for line in call_log.read_text().splitlines()] if call_log.exists() else []
+        status = ['status', '--hgs', str(self.home / '.local/bin/hgs'), '--json']
+        self.assertIn(calls, ([], [status]), 'an unregistered update permits only a read-only registration probe')
+        manager = self.root / 'systemctl'
+        self.assertFalse(manager.exists(), "an unregistered Next update must not invoke the service manager")
+        self.assertFalse((self.home / '.config/systemd/user/hgs-desktop.service').exists())
+        self.assertFalse((self.home / '.config/systemd/user/.hgs-desktop.zerus-registration.json').exists())
 
     def test_gui_without_a_signal_handler_is_never_killed(self):
         old = self.launch('old')
@@ -210,6 +273,20 @@ class TrayUpdate(unittest.TestCase):
         self.wait(lambda: [variant for variant, _ in self.running()] == ['first'])
         self.assertEqual(self.leftovers(), [])
 
+    def test_retired_qt_update_and_preflight_keep_both_images_untouched(self):
+        self.build('client-existing', self.installed)
+        legacy = self.build('qt-old')
+        before = (self.installed.read_bytes(), legacy.read_bytes())
+        for prefix in ([], ['--check']):
+            with self.subTest(prefix=prefix):
+                result = subprocess.run([sys.executable, str(UPDATER), *prefix,
+                                         str(legacy), str(self.installed)],
+                                        env=self.env, capture_output=True, text=True, timeout=20)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Qt installation is retired', result.stderr)
+                self.assertEqual((self.installed.read_bytes(), legacy.read_bytes()), before)
+                self.assertFalse((self.root / 'systemctl').exists())
+
     def test_stopped_gui_is_replaced_without_starting_it(self):
         self.build('first', self.installed)
         result = self.update(self.build('second'))
@@ -218,6 +295,18 @@ class TrayUpdate(unittest.TestCase):
         self.assertIn("'first'", (self.home / '.local/share/hgs/desktop-previous/hgs-tray').read_text())
         self.assertFalse((self.root / 'systemctl').exists())
         self.assertEqual(self.running(), [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_stopped_gui_that_cannot_report_itself_is_not_installed(self):
+        # Without a start, the new GUI's own --build-info verifies it.
+        self.build('first', self.installed)
+        result = self.update(self.build('unverifiable'))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('the new GUI was not verified', result.stderr)
+        self.assertIn('the previous GUI was restored', result.stderr)
+        self.assertIn(f'{self.installed} keeps the previous GUI', result.stdout)
+        self.assertIn("'first'", self.installed.read_text())
+        self.assertFalse((self.home / '.local/share/hgs/desktop-previous').exists())
 
     def test_update_removes_only_old_unused_leftover_folders(self):
         folder = self.installed.parent
@@ -238,7 +327,9 @@ class TrayUpdate(unittest.TestCase):
         leftover('.zerus-0.41.Abm', ['previous/hgs-tray', 'previous/hgs_state.py'])
         leftover('.hgs-tray-update-interrupted', ['hgs-tray'])
         kept = [leftover('.zerus-notes', ['notes.txt']), leftover('.zerus-recent', age=0),
-                leftover('.zerus-deep', ['a/b/hgs-tray']), leftover('.other-stage')]
+                leftover('.zerus-deep', ['a/b/hgs-tray']), leftover('.other-stage'),
+                # An interrupted update's set-aside GUI may be the only copy.
+                leftover('.hgs-tray-update-set-aside', ['previous/hgs-tray'])]
         running = leftover('.zerus-running', ['hgs-tray'])
         self.script(running / 'hgs-tray', f'#!{sys.executable}\nimport time\ntime.sleep(60)\n')
         os.utime(running, (time.time() - 7200,) * 2)
@@ -252,6 +343,7 @@ class TrayUpdate(unittest.TestCase):
                          sorted([p.name for p in kept] + ['.zerus-running', '.zerus-link']))
         self.assertIn('removed 4 leftover folders', result.stdout)
         self.assertIn('.zerus-notes: it holds files other than installer copies', result.stdout)
+        self.assertIn('.hgs-tray-update-set-aside: it holds files other than installer copies', result.stdout)
         self.assertIn('.zerus-running: a process still uses it', result.stdout)
         self.assertTrue((self.root / 'builds').exists())
 
@@ -263,38 +355,194 @@ class TrayUpdate(unittest.TestCase):
         self.assertIn('kept: missing', result.stderr)
         [snapshot] = (self.home / '.local/state/hgs/desktop-update').iterdir()
         self.assertIn(str(snapshot), result.stdout)
-        self.assertEqual(json.loads((snapshot / 'kept/draft.json').read_text())['text'], 'unsent text')
+        self.assertEqual(json.loads((snapshot / 'qt/kept/draft.json').read_text())['text'], 'unsent text')
         self.assertEqual(snapshot.stat().st_mode & 0o777, 0o700)
 
-    def installer(self, build, plugin=None):
-        """A copy of tray/install.sh whose cmake builds `build` and, given bytes, the native UI plugin."""
-        tray = self.root / 'tray'
+    def base_installer(self, build):
+        """A copy of the maintained installer with private service tools."""
+        # Task #28: the installer lives in packaging/desktop/ with its unit, its
+        # .desktop file and its icons beside it; the fixture root is the repo.
+        tray = self.root / 'packaging/desktop'
         if not tray.exists():
-            for name in ('install.sh', 'update-installed.py', 'packaging/hgs-tray.service', 'packaging/hgs-tray.desktop'):
+            for name in ('install.sh', 'update-installed.py', 'linux-launcher.py', 'hgs-tray.service', 'hgs-tray.desktop'):
                 (tray / name).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(REPO / 'tray' / name, tray / name)
-            shutil.copytree(REPO / 'tray/resources/icons', tray / 'resources/icons')
+                shutil.copy2(REPO / 'packaging/desktop' / name, tray / name)
+            shutil.copytree(REPO / 'packaging/desktop/icons', tray / 'icons')
+            helper = self.root / 'scripts/install-linux-desktop-service.py'
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO / 'scripts/desktop-revoke-hold.py', helper.with_name('desktop-revoke-hold.py'))
+            shutil.copy2(REPO / 'scripts/desktop-service-activation.py', helper.with_name('desktop-service-activation.py'))
+            self.script(helper, f'#!{sys.executable}\nimport json, os, pathlib, sys\n'
+                        'with (pathlib.Path(os.environ["TRAY_FIXTURE"]) / "desktop-service.calls").open("a") as log:\n'
+                        '    log.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                        'if "--check" not in sys.argv:\n'
+                        '    status = int(os.environ.get("TRAY_DESKTOP_SERVICE_STATUS", "0"))\n'
+                        '    if status: print("Desktop service refresh pending" if status == 3 else "Desktop service registration refused", file=sys.stderr)\n'
+                        '    sys.exit(status)\n')
             self.script(self.bin / 'uname', '#!/bin/sh\necho Linux\n')
             for tool in ('gtk-update-icon-cache', 'kbuildsycoca6'):
                 self.script(self.bin / tool, '#!/bin/sh\nexit 0\n')
-        source = self.root / 'plugin.so'
-        # Like CMakeLists.txt: a configuration without the plugin removes an old one.
-        step = f'cp "{source}" "$2/plugins/libhgs-tray-native-ui.so"' if plugin else 'rm -f "$2/plugins/libhgs-tray-native-ui.so"'
-        if plugin:
-            source.write_bytes(plugin)
-        self.script(self.bin / 'cmake', f'#!/bin/sh\nif [ "$1" = --build ]; then mkdir -p "$2/plugins" && cp "{build}" "$2/hgs-tray" && {step}; fi\n')
         return tray / 'install.sh'
 
-    def test_installer_places_and_removes_the_native_ui_plugin(self):
-        installed = self.home / '.local/lib/hgs-tray/plugins/libhgs-tray-native-ui.so'
-        build = self.build('first', self.installed)
-        for plugin, expected in ((b'first plugin', b'first plugin'), (b'second plugin', b'second plugin'), (None, None)):
-            result = subprocess.run(['bash', str(self.installer(build, plugin))], env=self.env, capture_output=True,
-                                    text=True, timeout=90)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('Installed hgs-tray.', result.stdout)
-            self.assertEqual(installed.read_bytes() if installed.exists() else None, expected)
-            self.assertFalse(installed.with_name(installed.name + '.new').exists())
+    def installer(self, build):
+        return self.client_installer(build)
+
+    def client_installer(self, build, gstreamer=True):
+        install = self.base_installer(build)
+        self.env.pop('HGS_LINUX_GUI', None)
+        tauri = self.root / 'client/src-tauri'
+        tauri.mkdir(parents=True, exist_ok=True)
+        (tauri / 'Cargo.toml').write_text('[features]\nmedia = []\nvideo = []\n')
+        shutil.copy2(REPO / 'client/src-tauri/tauri.switch.linux.conf.json',
+                     tauri / 'tauri.switch.linux.conf.json')
+        self.script(self.bin / 'npm', NPM.format(python=sys.executable))
+        self.script(self.bin / 'pkg-config', '#!/bin/sh\nexit "${TRAY_GSTREAMER_OK:-1}"\n')
+        self.env['TRAY_CLIENT_BUILD'] = str(build)
+        self.env['TRAY_GSTREAMER_OK'] = '0' if gstreamer else '1'
+        return install
+
+    def test_client_install_is_prefix_private_and_stays_selected(self):
+        install = self.client_installer(self.build('client-1'))
+        prefix = self.root / 'prefix%dev&review\\path'
+        plugin = prefix / 'lib/hgs-tray/plugins/libhgs-tray-native-ui.so'
+        plugin.parent.mkdir(parents=True)
+        plugin.write_bytes(b'for the Qt rollback')
+        env = dict(self.env, HGS_INSTALL_PREFIX=str(prefix))
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        binary = prefix / 'bin/hgs-tray'
+        self.assertTrue(binary.is_file())
+        self.assertIn("'client-1'", binary.read_text())
+        unit = prefix / 'lib/systemd/user/hgs-tray.service'
+        escaped = str(binary).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+        self.assertIn(f'ExecStart="{escaped}"', unit.read_text())
+        self.assertNotIn('--sessions', unit.read_text())
+        desktop = (prefix / 'share/applications/hgs-tray.desktop').read_text()
+        self.assertIn(f'Exec={binary} --sessions', desktop)
+        self.assertEqual(plugin.read_bytes(), b'for the Qt rollback')
+        self.assertFalse((self.root / 'systemctl').exists(), 'a scratch prefix never reaches systemd')
+        self.assertIn('no service-manager action', result.stdout)
+        unit_before = unit.read_bytes()
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(unit.read_bytes(), unit_before)
+        self.assertFalse(unit_before.endswith(b'\n\n'))
+        calls = [json.loads(line) for line in (self.root / 'npm.json').read_text().splitlines()]
+        self.assertEqual(len(calls), 4, 'npm ci and the Tauri build on each install')
+        for call in calls[1::2]:
+            self.assertEqual(call[-2:], ['--features', 'video'])
+
+    def test_default_install_upgrades_existing_qt_to_next(self):
+        install = self.client_installer(self.build('client-1'))
+        self.launch('qt-first')
+        env = dict(self.env)
+        self.assertNotIn('HGS_LINUX_GUI', env)
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("'client-1'", self.installed.read_text())
+        self.assertTrue((self.root / 'systemctl').exists())
+        calls = [json.loads(line) for line in (self.root / 'desktop-service.calls').read_text().splitlines()]
+        self.assertEqual(calls[0][-1], '--check')
+        self.assertNotIn('--check', calls[-1])
+        self.assertEqual(calls[-1], ['--hgs', str(self.home / '.local/bin/hgs')])
+
+    def test_headless_pending_backend_refresh_continues_the_live_gui_update(self):
+        install = self.client_installer(self.build('client-1'))
+        self.launch('first')
+        self.draft('kept', 'unsent Qt text')
+        env = dict(self.env, TRAY_DESKTOP_SERVICE_STATUS='3')
+        env.pop('XDG_SESSION_TYPE', None)
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Desktop backend refresh pending', result.stdout)
+        self.assertIn('Continuing the GUI update', result.stdout)
+        self.assertEqual([variant for variant, _ in self.running()], ['client-1'])
+        self.assertIn("'client-1'", self.installed.read_text())
+        self.assertEqual(json.loads((self.drafts / 'kept/draft.json').read_text())['text'], 'unsent Qt text')
+        calls = [json.loads(line) for line in (self.root / 'desktop-service.calls').read_text().splitlines()]
+        self.assertEqual(calls, [['--hgs', str(self.home / '.local/bin/hgs'), '--check'],
+                                 ['--hgs', str(self.home / '.local/bin/hgs')]])
+
+    def test_backend_registration_error_still_blocks_the_live_gui_update(self):
+        install = self.client_installer(self.build('client-1'))
+        self.launch('first')
+        env = dict(self.env, TRAY_DESKTOP_SERVICE_STATUS='1')
+        env.pop('XDG_SESSION_TYPE', None)
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([variant for variant, _ in self.running()], ['first'])
+        self.assertIn("'first'", self.installed.read_text())
+        self.assertIn('Desktop service registration refused', result.stderr)
+        self.assertNotIn('Continuing the GUI update', result.stdout)
+
+    def test_client_install_without_gstreamer_keeps_media_only(self):
+        install = self.client_installer(self.build('client-1'), gstreamer=False)
+        env = dict(self.env, HGS_LINUX_GUI='client', HGS_INSTALL_PREFIX=str(self.root / 'prefix'))
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('media only, without round video', result.stdout)
+        calls = [json.loads(line) for line in (self.root / 'npm.json').read_text().splitlines()]
+        self.assertEqual(calls[-1][-2:], ['--features', 'media'])
+
+    def test_local_webkit_selection_survives_preview_and_direct_updates(self):
+        stack = self.root / 'private webkit'
+        for name in ('gtk/lib/libgtk-3.so.0', 'gtk/lib/libgdk-3.so.0',
+                     'lib/libwebkit2gtk-4.1.so.0', 'lib/libjavascriptcoregtk-4.1.so.0',
+                     'libexec/webkit2gtk-4.1/WebKitWebProcess',
+                     'libexec/webkit2gtk-4.1/WebKitNetworkProcess',
+                     'libexec/webkit2gtk-4.1/WebKitGPUProcess'):
+            path = stack / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('fixture')
+            path.chmod(0o755)
+        install = self.client_installer(self.build('client-1'))
+        env = dict(self.env, HGS_LINUX_GUI='client', HGS_LINUX_WEBKIT_PREFIX=str(stack))
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        setting = self.home / '.local/share/hgs/local-webkit.json'
+        saved = setting.read_bytes()
+        launch = self.home / '.local/libexec/hgs-tray-launch'
+        self.assertTrue(launch.is_file())
+        unit = self.home / '.config/systemd/user/hgs-tray.service'
+        desktop = self.home / '.local/share/applications/hgs-tray.desktop'
+        self.assertIn(f'ExecStart="{launch}"', unit.read_text())
+        self.assertIn(f'Exec="{launch}" --sessions', desktop.read_text())
+        self.assertIn("'client-1'", self.installed.read_text(), 'the GUI stays a real file')
+        # Later preview updates do not need to repeat the opt-in, even if its
+        # disk disappears. A direct updater call also keeps it and the routing.
+        env.pop('HGS_LINUX_WEBKIT_PREFIX')
+        env.pop('HGS_LINUX_GUI')
+        shutil.rmtree(stack)
+        install = self.client_installer(self.build('client-2'))
+        result = subprocess.run(['bash', str(install)], env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.update(self.build('client-3'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(setting.read_bytes(), saved)
+        self.assertIn(f'ExecStart="{launch}"', unit.read_text())
+        result = subprocess.run(['bash', str(install)], env=dict(env, HGS_LINUX_WEBKIT_PREFIX=''),
+                                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(setting.exists())
+        self.assertEqual(unit.read_bytes(), (REPO / 'packaging/desktop/hgs-tray.service').read_bytes())
+        self.assertIn(f'Exec={self.installed} --sessions', desktop.read_text())
+
+
+    def test_default_install_keeps_the_packaged_unit_byte_identical(self):
+        install = self.installer(self.build('first'))
+        result = subprocess.run(['bash', str(install)], env=self.env,
+                                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installed = self.home / '.config/systemd/user/hgs-tray.service'
+        self.assertEqual(installed.read_bytes(), (REPO / 'packaging/desktop/hgs-tray.service').read_bytes())
+        desktop = self.home / '.local/share/applications/hgs-tray.desktop'
+        before = desktop.read_bytes()
+        result = subprocess.run(['bash', str(install)], env=self.env,
+                                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('already installed and unchanged', result.stdout)
+        self.assertEqual(desktop.read_bytes(), before)
+        self.assertTrue(before.endswith(b'\n') and not before.endswith(b'\n\n'))
 
     def test_installer_replaces_a_running_gui_through_the_updater(self):
         install = self.installer(self.build('second'))
@@ -308,6 +556,184 @@ class TrayUpdate(unittest.TestCase):
         calls = (self.root / 'systemctl').read_text()
         self.assertNotIn('restart', calls)
         self.assertIn('--user enable --now hgs-tray.service', calls)
+
+
+    def rollback(self):
+        return subprocess.run([sys.executable, str(UPDATER), '--rollback', str(self.installed)], env=self.env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_rollback_reinstalls_the_kept_copy(self):
+        self.launch('first')
+        self.draft('kept', 'unsent text')
+        result = self.update(self.build('second'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('reinstalling the rollback copy', result.stdout)
+        self.assertEqual([variant for variant, _ in self.running()], ['first'])
+        self.assertIn("'first'", self.installed.read_text())
+        self.assertIn("'second'", (self.home / '.local/share/hgs/desktop-previous/hgs-tray').read_text())
+        self.assertEqual(json.loads((self.drafts / 'kept/draft.json').read_text())['text'], 'unsent text')
+        self.assertEqual((self.root / 'activations').read_text(), 'sessions\nsessions\n')
+
+    def test_client_updates_keep_qt_as_the_rollback_copy(self):
+        prefix = self.root / 'prefix'
+        self.env['HGS_INSTALL_PREFIX'] = str(prefix)
+        self.installed = prefix / 'bin/hgs-tray'
+        (prefix / 'bin').mkdir(parents=True)
+        self.script(prefix / 'bin/hgs', REVOCATION_CLI.format(python=sys.executable))
+        self.launch('qt-first')
+        self.draft('kept', 'from Qt')
+        result = self.update(self.build('client-1'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([variant for variant, _ in self.running()], ['client-1'])
+        slot = prefix / 'share/hgs/desktop-previous/hgs-tray'
+        self.assertIn("'qt-first'", slot.read_text())
+        client_drafts = prefix / 'share/com.hgdev.hgs-tray/drafts'
+        (client_drafts / 'kept').mkdir(parents=True)
+        (client_drafts / 'kept/draft.json').write_text(json.dumps({'key': 'kept', 'text': 'from the client'}))
+        result = self.update(self.build('client-2'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([variant for variant, _ in self.running()], ['client-2'])
+        self.assertIn("'client-1'", slot.read_text())
+        [legacy] = (prefix / 'share/hgs/desktop-qt-legacy').glob('qt-*/hgs-tray')
+        self.assertIn("'qt-first'", legacy.read_text())
+        retained = legacy.read_bytes()
+        self.assertEqual(json.loads((client_drafts / 'kept/draft.json').read_text())['text'], 'from the client')
+        self.assertEqual(list(self.installed.parent.glob('.hgs-tray-kept-*')), [])
+        kind = subprocess.run([sys.executable, str(UPDATER), '--installed-gui', str(self.installed)],
+                              env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual((kind.returncode, kind.stdout.strip()), (0, 'tauri'), kind.stderr)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([variant for variant, _ in self.running()], ['client-1'])
+        self.assertIn("'client-2'", slot.read_text())
+        self.assertEqual(legacy.read_bytes(), retained)
+        result = self.update(self.build('client-3'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("'client-1'", slot.read_text())
+        self.assertEqual(legacy.read_bytes(), retained)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([variant for variant, _ in self.running()], ['client-1'])
+        self.assertEqual(legacy.read_bytes(), retained)
+        self.assertEqual(json.loads((client_drafts / 'kept/draft.json').read_text())['text'], 'from the client')
+
+    def test_an_unreadable_legacy_gui_is_replaced_and_keeps_the_existing_slot(self):
+        for variant in ('second', 'client-1'):
+            with self.subTest(variant=variant):
+                slot = self.home / '.local/share/hgs/desktop-previous/hgs-tray'
+                self.build('previous-good', slot)
+                self.build('legacy-broken', self.installed)
+                (self.drafts / 'kept').mkdir(parents=True, exist_ok=True)
+                (self.drafts / 'kept/draft.json').write_text(json.dumps({'key': 'kept', 'text': 'legacy draft'}))
+                result = self.update(self.build(variant))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"'{variant}'", self.installed.read_text())
+                self.assertIn("'previous-good'", slot.read_text())
+                self.assertEqual(json.loads((self.drafts / 'kept/draft.json').read_text())['text'], 'legacy draft')
+
+    def test_an_unknown_installed_kind_allows_an_on_disk_reinstall(self):
+        self.build('unverifiable', self.installed)
+        for variant in ('second', 'client-1'):
+            with self.subTest(variant=variant):
+                result = subprocess.run([sys.executable, str(UPDATER), '--check', str(self.build(variant)),
+                                         str(self.installed)], env=self.env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_an_on_disk_client_switch_needs_the_live_update(self):
+        self.build('qt-first', self.installed)
+        result = subprocess.run([sys.executable, str(UPDATER), '--check', str(self.build('client-1')),
+                                 str(self.installed)], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('needs the live update', result.stderr)
+        self.assertIn("'qt-first'", self.installed.read_text())
+
+    def test_qt_start_is_refused_without_touching_state_for_every_legacy_cli_condition(self):
+        self.build('client-1', self.installed)
+        for mode in ('noop', 'unsupported', 'held', 'pending', 'malformed', 'wrong_config', 'timeout'):
+            with self.subTest(mode=mode):
+                self.env['REVOCATION_MODE'] = mode
+                result = self.update(self.build('qt-new'))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Qt installation is retired', result.stderr)
+                self.assertIn("'client-1'", self.installed.read_text())
+                self.assertEqual(self.revocation_calls(), [])
+                self.assertEqual(self.running(), [])
+                self.assertFalse((self.root / 'systemctl').exists())
+
+    def revocation_calls(self):
+        path = self.root / 'revocation.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+
+
+
+
+
+
+
+    def test_rollback_without_a_copy_changes_nothing(self):
+        self.build('first', self.installed)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('there is no rollback copy', result.stderr)
+        self.assertIn("'first'", self.installed.read_text())
+
+    def test_an_unnumbered_build_never_replaces_a_numbered_dev_install(self):
+        # AGENTS.md and docs/reference.md: the live update and HGS_TRAY_RESTART=0 refuse alike.
+        self.build('dev-1413', self.installed)
+        result = self.update(self.build('second'))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Dev build 1413', result.stderr)
+        self.assertIn('ZERUS_LOCAL_PREVIEW_LABEL', result.stderr)
+        install = self.installer(self.build('third'))
+        result = subprocess.run(['bash', str(install)], env=dict(self.env, HGS_TRAY_RESTART='0'),
+                                capture_output=True, text=True, timeout=90)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Dev build 1413', result.stderr)
+        self.assertIn("'dev-1413'", self.installed.read_text())
+        self.assertFalse((self.root / 'systemctl').exists(), 'nothing was started or enabled')
+        result = self.update(self.build('dev-1414'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("'dev-1414'", self.installed.read_text())
+    def test_a_refused_install_changes_nothing_in_either_mode(self):
+        # Important: the guard runs right after the build, before the plugin, the
+        # icons, the launcher and the unit, with and without the live update.
+        plugin = self.home / '.local/lib/hgs-tray/plugins/libhgs-tray-native-ui.so'
+        written = [plugin, self.home / '.config/systemd/user/hgs-tray.service',
+                   self.home / '.local/share/applications/hgs-tray.desktop', self.home / '.local/share/icons']
+        for restart in ('1', '0'):
+            with self.subTest(restart=restart):
+                for path in written:
+                    shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+                (self.root / 'systemctl').unlink(missing_ok=True)
+                self.build('dev-1413', self.installed)
+                pid = self.launch('dev-1413') if restart == '1' else None
+                install = self.installer(self.build('third'))
+                result = subprocess.run(['bash', str(install)], env=dict(self.env, HGS_TRAY_RESTART=restart),
+                                        capture_output=True, text=True, timeout=90)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Dev build 1413', result.stderr)
+                self.assertIn('Nothing was replaced', result.stderr)
+                self.assertIn("'dev-1413'", self.installed.read_text())
+                self.assertEqual([path for path in written if path.exists()], [])
+                self.assertFalse((self.root / 'systemctl').exists(), 'nothing was started or enabled')
+                if pid:
+                    self.assertEqual(self.running(), [('dev-1413', pid)])
+
+
+class InstallerOrder(unittest.TestCase):
+    def test_the_guard_runs_before_the_first_change_on_macos_too(self):
+        script = (REPO / 'packaging/desktop/install.sh').read_text()
+        mac = script[:script.index('# --- 3. LaunchAgent')]
+        check = mac.index('update-installed.py" --check')
+        self.assertLess(check, mac.index('mkdir -p "${HOME}/Applications"'))
+        self.assertLess(check, mac.index('rm -rf "${APP_DEST}"'))
+        self.assertLess(check, script.index('printf \'%s\\n\' "${NEW_PLIST}" > "${PLIST_DEST}"'))
+        linux = script[script.index('# --- 2. binary'):]
+        self.assertLess(linux.index('update-installed.py" "${CHECK[@]}"'), linux.index('install -Dm755'))
 
 
 if __name__ == '__main__':

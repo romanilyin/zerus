@@ -3,6 +3,7 @@ No user credentials, live terminals, real model requests, or browser opening.
 """
 import base64
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -10,12 +11,15 @@ import re
 from pathlib import Path
 import shutil
 import socket
+from socketserver import StreamRequestHandler, ThreadingUnixStreamServer
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import uuid
 import signal
+import shlex
 import sys
 import urllib.request
 import http.cookiejar
@@ -29,12 +33,55 @@ fixture = importlib.util.module_from_spec(_fixture_spec)
 _fixture_spec.loader.exec_module(fixture)
 
 
+def host_process(pid, end=None):
+    """Read a birth identity and state; unreadable is not an exited host."""
+    if sys.platform == 'linux':
+        try:
+            state, _, _, birth = fixture.process_stat(pid, end)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        return state, birth
+    fixture.before(end)
+    timeout = 3 if end is None else min(3, end-time.monotonic())
+    result = subprocess.run(['ps', '-p', str(pid), '-o', 'stat=', '-o', 'lstart='],
+                            env={**os.environ, 'LC_ALL': 'C', 'TZ': 'UTC'},
+                            capture_output=True, text=True, timeout=timeout)
+    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+        return None
+    if result.returncode != 0:
+        raise RuntimeError('Cannot read the isolated host process: ' + result.stderr)
+    state, birth = result.stdout.strip().split(None, 1)
+    return state[0], birth
+
+
+def start_private_host(cls):
+    cls.proc = subprocess.Popen([DSH, '--profile', 'web', '--patch', str(cls.overlay), '--no-open',
+                                 '--host', '127.0.0.1', '--port', '0'], env=cls.env, cwd=cls.workspace,
+                                stdin=subprocess.DEVNULL, stdout=cls.log, stderr=cls.log, start_new_session=True)
+    deadline = time.monotonic() + 40
+    while not Path(cls.sock).exists() and cls.proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(.1)
+    if not Path(cls.sock).exists():
+        cls.proc.terminate(); cls.proc.wait(timeout=10)
+        raise RuntimeError('Native test host did not start: ' + (cls.root / 'host.log').read_text()[-2500:])
+
+
+def stop_private_host(cls):
+    if cls.proc.poll() is None:
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill(); cls.proc.wait(timeout=5)
+    Path(cls.sock).unlink(missing_ok=True)
+
+
 @unittest.skipUnless(fixture.required() or DSH and HGS.exists(), 'official dsh and built hgs required')
 class NativeHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         fixture.admit_fixture(DSH, HGS)
-        cls.temp = tempfile.TemporaryDirectory(prefix='hgs-dsh-', dir='/tmp')
+        cls.temp = tempfile.TemporaryDirectory(prefix='hgs-dsh-', dir=os.environ.get('ZERUS_TEST_SHORT_TMPDIR', '/tmp'))
         cls.root = Path(cls.temp.name)
         cls.home = cls.root / 'native'
         cls.state = cls.root / 's'
@@ -59,7 +106,7 @@ class NativeHarness(unittest.TestCase):
             shutil.copyfile(REPO / 'src/dsh/command-guard.mjs', cls.root / 'command-guard.mjs')
         patch = [
             {'id': 'llm-deepseek', 'disabled': True},
-            {'id': 'agent-default-model', 'config': {'provider': 'hgs-test', 'model': 'test-a'}},
+            {'id': 'agent-default-model', 'config': {'provider': 'hgs-test', 'model': 'test-a', **getattr(cls, 'DEFAULT_EFFORT', {})}},
             {'insert': [
                 {'id': 'hgs-test-model', 'name': str(REPO / 'tests/fixtures/dsh-model.mjs'), 'config': {'holds': str(cls.root / 'holds')}},
                 {'id': 'hgs-native-dsh', 'name': str(bridge), 'config': {'socket': cls.sock, 'recoveryPolicy': str(cls.state / 'recovery/policy.json')}},
@@ -71,8 +118,8 @@ class NativeHarness(unittest.TestCase):
         else:
             # A profile can still disable it; the other suites keep that profile.
             patch.append({'id': 'schedule', 'disabled': True})
-        overlay = cls.root / 'patch.json'
-        overlay.write_text(json.dumps(patch))
+        cls.overlay = cls.root / 'patch.json'
+        cls.overlay.write_text(json.dumps(patch))
         # hgs ls and the recovery worker also list tmux sessions. An existing
         # private TMUX_TMPDIR keeps them off the user's default server; a
         # missing directory would silently fall back to it.
@@ -85,23 +132,11 @@ class NativeHarness(unittest.TestCase):
                    'TMUX_TMPDIR': str(tmux)}
         Path(cls.env['HOME']).mkdir()
         cls.log = (cls.root / 'host.log').open('w')
-        cls.proc = subprocess.Popen([DSH, '--profile', 'web', '--patch', str(overlay), '--no-open',
-                                     '--host', '127.0.0.1', '--port', '0'], env=cls.env, cwd=cls.workspace,
-                                    stdin=subprocess.DEVNULL, stdout=cls.log, stderr=cls.log, start_new_session=True)
-        deadline = time.monotonic() + 40
-        while not Path(cls.sock).exists() and cls.proc.poll() is None and time.monotonic() < deadline:
-            time.sleep(.1)
-        if not Path(cls.sock).exists():
-            cls.proc.terminate(); cls.proc.wait(timeout=10)
-            raise RuntimeError('Native test host did not start: ' + (cls.root / 'host.log').read_text()[-2500:])
+        start_private_host(cls)
 
     @classmethod
     def tearDownClass(cls):
-        cls.proc.terminate()
-        try:
-            cls.proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            cls.proc.kill(); cls.proc.wait(timeout=5)
+        stop_private_host(cls)
         cls.log.close(); cls.temp.cleanup()
 
     @classmethod
@@ -118,7 +153,7 @@ class NativeHarness(unittest.TestCase):
         sid = 'session-' + str(uuid.uuid4())
         name = 'dsh/test/' + str(uuid.uuid4())[:8]
         self.rpc('create', {'sessionId': sid, 'cwd': str(self.workspace), 'title': name, **native})
-        binding = {'backend': 'dsh', 'name': name, 'conversation_id': sid, 'run_id': str(uuid.uuid4()),
+        binding = {'backend': 'dsh', 'agent': 'dsh', 'name': name, 'session_id': str(uuid.uuid4()), 'conversation_id': sid, 'run_id': str(uuid.uuid4()),
                    'agent_home': str(self.home), 'cwd': str(self.workspace), 'created': time.time()}
         directory = self.state / 'dsh/bindings'; directory.mkdir(exist_ok=True)
         (directory / (hashlib.sha256(name.encode()).hexdigest() + '.json')).write_text(json.dumps(binding))
@@ -134,6 +169,75 @@ class NativeHarness(unittest.TestCase):
         return {'request_id': str(uuid.uuid4()), 'expected_run_id': binding['run_id'],
                 'expected_conversation_id': binding['conversation_id'], **fields}
 
+    def test_native_shell_self_and_explicit_child_parent_are_claimed(self):
+        parent = self.create(permissionMode='bypass')
+        tag = 'claimed-' + uuid.uuid4().hex[:8]
+        output = self.workspace / (tag + '.json')
+        script = ('import json,subprocess;from pathlib import Path;'
+                  f'identity=json.loads(subprocess.check_output({[str(HGS),"self","--json"]!r},text=True));'
+                  f'Path({str(output)!r}).write_text(json.dumps(identity));'
+                  f'subprocess.run({[str(HGS),"dsh",str(self.workspace),"--new","-n",tag,"-d","--parent"]!r}+'
+                  '[json.dumps(identity["parent_identity"])],check=True)')
+        command = shlex.join([sys.executable, '-c', script])
+        self.cli('send', parent, self.payload(parent,text='HGS_SELF_NATIVE_FIXTURE '+command))
+        def finished():
+            if not output.exists():
+                return None
+            return next((json.loads(p.read_text()) for p in (self.state/'dsh/bindings').glob('*.json')
+                         if json.loads(p.read_text())['name'].endswith('/'+tag)), None)
+        child = self.wait(finished,timeout=30)
+        identity = json.loads(output.read_text())
+        self.assertEqual(identity['provider'],'dsh')
+        self.assertEqual(identity['identity_source'],'claimed')
+        self.assertEqual(identity['session_id'],parent['session_id'])
+        self.assertEqual(identity['conversation_id'],parent['conversation_id'])
+        self.assertEqual(child['parent']['source'],'claimed')
+        self.assertEqual(child['parent']['session_id'],parent['session_id'])
+        expected = dict(expected_run_id=child['run_id'],expected_conversation_id=child['conversation_id'])
+        for action in ('clear','adopt'):
+            request = dict(expected,action=action)
+            if action=='adopt':
+                request['parent']=identity['parent_identity']
+            result = subprocess.run([str(HGS),'parent',child['name'],'--json'],env=self.env,input=json.dumps(request),
+                text=True,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr)
+            if action=='adopt':
+                self.assertEqual(json.loads(result.stdout)['parent']['source'],'claimed')
+
+    def test_new_launch_records_parent_and_resume_keeps_identity_without_readopting(self):
+        # This entire host, native home, state and proven caller are fixture-owned.
+        lead = dict(version=1, agent='claude', name='claude/test/lead', session_id=str(uuid.uuid4()),
+                    run_id=str(uuid.uuid4()), conversation_id=str(uuid.uuid4()), pid=os.getpid(),
+                    process_start=subprocess.check_output(['ps', '-p', str(os.getpid()), '-o', 'lstart='],
+                        env=dict(self.env, LC_ALL='C', TZ='UTC'), text=True).strip())
+        path = self.state / (hashlib.sha256(lead['name'].encode()).hexdigest() + '.json')
+        path.write_text(json.dumps(lead))
+        env = dict(self.env, HGS_SESSION=lead['name'], HGS_RUN_ID=lead['run_id'])
+        try:
+            reference = subprocess.run([str(HGS), 'reference', lead['name'], '--json'], env=env,
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(reference.returncode, 0, reference.stderr)
+            tag = 'parent-' + uuid.uuid4().hex[:8]
+            def launch(new=False):
+                result = subprocess.run([str(HGS), 'dsh', str(self.workspace), '-n', tag, '-d', *(['--new'] if new else [])],
+                    env=env, cwd=REPO, text=True, capture_output=True, timeout=35)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return next(json.loads(p.read_text()) for p in (self.state / 'dsh/bindings').glob('*.json')
+                            if json.loads(p.read_text())['name'].endswith('/' + tag))
+            child = launch(new=True)
+            self.assertEqual(child['parent']['session_id'], lead['session_id'])
+            self.assertEqual(self.cli('inspect', child)['parent']['session_id'], lead['session_id'])
+            request = dict(expected_run_id=child['run_id'], expected_conversation_id=child['conversation_id'], action='clear')
+            cleared = subprocess.run([str(HGS), 'parent', child['name'], '--json'], input=json.dumps(request),
+                env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertIsNone(json.loads(cleared.stdout)['parent'])
+            resumed = launch()
+            self.assertEqual((resumed['session_id'], resumed['conversation_id']), (child['session_id'], child['conversation_id']))
+            self.assertNotIn('parent', resumed)
+        finally:
+            path.unlink(missing_ok=True)
+
     def wait(self, predicate, timeout=15):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
@@ -142,6 +246,22 @@ class NativeHarness(unittest.TestCase):
                 return value
             time.sleep(.1)
         self.fail('Native event did not arrive')
+
+    def test_leading_absolute_path_is_literal_message_text(self):
+        b = self.create()
+        text = '/help/fixture/capture.png\nWhat is shown in this screenshot?'
+        request = self.payload(b, text=text, attachments=[])
+        receipt = self.cli('send', b, request)
+        self.assertEqual(receipt['status'], 'submitted')
+        from delivery_receipt_checks import check_delivery_lookup
+        check_delivery_lookup(self, HGS, self.env, b, receipt, 'dsh')
+        data = self.wait(lambda: (d if d.get('reply_id') and any(e['type'] == 'AgentMessage' for e in d['events']) else None)
+                         if (d := self.cli('inspect', b)) else None)
+        self.assertEqual([e['detail'] for e in data['events'] if e['type'] == 'UserPromptSubmit'], [text])
+        self.assertTrue(any(text in e['detail'] for e in data['events'] if e['type'] == 'AgentMessage'))
+        self.assertEqual(self.cli('send', b, request), receipt)
+        after = self.cli('inspect', b)
+        self.assertEqual([e['detail'] for e in after['events'] if e['type'] == 'UserPromptSubmit'], [text])
 
     def test_real_history_goals_private_reasoning_and_idempotent_send(self):
         b = self.create()
@@ -170,6 +290,13 @@ class NativeHarness(unittest.TestCase):
         b=self.create()
         self.cli('send',b,self.payload(b,text='SHELL_BACKGROUND_FIXTURE',attachments=[]))
         data=self.wait(lambda: (d if d['phase']=='idle' and d.get('processes',{}).get('active_count')==1 else None) if (d:=self.cli('inspect',b)) else None)
+        # zerus-yj7ef: the listing itself reports the running background job (Background),
+        # from the bridge's bounded listJobs summary, without an inspection.
+        self.assertIs(self.rpc('ping').get('listJobs'),True)
+        def listed():
+            return next(r for r in json.loads(subprocess.check_output([str(HGS),'ls','--local','--json'],env=self.env,text=True))['sessions'] if r['name']==b['name'])
+        row=listed()
+        self.assertEqual((row['activity'],row['phase'],row['process_work']['count']),('idle','idle',1),row)
         light=subprocess.run([str(HGS),'inspect',b['name'],'--skip-processes'],env=self.env,text=True,capture_output=True,timeout=15)
         self.assertEqual(light.returncode,0,light.stderr);self.assertNotIn('processes',json.loads(light.stdout))
         self.assertNotIn('jobs',self.rpc('inspect',{'sessionId':b['conversation_id'],'includeProcesses':False}))
@@ -195,6 +322,9 @@ class NativeHarness(unittest.TestCase):
         stopped=process('--stop');self.assertEqual(stopped.returncode,0,stopped.stderr)
         final=self.wait(lambda: (d if any(j['status']=='stopped' for j in d['processes']['items']) else None) if (d:=self.cli('inspect',b)) else None)
         self.assertEqual(final['processes']['active_count'],0)
+        # A settled job is no background work: a count of 0, not unknown.
+        row=self.wait(lambda: (r if r['phase']=='idle' else None) if (r:=listed()) else None)
+        self.assertEqual(row['process_work']['count'],0,row)
 
     def test_foreground_shell_failure_keeps_output_after_registry_removal(self):
         b=self.create();self.cli('send',b,self.payload(b,text='SHELL_FOREGROUND_FIXTURE',attachments=[]))
@@ -354,6 +484,7 @@ class NativeHarness(unittest.TestCase):
             data=self.wait(lambda: d if (d:=self.cli('inspect',b))['pending_questions'] else None)
             question=data['pending_questions'][0]
             self.assertFalse(question['questions'][0]['allow_other'])
+            self.assertIs(question.get('blocking'), False)
             self.assertEqual(data['phase'],'input')
             raw=self.rpc('inspect',{'sessionId':b['conversation_id']})
             self.assertFalse(any(r.get('event',{}).get('type')=='approval/decided' for r in raw['page']['records']))
@@ -720,7 +851,7 @@ class NativeHarness(unittest.TestCase):
                 'content': [{'type': 'text', 'text': 'wrong parent'}]})
 
     def test_real_cli_startup_and_native_browser_authentication(self):
-        with tempfile.TemporaryDirectory(prefix='hgs-dsh-launch-', dir='/tmp') as directory:
+        with tempfile.TemporaryDirectory(prefix='hgs-dsh-launch-', dir=os.environ.get('ZERUS_TEST_SHORT_TMPDIR', '/tmp')) as directory:
             root=Path(directory); home=root/'user';home.mkdir();workspace=root/'project';workspace.mkdir()
             env={**self.env,'HOME':str(home),'DSH_HOME':str(root/'native'),'HGS_STATE_DIR':str(root/'state'),'HGS_CONFIG_DIR':str(root/'config')}
             # Match a desktop service, which does not source the user's shell rc.
@@ -771,14 +902,29 @@ class NativeHarness(unittest.TestCase):
                 # A cold restart reuses the native profile rather than trying
                 # to create it a second time with --from-default-profile.
                 pidfile=next((root/'state/dsh/hosts').glob('*/host.pid'))
-                os.kill(int(pidfile.read_text()),signal.SIGTERM)
+                overlay=json.loads((pidfile.parent/'hgs.patch.json').read_text())
+                bridge=next(entry for patch in overlay for entry in patch.get('insert',[])
+                            if entry.get('id')=='hgs-native-dsh')
+                self.assertEqual(bridge['config'].get('agentHint'),
+                    'This agent runs in a Zerus session: the hgs CLI reads, messages, launches and stops other agent sessions on this and other computers. Run hgs guide before using it.')
+                pid=int(pidfile.read_text())
+                original=host_process(pid)
+                self.assertIsNotNone(original)
+                self.assertNotIn(original[0], ('Z', 'X'))
+                os.kill(pid,signal.SIGTERM)
                 sock=pidfile.parent/'host.sock'
-                for _ in range(100):
+                deadline=time.monotonic()+5
+                while time.monotonic()<deadline:
                     try:
                         with socket.socket(socket.AF_UNIX) as probe: probe.connect(str(sock))
-                    except OSError: break
+                    except OSError:
+                        # Socket teardown can precede exit. A reused PID is an
+                        # exited original, never a reason to signal that PID.
+                        current=host_process(pid, deadline)
+                        if current is None or current[1]!=original[1] or current[0] in ('Z', 'X'):
+                            break
                     time.sleep(.05)
-                else: self.fail('Isolated native host did not stop')
+                else: self.fail('Isolated native host did not exit')
                 run('resume','dsh/project/startup')
                 restarted=json.loads(run('inspect','dsh/project/startup'))
                 self.assertEqual(restarted['conversation_id'],inspection['conversation_id'])
@@ -813,6 +959,57 @@ class NativeHarness(unittest.TestCase):
             self.assertEqual(after['selection'], before['selection'])
             self.assertEqual(after['page']['records'], before['page']['records'])
 
+    def test_id_settings_preserves_original_session_default_and_no_model_calls(self):
+        calls = self.root / 'holds' / 'SETTINGS_MODEL_STREAMS'
+        before_control = calls.read_bytes() if calls.exists() else b''
+        control = self.create()
+        self.cli('send', control, self.payload(control, text='Settings stream counter positive control', attachments=[]))
+        self.wait(lambda: (value.get('reply_id') and value['phase'] == 'idle')
+                  if (value := self.cli('inspect', control)) else False)
+        self.assertGreater(len(calls.read_bytes()), len(before_control),
+                           'the no-model-call counter must observe a real inference stream')
+        a, b = self.create(), self.create()
+        defaults = self.rpc('catalog')['default']
+        original = self.rpc('inspect', {'sessionId': a['conversation_id']})
+        before = calls.read_bytes()
+        reference = subprocess.run([str(HGS), 'reference', a['name'], '--json'],
+                                   env=self.env, cwd=REPO, text=True, capture_output=True, timeout=35)
+        self.assertEqual(reference.returncode, 0, reference.stdout + reference.stderr)
+        uri = json.loads(reference.stdout)['uri']
+        self.assertTrue(uri.startswith('zerus://session?'))
+        for selector, model, effort in (([a['name'], '--session-id', a['session_id']], 'test-b', 'off'),
+                                        ([uri], 'test-a', 'high')):
+            with self.subTest(selector=selector):
+                request = self.payload(a, model='hgs-test/' + model, effort=effort)
+                result = subprocess.run([str(HGS), 'settings', *selector, '--json'],
+                                        input=json.dumps(request), env=self.env, cwd=REPO,
+                                        text=True, capture_output=True, timeout=35)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)['scope'], 'session')
+                selected = self.cli('inspect', a)
+                self.assertEqual((selected['session_id'], selected['conversation_id'], selected['run_id']),
+                                 (a['session_id'], a['conversation_id'], a['run_id']))
+                self.assertEqual((selected['model'], selected['effort']), (model, effort))
+                self.assertEqual(self.cli('inspect', b)['model'], 'test-a')
+                self.assertEqual(self.rpc('catalog')['default'], defaults)
+                current = self.rpc('inspect', {'sessionId': a['conversation_id']})
+                self.assertEqual(current['generation'], original['generation'])
+                # Native selection events are legitimate; inference is forbidden.
+                self.assertEqual(calls.read_bytes(), before,
+                                 'Settings invoked the private model stream')
+
+    def test_launch_applies_model_and_effort_to_new_session(self):
+        before = self.rpc('catalog')['default']
+        name = 'dsh/test/' + str(uuid.uuid4())[:8]
+        result = subprocess.run([str(HGS), 'dsh', str(self.workspace), '--new', '-n', name,
+                                 '--launch-id', str(uuid.uuid4()), '--model', 'hgs-test/test-b', '--effort', 'off'],
+                                env=self.env, cwd=REPO, text=True, capture_output=True, timeout=35)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inspection = self.cli('inspect', {'name': name})
+        self.assertEqual((inspection['model_provider'], inspection['model'], inspection['effort']),
+                         ('hgs-test', 'test-b', 'off'))
+        self.assertEqual(self.rpc('catalog')['default'], before)
+
     def test_model_settings_do_not_change_default_or_other_session(self):
         a, b = self.create(), self.create()
         before = self.rpc('catalog')['default']
@@ -822,6 +1019,233 @@ class NativeHarness(unittest.TestCase):
         self.assertEqual(self.cli('inspect', a)['model'], 'test-b')
         self.assertEqual(self.cli('inspect', b)['model'], 'test-a')
         self.assertEqual(self.rpc('catalog')['default'], before)
+        # The native selection is durable on this session, not just a live
+        # option override; a new Agent resumes it without changing the default.
+        self.cli('pause', a)
+        self.cli('resume', a)
+        resumed = self.cli('inspect', a)
+        self.assertEqual((resumed['model'], resumed['effort']), ('test-b', 'off'))
+        self.assertEqual(self.cli('inspect', b)['model'], 'test-a')
+        self.assertEqual(self.rpc('catalog')['default'], before)
+
+    def test_account_defaults_reach_only_a_new_session_before_its_first_prompt(self):
+        # zerus-v7tqa: a launch applies the account's model and effort through
+        # the scoped settings method; relaunch and the native default keep theirs.
+        before = self.rpc('catalog')['default']
+        def run(*args, ok=True):
+            result = subprocess.run([str(HGS), *args], env=self.env, cwd=self.workspace, text=True, capture_output=True, timeout=45)
+            self.assertEqual(result.returncode == 0, ok, result.stderr); return result
+        def launch(tag, *flags):
+            out = run('dsh', str(self.workspace), '-n', tag, *flags)
+            return {'name': out.stdout.split('DeepSeek session ready: ')[1].split('\n')[0]}, out.stderr
+        settings = json.loads(run('account', 'model-settings', 'native-dsh', '--json').stdout)
+        self.assertIn({'id': 'hgs-test/test-b', 'label': 'Test B (HGS test model)', 'effort_options': ['off', 'high']}, settings['models'])
+        self.assertEqual((settings['provider_defaults'], settings['effort_supported']), ({'model': 'hgs-test/test-a', 'effort': ''}, True))
+        run('account', 'model-defaults', 'native-dsh', '--model', 'hgs-test/test-b', '--effort', 'max', ok=False)
+        try:
+            run('account', 'model-defaults', 'native-dsh', '--model', 'hgs-test/test-b', '--effort', 'off')
+            binding, warning = launch('defaults', '--new')
+            self.assertEqual(warning, '')
+            seen = self.cli('inspect', binding)
+            self.assertEqual((seen['model'], seen['effort'], seen['account_defaults']['status']), ('test-b', 'off', 'applied'))
+            records = self.rpc('inspect', {'sessionId': seen['conversation_id']})['page']['records']
+            self.assertFalse([r for r in records if r['event']['type'] == 'turn/start'])
+            self.assertEqual(self.rpc('catalog')['default'], before)
+            # Relaunching the name resumes it under its own stored selection.
+            run('account', 'model-defaults', 'native-dsh', '--model', 'hgs-test/test-a', '--effort', 'high')
+            launch('defaults')
+            again = self.cli('inspect', binding)
+            self.assertEqual((again['model'], again['effort'], again['account_defaults']['model']), ('test-b', 'off', 'hgs-test/test-b'))
+            # A default the host refuses is reported once; the session starts natively.
+            path = Path(self.env['HGS_CONFIG_DIR']) / 'accounts.json'
+            catalog = json.loads(path.read_text())
+            catalog['model_defaults']['native-dsh'] = {'model': 'hgs-test/missing', 'effort': ''}
+            path.write_text(json.dumps(catalog))
+            refused, warning = launch('refused', '--new')
+            self.assertIn('account defaults were not applied', warning)
+            seen = self.cli('inspect', refused)
+            self.assertEqual((seen['model'], seen['account_defaults']['status']), ('test-a', 'failed'))
+            # An effort this build cannot validate is preserved, but never
+            # passed to the host's scoped settings call in the first place.
+            catalog['model_defaults']['native-dsh'] = {'model': 'hgs-test/test-b', 'effort': 'future-effort'}
+            path.write_text(json.dumps(catalog))
+            untouched = path.read_bytes()
+            settings = json.loads(run('account', 'model-settings', 'native-dsh', '--json').stdout)
+            self.assertEqual(settings['model_defaults_status'], 'ignored')
+            self.assertTrue(settings['model_defaults_reason'])
+            ignored, warning = launch('ignored-default', '--new')
+            self.assertEqual(warning, '')
+            seen = self.cli('inspect', ignored)
+            self.assertEqual(seen['model'], 'test-a')
+            self.assertIsNone(seen.get('account_defaults'))
+            self.assertEqual(path.read_bytes(), untouched)
+        finally:
+            run('account', 'model-defaults', 'native-dsh', '--model', '')
+
+    def test_settings_resume_a_paused_session_under_the_account_permissions(self):
+        def preset(binding):
+            return self.rpc('inspect', {'sessionId': binding['conversation_id']})['baseline']['values']['permissions']['currentValue']
+        command = [str(HGS), 'account', 'permissions', 'native-dsh', '--mode']
+        b = self.create(); old = preset(b)
+        try:
+            subprocess.run(command+['bypass'], env=self.env, check=True, capture_output=True)
+            self.cli('pause', b)
+            self.assertFalse(self.rpc('inspect', {'sessionId': b['conversation_id']})['live'])
+            self.cli('settings', b, self.payload(b, model='hgs-test/test-b', effort='off'))
+            self.assertTrue(self.rpc('inspect', {'sessionId': b['conversation_id']})['live'])
+            self.assertNotEqual(old, 'danger-full-access')
+            self.assertEqual(preset(b), 'danger-full-access')
+        finally:
+            subprocess.run(command+['provider'], env=self.env, check=True, capture_output=True)
+
+    def test_settings_and_image_admission_use_the_same_native_queue(self):
+        b = self.create()
+        gate = self.root / 'holds' / 'MODEL_ADMISSION_HOLD'
+        encoded = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGP4DwYMEAoAU7oL9ZisIGcAAAAASUVORK5CYII='
+        request = self.payload(b, text='Image admission must see the selected text-only model',
+                               attachments=[dict(name='pixel.png', mime='image/png', data_base64=encoded)])
+        before = self.rpc('catalog')['default']
+        gate.touch()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                # Two CLI writers also share bindings.lock. Use the original
+                # bridge RPC for settings to test the HOST's admission queue.
+                settings = pool.submit(self.rpc, 'settings', dict(sessionId=b['conversation_id'],
+                                       provider='hgs-test', model='test-b', reasoningEffort='off'))
+                try:
+                    self.wait(lambda: gate.with_suffix('.resolving').exists())
+                    image = pool.submit(self.hgs, 'send', b['name'], request=request)
+                    self.wait(lambda: gate.with_suffix('.queued').exists())
+                finally:
+                    gate.unlink(missing_ok=True)
+                self.assertEqual(settings.result(timeout=30)['scope'], 'session')
+                refused = image.result(timeout=30)
+        finally:
+            gate.unlink(missing_ok=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('does not support image input', refused.stderr)
+        data = self.cli('inspect', b)
+        self.assertEqual(data['model'], 'test-b')
+        self.assertFalse(any(e['type'] == 'UserPromptSubmit' for e in data['events']))
+        self.assertEqual(self.rpc('catalog')['default'], before)
+
+    def launch_spawn_subject(self):
+        tag = 'spawn-' + uuid.uuid4().hex[:10]
+        started = self.hgs('dsh', str(self.workspace), '--new', '-n', tag, '-d')
+        self.assertEqual(started.returncode, 0, started.stderr)
+        return next(row for name, row in self.bindings().items() if name.endswith('/' + tag))
+
+    def spawn_probe(self, subject, action):
+        session = {'sessionId': subject['conversation_id']}
+        before = self.rpc('inspect', session)['baseline']['asOfSeq']
+        # Use the resident adapter's send and inspect paths directly. hgs
+        # inspect also pings, which could repair the wrapper ahead of the hook.
+        self.rpc('send', {**session, 'requestId': str(uuid.uuid4()), 'mode': 'steer',
+                          'content': [{'type': 'text', 'text': 'HGS_SPAWN_FIXTURE ' + action}]})
+
+        def result():
+            inspected = self.rpc('inspect', session)
+            events = [row.get('event', {}) for row in inspected['page']['records']]
+            if not any(event.get('type') == 'turn/end' and event['seq'] > before for event in events):
+                return None
+            for event in events:
+                if event.get('type') != 'tool/result' or event['seq'] <= before:
+                    continue
+                message = event['data']['message']
+                if message.get('toolCallId') == 'spawn-probe':
+                    self.assertFalse(message.get('isError'), message['content'])
+                    return message['content'][0]['text']
+            return None
+
+        return json.loads(self.wait(result, timeout=30))
+
+    def test_spawn_wrappers_survive_repeated_native_reads(self):
+        first, second = self.launch_spawn_subject(), self.launch_spawn_subject()
+        born, generation = host_process(self.proc.pid), self.rpc('ping')['generation']
+        initial = self.spawn_probe(first, 'once')
+        self.assertEqual(initial.get('completed'), 1, initial)
+        self.assertGreater(initial['minDepth'], 0, initial)
+        for _ in range(5000):
+            self.assertTrue(self.rpc('ping')['shellIdentity'])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+            results = [workers.submit(self.spawn_probe, subject, 'bulk') for subject in (first, second)]
+            for result in results:
+                value = result.result()
+                self.assertEqual(value.get('completed'), 500, value)
+                self.assertEqual(value['minDepth'], initial['minDepth'], value)
+                self.assertEqual(value['maxDepth'], initial['maxDepth'], value)
+                self.assertEqual(value['installation'], initial['installation'],
+                                 'Repeated checks replaced the installed native spawn wrapper')
+                print(f"Native spawns completed: {value['completed']}, stack depth {value['minDepth']}–{value['maxDepth']}", flush=True)
+        self.assertEqual(self.rpc('ping')['generation'], generation)
+        self.assertEqual(host_process(self.proc.pid)[1], born[1])
+
+    def test_recursive_spawn_chain_recovers_on_the_same_host(self):
+        first, second = self.launch_spawn_subject(), self.launch_spawn_subject()
+        born, generation = host_process(self.proc.pid), self.rpc('ping')['generation']
+        initial = self.spawn_probe(first, 'once')
+        self.assertEqual(initial.get('completed'), 1, initial)
+        failed = self.spawn_probe(first, 'damage')
+        self.assertEqual(failed, {'error': 'RangeError: Maximum call stack size exceeded'})
+        repaired = self.spawn_probe(first, 'once')
+        self.assertNotEqual(repaired.get('installation'), initial['installation'])
+        self.assertEqual(repaired, {**initial, 'installation': repaired.get('installation')})
+        self.assertEqual(self.spawn_probe(second, 'once'), repaired)
+        self.assertEqual(self.rpc('ping')['generation'], generation)
+        self.assertEqual(host_process(self.proc.pid)[1], born[1])
+
+    def unload_spawn_bridge(self, subject, action, evidence_file, generation):
+        self.rpc('send', {'sessionId': subject['conversation_id'], 'requestId': str(uuid.uuid4()),
+                          'mode': 'steer',
+                          'content': [{'type': 'text', 'text': 'HGS_SPAWN_FIXTURE ' + action}]})
+        evidence = self.root / 'holds' / evidence_file
+        self.wait(evidence.is_file, timeout=30)
+        result = json.loads(evidence.read_text())
+
+        def reloaded():
+            try:
+                ping = self.rpc('ping')
+            except OSError:
+                return None
+            return ping if ping['generation'] != generation else None
+
+        self.assertTrue(self.wait(reloaded)['shellIdentity'])
+        return result
+
+    def test_spawn_wrappers_are_restored_when_private_bridge_unloads(self):
+        subject = self.launch_spawn_subject()
+        born, generation = host_process(self.proc.pid), self.rpc('ping')['generation']
+        result = self.unload_spawn_bridge(subject, 'cleanup', 'spawn-cleanup.json', generation)
+        self.assertEqual(result, {'wrapped': [True, True], 'restored': [True, True]})
+        self.assertEqual(host_process(self.proc.pid)[1], born[1])
+
+    def test_spawn_wrappers_follow_replaced_cordis_service_on_same_host(self):
+        subject = self.launch_spawn_subject()
+        born, generation = host_process(self.proc.pid), self.rpc('ping')['generation']
+        initial = self.spawn_probe(subject, 'once')
+        changed = self.spawn_probe(subject, 'swap')
+        try:
+            # The next real tool hook sees the new Cordis service and spawns
+            # through it. The resident bridge stays active during this swap.
+            updated = self.spawn_probe(subject, 'once')
+            # The tool records its own service before a ping or cleanup can
+            # repair it. A different installation ID alone would also hold
+            # for a completely unwrapped replacement.
+            self.assertEqual(updated.get('wrapperMarked'), [True, True],
+                             'The post-swap tool did not see both HGS wrappers')
+        finally:
+            result = self.unload_spawn_bridge(subject, 'cleanup-swap', 'spawn-swap-cleanup.json', generation)
+
+        self.assertEqual(changed, {'replacementNative': [True, True]})
+        self.assertEqual(initial.get('completed'), 1, initial)
+        self.assertEqual(updated.get('completed'), 1, updated)
+        self.assertNotEqual(updated['installation'], initial['installation'])
+        self.assertEqual(result.get('wrapped'), [True, True], result)
+        self.assertEqual(result.get('previousRestored'), [True, True],
+                         'The previous service kept the HGS wrapper after the swap')
+        self.assertEqual(result.get('restored'), [True, True],
+                         'The replacement service kept the HGS wrapper after bridge unload')
+        self.assertEqual(host_process(self.proc.pid)[1], born[1])
 
     def test_pause_resume_preserves_identity_and_other_agent(self):
         a, b = self.create(), self.create()
@@ -835,11 +1259,451 @@ class NativeHarness(unittest.TestCase):
         self.assertEqual(self.cli('inspect', a)['conversation_id'], a['conversation_id'])
         self.assertTrue(self.rpc('inspect', {'sessionId': a['conversation_id']})['live'])
 
+    def launch_archive_subject(self, tag=None, folder=None):
+        tag = tag or 'archive-' + uuid.uuid4().hex[:12]
+        launched = self.hgs('dsh', str(folder or self.workspace), '--new', '-n', tag, '-d')
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        return next(json.loads(path.read_text())
+                    for path in (self.state / 'dsh/bindings').glob('*.json')
+                    if json.loads(path.read_text())['name'].endswith('/' + tag))
+
+    def archive_row(self, subject):
+        self.assertNotIn(subject['name'], self.bindings())
+        listing = self.hgs('archives', '--json', '--bounded', request={})
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        rows = [row for row in json.loads(listing.stdout)['sessions']
+                if row['name'] == subject['name']]
+        [archived] = rows
+        self.assertEqual(archived['state'], 'archived')
+        for key in ('session_id', 'run_id', 'conversation_id'):
+            self.assertEqual(archived[key], subject[key])
+        return archived['archive_id']
+
+    @contextmanager
+    def archive_rpc_proxy(self, intercept):
+        """Interpose on this fixture's CLI socket without restarting its resident host."""
+        address = Path(self.sock)
+        upstream = address.with_name('real.sock')
+        address.rename(upstream)
+
+        class Handler(StreamRequestHandler):
+            def handle(self):
+                line = self.rfile.readline()
+                if not line:
+                    return
+
+                def forward(request):
+                    with socket.socket(socket.AF_UNIX) as client:
+                        client.settimeout(20)
+                        client.connect(str(upstream))
+                        client.sendall((json.dumps(request) + '\n').encode())
+                        with client.makefile('rb') as reader:
+                            return json.loads(reader.readline())
+
+                if (response := intercept(json.loads(line), forward)) is not None:
+                    self.wfile.write((json.dumps(response) + '\n').encode())
+
+        try:
+            with ThreadingUnixStreamServer(self.sock, Handler) as server:
+                address.chmod(0o600)
+                thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05})
+                thread.start()
+                try:
+                    yield
+                finally:
+                    server.shutdown()
+                    thread.join()
+        finally:
+            address.unlink(missing_ok=True)
+            upstream.rename(address)
+
+    def archived_subject(self):
+        subject = self.launch_archive_subject()
+        retired = self.hgs('terminate', subject['name'])
+        self.assertEqual(retired.returncode, 0, retired.stderr)
+        return subject, self.archive_row(subject)
+
+    def scoped_archive_action(self, subject, action, **fields):
+        return self.archive_action_request(subject, self.payload(subject, action=action, **fields))
+
+    def archive_action_request(self, subject, request):
+        result = self.hgs('session-action', subject['name'], '--json', request=request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_lost_restore_request_is_fenced_before_releasing_archive(self):
+        subject, archive = self.archived_subject()
+        dropped = []
+
+        def intercept(request, forward):
+            if request['method'] == 'session-action' and request['params'].get('action') == 'resume':
+                dropped.append(request['params'])
+                return None
+            return forward(request)
+
+        with self.archive_rpc_proxy(intercept):
+            receipt = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(receipt['status'], 'uncertain', receipt)
+            settled = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(settled['status'], 'failed', settled)
+            self.assertIn('available for a new Restore', json.dumps(settled))
+        [original] = dropped
+        self.assertEqual(self.archive_row(subject), archive)
+        self.assertEqual(self.rpc('session-action', original)['status'], 'failed')
+        self.assertFalse(self.rpc('inspect', {'sessionId': subject['conversation_id']})['live'])
+        retry = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+        self.assertEqual(retry['status'], 'completed', retry)
+
+    def test_restart_fences_restore_with_a_lost_acknowledgement(self):
+        subject, archive = self.archived_subject()
+        resumes = []
+
+        def intercept(request, forward):
+            reply = forward(request)
+            if request['method'] == 'session-action' and request['params'].get('action') == 'resume':
+                resumes.append(reply['value']['status'])
+                return None
+            return reply
+
+        with self.archive_rpc_proxy(intercept):
+            receipt = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(receipt['status'], 'uncertain', receipt)
+        generation = self.rpc('ping')['generation']
+        self.assertTrue(self.rpc('inspect', {'sessionId': subject['conversation_id']})['live'])
+        stop_private_host(type(self))
+        start_private_host(type(self))
+        self.assertNotEqual(self.rpc('ping')['generation'], generation)
+        with self.archive_rpc_proxy(intercept):
+            settled = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(settled['status'], 'failed', settled)
+            self.assertIn('host restarted', json.dumps(settled))
+            self.assertIn('available for a new Restore', json.dumps(settled))
+        self.assertEqual(resumes, ['completed'])
+        self.assertEqual(self.archive_row(subject), archive)
+        retry = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+        self.assertEqual(retry['status'], 'completed', retry)
+
+    def test_managed_worktree_removal_preserves_native_archive_restore(self):
+        repo = self.root / ('repo-' + uuid.uuid4().hex[:8])
+        checkout = repo.with_suffix('.checkout')
+
+        def git(*args):
+            return subprocess.check_output(['git', *args], env=self.env, stderr=subprocess.PIPE, text=True).strip()
+
+        git('init', '-q', '-b', 'main', str(repo))
+        git('-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+            'commit', '--allow-empty', '-qm', 'initial')
+        created = self.hgs('worktrees', 'create', '--path', str(repo), '--destination', str(checkout),
+                           '--branch', 'native-session', '--json')
+        self.assertEqual(created.returncode, 0, created.stderr)
+        subject = self.launch_archive_subject(folder=checkout)
+        retired = self.hgs('terminate', subject['name'])
+        self.assertEqual(retired.returncode, 0, retired.stderr)
+        archive = self.archive_row(subject)
+        reviewed = self.hgs('worktrees', 'review', '--path', str(repo), '--worktree', str(checkout), '--json')
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
+        [row] = json.loads(reviewed.stdout)['worktrees']
+        self.assertEqual(row['archived_sessions'], 1, row)
+        consent = []
+        if row.get('process_fingerprint'):
+            consent = ['--process-fingerprint', row['process_fingerprint']]
+        removed = self.hgs('worktrees', 'remove', '--path', str(checkout), '--common-dir', str(repo / '.git'),
+                           '--fingerprint', row['fingerprint'], '--ignored-fingerprint', row['ignored_fingerprint'],
+                           '--preserve-archive-restore', '--json', *consent)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(checkout.exists())
+
+        import sqlite3
+        database = self.state / 'dsh/archives-v1.sqlite3'
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+            body = db.execute('SELECT body FROM archive_rows WHERE id = ?', (archive,)).fetchone()
+        marked = json.loads(body[0])
+        self.assertEqual(marked['session_id'], subject['session_id'])
+        self.assertEqual(marked['worktree_cleanup']['status'], 'removal_pending')
+        self.assertEqual(marked['worktree_cleanup']['owner']['id'], row['ownership_id'])
+        detail = self.hgs('inspect', subject['name'], '--archive', archive)
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        self.assertIn('restore', json.loads(detail.stdout)['allowed_actions'])
+
+        def refuse_resume(request, forward):
+            if request['method'] == 'session-action' and request['params'].get('action') == 'resume':
+                request['params']['permissionMode'] = 'invalid-fixture-mode'
+            return forward(request)
+
+        with self.archive_rpc_proxy(refuse_resume):
+            refused = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(refused['status'], 'failed', refused)
+        self.assertTrue(checkout.is_dir(), 'the checkout was recreated before native admission')
+        self.assertEqual(self.archive_row(subject), archive)
+        restored = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+        self.assertEqual(restored['status'], 'completed', restored)
+        binding = self.bindings()[subject['name']]
+        self.assertEqual(binding['conversation_id'], subject['conversation_id'])
+        self.assertNotEqual(binding['worktree_owner']['id'], row['ownership_id'])
+        self.assertNotIn('worktree_cleanup', binding)
+
+    def test_lost_restore_ack_can_be_checked_without_replaying_resume(self):
+        for status_available in (True, False):
+            with self.subTest(receipt_read=status_available):
+                subject, archive = self.archived_subject()
+                acknowledgements = []
+                readable = False
+
+                def intercept(request, forward):
+                    method, params = request['method'], request['params']
+                    if params.get('sessionId') == subject['conversation_id']:
+                        if method == 'session-action' and params.get('action') == 'resume':
+                            acknowledgements.append(forward(request))
+                            return None
+                        if method == 'session-resume-status' and (not readable or not status_available):
+                            return None
+                        if method == 'inspect' and acknowledgements and not readable:
+                            return None
+                    return forward(request)
+
+                request = self.payload(subject, action='restore', archive_id=archive)
+                with self.archive_rpc_proxy(intercept):
+                    unknown = self.archive_action_request(subject, request)
+                    self.assertEqual(unknown['status'], 'uncertain', unknown)
+                    self.assertEqual(self.archive_action_request(subject, request), unknown)
+                    current = self.bindings()[subject['name']]
+                    refused = self.hgs('send', subject['name'], request=self.payload(current, text='blocked'))
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout)
+                    self.assertIn('restore is awaiting native confirmation', refused.stderr)
+                    detail = self.hgs('inspect', subject['name'], '--archive', archive)
+                    self.assertEqual(detail.returncode, 0, detail.stderr)
+                    inspected = json.loads(detail.stdout)
+                    self.assertTrue(inspected['restore_pending'])
+                    self.assertIn('restore', inspected['allowed_actions'])
+                    listing = self.hgs('archives', '--json', '--bounded', request={'query': archive})
+                    self.assertEqual(listing.returncode, 0, listing.stderr)
+                    [row] = json.loads(listing.stdout)['sessions']
+                    self.assertTrue(row['restore_pending'])
+                    self.assertEqual(row['allowed_actions'], ['restore'])
+                    readable = True
+                    completed = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+                self.assertEqual(completed['status'], 'completed', completed)
+                self.assertEqual(completed['result_target']['run_id'], current['run_id'])
+                self.assertEqual([reply['value']['status'] for reply in acknowledgements], ['completed'])
+                self.assertNotIn('expected_id', self.bindings()[subject['name']])
+                consumed = self.hgs('inspect', subject['name'], '--archive', archive)
+                self.assertIn(f'cannot read archive {archive}', consumed.stderr)
+                self.wait_for_archive_fixture_reply(current, 'The settled native conversation still replies')
+
+    def test_lost_restore_refusal_releases_the_archive_for_a_new_request(self):
+        subject, archive = self.archived_subject()
+        acknowledgements = []
+
+        def intercept(request, forward):
+            if request['method'] == 'session-action' and request['params'].get('action') == 'resume':
+                request['params']['permissionMode'] = 'invalid-fixture-mode'
+                acknowledgements.append(forward(request))
+                return None
+            return forward(request)
+
+        with self.archive_rpc_proxy(intercept):
+            unknown = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(unknown['status'], 'uncertain', unknown)
+            checked = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(checked['status'], 'failed', checked)
+            self.assertIn('available for a new Restore', json.dumps(checked))
+        self.assertEqual([reply['value']['status'] for reply in acknowledgements], ['failed'])
+        self.assertEqual(self.archive_row(subject), archive)
+        self.assertFalse(self.rpc('inspect', {'sessionId': subject['conversation_id']})['live'])
+        completed = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+        self.assertEqual(completed['status'], 'completed', completed)
+
+    def test_archive_writes_wait_for_bindings_lock_after_native_ack(self):
+        import fcntl
+
+        subject = self.launch_archive_subject()
+        timers = []
+
+        def intercept(request, forward):
+            response = forward(request)
+            if request['method'] == 'session-action':
+                lock = (self.state / 'dsh/bindings.lock').open('a')
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                timer = threading.Timer(3, lock.close)
+                timers.append(timer)
+                timer.start()
+            return response
+
+        def wait_for_unlocks():
+            for timer in timers:
+                timer.join()
+
+        self.addCleanup(wait_for_unlocks)
+        with self.archive_rpc_proxy(intercept):
+            retired = self.scoped_archive_action(subject, 'terminate')
+            self.assertEqual(retired['status'], 'completed', retired)
+            archive = self.archive_row(subject)
+            restored = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+            self.assertEqual(restored['status'], 'completed', restored)
+        self.assertEqual(len(timers), 2)
+        self.assertNotIn('expected_id', self.bindings()[subject['name']])
+
+    def test_restore_recovers_known_outcomes_after_the_lock_wait_expires(self):
+        import fcntl
+
+        for native_accepts in (True, False):
+            with self.subTest(native_accepts=native_accepts):
+                subject, archive = self.archived_subject()
+                lock = (self.state / 'dsh/bindings.lock').open('a')
+                self.addCleanup(lock.close)
+                outcomes = []
+
+                def intercept(request, forward):
+                    if request['method'] == 'session-action' and request['params'].get('action') == 'resume':
+                        if not native_accepts:
+                            request['params']['permissionMode'] = 'invalid-fixture-mode'
+                        reply = forward(request)
+                        outcomes.append(reply['value']['status'])
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        return reply
+                    if outcomes and request['method'] in ('inspect', 'session-resume-status'):
+                        return None
+                    return forward(request)
+
+                with self.archive_rpc_proxy(intercept):
+                    first = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+                    self.assertEqual(first['status'], 'uncertain', first)
+                    self.assertIn('bindings are busy', first['error'])
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    checked = self.scoped_archive_action(subject, 'restore', archive_id=archive)
+                if native_accepts:
+                    self.assertEqual(outcomes, ['completed'])
+                    self.assertEqual(checked['status'], 'completed', checked)
+                    self.assertNotIn('expected_id', self.bindings()[subject['name']])
+                else:
+                    self.assertEqual(outcomes, ['failed'])
+                    self.assertIn('available for a new Restore', checked['error'])
+                    self.assertEqual(self.archive_row(subject), archive)
+
+    def test_terminate_does_not_archive_without_confirming_stop(self):
+        subject = self.launch_archive_subject()
+
+        def intercept(request, forward):
+            if request['method'] == 'session-action' and request['params'].get('action') == 'forget':
+                fields = {key: request['params'][key] for key in ('sessionId', 'generation', 'action')}
+                return {'ok': True, 'value': dict(fields, status='completed')}
+            return forward(request)
+
+        with self.archive_rpc_proxy(intercept):
+            retired = self.scoped_archive_action(subject, 'terminate')
+        self.assertEqual(retired['status'], 'uncertain', retired)
+        self.assertIn('shutdown was not confirmed', json.dumps(retired))
+        self.assertEqual(self.bindings()[subject['name']], subject)
+        self.assertTrue(self.rpc('inspect', {'sessionId': subject['conversation_id']})['live'])
+        listing = self.hgs('archives', '--json', '--bounded', request={})
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertNotIn(subject['name'], [row['name'] for row in json.loads(listing.stdout)['sessions']])
+
+    def wait_for_archive_fixture_reply(self, subject, text):
+        receipt = self.cli('send', subject, self.payload(subject, text=text))
+        self.assertEqual(receipt['status'], 'submitted')
+        return self.wait(lambda: next((event['detail']
+                         for event in self.cli('inspect', subject)['events']
+                         if event['type'] == 'AgentMessage' and text in event['detail']), None))
+
+    def test_terminate_archives_and_restores_one_native_session(self):
+        retired, other = self.launch_archive_subject(), self.launch_archive_subject()
+        born = host_process(self.proc.pid)
+        generation = self.rpc('ping')['generation']
+        history = 'Retain this native transcript in Archive'
+        self.wait_for_archive_fixture_reply(retired, history)
+
+        stale = self.hgs('terminate', retired['name'], '--expected-run-id', str(uuid.uuid4()))
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertTrue(self.rpc('inspect', {'sessionId': retired['conversation_id']})['live'])
+        stopped = self.hgs('terminate', retired['name'], '--expected-run-id', retired['run_id'])
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertFalse(self.rpc('inspect', {'sessionId': retired['conversation_id']})['live'])
+
+        archive = self.archive_row(retired)
+        detail = self.hgs('inspect', retired['name'], '--archive', archive, '--skip-processes')
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        inspected = json.loads(detail.stdout)
+        self.assertEqual(inspected['archive_id'], archive)
+        self.assertIn('restore', inspected['allowed_actions'])
+        self.assertTrue(any(history in event['detail'] for event in inspected['events']
+                            if event['type'] == 'AgentMessage'))
+
+        self.wait_for_archive_fixture_reply(other, 'This second native session is still working')
+        self.assertEqual(self.cli('inspect', other)['run_id'], other['run_id'])
+        self.assertEqual(self.rpc('ping')['generation'], generation)
+        self.assertEqual(host_process(self.proc.pid)[1], born[1])
+
+        restored = self.hgs('resume', retired['name'], '--archive', archive, '-d')
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        current = self.cli('inspect', retired)
+        self.assertNotEqual(current['run_id'], retired['run_id'])
+        for key in ('session_id', 'conversation_id'):
+            self.assertEqual(current[key], retired[key])
+        consumed = self.hgs('inspect', retired['name'], '--archive', archive)
+        self.assertIn(f'cannot read archive {archive}', consumed.stderr)
+        self.assertEqual(self.rpc('ping')['generation'], generation)
+        self.assertTrue(self.rpc('inspect', {'sessionId': other['conversation_id']})['live'])
+        self.wait_for_archive_fixture_reply(current, 'This restored native session also replies')
+
+    def test_archive_requires_a_stopped_native_session(self):
+        subject = self.launch_archive_subject()
+        active = self.hgs('archive', subject['name'])
+        self.assertNotEqual(active.returncode, 0)
+        self.assertTrue(self.rpc('inspect', {'sessionId': subject['conversation_id']})['live'])
+        self.cli('pause', subject)
+        archived = self.hgs('archive', subject['name'])
+        self.assertEqual(archived.returncode, 0, archived.stderr)
+        archive = self.archive_row(subject)
+        stale = self.payload(subject, action='restore', archive_id=archive)
+        stale['expected_run_id'] = str(uuid.uuid4())
+        def action(request):
+            result = self.hgs('session-action', subject['name'], '--json', request=request)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        refused = action(stale)
+        self.assertEqual(refused['status'], 'failed')
+        self.assertEqual(self.archive_row(subject), archive)
+
+        restore = self.payload(subject, action='restore', archive_id=archive)
+        receipt = action(restore)
+        self.assertEqual(receipt['status'], 'completed', receipt)
+        self.assertEqual(receipt['result_target']['conversation_id'], subject['conversation_id'])
+        self.assertNotEqual(receipt['result_target']['run_id'], subject['run_id'])
+        self.assertEqual(action(restore), receipt)
+
+    def test_archive_inspection_and_restore_select_the_exact_saved_conversation(self):
+        archived = self.launch_archive_subject()
+        retired = self.hgs('terminate', archived['name'])
+        self.assertEqual(retired.returncode, 0, retired.stderr)
+        archive = self.archive_row(archived)
+        replacement = self.launch_archive_subject(archived['name'].rsplit('/', 1)[1])
+        self.assertNotEqual(replacement['conversation_id'], archived['conversation_id'])
+        detail = self.hgs('inspect', archived['name'], '--archive', archive)
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        inspected = json.loads(detail.stdout)
+        self.assertEqual(inspected['conversation_id'], archived['conversation_id'])
+        self.assertNotIn('restore', inspected['allowed_actions'])
+        refused = self.hgs('resume', archived['name'], '--archive', archive, '-d')
+        self.assertIn('already uses this name', refused.stderr)
+        self.assertEqual(self.cli('inspect', replacement)['run_id'], replacement['run_id'])
+
     def test_question_answer_is_bound_to_current_native_request(self):
         b = self.create()
         self.cli('send', b, self.payload(b, text='QUESTION', attachments=[]))
         data = self.wait(lambda: d if (d := self.cli('inspect', b))['pending_questions'] else None)
         question = data['pending_questions'][0]
+        self.assertIsInstance(data.get('question_routing'),dict)
+        self.assertIs(data['question_routing']['send_to_parent'],True)
+        listed=self.hgs('ls','--local','--json')
+        self.assertEqual(listed.returncode,0,listed.stderr)
+        row=next(row for row in json.loads(listed.stdout)['sessions'] if row['name']==b['name'])
+        self.assertEqual(row.get('question_routing'),data['question_routing'])
+        self.assertIs(question.get('blocking'), True)
+        bounded=self.hgs('inspect',b['name'],'--after',str(2**63-1),'--skip-processes')
+        self.assertEqual(bounded.returncode,0,bounded.stderr)
+        self.assertEqual(json.loads(bounded.stdout)['pending_questions'],data['pending_questions'])
         answer = self.payload(b, question_id=question['question_id'], expected_question_hash=question['question_hash'],
                               answers=[{'question_id':'choice','selected_option_ids':['1'],'text':''}])
         self.assertEqual(self.cli('answer', b, answer)['status'], 'answered')
@@ -848,6 +1712,87 @@ class NativeHarness(unittest.TestCase):
             self.rpc('answer', {'sessionId':b['conversation_id'],'id':question['question_id'],
                                 'generation':data['host_generation'],'answers':[]})
 
+    def test_question_route_answers_keep_exact_identity_and_durable_no_replay(self):
+        for mode in ('MULTIPLE','PARTS','OTHER'):
+            with self.subTest(mode=mode):
+                b = self.create()
+                self.cli('send',b,self.payload(b,text='QUESTION_'+mode,attachments=[]))
+                data = self.wait(lambda: d if (d:=self.cli('inspect',b))['pending_questions'] else None)
+                [card] = data['pending_questions']
+                self.assertEqual((card['source'],card['answer_transport']),('dsh_native','native_dsh'))
+                self.assertIs(card.get('blocking'),True)
+                items = card['questions']
+                answers = [{'question_id':items[0]['id'],'selected_option_ids':['0'],'text':''}]
+                if mode == 'MULTIPLE':
+                    self.assertIs(items[0]['multi_select'],True)
+                    answers[0]['selected_option_ids']=['0','1']
+                elif mode == 'PARTS':
+                    self.assertEqual(len(items),2)
+                    answers.append({'question_id':items[1]['id'],'selected_option_ids':['1'],'text':''})
+                else:
+                    answers[0].update(selected_option_ids=[],text='A private custom choice')
+                answer=self.payload(b,question_id=card['question_id'],expected_question_hash=card['question_hash'],answers=answers)
+                for key,value in [('expected_run_id','replacement'),('expected_conversation_id','session-replacement'),
+                                  ('question_id','replacement'),('expected_question_hash','changed')]:
+                    refused=self.hgs('answer',b['name'],'--json',request={**answer,key:value})
+                    self.assertNotEqual(refused.returncode,0,refused.stdout)
+                    self.assertEqual(self.cli('inspect',b)['pending_questions'][0]['question_hash'],card['question_hash'])
+                first=self.cli('answer',b,answer)
+                self.assertEqual(first['status'],'answered')
+                self.wait(lambda:not self.cli('inspect',b)['pending_questions'])
+                self.assertEqual(self.cli('answer',b,answer),first)
+                refused=self.hgs('answer',b['name'],'--json',request={**answer,'answers':[]})
+                self.assertNotEqual(refused.returncode,0,refused.stdout)
+                self.assertIn('different content',refused.stderr)
+
+    def test_inspect_refuses_an_archive_instead_of_the_live_session(self):
+        """An explicit missing archive cannot fall back to a live DeepSeek session."""
+        b = self.create()
+        archive = str(uuid.uuid4())
+        for extra in ([], ['--current-read']):
+            proc = self.hgs('inspect', b['name'], '--archive', archive, *extra)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn(f'cannot read archive {archive}', proc.stderr)
+            self.assertNotIn('current_read', proc.stdout)
+        self.assertEqual(self.cli('inspect', b)['conversation_id'], b['conversation_id'])
+
+    def test_current_read_names_what_read_accepts_from_the_list_read_before_the_page(self):
+        """zerus-a4mub.24: `inspect --current-read` names exactly what `hgs read` accepts,
+        from the host list read before the page, and inspecting acknowledges nothing."""
+        b = self.create()
+        def inspect():
+            proc = self.hgs('inspect', b['name'], '--current-read')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)
+        def mark(current):
+            proc = self.hgs('read', b['name'], '--json', request={key: current[key] for key in
+                            ('run_id', 'conversation_id', 'reply_id', 'attention_signature')})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)['applied']
+        self.cli('send', b, self.payload(b, text='QUESTION', attachments=[]))
+        data = self.wait(lambda: d if (d := inspect())['pending_questions'] and d['current_read']['attention_signature'] else None)
+        asked = data['current_read']
+        self.assertEqual(set(asked), {'schema', 'run_id', 'conversation_id', 'reply_id', 'attention_signature',
+                                      'attention_complete'})
+        self.assertEqual((asked['schema'], asked['run_id'], asked['conversation_id'], asked['attention_complete']),
+                         (1, b['run_id'], b['conversation_id'], True))
+        self.assertRegex(asked['attention_signature'], r'^[0-9a-f]{64}$')
+        self.assertNotIn('current_read', self.cli('inspect', b))
+        self.assertFalse((self.state / 'read-marks.json').exists())
+        self.assertTrue(mark(asked)['attention_signature'])
+        question = data['pending_questions'][0]
+        self.assertEqual(self.cli('answer', b, self.payload(
+            b, question_id=question['question_id'], expected_question_hash=question['question_hash'],
+            answers=[{'question_id': 'choice', 'selected_option_ids': ['1'], 'text': ''}]))['status'], 'answered')
+        final = self.wait(lambda: d if not (d := inspect())['pending_questions'] and d['current_read']['reply_id']
+                          and d['phase'] == 'idle' else None)
+        replied = final['current_read']
+        # The named turn's final message is in the page shown, under the same identity.
+        self.assertTrue(any(e['type'] == 'AgentMessage' and e.get('reply_id') == replied['reply_id']
+                            for e in final['events']), final['events'])
+        self.assertEqual(mark(asked), {'reply_id': False, 'attention_signature': False})
+        self.assertEqual(mark(replied), {'reply_id': True, 'attention_signature': False})
+
     def hgs(self, *args, request=None):
         return subprocess.run([str(HGS), *args], input=json.dumps(request) if request is not None else None,
                               env=self.env, cwd=REPO, text=True, capture_output=True, timeout=35)
@@ -855,11 +1800,50 @@ class NativeHarness(unittest.TestCase):
     def bindings(self):
         return {b['name']: b for b in (json.loads(p.read_text()) for p in (self.state / 'dsh/bindings').glob('*.json'))}
 
+    def swarm(self, *args, request=None):
+        result = self.hgs('swarm', *args, request=request)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def project_of(self, record, node):
+        return self.swarm('session-project', '--json', request={
+            'request_id': str(uuid.uuid4()), 'name': record['name'], 'expected_run_id': record['run_id'],
+            'expected_conversation_id': record['conversation_id'], 'expected_machine_id': node})['current_project_id']
+
+    def test_native_id_twins_fork_their_own_original_conversations(self):
+        first, second = self.create(), self.create()
+        shared = first['name']
+        for record in (first, second):
+            (self.state / 'dsh/bindings' / (hashlib.sha256(record['name'].encode()).hexdigest() + '.json')).unlink()
+            record.update(name=shared, layout='id', journal_name=record['session_id'])
+            folder = self.state / 'dsh/sessions'
+            folder.mkdir(exist_ok=True)
+            (folder / (record['session_id'] + '.json')).write_text(json.dumps(record))
+        children = []
+        for index, record in enumerate((first, second)):
+            sent = self.hgs('send', shared, '--session-id', record['session_id'], '--json',
+                            request=self.payload(record, text='FORK_SOURCE_MARKER', attachments=[]))
+            self.assertEqual(sent.returncode, 0, sent.stderr)
+            self.wait(lambda: self.rpc('inspect', {'sessionId': record['conversation_id']}).get('forkReady'))
+            tag = 'id-fork-' + uuid.uuid4().hex[:8]
+            forked = self.hgs('fork', shared, '--session-id', record['session_id'], '-n', tag, '-d')
+            self.assertEqual(forked.returncode, 0, forked.stderr)
+            name = shared.rsplit('/', 1)[0] + '/' + tag
+            child = self.bindings()[name]
+            self.assertEqual(child['fork_parent_id'], record['conversation_id'])
+            self.assertNotEqual(child['conversation_id'], record['conversation_id'])
+            children.append(child['conversation_id'])
+            original = json.loads((self.state / 'dsh/sessions' / (record['session_id'] + '.json')).read_text())
+            self.assertEqual(original, record)
+        self.assertNotEqual(children[0], children[1])
+
     def test_native_fork_binds_the_exact_new_session_and_keeps_the_source(self):
         source = self.create()
         tag = 'fork-' + uuid.uuid4().hex[:8]
         # Native fork copies a completed turn; an empty conversation has none.
         empty = self.cli('inspect', source)
+        # A session that is not a fork says so; only an older hgs omits the fields.
+        self.assertEqual((empty['fork_parent_id'], empty['fork_source_name']), (None, None))
         self.assertFalse(empty['fork_supported'])
         self.assertEqual(empty['fork_reason'], 'Wait for a completed reply before forking')
         self.assertNotIn('fork', empty['allowed_actions'])
@@ -870,6 +1854,11 @@ class NativeHarness(unittest.TestCase):
         ready = self.wait(lambda: d if (d := self.cli('inspect', source))['fork_supported'] else None)
         self.assertEqual(ready['fork_reason'], '')
         self.assertIn('fork', ready['allowed_actions'])
+        # zerus-zjsj: the fork starts in its source session's project.
+        node = self.swarm('hello')['node_id']
+        self.swarm('initialize', request={'projects': [dict(id='work', name='Work', color='#123456', folders=[],
+                                                            sessions=[node + '\n' + source['name']])]})
+        self.assertEqual(self.project_of(source, node), 'work')
         stale = self.hgs('fork', source['name'], '-n', tag, '-d', '--expected-run-id', 'old-run')
         self.assertNotEqual(stale.returncode, 0)
         forked = self.hgs('fork', source['name'], '-n', tag, '-d', '--expected-run-id', source['run_id'],
@@ -885,9 +1874,17 @@ class NativeHarness(unittest.TestCase):
         for key in ('agent_home', 'cwd'):
             self.assertEqual(fork[key], source[key])
         self.assertEqual((fork['fork_parent_id'], fork['fork_source_name']), (source['conversation_id'], source['name']))
+        # Both bindings carry durable IDs; the fork never borrows the source's.
+        self.assertEqual(str(uuid.UUID(fork['session_id'])), fork['session_id'])
+        self.assertNotEqual(fork['session_id'], source['session_id'])
+        self.assertEqual(self.cli('inspect', fork).get('session_id'), fork['session_id'])
+        self.assertEqual(self.project_of(fork, node), 'work')
         self.assertFalse(list((self.state / 'dsh/forks').glob('*.json')))
         row = next(r for r in self.rpc('list')['items'] if r['sessionId'] == fork['conversation_id'])
-        self.assertEqual(row['parentSessionId'], source['conversation_id'])
+        # 0.2.2 omits ordinary fork parent metadata; the bridge instead pins
+        # and verifies the exact inherited source prefix before accepting it.
+        self.assertIn(row.get('parentSessionId'), (None, source['conversation_id']))
+        self.assertNotEqual(row.get('origin'), 'subagent')
         self.assertEqual(row['projections']['values']['title'], tag)
         # The fork starts from the source's history and then diverges.
         data = self.cli('inspect', fork)
@@ -900,9 +1897,11 @@ class NativeHarness(unittest.TestCase):
         self.cli('send', fork, self.payload(fork, text='FORK_ONLY_MARKER', attachments=[]))
         self.wait(lambda: any(e['type'] == 'AgentMessage' and 'FORK_ONLY_MARKER' in e['detail'] for e in self.cli('inspect', fork)['events']))
         self.assertFalse(any('FORK_ONLY_MARKER' in e['detail'] for e in self.cli('inspect', source)['events']))
+        # zerus-ucck: a name in use is not a refusal; the fork gets the first free suffix.
         duplicate = self.hgs('fork', source['name'], '-n', tag, '-d')
-        self.assertNotEqual(duplicate.returncode, 0)
-        self.assertIn('already uses this name', duplicate.stderr)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.wait(lambda: (name + '-2') in self.bindings())
+        self.assertNotEqual(self.bindings()[name + '-2']['conversation_id'], fork['conversation_id'])
         # The scoped mobile action reports the exact new identity it created.
         request = {'request_id': str(uuid.uuid4()), 'action': 'fork', 'expected_run_id': source['run_id'],
                    'expected_conversation_id': source['conversation_id'], 'tag': tag + '-scoped'}
@@ -985,7 +1984,8 @@ class NativeSchedules(unittest.TestCase):
         listed = self.wait(lambda: d if (d := json.loads(self.hgs('schedules', b['name']).stdout))['items'] else None)
         self.assertEqual((listed['name'], listed['run_id'], listed['conversation_id']), (b['name'], b['run_id'], b['conversation_id']))
         [item] = listed['items']
-        self.assertEqual((item['title'], item['kind'], item['status'], item['recurring']), ('Fixture check', 'every', 'active', True))
+        self.assertEqual((item['title'], item['status'], item['recurring']), ('Fixture check', 'active', True))
+        self.assertIn(item['kind'], ('every', 'rrule'))
         self.assertGreater(item['scheduled_at'], time.time())
         self.assertEqual(json.loads(self.hgs('schedules', other['name']).stdout)['items'], [])
         row = self.wait(lambda: next((r for r in json.loads(self.hgs('ls', '--local', '--json').stdout)['sessions']
@@ -1012,6 +2012,281 @@ class NativeSchedules(unittest.TestCase):
         self.assertEqual(json.loads(self.hgs('schedules', b['name']).stdout)['items'], [])
         self.wait(lambda: next(r for r in json.loads(self.hgs('ls', '--local', '--json').stdout)['sessions']
                                if r['name'] == b['name'])['schedules']['count'] == 0)
+
+
+@unittest.skipUnless(fixture.required() or DSH and HGS.exists(), 'official dsh and built hgs required')
+class NativeDefaultEffort(unittest.TestCase):
+    """A native default effort reaches sessions HGS creates or resumes (zerus-v7tqa)."""
+    DEFAULT_EFFORT = {'reasoningEffort': 'off'}
+    setUpClass = NativeHarness.__dict__['setUpClass']
+    tearDownClass = NativeHarness.__dict__['tearDownClass']
+    rpc = NativeHarness.__dict__['rpc']
+    create = NativeHarness.create
+    cli = NativeHarness.cli
+    payload = NativeHarness.payload
+
+    def test_native_default_effort_reaches_new_routes_but_not_stored_selections(self):
+        self.assertEqual(self.rpc('catalog')['default'], {'provider': 'hgs-test', 'model': 'test-a', 'reasoningEffort': 'off'})
+        fresh, chosen = self.create(), self.create()
+        selection = lambda b: (lambda v: (v['model'], v['effort']))(self.cli('inspect', b))
+        self.assertEqual(selection(fresh), ('test-a', 'off'))
+        self.cli('settings', chosen, self.payload(chosen, model='hgs-test/test-b', effort='high'))
+        for binding in (fresh, chosen):
+            self.cli('pause', binding); self.cli('resume', binding)
+        self.assertEqual(selection(fresh), ('test-a', 'off'))
+        self.assertEqual(selection(chosen), ('test-b', 'high'))
+
+
+WITNESS_FACTS = REPO / 'tests/fixtures/dsh-input-witness-facts.json'
+# Rewrites WITNESS_FACTS from this run's real input-witness answers.
+REGENERATE_WITNESS_FACTS = 'ZERUS_REGENERATE_DSH_WITNESS_FACTS'
+# WITNESS_FACTS comes from the pinned reviewed host only (zerus-hfw2s.9); the
+# Rust tests reading it require the same version.
+WITNESS_FACTS_HOST = '0.2.1-rc.2'
+# A bare session mention the host's SessionReferenceResolver cannot resolve:
+# the turn that claims it ends in error (probe C1, zerus-hfw2s).
+BAD_MENTION = 'dsh-session:session-00000000-0000-4000-8000-000000000000'
+
+
+def witness_digest(content):
+    """The content digest hgs and the bridge both compute (docs/reference.md)."""
+    digest = hashlib.sha256()
+    for block in content:
+        digest.update(f"{block['type']}\0{block['text'] if block['type'] == 'text' else ''}\0".encode())
+    return digest.hexdigest()
+
+
+@unittest.skipUnless(fixture.required() or DSH and HGS.exists(), 'official dsh and built hgs required')
+class NativeInputWitness(unittest.TestCase):
+    """zerus-hfw2s: the bridge's input witness on the real harness. hgs classifies
+    these facts (src/state/dsh/witness.rs), whose unit tests read the facts
+    captured here (REGENERATE_WITNESS_FACTS)."""
+    setUpClass = NativeHarness.__dict__['setUpClass']
+    tearDownClass = NativeHarness.__dict__['tearDownClass']
+    rpc = NativeHarness.__dict__['rpc']
+    create = NativeHarness.create
+    wait = NativeHarness.wait
+
+    @classmethod
+    def restart(cls):
+        """kill -9 this class's private host and start a fresh one on the same home."""
+        cls.proc.kill()
+        cls.proc.wait(timeout=10)
+        Path(cls.sock).unlink(missing_ok=True)
+        cls.proc = subprocess.Popen([DSH, '--profile', 'web', '--patch', str(cls.root / 'patch.json'), '--no-open',
+                                     '--host', '127.0.0.1', '--port', '0'], env=cls.env, cwd=cls.workspace,
+                                    stdin=subprocess.DEVNULL, stdout=cls.log, stderr=cls.log, start_new_session=True)
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            try:
+                return cls.rpc('ping')
+            except (OSError, RuntimeError):
+                time.sleep(.1)
+        raise RuntimeError('Native test host did not restart')
+
+    def generation(self):
+        return self.rpc('ping')['generation']
+
+    def offer(self, sid, text):
+        rid, content = str(uuid.uuid4()), [{'type': 'text', 'text': text}]
+        self.rpc('send', {'sessionId': sid, 'requestId': rid, 'content': content, 'mode': 'steer'})
+        return rid, witness_digest(content)
+
+    def witness(self, sid, rid, wait_ms=20000):
+        return self.rpc('input-witness', {'sessionId': sid, 'requestId': rid, 'generation': self.generation(), 'waitMs': wait_ms})
+
+    @staticmethod
+    def delivered(facts):
+        return [e for e in facts['events'] if e['type'] == 'user/message' and e['id'] == facts['messageId']]
+
+    def searched(self, sid, token):
+        [session] = self.rpc('search-history', {'sessionIds': [sid], 'query': token})['sessions']
+        self.assertEqual(session['status'], 'ok', session)
+        return session['events']
+
+    def assert_dropped(self, facts):
+        """A claim of the message, then turn/end in error, and no user/message for it."""
+        self.assertEqual((facts['state'], facts['complete']), ('tracked', True), facts)
+        claims = [e for e in facts['events'] if e['type'] == 'agent/inbox/spliced' and e['seq'] > facts['spliceSeq']
+                  and e['removedCount'] > 0 and e['outcome'] is None]
+        ends = [e for e in facts['events'] if e['type'] == 'turn/end' and claims and e['seq'] > claims[0]['seq']]
+        self.assertTrue(claims and ends and ends[0]['reason'] == 'error', facts)
+        self.assertEqual(self.delivered(facts), [], facts)
+
+    def test_witness_facts_for_received_pending_disposed_and_dropped(self):
+        self.assertIs(self.rpc('ping').get('inputWitness'), True)
+        captured = {}
+        # Received: its own durable user/message, content unchanged by any plugin.
+        sid = self.create()['conversation_id']
+        rid, digest = self.offer(sid, 'WITNESS received')
+        facts = self.witness(sid, rid)
+        self.assertEqual((facts['state'], facts['durable'], facts['complete']), ('tracked', True, True), facts)
+        first = facts['events'][0]
+        self.assertEqual((first['type'], first['seq']), ('agent/inbox/spliced', facts['spliceSeq']), facts)
+        self.assertIn({'id': facts['messageId'], 'rpcId': rid}, first['inserted'])
+        self.assertEqual([(e['rpcId'], e['digest']) for e in self.delivered(facts)], [(rid, digest)])
+        captured['received'] = (facts, rid, digest)
+        # Pending behind a held model step, then received once the step ends.
+        sid = self.create()['conversation_id']
+        self.offer(sid, 'INTERRUPT_WAIT_FIXTURE')
+        time.sleep(1.5)
+        rid, digest = self.offer(sid, 'WITNESS queued behind a held step')
+        early = self.witness(sid, rid, 300)
+        self.assertTrue(early['pending'], early)
+        self.assertEqual(self.delivered(early), [])
+        captured['pending'] = (early, rid, digest)
+        late = self.witness(sid, rid, 25000)
+        self.assertEqual([(e['rpcId'], e['digest']) for e in self.delivered(late)], [(rid, digest)], late)
+        # Disposed by the bridge's own forget while queued: a canceled removal in its window.
+        sid = self.create()['conversation_id']
+        self.offer(sid, 'INTERRUPT_WAIT_FIXTURE')
+        time.sleep(1.5)
+        rid, digest = self.offer(sid, 'WITNESS disposed while queued')
+        forgot = self.rpc('session-action', {'sessionId': sid, 'action': 'forget', 'generation': self.generation()})
+        self.assertEqual(forgot['status'], 'completed', forgot)
+        facts = self.witness(sid, rid, 2000)
+        # The adapter kept the record but answers from its final facts, without the disposed session.
+        self.assertIs(facts.get('frozen'), True, facts)
+        canceled = [e for e in facts['events'] if e['type'] == 'agent/inbox/spliced' and e['outcome'] == 'canceled']
+        self.assertTrue(canceled, facts)
+        self.assertTrue(any(start <= canceled[-1]['seq'] < end for start, end in facts['disposals']), facts)
+        self.assertEqual(self.delivered(facts), [])
+        # zerus-hfw2s.9: a frozen record pages from fromSeq like a live one.
+        paged = self.rpc('input-witness', {'sessionId': sid, 'requestId': rid, 'generation': self.generation(),
+                                           'waitMs': 0, 'fromSeq': canceled[-1]['seq']})
+        self.assertIs(paged.get('frozen'), True, paged)
+        self.assertEqual([e['seq'] for e in paged['events']], [e['seq'] for e in facts['events'] if e['seq'] >= canceled[-1]['seq']])
+        self.assertNotIn(facts['spliceSeq'], [e['seq'] for e in paged['events']])
+        captured['host_disposed'] = (facts, rid, digest)
+        # Claimed by a turn that fails on a bare session mention: dropped.
+        sid = self.create()['conversation_id']
+        rid, digest = self.offer(sid, f'WITNESS {BAD_MENTION}')
+        facts = self.witness(sid, rid)
+        self.assert_dropped(facts)
+        captured['dropped_after_claim'] = (facts, rid, digest)
+        host = json.loads((fixture.package_root(DSH) / 'package.json').read_text())['version']
+        if os.environ.get(REGENERATE_WITNESS_FACTS) == '1':
+            self.assertEqual(host, WITNESS_FACTS_HOST, 'Regenerate the witness facts on the pinned reviewed host only')
+            WITNESS_FACTS.write_text(json.dumps({
+                'about': 'Real input-witness answers of the bridge on the official harness (zerus-hfw2s), message and '
+                         'request IDs and the host generation normalised. Written by tests/test_dsh_native.py '
+                         f'NativeInputWitness with {REGENERATE_WITNESS_FACTS}=1 on the pinned host; read by '
+                         'src/state/dsh/witness.rs.',
+                'host': {'package': '@deepseek-ai/dsh', 'version': host},
+                'scenarios': {name: {'expected': name, 'request_id': '<request>', 'digest': digest,
+                                     'facts': self.normalised(facts, rid)} for name, (facts, rid, digest) in captured.items()},
+            }, indent=2, sort_keys=True) + '\n')
+        # On the pinned host the committed facts must still be what it answers:
+        # the same events, in order, with their outcome, reason and frozen state.
+        stored = json.loads(WITNESS_FACTS.read_text())
+        self.assertEqual(stored['host']['version'], WITNESS_FACTS_HOST)
+        if host == WITNESS_FACTS_HOST:
+            shape = lambda facts: (facts.get('frozen'), [(e['type'], e.get('outcome'), e.get('reason')) for e in facts['events']])
+            for name, (facts, rid, _) in captured.items():
+                self.assertEqual(shape(self.normalised(facts, rid)), shape(stored['scenarios'][name]['facts']), name)
+
+    @staticmethod
+    def normalised(facts, rid):
+        facts = json.loads(json.dumps(facts))
+        ids = {facts['messageId']: '<message>'}
+        name = lambda value: ids.setdefault(value, f'<message-{len(ids)}>')
+        request = lambda value: None if value is None else ('<request>' if value == rid else '<other-request>')
+        facts['messageId'], facts['generation'] = '<message>', '<generation>'
+        for event in facts['events']:
+            if event['type'] == 'agent/inbox/spliced':
+                event['inserted'] = [{'id': name(m['id']), 'rpcId': request(m['rpcId'])} for m in event['inserted']]
+            elif event['type'] == 'user/message':
+                event['id'], event['rpcId'] = name(event['id']), request(event['rpcId'])
+        return facts
+
+    def test_claimed_message_dropped_by_turn_error_is_never_queued_again(self):
+        sid = self.create()['conversation_id']
+        token = 'WITNESS-DROPPED-' + uuid.uuid4().hex
+        rid, _ = self.offer(sid, f'{token} {BAD_MENTION}')
+        # Precondition: the harness still drops this claim. It fails here, never skips.
+        facts = self.witness(sid, rid)
+        self.assert_dropped(facts)
+        message = facts['messageId']
+
+        def never_again(facts):
+            inserts = [e['seq'] for e in facts['events'] if e['type'] == 'agent/inbox/spliced' and any(m['id'] == message for m in e['inserted'])]
+            self.assertEqual(inserts, [facts['spliceSeq']], facts)
+            self.assertEqual([e for e in facts['events'] if e['type'] == 'user/message' and (e['id'] == message or e['rpcId'] == rid)], [])
+
+        def turn_completes():
+            later, _ = self.offer(sid, 'WITNESS after a dropped claim')
+            self.assertTrue(self.delivered(self.witness(sid, later)))
+            self.assertEqual(self.searched(sid, token), [])
+
+        # a) A second turn on the same live agent.
+        turn_completes()
+        never_again(self.witness(sid, rid, 0))
+        # b) Forget, then resume.
+        for action in ('forget', 'resume'):
+            answer = self.rpc('session-action', {'sessionId': sid, 'action': action, 'generation': self.generation()})
+            self.assertEqual(answer['status'], 'completed', answer)
+        turn_completes()
+        # c) kill -9, a fresh host on the same home, then resume.
+        self.restart()
+        answer = self.rpc('session-action', {'sessionId': sid, 'action': 'resume', 'generation': self.generation()})
+        self.assertEqual(answer['status'], 'completed', answer)
+        turn_completes()
+
+    def test_a_received_input_is_durable_before_the_witness_answers(self):
+        sid = self.create()['conversation_id']
+        token = 'WITNESS-DURABLE-' + uuid.uuid4().hex
+        rid, digest = self.offer(sid, token)
+        facts = self.witness(sid, rid)
+        self.assertTrue(facts['durable'], facts)
+        [message] = self.delivered(facts)
+        self.assertEqual((message['rpcId'], message['digest']), (rid, digest))
+        # kill -9 at once: the fresh host reads the stored log cold, without resuming.
+        self.restart()
+        found = [e for e in self.searched(sid, token) if e['type'] == 'user/message']
+        self.assertEqual([e['seq'] for e in found], [message['seq']], found)
+
+
+@unittest.skipUnless(fixture.required() or DSH and HGS.exists(), 'official dsh and built hgs required')
+class NativeQuestionRouteModes(unittest.TestCase):
+    """Official user-question service modes through a private keyless fixture tool."""
+    setUpClass = NativeHarness.__dict__['setUpClass']
+    tearDownClass = NativeHarness.__dict__['tearDownClass']
+    rpc = NativeHarness.__dict__['rpc']
+    create = NativeHarness.create
+    cli = NativeHarness.cli
+    payload = NativeHarness.payload
+    wait = NativeHarness.wait
+    hgs = NativeHarness.hgs
+
+    def test_timed_question_never_grants_parent_route_authority(self):
+        b=self.create()
+        self.cli('send',b,self.payload(b,text='QUESTION_TIMED',attachments=[]))
+        data=self.wait(lambda:d if (d:=self.cli('inspect',b))['pending_questions'] else None)
+        [card]=data['pending_questions']
+        self.assertIs(card.get('blocking'),False)
+        self.assertTrue(card['can_answer'])
+        self.assertFalse(card['approval'])
+
+    def test_typed_approval_and_plan_questions_stay_person_only(self):
+        for mode in ('APPROVAL','PLAN'):
+            b=self.create()
+            self.cli('send',b,self.payload(b,text='QUESTION_INTENT_'+mode,attachments=[]))
+            data=self.wait(lambda:d if (d:=self.cli('inspect',b))['pending_questions'] else None)
+            [card]=data['pending_questions']
+            self.assertIs(card.get('blocking'),False)
+            # The existing manual card is independent from route authority.
+            self.assertTrue(card['can_answer'])
+
+    def test_explicit_forever_question_keeps_the_qualified_native_answer_path(self):
+        b=self.create()
+        self.cli('send',b,self.payload(b,text='QUESTION_FOREVER',attachments=[]))
+        data=self.wait(lambda:d if (d:=self.cli('inspect',b))['pending_questions'] else None)
+        [card]=data['pending_questions']
+        self.assertIs(card.get('blocking'),True)
+        answer=self.payload(b,question_id=card['question_id'],expected_question_hash=card['question_hash'],
+                            answers=[{'question_id':'choice','selected_option_ids':['0'],'text':''}])
+        self.assertEqual(self.cli('answer',b,answer)['status'],'answered')
+        self.wait(lambda:not self.cli('inspect',b)['pending_questions'])
 
 
 if __name__ == '__main__':

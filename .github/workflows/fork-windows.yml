@@ -1,22 +1,43 @@
 name: Fork Windows build
 
-# WhiteWh/zerus only; not part of upstream Zerus. Builds and tests the Windows
-# portable zip of whitewh/main, then publishes it with its update feed as a
-# release of this fork. The fork's desktop updater installs those releases
-# (docs/fork-updates.md). A pushed tag whitewh-exp-* builds that commit the same
-# way and publishes an experimental prerelease: never the latest release, no
-# feed, and no updater in its desktop app.
+# WhiteWh/zerus only; not part of upstream Zerus. Owner, 2026-11-09 ("build
+# only on a pin"): builds run ONLY on a manual dispatch - a push builds
+# nothing, and a pushed tag is no trigger either. The dispatch picks one channel:
+#   numbered  a `whitewh-<build>` release with the Windows ZIP and the
+#             stable `zerus-fork-feed.json` feed that existing fork builds
+#             update from (the default). <build> is the run number unless the
+#             dispatch names one: owner, 2026-11-14, local builds had already
+#             passed the run numbers, so an installed build never saw the next
+#             release as an update. A named build must exceed the latest
+#             numbered release;
+#   latest    a refresh of the single rolling `Latest` prerelease: fixed tag
+#             `latest`, one Windows ZIP, no feed, never the stable latest
+#             release (scripts/publish-fork-latest.py).
+# Run it from `whitewh/main`: a dispatch from another branch builds and
+# self-tests the zip but publishes nothing.
+# Task #388 (owner, 2026-11-08): only the Tauri desktop is built and packaged -
+# no Qt step and no Qt in the zip (docs/fork-updates.md).
 on:
-  push:
-    branches: [whitewh/main]
-    tags: ['whitewh-exp-*']
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Numbered release or refresh the rolling Latest prerelease
+        type: choice
+        options: [numbered, latest]
+        default: numbered
+      build:
+        description: Release build number (numbered only); empty uses the run number
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
   group: fork-windows
+  # GitHub keeps one running and one replaceable pending run per group; the
+  # `queue` key stays omitted because actionlint 1.7.12 cannot parse it.
   cancel-in-progress: false
 
 jobs:
@@ -34,22 +55,51 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       ZERUS_BUILD_JOBS: 4
-      CCACHE_DEPEND: 1
-      CCACHE_MAXSIZE: 500M
-      EXPERIMENTAL: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') }}
-      # Embedded in hgs-tray: the build the updater compares and the feed it reads.
-      # Empty for an experimental build, so it neither updates nor gets updated.
-      ZERUS_FORK_BUILD: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.run_number || '' }}
-      ZERUS_FORK_FEED_URL: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
+      # The channel of this dispatch; nothing else starts a run.
+      CHANNEL: ${{ inputs.channel }}
+      LATEST_BUILD: ${{ inputs.channel == 'latest' }}
+      # Embedded in hgs-tray (the Tauri app since task #63): the build the
+      # updater compares and the feed it reads. Only a manual numbered dispatch
+      # from whitewh/main gets both; the Latest channel and a probe from another
+      # branch build the same zip with neither, so that build neither updates
+      # itself nor is offered by an updater.
+      ZERUS_FORK_BUILD: ${{ github.ref == 'refs/heads/whitewh/main' && inputs.channel != 'latest' && (inputs.build || github.run_number) || '' }}
+      ZERUS_FORK_FEED_URL: ${{ github.ref == 'refs/heads/whitewh/main' && inputs.channel != 'latest' && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
     steps:
       - name: Check out text files unchanged
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Latest builds the current head of whitewh/main, including commits
+          # that landed while the run waited for its slot; a numbered build keeps
+          # the commit selected at dispatch.
+          ref: ${{ inputs.channel == 'latest' && 'refs/heads/whitewh/main' || github.sha }}
           persist-credentials: false
+      - name: Record the checked-out source
+        id: source
+        run: |
+          commit=$(git rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Source commit: $commit (dispatch $GITHUB_SHA, channel ${CHANNEL:-numbered})" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check the release build number
+        if: env.LATEST_BUILD != 'true' && github.ref == 'refs/heads/whitewh/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ inputs.build || github.run_number }}
+        run: |
+          case "$BUILD" in ''|*[!0-9]*) echo "::error::build must be a positive integer, got '$BUILD'"; exit 1;; esac
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          previous=${latest#whitewh-}
+          case "$previous" in ''|*[!0-9]*) previous=0;; esac
+          if [ "$BUILD" -le "$previous" ]; then
+            echo "::error::build $BUILD must exceed the latest numbered release $latest"; exit 1
+          fi
+          echo "Release build: $BUILD (latest numbered release: ${latest:-none})" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13.15'
+      - name: Latest publication contract tests
+        run: python -m unittest discover -s tests -p test_fork_latest_publication.py
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Rust cache identity
         id: rust
@@ -64,18 +114,18 @@ jobs:
             target
             services/mobile/connector/target
             services/mobile/relay/target
-          key: fork-windows-cli-${{ steps.rust.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'services/mobile/connector/Cargo.lock', 'services/mobile/relay/Cargo.lock') }}
+          key: fork-windows-cli-${{ steps.rust.outputs.rustc }}-${{ hashFiles('Cargo.lock', 'crates/lore-bin/Cargo.lock', 'services/mobile/connector/Cargo.lock', 'services/mobile/relay/Cargo.lock') }}
           restore-keys: fork-windows-cli-${{ steps.rust.outputs.rustc }}-
       # The runner gives every step a synchronous pipe as stdin; hgs must not inherit it.
-      - name: Rust tests and release build
+      - name: Rust tests
         run: |
           mkdir -p artifacts/test-results
-          cargo test --locked --features socraticode </dev/null 2>&1 | tee artifacts/test-results/rust.log
-          cargo build --release --locked --features socraticode
-          # WhiteWh fork: the mobile gateway's connector and relay (docs/fork-updates.md).
-          cargo test --locked --lib --manifest-path services/mobile/connector/Cargo.toml </dev/null 2>&1 | tee artifacts/test-results/connector.log
-          cargo build --release --locked --manifest-path services/mobile/connector/Cargo.toml
-          cargo build --release --locked --manifest-path services/mobile/relay/Cargo.toml
+          # Owner, 2026-11-11: every test binary runs, and a test that failed is
+          # run once more alone; only one that fails twice fails the build
+          # (scripts/ci/cargo-test-retry.py names the unstable ones).
+          python scripts/ci/cargo-test-retry.py --log artifacts/test-results/rust.log -- cargo test --locked --features socraticode
+          # WhiteWh fork: the mobile gateway's connector (docs/fork-updates.md).
+          python scripts/ci/cargo-test-retry.py --log artifacts/test-results/connector.log -- cargo test --locked --lib --manifest-path services/mobile/connector/Cargo.toml
       - name: Save Rust cache
         if: steps.rust-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -87,69 +137,60 @@ jobs:
             services/mobile/connector/target
             services/mobile/relay/target
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
-      - name: Pinned ConPTY pair
-        run: python scripts/fetch-conpty.py --output "$RUNNER_TEMP/conpty" </dev/null
-      - name: Restore Qt 6.10.3 for MSVC
-        id: qt-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          path: ${{ runner.temp }}/Qt
-          key: fork-windows-qt-6.10.3-win64_msvc2022_64-${{ hashFiles('packaging/windows/qt.json', 'scripts/install-qt-windows.py', 'scripts/qt_archives.py') }}
-      - name: Install the pinned Qt 6.10.3 for MSVC
-        if: steps.qt-cache.outputs.cache-hit != 'true'
-        run: python scripts/install-qt-windows.py --output "$RUNNER_TEMP/Qt" </dev/null
-      - name: Use Qt 6.10.3
+          node-version: '24'
+          package-manager-cache: false
+      - name: WebView2 Evergreen prerequisite for the portable self-test
+        timeout-minutes: 6
+        run: python scripts/ci/ensure-webview2.py </dev/null
+      # Task #446 (PR #22): the zip is built by the same release candidate our
+      # local packages use - the machine-dependent test scan, the release hgs,
+      # the fork update and Qt-to-Tauri handoff tests, the Tauri build with the
+      # fork channel, the frontend license notices, the portable zip and its
+      # self-test (scripts/release-candidate-local.py). Task #388: no Qt step,
+      # no Qt in the zip.
+      - name: Release candidate build, package and self-test
+        timeout-minutes: 90
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          python scripts/install-qt-windows.py --check "$RUNNER_TEMP/Qt" </dev/null
-          qt=$(cygpath -w "$RUNNER_TEMP/Qt/6.10.3/msvc2022_64")
-          test -f "$(cygpath -u "$qt")/bin/windeployqt.exe"
-          echo "QT_ROOT_DIR=$qt" >> "$GITHUB_ENV"
-      - name: Pinned ccache 4.14.1
+          python scripts/release-candidate.py --commit "$COMMIT" \
+            --fork-build "$ZERUS_FORK_BUILD" --fork-feed "$ZERUS_FORK_FEED_URL" \
+            </dev/null 2>&1 | tee artifacts/test-results/release-candidate.log
+      # Multi-person activation (services/artifact-executor/README.md,
+      # "Activation"): qualify the exact release executor on this disposable
+      # free runner as a throwaway non-administrator account, synthetic data
+      # only. Only an all-pass record is packaged; otherwise the release ships
+      # with multi-person mode off, as before.
+      - name: AppContainer qualification of the release executor
+        id: qualify
+        if: env.LATEST_BUILD != 'true' && github.ref == 'refs/heads/whitewh/main'
+        continue-on-error: true
+        timeout-minutes: 45
+        shell: pwsh
+        run: ./scripts/ci/qualify-release-executor.ps1
+      - name: Package the qualification record beside the executor
+        if: steps.qualify.outcome == 'success'
         run: |
-          cd "$(cygpath -u "$RUNNER_TEMP")"
-          curl -fsSLO https://github.com/ccache/ccache/releases/download/v4.14.1/ccache-4.14.1-windows-x86_64.zip
-          echo '6219f3865ca59aec41ee4b678df171d5d35855ecb2b6dbbbd20690b3a68af7b4  ccache-4.14.1-windows-x86_64.zip' | sha256sum --check --strict
-          python -m zipfile -e ccache-4.14.1-windows-x86_64.zip .
-          cygpath -w "$PWD/ccache-4.14.1-windows-x86_64" >> "$GITHUB_PATH"
-          echo "CCACHE_DIR=$(cygpath -w "$RUNNER_TEMP/ccache")" >> "$GITHUB_ENV"
-      - name: Restore ccache
-        id: ccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/ccache
-          key: fork-windows-ccache-qt6.10.3-${{ github.run_id }}
-          restore-keys: fork-windows-ccache-qt6.10.3-
-      - name: Desktop build
-        run: bash scripts/ci/gui.sh build </dev/null
-      - name: Save ccache
-        if: ${{ !cancelled() }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/ccache
-          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
-      - name: Save Qt 6.10.3
-        if: steps.qt-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/Qt
-          key: ${{ steps.qt-cache.outputs.cache-primary-key }}
-      - name: Offscreen Qt suites
-        run: bash scripts/ci/gui.sh test </dev/null
-      - name: Portable zip from the tested executables
+          python scripts/add-qualification-record.py --record artifacts/test-results/appcontainer-qualification.json \
+            artifacts/zerus-windows-x86_64.zip artifacts/hgs-executor-windows-x86_64.zip </dev/null
+      - name: Refresh the rolling Latest prerelease
+        if: env.LATEST_BUILD == 'true' && github.ref == 'refs/heads/whitewh/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          python scripts/package-windows.py --cli target/release/hgs.exe --gui .ci-build/gui/hgs-tray.exe \
-            --connector services/mobile/connector/target/release/zerus-mobile-connector.exe \
-            --mobile-relay services/mobile/relay/target/release/zerus-relay.exe \
-            --conpty "$RUNNER_TEMP/conpty" --output artifacts/zerus-windows-x86_64.zip </dev/null 2>&1 | tee artifacts/test-results/package.log
-          python scripts/check-windows-portable.py artifacts/zerus-windows-x86_64.zip --run --selftest \
-            </dev/null 2>&1 | tee artifacts/test-results/portable.log
+          python scripts/publish-fork-latest.py --repository "$GITHUB_REPOSITORY" \
+            --commit "$COMMIT" --run-id "$GITHUB_RUN_ID" \
+            --zip artifacts/zerus-windows-x86_64.zip </dev/null
       # Schema 1 of docs/fork-updates.md: the updater installs `url` only when its
       # size and SHA-256 match and the zip's build-info.json names `commit`.
       - name: Update feed
-        if: env.EXPERIMENTAL != 'true'
+        if: env.LATEST_BUILD != 'true' && github.ref == 'refs/heads/whitewh/main'
         env:
-          BUILD: ${{ github.run_number }}
-          COMMIT: ${{ github.sha }}
+          BUILD: ${{ inputs.build || github.run_number }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           python - <<'EOF'
           import hashlib, json, os, pathlib
@@ -162,22 +203,19 @@ jobs:
           print(json.dumps(feed, indent=2))
           EOF
       - name: Publish the fork release
-        if: env.EXPERIMENTAL != 'true'
+        if: env.LATEST_BUILD != 'true' && github.ref == 'refs/heads/whitewh/main'
         env:
           GH_TOKEN: ${{ github.token }}
-          BUILD: ${{ github.run_number }}
+          BUILD: ${{ inputs.build || github.run_number }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
+          # zerus-y0cj: the standalone model-free executor package for test hosts
+          # that need no desktop; the same hgs-executor.exe ships inside the zip.
           gh release create "whitewh-$BUILD" artifacts/zerus-windows-x86_64.zip artifacts/zerus-fork-feed.json \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            artifacts/hgs-executor-windows-x86_64.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --latest \
             --title "Zerus fork build $BUILD" \
-            --notes "Windows portable build $BUILD of whitewh/main at $GITHUB_SHA. Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
-      - name: Publish the experimental prerelease
-        if: env.EXPERIMENTAL == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          gh release create "$TAG" artifacts/zerus-windows-x86_64.zip             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false             --title "Zerus fork experimental $TAG"             --notes "Experimental Windows portable build of $GITHUB_SHA (tag $TAG). Not the latest release and not offered by the fork updater; this build does not update itself. Install it by hand (docs/fork-updates.md)."
+            --notes "Windows portable build $BUILD of whitewh/main at $COMMIT. Installed automatically by fork builds of Zerus (docs/fork-updates.md). hgs-executor-windows-x86_64.zip is the standalone model-free artifact executor with its linked-license notices (services/artifact-executor/README.md)."
       - name: Retain test logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -185,3 +223,4 @@ jobs:
           name: fork-windows-${{ github.run_number }}
           path: artifacts/test-results
           retention-days: 7
+

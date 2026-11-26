@@ -8,6 +8,10 @@ on:
       - '.github/workflows/kimi-approvals.yml'
       - 'scripts/ci/kimi-approvals.py'
       - 'scripts/ci/kimi-native.py'
+      - 'scripts/ci/native_discovery.py'
+      - 'tests/test_native_discovery.py'
+      - 'tests/test_ci_native_discovery_auth.py'
+      - 'tests/fixtures/github-native-discovery.json'
       - 'scripts/ci/kimi-native-pins.json'
       - 'scripts/ci/kimi-native-manifests/**'
       - 'scripts/ci/outside-job.py'
@@ -37,9 +41,12 @@ cache-mode: none
 env:
   PYTHONUTF8: '1'
 
+# Pull requests: one run per PR, and a new head cancels the older run;
+# closing the PR cancels the rest (pr-closed.yml, zerus-b8zze).
+# Manual runs keep their per-ref group without cancellation.
 concurrency:
-  group: kimi-approvals-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('kimi-approvals-pr-{0}', github.event.pull_request.number) || format('kimi-approvals-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   approvals:
@@ -59,12 +66,14 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14.8'
       - name: Finite source and memory controls, with no native cases
         shell: bash
         run: |
+          python -B -m unittest discover -s tests -p test_native_discovery.py -v
+          python -B -m unittest discover -s tests -p test_ci_native_discovery_auth.py -v
           python -B -m unittest discover -s tests -p test_kimi_approvals_ci.py -v
           python -B -m unittest discover -s tests -p test_kimi_release.py -v
       - name: Keep compiler state in this disposable runner
@@ -96,16 +105,20 @@ jobs:
         run: |
           rustup toolchain install 1.99.1 --profile minimal
           cargo +1.99.1 build --locked --bin hgs -j 2
-      - name: macOS seven Bash, four CreateGoal and one ExitPlanMode approval cases on one official latest release
+      - name: macOS seven Bash, eight CreateGoal and one ExitPlanMode approval cases on one official latest release
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python -s -B scripts/ci/kimi-approvals.py --source-sha "$SOURCE_SHA" \
             --hgs "$CARGO_TARGET_DIR/debug/hgs" --tmux "$RUNNER_TEMP/kimi-approvals-tmux/bin/tmux" \
             --output "$GITHUB_WORKSPACE/artifacts/test-results/kimi-approvals" </dev/null
-      - name: Windows layout preflight, then seven Bash, four CreateGoal and one ExitPlanMode approval cases on one official latest release
+      - name: Windows layout preflight, then seven Bash, eight CreateGoal and one ExitPlanMode approval cases on one official latest release
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python -s -B scripts/ci/kimi-approvals.py --source-sha $env:SOURCE_SHA `
             --hgs "$env:CARGO_TARGET_DIR/debug/hgs.exe" `

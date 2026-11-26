@@ -13,6 +13,7 @@ from pathlib import Path
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -86,6 +87,65 @@ class WindowsClient(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding='utf-8').splitlines()]
 
+    def test_kimi_login_abort_refreshes_only_a_new_verified_grant(self):
+        """Exercise the Windows login command, its exit code and catalog cache."""
+        node = shutil.which('node')
+        fake = Path(os.environ.get('HGS_TEST_FAKE_AGENT', REPO / 'target/debug/examples/fake_agent.exe'))
+        self.assertTrue(node and fake.is_file(), 'build fake_agent and provide Node.js for the login fixture')
+        folder = self.home / '.local/bin'
+        folder.mkdir(parents=True)
+        shutil.copy2(fake, folder / 'curl.exe')
+        fixture_hgs = folder / 'hgs.exe'
+        shutil.copy2(HGS, fixture_hgs)  # Windows searches the executable's folder before System32.
+        script = folder / 'login.js'
+        script.write_text('''const fs = require('fs'), path = require('path');
+if (process.argv[2] === '--version') { console.log('2.4.1'); }
+else if (process.argv[2] === 'login') {
+  if (process.env.KIMI_FIXTURE_WRITE === '1') {
+    const file = path.join(process.env.KIMI_CODE_HOME, 'credentials/kimi-code.json');
+    fs.mkdirSync(path.dirname(file), {recursive:true});
+    fs.writeFileSync(file, JSON.stringify({access_token:'new-fixture', expires_at:4102444800}));
+  }
+  console.error('Logged in to managed:kimi-code.');
+  console.error('Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\\\\win\\\\async.c, line 76');
+  process.exitCode = Number(process.env.KIMI_FIXTURE_EXIT);
+} else { process.exitCode = 1; }
+''', encoding='utf-8')
+        shim = ('@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\n'
+                'IF EXIST "%dp0%\\node.exe" (\n  SET "_prog=%dp0%\\node.exe"\n) ELSE (\n  SET "_prog=node"\n'
+                '  SET PATHEXT=%PATHEXT:;.JS;=;%\n)\n\n'
+                'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\login.js" %*\n')
+        (folder / 'kimi.cmd').write_text(shim, encoding='utf-8')
+        self.env = {key: value for key, value in self.env.items()
+                    if key.upper() not in ('PATH', 'NODE_OPTIONS') and not key.upper().startswith(('KIMI_', 'FAKE_AGENT_'))}
+        self.env.update(PATH=os.pathsep.join([str(folder), str(Path(node).parent), str(Path(os.environ['SystemRoot']) / 'System32')]),
+                        APPDATA=str(self.root / 'appdata'), HGS_CONFIG_DIR=str(self.root / 'config'),
+                        HGS_STATE_DIR=str(self.root / 'state'), FAKE_AGENT_RAW='0', FAKE_AGENT_MODES='none',
+                        FAKE_AGENT_RESET_MODES='0', FAKE_AGENT_HOOKS='none', FAKE_AGENT_ON_EOF='exit:0')
+        config = self.root / 'config'
+        config.mkdir()
+        (config / 'local-sessions').touch()  # Private account commands; no host is started.
+        self.ok('account', 'add', 'kimi-fixture', '--provider', 'kimi')
+        credentials = self.root / 'config/accounts/kimi-fixture/credentials/kimi-code.json'
+        credentials.parent.mkdir()
+        for write, code, identity, expected in [(True, 3, True, 0), (False, 3, True, 3),
+                                               (True, 3, False, 3), (True, 1, True, 1), (True, 130, True, 130)]:
+            with self.subTest(write=write, code=code, identity=identity):
+                credentials.write_text(json.dumps({'access_token':'old-fixture', 'expires_at':4102444800}))
+                # The private native curl stand-in answers both reads. No quota is
+                # present, and a profile without a stable id verifies nothing.
+                self.env.update(KIMI_FIXTURE_WRITE=str(int(write)), KIMI_FIXTURE_EXIT=str(code),
+                                FAKE_AGENT_PROMPT=json.dumps({'user_id':'fixture-user'} if identity else {'nickname':'Fixture'}) + r'\n200')
+                result = subprocess.run([str(fixture_hgs), 'account', 'login', 'kimi-fixture'], env=self.env,
+                                        cwd=folder, input='', capture_output=True, text=True, encoding='utf-8', timeout=30)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual('Sign-in verified' in result.stderr, expected == 0)
+                if expected == 0:
+                    row = next(p for p in self.json('account', 'ls')['profiles'] if p['id'] == 'kimi-fixture')
+                    self.assertEqual(row['account_status']['auth_status'], 'signed_in')
+                    self.assertEqual(row['account_status']['status'], 'unavailable')
+                    self.assertEqual(row['account_status']['windows'], [])
+
     def canned(self, stdout=None, stderr=None, code=0):
         values = dict(FAKE_SSH_MODE='canned', FAKE_SSH_EXIT=str(code))
         for name, text in (('FAKE_SSH_STDOUT', stdout), ('FAKE_SSH_STDERR', stderr)):
@@ -104,6 +164,27 @@ class WindowsClient(unittest.TestCase):
             (source / name).parent.mkdir(parents=True, exist_ok=True)
             (source / name).write_bytes(text.encode())
         return source
+
+    def test_windows_pipe_helper_preserves_native_bytes_exit_and_slow_consumers(self):
+        data = bytes(range(256))*32
+        stdout, stderr = self.root/'bytes.out', self.root/'bytes.err'
+        stdout.write_bytes(data); stderr.write_bytes(data[::-1])
+        for code, pause in ((0, 0), (7, 3)):
+            with self.subTest(code=code, pause=pause):
+                environment = dict(self.env, FAKE_SSH_MODE='canned', FAKE_SSH_EXIT=str(code),
+                                   FAKE_SSH_STDOUT=str(stdout), FAKE_SSH_STDERR=str(stderr))
+                child = subprocess.Popen([str(HGS), '--ssh-bytes-client', 'peer', '__hgs_ssh_bytes_v1__ fixed'],
+                                         env=environment, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    if pause: time.sleep(pause)
+                    out, err = child.communicate(timeout=10)
+                    self.assertEqual(child.returncode, code)
+                    self.assertEqual(out, data)
+                    self.assertEqual(err, data[::-1])
+                finally:
+                    if child.poll() is None: child.terminate(); child.wait(timeout=5)
+                    child.stdout.close(); child.stderr.close()
 
     def test_the_fake_client_refuses_streams_that_break_windows_openssh(self):
         # Every other test therefore proves that hgs gives ssh.exe only consoles
@@ -533,10 +614,12 @@ class WindowsClient(unittest.TestCase):
         self.assertIn('Setup complete', result.stdout)
         self.assertTrue(self.calls()[-1][-1].startswith("sh -c 'set -eu"))
         with tarfile.open(bundle) as archive:
-            names = set(archive.getnames())
+            # The private source snapshot is archived as `-C snapshot .`.
+            members = {member.name.removeprefix('./'): member for member in archive.getmembers()}
+            names = set(members)
             self.assertTrue({'Cargo.toml', 'src/main.rs', 'scripts/tool.py', 'install.sh', 'hgs_state.py'} <= names, names)
             self.assertFalse([name for name in names if '\\' in name])
-            self.assertEqual(archive.extractfile('install.sh').read(), (source / 'install.sh').read_bytes())
+            self.assertEqual(archive.extractfile(members['install.sh']).read(), (source / 'install.sh').read_bytes())
         (source / 'install.sh').write_bytes(b'#!/usr/bin/env bash\r\necho installed\r\n')
         calls = len(self.calls())
         result = self.hgs('machine', 'setup', 'peer', '--source', str(source), FAKE_SSH_MODE='bundle', FAKE_SSH_BUNDLE=str(bundle))
@@ -671,6 +754,11 @@ class WindowsClient(unittest.TestCase):
             process.kill()  # TerminateProcess, as the desktop app stops a stuck poll
             process.wait(timeout=10)
         self.assertTrue(exited(child, 5), 'the job object should end the SSH client with hgs')
+
+
+# The same Windows job builds fake_agent. Keep the fixed remote decoder's
+# native PowerShell/cmd controls in its ordinary client cohort.
+from test_remote_windows import WindowsNativeTransport  # noqa: E402,F401
 
 
 if __name__ == '__main__':

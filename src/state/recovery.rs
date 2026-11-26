@@ -194,20 +194,50 @@ fn next_delay(delays: &[Value], attempt: usize) -> Option<f64> {
         _ => None,
     }
 }
-fn job_path(name: &str) -> PathBuf {
-    root()
-        .join("recovery/jobs")
-        .join(legacy_record_path(name).file_name().unwrap())
+/// A job file is keyed by its session's owner key (`storage::owner_key`),
+/// taken from the verified record or snapshot that the caller holds, never
+/// from a label or the command's selection (#1437 review). A worker keeps the
+/// key it observed, so a rename or a vanished record never moves its job to
+/// the label's other holder.
+fn job_path(owner: &str) -> PathBuf {
+    root().join("recovery/jobs").join(format!("{owner}.json"))
 }
-fn load_job(name: &str) -> Value {
-    read_json(&job_path(name)).unwrap_or(Value::Null)
+fn load_job(owner: &str) -> Value {
+    read_json(&job_path(owner)).unwrap_or(Value::Null)
 }
+fn owner(record: &Value) -> String {
+    storage::owner_key(record)
+}
+/// A legacy rename moves the job from the old label's key to the new one's.
 pub(super) fn rename_job(old: &str, new: &str, run_id: &str) -> Result<()> {
-    let mut job = load_job(old);
-    if !job.is_object() || job["identity"][0] != run_id {
+    let (from, to) = (storage::label_key(old), storage::label_key(new));
+    let Some(mut job) = renamed_job(&from, run_id) else {
         return Ok(());
-    }
+    };
     job["name"] = json!(new);
+    // Called inside the existing rename transaction's lock; replay is harmless.
+    atomic(&job_path(&to), &job.to_string())?;
+    fs::remove_file(job_path(&from)).map_err(|e| e.to_string())
+}
+/// A rename in place keeps the session's key; its job takes the new label.
+pub(super) fn rename_job_in_place(record: &Value, new: &str) -> Result<()> {
+    let key = owner(record);
+    let Some(mut job) = renamed_job(&key, string(record, "run_id")) else {
+        return Ok(());
+    };
+    job["name"] = json!(new);
+    atomic(&job_path(&key), &job.to_string())
+}
+/// `owner`'s job for `run_id`, stopped as uncertain when a rename caught it
+/// during delivery; None when it has none for that run.
+fn renamed_job(owner: &str, run_id: &str) -> Option<Value> {
+    renamed_job_value(load_job(owner), run_id)
+}
+
+fn renamed_job_value(mut job: Value, run_id: &str) -> Option<Value> {
+    if !job.is_object() || job["identity"][0] != run_id {
+        return None;
+    }
     if job["state"] == "dispatching" {
         stop(
             &mut job,
@@ -215,12 +245,49 @@ pub(super) fn rename_job(old: &str, new: &str, run_id: &str) -> Result<()> {
             "Session renamed during delivery; inspect the agent",
         );
     }
-    // Called inside the existing rename transaction's lock; replay is harmless.
-    atomic(&job_path(new), &job.to_string())?;
-    fs::remove_file(job_path(old)).map_err(|e| e.to_string())
+    Some(job)
 }
-fn save_job(job: &Value) -> Result<()> {
-    let previous = load_job(string(job, "name"));
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn rename_job_guarded(
+    view: &mut guarded_recovery::View<'_>,
+    old: &str,
+    new: &str,
+    run_id: &str,
+) -> Result<()> {
+    let (from, to) = (storage::label_key(old), storage::label_key(new));
+    let job = view
+        .read(&job_path(&from), storage::ID_RECORD_BYTES)?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let Some(mut job) = renamed_job_value(job, run_id) else {
+        return Ok(());
+    };
+    job["name"] = json!(new);
+    view.atomic(&job_path(&to), job.to_string().as_bytes())?;
+    view.remove(&job_path(&from))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn rename_job_in_place_guarded(
+    view: &mut guarded_recovery::View<'_>,
+    record: &Value,
+    new: &str,
+) -> Result<()> {
+    let key = owner(record);
+    let job = view
+        .read(&job_path(&key), storage::ID_RECORD_BYTES)?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let Some(mut job) = renamed_job_value(job, string(record, "run_id")) else {
+        return Ok(());
+    };
+    job["name"] = json!(new);
+    view.atomic(&job_path(&key), job.to_string().as_bytes())
+}
+
+fn save_job(job: &Value, owner: &str) -> Result<()> {
+    let previous = load_job(owner);
     let mut job = job.clone();
     let mut history = if previous["id"] == job["id"] {
         previous["history"].as_array().cloned().unwrap_or_default()
@@ -234,7 +301,7 @@ fn save_job(job: &Value) -> Result<()> {
         }
     }
     job["history"] = json!(history);
-    atomic(&job_path(string(&job, "name")), &job.to_string())?;
+    atomic(&job_path(owner), &job.to_string())?;
     crate::analytics::adapters::recovery(&root(), &job);
     Ok(())
 }
@@ -294,7 +361,7 @@ fn contains(text: &str, words: &[&str]) -> bool {
 fn status_code(text: &str, codes: &[&str]) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| codes.contains(&word))
 }
-fn class(error: &Value) -> &'static str {
+pub(super) fn class(error: &Value) -> &'static str {
     if let Some(kind) = provider_errors::native_kind(error) {
         return if kind == "session_limit" { "session_limit" } else { "manual" };
     }
@@ -305,7 +372,7 @@ fn class(error: &Value) -> &'static str {
     }
     let native_detail = provider_errors::native_detail(error);
     if ["", "provider", "quota", "rate_limit"].contains(&string(error, "error_kind"))
-        && provider_errors::rolling_rate_limit(&native_detail) {
+        && provider_errors::rolling_rate_error(error) {
         return "rate_limit";
     }
     let text = format!(
@@ -386,6 +453,12 @@ fn class(error: &Value) -> &'static str {
             "econnrefused",
             "etimedout",
             "stream disconnected",
+            // DCB-svn report (2026-11-12): DeepSeek's own words for a request
+            // that its retries could not get through (code TRANSPORT).
+            "transport failed",
+            "transport error",
+            "fetch failed",
+            "socket hang up",
         ],
     ) {
         return "network";
@@ -407,20 +480,54 @@ fn stop(job: &mut Value, state: &str, reason: &str) {
     job["reason"] = json!(reason);
     job["updated_at"] = json!(now());
 }
-pub(super) fn cancel_for_input(name: &str) -> Result<()> {
-    let mut job = load_job(name);
+/// New input to the session `record` cancels its automatic recovery.
+pub(super) fn cancel_for_input(record: &Value) -> Result<()> {
+    let key = owner(record);
+    let mut job = load_job(&key);
     if active(&job) {
         stop(
             &mut job,
             "cancelled",
             "New input cancelled automatic recovery",
         );
-        save_job(&job)?;
+        save_job(&job, &key)?;
     }
     Ok(())
 }
+
+/// Read-only cancellation description for the original Send owner. The
+/// ordinary save_job wrapper still owns every existing caller. Cancellation
+/// emits no recovery analytics event (the adapter ignores cancelled state).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::state) fn input_cancellation(record: &Value) -> Result<Option<(guarded_recovery::Original,Value)>> {
+    let path=job_path(&owner(record));
+    let Some(source)=guarded_recovery::Original::read_existing(&path,storage::ID_RECORD_BYTES)? else {return Ok(None)};
+    let mut job=serde_json::from_slice::<Value>(source.bytes()).unwrap_or(Value::Null);
+    if !active(&job) {return Ok(None);}
+    let previous=job.clone();
+    stop(&mut job,"cancelled","New input cancelled automatic recovery");
+    let mut history=previous["history"].as_array().cloned().unwrap_or_default();
+    if previous["state"]!=job["state"] || previous["attempt"]!=job["attempt"] {
+        history.push(json!({"at":now(),"state":job["state"],"attempt":job["attempt"],"reason":job["reason"]}));
+        if history.len()>32 {history.remove(0);}
+    }
+    job["history"]=json!(history);
+    Ok(Some((source,job)))
+}
 fn active(job: &Value) -> bool {
     ["waiting", "dispatching", "retrying"].contains(&string(job, "state"))
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn same_active_failure(record: &Value, job: &Value) -> bool {
+    active(job)
+        && job["identity"][0] == record["run_id"]
+        && job["identity"][1] == record["conversation_id"]
+        && same_failure(job, record)
+}
+
+/// Whether an automatic recovery episode owns this session's next input.
+pub(super) fn job_active(record: &Value) -> bool {
+    active(&load_job(&owner(record)))
 }
 /// The agent works again after a provider failure while the continuation it
 /// accepted is still its latest input: that turn went on rather than stopped.
@@ -527,6 +634,11 @@ fn schedule(job: &mut Value, s: &Value, time: f64) {
 // Pure transition function; wall clock is supplied so tests can exercise long
 // backoff sequences, restarts, and interleaved user activity without sleeping.
 fn advance(mut job: Value, s: &Value, p: &Policy, time: f64) -> Value {
+    // A failed keep-warm ping is not the person's work: never continue it,
+    // whatever earlier, finished episode the session keeps.
+    if s["phase"] == "error" && keep_warm::ping_was_last_prompt(s) && !active(&job) {
+        return Value::Null;
+    }
     let error = &s["provider_error"];
     let fid = failure_id(s);
     let user_at = seconds(s, "recovery_user_at");
@@ -688,12 +800,13 @@ pub(super) fn enrich(record: &Value, output: &mut Value) {
         "recovery_user_text",
         "recovery_success_at",
         "recovery_cancel_at",
+        "keep_warm_prompt_at",
     ] {
         if let Some(v) = record.get(key) {
             output[key] = v.clone();
         }
     }
-    let job = load_job(string(record, "name"));
+    let job = load_job(&owner(record));
     // Never show a previous conversation's countdown in a reused session row.
     if job.is_object()
         && job["identity"][0] == output["run_id"]
@@ -706,7 +819,7 @@ pub(super) fn enrich(record: &Value, output: &mut Value) {
 }
 
 pub(super) fn check_submission(record: &Value, id: &str) -> Result<()> {
-    let job = load_job(string(record, "name"));
+    let job = load_job(&owner(record));
     let p = policy()?;
     let s = journal::summary(record, true);
     let p = effective_policy(&p, override_for(&team_overrides(), &s));
@@ -724,7 +837,7 @@ pub(super) fn check_submission(record: &Value, id: &str) -> Result<()> {
 }
 
 pub(super) fn check_native_submission(snapshot: &Value) -> Result<()> {
-    let job = load_job(string(snapshot, "name"));
+    let job = load_job(&owner(snapshot));
     let p = effective_policy(&policy()?, override_for(&team_overrides(), snapshot));
     if job["state"] != "dispatching"
         || job["identity"] != identity(snapshot)
@@ -736,15 +849,16 @@ pub(super) fn check_native_submission(snapshot: &Value) -> Result<()> {
     Ok(())
 }
 
-fn observe() -> Result<Vec<Value>> {
+pub(super) fn observe() -> Result<Vec<Value>> {
     let panes = live()?;
     let mut snapshots = Vec::new();
     for record in records()? {
         let mut s = journal::summary(
             &record,
-            matches(&record, panes.get(string(&record, "name"))),
+            matches(&record, panes_of(&panes, &record)),
         );
-        for key in ["name", "agent", "run_id", "conversation_id"] {
+        // The record's own key goes with its observation (#1437 review).
+        for key in ["name", "agent", "run_id", "conversation_id", "session_id", "layout"] {
             s[key] = record[key].clone();
         }
         snapshots.push(s);
@@ -753,7 +867,7 @@ fn observe() -> Result<Vec<Value>> {
         if record["state"] == "running"
             && (record["native_recovery"].is_object()
                 || record["phase"] == "error"
-                || active(&load_job(string(&record, "name"))))
+                || active(&load_job(&owner(&record))))
         {
             if let Ok(s) = dsh::inspect(string(&record, "name"), None) {
                 snapshots.push(s);
@@ -763,6 +877,10 @@ fn observe() -> Result<Vec<Value>> {
     Ok(snapshots)
 }
 fn tick() -> Result<()> {
+    #[cfg(unix)]
+    let Some(_round) = storage::job_round::try_acquire(storage::job_round::Kind::Recovery)? else {
+        return Ok(());
+    };
     crate::analytics::maintenance(&root());
     let mut sends = Vec::new();
     // Native inspection can wait on an agent. Never hold the global write lock
@@ -773,6 +891,8 @@ fn tick() -> Result<()> {
     let mut dismisses = Vec::new();
     {
         let _guard = lock(None)?;
+        #[cfg(unix)]
+        _round.verify()?;
         let p = policy()?;
         let heartbeat = root().join("recovery/heartbeat.json");
         let last = read_json(&heartbeat).unwrap_or(Value::Null);
@@ -787,12 +907,13 @@ fn tick() -> Result<()> {
         }
         let mut occupied = std::collections::BTreeSet::new();
         for s in &snapshots {
-            let job = load_job(string(s, "name"));
+            let job = load_job(&owner(s));
             if occupies(&job, s) {
                 occupied.insert(json!([s["agent"], s["account_id"]]).to_string());
             }
         }
         for s in snapshots {
+            let key = owner(&s);
             // H1: a team's request only wakes the session-limit class for this
             // session; everything else follows the shared policy.
             let requested = override_for(&overrides, &s);
@@ -800,7 +921,7 @@ fn tick() -> Result<()> {
                 continue;
             }
             let effective = effective_policy(&p, requested);
-            let old = load_job(string(&s, "name"));
+            let old = load_job(&key);
             let mut job = advance(old.clone(), &s, &effective, now());
             if job.is_null() {
                 if old.is_object() {
@@ -810,7 +931,7 @@ fn tick() -> Result<()> {
                             .join(format!("{}.json", string(&old, "id"))),
                         &old.to_string(),
                     )?;
-                    fs::remove_file(job_path(string(&s, "name"))).map_err(|e| e.to_string())?;
+                    fs::remove_file(job_path(&key)).map_err(|e| e.to_string())?;
                 }
                 if s["native_recovery"].is_object() {
                     dismisses.push(s.clone());
@@ -836,7 +957,7 @@ fn tick() -> Result<()> {
                 sends.push((s.clone(), job.clone()));
             }
             if job != old {
-                save_job(&job)?;
+                save_job(&job, &key)?;
             }
             if !active(&job) && s["native_recovery"].is_object() {
                 dismisses.push(s.clone());
@@ -844,9 +965,13 @@ fn tick() -> Result<()> {
         }
     }
     for s in dismisses {
+        #[cfg(unix)]
+        _round.verify()?;
         let _ = dsh::dismiss_recovery(&s);
     }
     for (s, mut job) in sends {
+        #[cfg(unix)]
+        _round.verify()?;
         let result = if s["agent"] == "dsh" {
             dsh::recover(&s, string(&job, "request_id"))
         } else {
@@ -859,7 +984,10 @@ fn tick() -> Result<()> {
             )
         };
         let _guard = lock(None)?;
-        let current = load_job(string(&s, "name"));
+        #[cfg(unix)]
+        _round.verify()?;
+        let key = owner(&s);
+        let current = load_job(&key);
         if current["id"] != job["id"] || current["state"] != "dispatching" {
             continue;
         }
@@ -894,22 +1022,29 @@ fn tick() -> Result<()> {
                 );
             }
         }
-        save_job(&job)?;
+        save_job(&job, &key)?;
     }
     Ok(())
+}
+/// The owner key of a job file: its own stem, which outlives its record.
+fn stem(path: &Path) -> Option<String> {
+    path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned)
 }
 fn recover_interrupted_jobs() -> Result<()> {
     let _guard = lock(None)?;
     if let Ok(entries) = fs::read_dir(root().join("recovery/jobs")) {
         for entry in entries.flatten() {
-            if let Ok(mut job) = read_json(&entry.path()) {
+            let (Ok(mut job), Some(key)) = (read_json(&entry.path()), stem(&entry.path())) else {
+                continue;
+            };
+            {
                 if job["state"] == "dispatching" {
                     stop(
                         &mut job,
                         "uncertain",
                         "Recovery worker restarted during delivery; inspect the agent",
                     );
-                    save_job(&job)?;
+                    save_job(&job, &key)?;
                 }
             }
         }
@@ -949,12 +1084,55 @@ fn worker() -> Result<i32> {
     };
     recover_interrupted_jobs()?;
     super::worktree_maintenance::worker();
+    // Keep-warm rounds run beside recovery, whatever its policy says.
+    let mut keep_warm_at: Option<std::time::Instant> = None;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (mut process_index_work, mut process_index_at) = (None, std::time::Instant::now());
+    let (mut listing_work, mut listing_at) = (None, std::time::Instant::now());
     loop {
         if replaced() || owner.yields() {
             return Ok(0);
         }
         if let Err(e) = tick() {
             eprintln!("hgs recovery: {e}");
+        }
+        if std::time::Instant::now() >= listing_at {
+            match super::listing_metadata::background_at(&root(), &mut listing_work) {
+                Ok(step) => {
+                    debug_assert!(step.entries <= 256 && step.bytes <= 16 << 20 && step.rows <= 128);
+                    listing_at = std::time::Instant::now()
+                        + Duration::from_secs(if step.done && step.complete { 60 } else { 2 });
+                }
+                Err(error) => {
+                    eprintln!("hgs advisory listing metadata: {error}");
+                    listing_at = std::time::Instant::now() + Duration::from_secs(15);
+                }
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if std::time::Instant::now() >= process_index_at {
+            match super::process_index_writer::background_at(&root(), &mut process_index_work) {
+                Ok(step) => {
+                    debug_assert!(
+                        step.entries <= 256 && step.bytes <= 2 * 1024 * 1024 && step.rows <= 128
+                    );
+                    process_index_at = std::time::Instant::now()
+                        + Duration::from_secs(if step.done && step.gaps == 0 { 60 } else { 2 });
+                    if step.done {
+                        process_index_work = None;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("hgs advisory process index: {error}");
+                    process_index_at = std::time::Instant::now() + Duration::from_secs(15);
+                }
+            }
+        }
+        if keep_warm_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(15)) {
+            keep_warm_at = Some(std::time::Instant::now());
+            if let Err(e) = keep_warm::tick() {
+                eprintln!("hgs keep-warm: {e}");
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -965,11 +1143,13 @@ fn worker() -> Result<i32> {
 /// from hgs.exe's job would outlive the GUI and keep the GUI's hgs.exe from
 /// being replaced.
 #[cfg(windows)]
-fn ensure_worker() -> Result<()> {
+pub(super) fn ensure_worker() -> Result<()> {
+    crate::self_exec::ensure().map_err(|e| e.to_string())?;
     backend::host::HOST.supervise_recovery()
 }
 #[cfg(not(windows))]
-fn ensure_worker() -> Result<()> {
+pub(super) fn ensure_worker() -> Result<()> {
+    let executable = crate::self_exec::current().map_err(|e| e.to_string())?;
     // Policy refresh must not race the installed supervisor with a detached
     // executor. Starting an active unit preserves its PID and current delivery.
     #[cfg(target_os = "linux")]
@@ -984,7 +1164,7 @@ fn ensure_worker() -> Result<()> {
     }
     // Detached from both SSH and GUI lifetime; service installation additionally
     // restarts the worker after login. The worker lock handles competing GUIs.
-    let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    let mut cmd = Command::new(executable);
     cmd.args(["recovery", "worker"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -997,6 +1177,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         Some("worker") if args.len() == 1 => return worker(),
         Some("tick") if args.len() == 1 => {
             tick()?;
+            keep_warm::tick()?;
             return Ok(0);
         }
         Some("get") if args.len() == 1 => {
@@ -1043,14 +1224,17 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
                 {
                     if let Ok(entries) = fs::read_dir(root().join("recovery/jobs")) {
                         for entry in entries.flatten() {
-                            if let Ok(mut job) = read_json(&entry.path()) {
+                            let (Ok(mut job), Some(key)) = (read_json(&entry.path()), stem(&entry.path())) else {
+                                continue;
+                            };
+                            {
                                 if active(&job) && !enabled(&p, string(&job, "class")) {
                                     stop(
                                         &mut job,
                                         "cancelled",
                                         "Automatic recovery disabled for this error class",
                                     );
-                                    save_job(&job)?;
+                                    save_job(&job, &key)?;
                                 }
                             }
                         }
@@ -1081,7 +1265,12 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
         Some("action") if args.len() == 1 => {
             let request = stdin_json()?;
             let _guard = lock(None)?;
-            let mut job = load_job(string(&request, "name"));
+            // The job of the session this name reads as now; with no record
+            // there is no job to change.
+            let key = read(string(&request, "name"))
+                .map(|record| owner(&record))
+                .map_err(|_| "This scheduled recovery is no longer current; nothing was changed")?;
+            let mut job = load_job(&key);
             if job["id"] != request["id"] || job["state"] != "waiting" {
                 return Err(
                     "This scheduled recovery is no longer current; nothing was changed".into(),
@@ -1094,7 +1283,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<i32> {
                 }
                 _ => return Err("Unknown recovery action".into()),
             }
-            save_job(&job)?;
+            save_job(&job, &key)?;
             println!("{job}");
         }
         _ => return Err("usage: hgs recovery get | set | sync | action | worker".into()),
@@ -1144,6 +1333,9 @@ fn scoped_action(request: Value) -> Result<()> {
         return Err("Unknown scoped recovery action".into());
     }
     let name = string(&request, "name");
+    // zerus-ucck P3c: the name arrives in the request, so it is resolved here:
+    // its identities select among sessions that share the label.
+    select_by(name, string(&request, "expected_run_id"), string(&request, "expected_conversation_id"))?;
     let directory = absolute_root()?.join("recovery_receipts");
     private_dir(&directory)?;
     let path = directory.join(format!("{}.json", string(&request, "request_id")));
@@ -1202,7 +1394,8 @@ fn scoped_action(request: Value) -> Result<()> {
             {
                 return Err("Normalized recovery session changed".into());
             }
-            let mut job = load_job(name);
+            let key = owner(&current);
+            let mut job = load_job(&key);
             if string(&current, "name") != name
                 || current["run_id"] != request["expected_run_id"]
                 || current["conversation_id"] != request["expected_conversation_id"]
@@ -1224,7 +1417,7 @@ fn scoped_action(request: Value) -> Result<()> {
                 _ => unreachable!(),
             }
             changed = true;
-            save_job(&job)?;
+            save_job(&job, &key)?;
             Ok(job)
         })();
         match outcome {
@@ -1251,6 +1444,18 @@ fn scoped_action(request: Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_image_refuses_before_service_activation() {
+        crate::self_exec::private_probe("state::recovery::tests::service_activation_probe");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by test_image_refuses_before_service_activation"]
+    fn service_activation_probe() {
+        crate::self_exec::probe_child("state::recovery::tests::service_activation_probe");
+        assert_eq!(ensure_worker().unwrap_err(), crate::self_exec::TEST_IMAGE);
+    }
     fn codex_copy(snapshot: &mut Value) {
         let original = failure_id(snapshot);
         snapshot["provider_error"]["source"] = json!("codex_native_log");
@@ -1315,6 +1520,25 @@ mod tests {
             enabled_at: 1.0,
             ..Policy::default()
         }
+    }
+    #[test]
+    fn a_verified_keep_warm_ping_failure_never_starts_recovery() {
+        let mut earlier = snapshot("claude");
+        earlier["provider_error"]["at"] = json!(3.0);
+        earlier["recovery_user_at"] = json!(2.0);
+        let mut old = advance(Value::Null, &earlier, &on(), 3.5);
+        assert_eq!(old["state"], "waiting");
+        stop(&mut old, "succeeded", "Agent completed the turn");
+        old["completed_at"] = json!(4.0);
+        let mut ping = snapshot("claude");
+        ping["recovery_user_text"] = json!(keep_warm::TEXT);
+        ping["keep_warm_prompt_at"] = ping["recovery_user_at"].clone();
+        assert!(advance(Value::Null, &ping, &on(), 11.0).is_null());
+        assert!(advance(old.clone(), &ping, &on(), 11.0).is_null(), "a completed earlier episode must not let a ping failure in");
+        // The same text typed by the person is the person's turn.
+        let mut typed = ping.clone();
+        typed["keep_warm_prompt_at"] = json!(1.0);
+        assert_eq!(advance(old, &typed, &on(), 11.0)["state"], "waiting");
     }
     #[test]
     fn independent_sequences_keep_class_budgets_and_repeat_last_delay() {
@@ -1383,6 +1607,48 @@ mod tests {
             advance(Value::Null, &s, &on(), 11.0)["action"],
             "retry_request"
         );
+    }
+    #[test]
+    fn projected_non_string_kimi_evidence_never_admits_recovery() {
+        let window = "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends.";
+        for detail in [window.to_owned(), format!("429 {window}")] {
+            for code in [json!({"code":"insufficient_quota","message":"billing account exhausted"}),
+                json!(401), json!(["provider_policy"]), Value::Null, json!(false)] {
+                let mut s = snapshot("kimi");
+                journal::update_activity(&mut s, &json!({"hook_event_name":"StopFailure",
+                    "error_type":"APIProviderRateLimitError","error_message":detail,"error":code}));
+                let failure = s["provider_error"].clone();
+                assert!(failure.get("native_error_code").is_some_and(Value::is_null));
+                provider_errors::apply(&mut s, &failure);
+                assert_eq!(s["provider_error"]["native_error_code"], Value::Null);
+                assert_eq!(s["provider_error"]["detail"], detail);
+                assert!(!provider_errors::rolling_rate_error(&s["provider_error"]));
+                assert_eq!(class(&s["provider_error"]), "manual");
+                assert!(advance(Value::Null, &s, &on(), 11.0).is_null());
+            }
+        }
+    }
+    #[test]
+    fn typed_kimi_window_requires_native_evidence_and_the_existing_enabled_policy() {
+        let mut s = snapshot("kimi");
+        s["provider_error"] = json!({"source":"provider_hook","message_id":"original-failure","at":10.0,
+            "error_kind":"quota","native_error_type":"APIProviderRateLimitError",
+            "detail":"You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."});
+        assert_eq!(class(&s["provider_error"]), "rate_limit");
+        let before = s.clone();
+        let job = advance(Value::Null, &s, &on(), 11.0);
+        assert_eq!(job["state"], "waiting");
+        assert_eq!(job["class"], "rate_limit");
+        assert_eq!(s, before);
+        assert_eq!(advance(job.clone(), &s, &on(), 12.0), job);
+        let mut disabled = on(); disabled.rate_limit = false;
+        assert!(advance(Value::Null, &s, &disabled, 11.0).is_null());
+        for (key, value) in [("native_error_type", ""), ("native_error_code", "quota"),
+            ("native_error_code", "authentication"), ("error_kind", "provider_policy")] {
+            let mut changed = s.clone(); changed["provider_error"][key] = json!(value);
+            assert_eq!(class(&changed["provider_error"]), "manual");
+            assert!(advance(Value::Null, &changed, &on(), 11.0).is_null());
+        }
     }
     #[test]
     fn kimi_rolling_window_uses_existing_rate_schedule_without_inventing_a_reset() {

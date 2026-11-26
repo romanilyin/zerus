@@ -64,8 +64,11 @@ def release_version(manifest, version=None):
 def installation_record(manifest, version):
     """installation.json for the build that build-info.json describes, released as
     `version` (release_version): the same version the installer itself carries."""
-    return {"schema": 1, "kind": "installer", "product": "Zerus", "version": version,
-            "product_version": manifest["version"], "source_commit": manifest["source_commit"]}
+    record = {"schema": 1, "kind": "installer", "product": "Zerus", "version": version,
+              "product_version": manifest["version"], "source_commit": manifest["source_commit"]}
+    if manifest.get("desktop") == "tauri":
+        record["desktop"] = "tauri"
+    return record
 
 
 def sha256(path):
@@ -111,7 +114,10 @@ def stage(zip_path, destination, version=None):
     listing = destination.joinpath(*PAYLOAD_LIST.split("/"))
     listing.parent.mkdir()
     # The installer compares these case-insensitively with the files it finds.
-    listing.write_text("".join(path.replace("/", "\\") + "\r\n" for path in sorted(expected)), encoding="utf-8")
+    # newline="": the explicit CR LF stays CR LF on every build host (text mode on
+    # Windows would otherwise write CR CR LF).
+    listing.write_text("".join(path.replace("/", "\\") + "\r\n" for path in sorted(expected)), encoding="utf-8",
+                       newline="")
     expected[PAYLOAD_LIST] = sha256(listing)
     return record, expected
 

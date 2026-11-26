@@ -40,6 +40,12 @@ class BeadsAttributionTest(unittest.TestCase):
         self.assertEqual(privacy.findings("packaging/windows/README.txt", text), [(1, "non-example email address")])
         self.assertEqual(privacy.findings("packaging/windows/licenses/notes.txt", "See /home/" + "someone/notes"),
                          [(1, "non-example absolute home path")])
+        # Upstream notices of crates that publish none, copied unchanged into a folder
+        # per crate; the README beside them is ours and stays checked.
+        self.assertEqual(privacy.findings("packaging/rust-licenses/dlopen2/LICENSE", text), [])
+        self.assertEqual(privacy.findings("packaging/rust-licenses/README.md", text), [(1, "non-example email address")])
+        self.assertEqual(privacy.findings("packaging/rust-licenses/dlopen2/LICENSE", "See /home/" + "someone/notes"),
+                         [(1, "non-example absolute home path")])
         # Only the generated verbatim Google notices, not their neighbors.
         google = "mobile/android/app/src/main/assets/licenses/google-notices.txt"
         self.assertEqual(privacy.findings(google, text), [])
@@ -53,6 +59,20 @@ class BeadsAttributionTest(unittest.TestCase):
     def test_attribution_does_not_hide_paths(self):
         line = issue(owner=WORK, description="See /home/" + "someone/notes")
         self.assertEqual(privacy.findings(".beads/issues.jsonl", line), [(1, "non-example absolute home path")])
+
+
+class PrivateKeyTest(unittest.TestCase):
+    def test_only_the_vectors_bare_header_is_not_key_material(self):
+        # Spelled in parts: this file must not hold the header itself.
+        header = b"-----BEGIN " + b"RSA PRIVATE KEY-----"
+        bare = b'{"text": "' + header + b'", "pattern": "pem-private-key"}'
+        keyed = b'{"text": "' + header + b'\\nMIIEowIBAAKCAQEA"}'
+        vectors = privacy.SECRET_VECTORS
+        self.assertFalse(privacy.private_key_material(vectors, bare))
+        self.assertTrue(privacy.private_key_material(vectors, keyed))
+        self.assertTrue(privacy.private_key_material(vectors, bare + b"\n" + header))
+        self.assertTrue(privacy.private_key_material("tests/fixtures/other.json", bare))
+        self.assertTrue(privacy.private_key_material("docs/key.md", header))
 
 
 class FileNameTest(unittest.TestCase):

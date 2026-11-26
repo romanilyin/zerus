@@ -4,8 +4,10 @@ use super::*;
 use std::process::Command;
 use std::time::Duration;
 
+mod source;
+
 fn unavailable(record: &Value, live_pane: bool) -> Option<&'static str> {
-    if !AGENTS.contains(&string(record, "agent")) {
+    if !AGENTS.contains(&string(record, "agent")) || matches!(string(record, "agent"), "qwen" | "hermes") {
         return Some("This provider does not support session forks");
     }
     if string(record, "conversation_id").is_empty()
@@ -16,6 +18,11 @@ fn unavailable(record: &Value, live_pane: bool) -> Option<&'static str> {
     }
     if live_pane && (!telemetry::settled(record) || pause_active(record)) {
         return Some("Wait for Ready before forking the saved context");
+    }
+    // Kimi's external fork utility requires the source instance lock closed;
+    // Ready only means the turn finished. Pause remains a separate user action.
+    if live_pane && string(record, "agent") == "kimi" {
+        return Some("Pause or close this Kimi session before forking its saved context");
     }
     if record["base"].as_array().is_none() {
         return Some("Saved launch arguments are unavailable");
@@ -48,6 +55,15 @@ pub(super) fn wait_for_chooser(output: &mut Value, reason: &str) {
     }
 }
 
+/// The session's explicit per-launch permission choice, if any. Account
+/// defaults are deliberately absent from this field.
+fn permission_override(record: &Value) -> Option<String> {
+    record["permission_override"]
+        .as_str()
+        .filter(|mode| !mode.is_empty())
+        .map(str::to_owned)
+}
+
 fn fork_argv(record: &Value, new_id: Option<&str>) -> Result<Vec<String>> {
     let agent = string(record, "agent");
     let mut argv = recipes::resume_argv(
@@ -56,7 +72,7 @@ fn fork_argv(record: &Value, new_id: Option<&str>) -> Result<Vec<String>> {
         new_id.unwrap_or_else(|| string(record, "conversation_id")),
     )?;
     match agent {
-        "codex" => argv[1] = "fork".into(),
+        "codex" => { let program = crate::project_launcher::program_words(&argv); argv[program] = "fork".into(); },
         "claude" => argv.push("--fork-session".into()),
         "kimi" => {}
         _ => return Err("this provider does not support session forks".into()),
@@ -101,6 +117,9 @@ fn kimi_fork(record: &Value) -> Result<String> {
     }
     for key in [
         "HGS_SESSION",
+        "HGS_SESSION_ID",
+        launch_identity::DECLARATION,
+        "HGS_RESUME_SESSION_ID",
         "HGS_RUN_ID",
         "HGS_AGENT",
         "HGS_REQUESTED_ID",
@@ -144,21 +163,32 @@ pub(super) fn choose_name(
         {
             return Err("fork name must be a nonempty tag without '/', ':', '.', control characters or surrounding whitespace".into());
         }
-        let name = format!("{prefix}{tag}");
-        if occupied.contains(&name) {
-            return Err(format!("{name}: a session already uses this name"));
+        if let Some(problem) = zerus_client_core::actions::tag_problem(tag) {
+            return Err(problem.into());
         }
-        return Ok(name);
+        // A name is a label: one a live or saved session uses gets the first
+        // free `-2`, `-3`… instead of failing the fork.
+        return free(&format!("{prefix}{tag}"), occupied);
     }
-    let base = format!("{}-fork", parts.get(2).copied().unwrap_or("session"));
+    let source_tag = parts.get(2).copied().unwrap_or("session");
+    let base = if zerus_client_core::actions::tag_problem(source_tag).is_none() {
+        format!("{source_tag}-fork")
+    } else {
+        "fork".to_owned()
+    };
+    free(&format!("{prefix}{base}"), occupied)
+}
+
+/// `name`, or `name-2`, `name-3`… while a live or saved session uses it.
+fn free(name: &str, occupied: &std::collections::BTreeSet<String>) -> Result<String> {
     for suffix in 1..10000 {
-        let name = if suffix == 1 {
-            format!("{prefix}{base}")
+        let candidate = if suffix == 1 {
+            name.to_owned()
         } else {
-            format!("{prefix}{base}-{suffix}")
+            format!("{name}-{suffix}")
         };
-        if !occupied.contains(&name) {
-            return Ok(name);
+        if !occupied.contains(&candidate) {
+            return Ok(candidate);
         }
     }
     Err("could not find an unused fork name".into())
@@ -187,12 +217,22 @@ pub(super) fn start_scoped(
     if archive_id.is_none() && dsh::exists(name) {
         return dsh::fork(name, tag, expected_run, expected_conversation, dry, scope);
     }
+    // Read-only capability I/O stays outside the shared state writer. The
+    // resulting mode is frozen for the original operation below.
+    let executable = runner_executable()?;
+    let helper = if dry {
+        None
+    } else {
+        Some(launch_identity::helper::Observed::probe(&executable))
+    };
     let _guard = lock(None)?;
+    let source = if archive_id.is_none() { Some(source::Selected::capture(name)?) } else { None };
     let record = if let Some(id) = archive_id {
         archive::read_archive(name, id)?
     } else {
         read(name)?
     };
+    terminating::check_mutation(&record)?;
     if let Some(scope)=scope {scope.check(&record)?;}
     if expected_run.is_some_and(|id| id != string(&record, "run_id"))
         || expected_conversation.is_some_and(|id| id != string(&record, "conversation_id"))
@@ -200,8 +240,8 @@ pub(super) fn start_scoped(
         return Err("source session changed; refresh before forking".into());
     }
     let snapshot = live()?;
-    let live_pane = archive_id.is_none() && snapshot.contains_key(name);
-    if live_pane && (!matches(&record, snapshot.get(name)) || !process_alive(&record)) {
+    let live_pane = archive_id.is_none() && terminal_live(&snapshot, &record)?;
+    if live_pane && (!matches(&record, panes_of(&snapshot, &record)) || !process_alive(&record)) {
         return Err("source process no longer matches its tracked session".into());
     }
     if let Some(reason) = unavailable(&record, live_pane) {
@@ -214,42 +254,62 @@ pub(super) fn start_scoped(
             string(&record, "conversation_id"),
         )?;
     }
-    recipes::verify_history(&record, archive_id.is_some())?;
-    if !Path::new(string(&record, "launch_dir")).is_dir() {
+    // Availability keeps its ordinary current projections. Prepare only from
+    // the original raw frame; never fingerprint those derived observations.
+    let archived = if source.is_none() { Some(record) } else { drop(record); None };
+    let record = source.as_ref().map(source::Selected::record).or(archived.as_ref()).unwrap();
+    recipes::verify_history(record, archive_id.is_some())?;
+    if !Path::new(string(record, "launch_dir")).is_dir() {
         return Err("the source working directory is missing".into());
     }
+    // Live and saved sessions keep unique names; an archived session's name
+    // is free for a new one (names are labels, archives are found by ID).
     let mut occupied: std::collections::BTreeSet<String> = snapshot.keys().cloned().collect();
-    for record in records()?.into_iter().chain(archive::records()?) {
+    for record in records()? {
         occupied.insert(string(&record, "name").into());
     }
     let target = choose_name(name, tag, &occupied)?;
-    let agent = string(&record, "agent");
+    // Allocate before either the native Kimi fork or terminal spawn. The
+    // launch environment carries this exact identity into its own bootstrap.
+    let allocation=launch_identity::Allocation::fresh();
+    let count = match &helper {
+        Some(helper) => helper.count(allocation.session(), allocation.run(), 0)?,
+        None => "0".into(),
+    };
+    let agent = string(record, "agent").to_owned();
     // Check the saved recipe before the only operation that can create history.
-    fork_argv(&record, None)?;
+    fork_argv(record, None)?;
     let new_id = if agent == "kimi" {
         if dry {
             Some("NEW_KIMI_FORK_ID".to_owned())
         } else {
+            if let Some(source) = &source { source.check(name)?; }
             if let Some(scope)=scope {scope.changing();}
-            Some(kimi_fork(&record)?)
+            Some(kimi_fork(record)?)
         }
     } else {
         None
     };
-    let argv = fork_argv(&record, new_id.as_deref())?;
-    let executable = runner_executable()?;
-    let hint_environment = crate::config::agent_hint_environment(agent);
-    let launch = supervisor_command(&record, &executable, argv, &hint_environment);
-    let new_run=uuid::Uuid::new_v4().to_string();
+    let kept = |error| source::kept(error, new_id.as_deref().filter(|_| !dry));
+    let argv = fork_argv(record, new_id.as_deref()).map_err(kept)?;
+    let hint_environment = crate::config::agent_hint_environment(&agent);
+    let launch = storage::supervisor_command_with_count(
+        record, &executable, argv, &hint_environment, &count,
+    );
+    let new_run=allocation.run().to_owned();
+    let lineage = journal::fork_lineage(record);
     let mut environment = BTreeMap::from([
         ("HGS_SESSION", target.clone()),
-        ("HGS_AGENT", agent.into()),
+        // A fork's terminal is its own new label (zerus-ucck P3b).
+        ("HGS_TERMINAL_NAME", target.clone()),
+        ("HGS_AGENT", agent.clone()),
         (
             "HGS_STATE_DIR",
-            absolute_root()?.to_string_lossy().into_owned(),
+            absolute_root().map_err(kept)?.to_string_lossy().into_owned(),
         ),
         ("HGS_EXECUTABLE", executable),
         ("HGS_RUN_ID", new_run.clone()),
+        ("HGS_RESUME_SESSION_ID", String::new()),
         ("HGS_EXPECTED_ID", String::new()),
         ("HGS_REQUESTED_ID", new_id.clone().unwrap_or_default()),
         ("HGS_ARCHIVE_ID", String::new()),
@@ -257,32 +317,57 @@ pub(super) fn start_scoped(
         ("HGS_FRESH_REPLACES", String::new()),
         (
             "HGS_FORK_PARENT_ID",
-            string(&record, "conversation_id").into(),
+            string(record, "conversation_id").into(),
         ),
         ("HGS_FORK_SOURCE_NAME", name.into()),
-        (agent_hint::FORK_REVISION_ENV, agent_hint::fork_revision(&record)),
+        // The archived source's own identity, so the fork can inherit its project.
+        ("HGS_FORK_SOURCE_ARCHIVE", archive_id.unwrap_or_default().into()),
+        // The source history the fork's Activity shows (zerus-b4qk).
+        ("HGS_FORK_LINEAGE", lineage.clone()),
+        // The labels its sources had, where a journal is not one (P2b).
+        (
+            "HGS_FORK_LINEAGE_LABELS",
+            journal::fork_lineage_labels(record, &lineage),
+        ),
+        (agent_hint::FORK_REVISION_ENV, agent_hint::fork_revision(record)),
+        // A fork an agent runs is also that agent's child (zerus-sa9qn.2).
+        (parent_link::ENV, parent_link::launcher_value().map_err(kept)?),
         ("HGS_TRACKING", "1".into()),
         (
             "HGS_CLIENT",
             nonempty_env("HGS_CLIENT").unwrap_or_else(|| "local".into()),
         ),
     ]);
-    for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"] {
+    environment.extend(helper.as_ref().map_or_else(
+        || allocation.environment(),
+        |helper| helper.environment(&allocation),
+    ));
+    for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME", "QWEN_HOME"] {
         environment.insert(key, String::new());
     }
-    environment.insert(home_var(agent)?, string(&record, "agent_home").into());
+    // A fork keeps the parent's explicit per-launch permission choice; the
+    // account default remains dynamic when no override was stored.
+    if let Some(mode) = permission_override(record) {
+        environment.insert("HGS_PERMISSION_MODE", mode);
+    }
+    environment.insert(home_var(&agent).map_err(kept)?, string(record, "agent_home").into());
     let spec = backend::LaunchSpec {
         name: target.clone(),
-        cwd: string(&record, "launch_dir").into(),
+        cwd: string(record, "launch_dir").into(),
         env: environment
             .into_iter()
             .map(|(key, value)| format!("{key}={value}"))
-            .chain(account_variables(&record))
+            .chain(account_variables(record))
             .chain(hint_environment)
             .collect(),
         command: launch,
         detached: true,
     };
+    let parent_conversation = string(record, "conversation_id").to_owned();
+    let source = source.map(source::Selected::into_fence);
+    if let Some(source) = &source {
+        source.check(name).map_err(kept)?;
+    }
     if dry {
         if agent == "kimi" {
             println!(
@@ -290,7 +375,7 @@ pub(super) fn start_scoped(
                 join_command(&[
                     "kimi".into(),
                     "fork".into(),
-                    string(&record, "conversation_id").into(),
+                    parent_conversation,
                     "--yes".into()
                 ])
             );
@@ -299,11 +384,7 @@ pub(super) fn start_scoped(
     } else {
         if let Some(scope)=scope {scope.changing();}
         if let Err(error) = backend::current().start(&spec) {
-        return Err(if let Some(id) = &new_id {
-            format!("{error}; Kimi fork {id} is saved and can be opened explicitly")
-        } else {
-            error
-        });
+        return Err(kept(error));
         } else if scope.is_none() {println!("hgs: forked {name} as {target}");}
         if let (Some(scope),Some(id))=(scope,new_id.as_deref()) {scope.result(&target,&new_run,id,None);}
     }
@@ -312,12 +393,33 @@ pub(super) fn start_scoped(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_session_tags_reject_shell_syntax() {
+        let used = Default::default();
+        for tag in ["bad$tag", "bad;tag", "bad\u{200b}tag"] {
+            assert!(choose_name("codex/project/old$tag", Some(tag), &used).is_err());
+        }
+        assert_eq!(choose_name("codex/project/old$tag", Some("safe name"), &used).unwrap(), "codex/project/safe name");
+        assert_eq!(choose_name("codex/project/old$tag", None, &used).unwrap(), "codex/project/fork");
+    }
     use super::*;
     #[test]
-    fn live_forks_wait_for_the_ready_state_the_listing_reports() {
+    fn powershell_codex_fork_replaces_the_agent_selector_only() {
+        let prefix = [r"C:\PowerShell\pwsh.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", r"C:\p\run_codex.ps1"].map(str::to_owned).to_vec();
+        let base = [prefix.clone(), vec!["resume".into(), "old".into(), "--model".into(), "model-name".into(), "original prompt".into()]].concat();
+        let record = json!({"agent":"codex","base":base,"conversation_id":"parent"});
+        let fork = fork_argv(&record, None).unwrap();
+        assert_eq!(&fork[..7], prefix.as_slice());
+        assert_eq!(&fork[7..], ["fork", "parent", "--model", "model-name"]);
+    }
+    #[test]
+    fn live_forks_keep_ready_and_provider_instance_requirements() {
         let mut stale = telemetry::stale_hook_child();
         stale["base"] = json!(["kimi"]);
-        assert_eq!(unavailable(&stale, true), None);
+        assert_eq!(
+            unavailable(&stale, true),
+            Some("Pause or close this Kimi session before forking its saved context")
+        );
         for (case, mut record) in telemetry::remaining_work() {
             record["base"] = json!(["kimi"]);
             assert_eq!(unavailable(&record, true), Some("Wait for Ready before forking the saved context"), "{case}");
@@ -330,6 +432,19 @@ mod tests {
         let reason = "Wait until the agent's question is answered";
         let mut stale = telemetry::stale_hook_child();
         stale["base"] = json!(["kimi"]);
+        // A supported live provider exercises chooser suppression. Kimi's
+        // earlier closed-instance requirement must keep its own reason.
+        let mut kimi = summary(&stale, true);
+        wait_for_chooser(&mut kimi, reason);
+        assert_eq!(kimi, summary(&stale, true));
+        stale = json!({
+            "agent": "codex",
+            "conversation_id": "conversation",
+            "base": ["codex"],
+            "activity": "idle",
+            "phase": "idle",
+            "main_done": true
+        });
         let mut output = summary(&stale, true);
         output["allowed_actions"] = json!(["rename", "fork"]);
         output["action_reasons"] = json!({});
@@ -345,6 +460,14 @@ mod tests {
         assert_eq!(output, summary(&stale, true));
         assert_eq!(output["fork_reason"], "Wait for a confirmed conversation before forking");
     }
+    #[test]
+    fn forks_keep_only_explicit_permission_overrides() {
+        let record = json!({"permission_override":"native:{\"mode\":\"acceptEdits\"}"});
+        assert_eq!(permission_override(&record).as_deref(), Some("native:{\"mode\":\"acceptEdits\"}"));
+        assert_eq!(permission_override(&json!({})), None);
+        assert_eq!(permission_override(&json!({"permission_override":""})), None);
+    }
+
     #[test]
     fn forks_use_exact_parent_and_preserve_safe_launch_options() {
         let record = |agent, base| json!({"agent":agent,"base":base,"conversation_id":"parent"});
@@ -405,7 +528,14 @@ mod tests {
             choose_name("codex/project/work", None, &used).unwrap(),
             "codex/project/work-fork-3"
         );
-        assert!(choose_name("codex/project/work", Some("work-fork"), &used).is_err());
+        assert_eq!(
+            choose_name("codex/project/work", Some("work-fork"), &used).unwrap(),
+            "codex/project/work-fork-3"
+        );
+        assert_eq!(
+            choose_name("codex/project/work", Some("other"), &used).unwrap(),
+            "codex/project/other"
+        );
         assert!(choose_name("codex/project/work", Some("../bad"), &used).is_err());
         assert_eq!(
             parse_kimi_id(

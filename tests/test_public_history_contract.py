@@ -3,6 +3,7 @@
 Persisted binding changes model a confirmed same-conversation resume. These tests
 exercise indexing and wire identity, not lifecycle execution or model traffic.
 """
+import base64
 import hashlib
 from contextlib import closing
 import json
@@ -244,6 +245,64 @@ class PublicHistoryContract(unittest.TestCase):
         self.assertEqual(body["conversation_id"], payload["expected_conversation_id"])
         self.assertLessEqual(len(body["events"]), payload.get("limit", 100))
         return body
+
+    def test_recent_inspection_does_not_wait_for_historical_index_or_shared_receipts(self):
+        """The initial mobile transcript can use inspect while older pages build.
+
+        The latest provider progress is after a large private tool result and
+        the latest journal prompt is before a long tool-only timeline. Neither
+        needs the public_history index or unrelated delivery classification.
+        """
+        self.write_source([self.message(0), self.large_tool_output(9 * 1024 * 1024),
+                           self.message(1, text="Newest native progress after large private output.",
+                                        message_id="newest-native-progress")])
+        self.journal([dict(type="UserPromptSubmit", agent_id="", at=1_700_000_002,
+                           detail="Newest person prompt before tool activity."),
+                      *[dict(type="PostToolUse", agent_id="", at=1_700_000_003 + index,
+                             detail="Private tool-only activity.") for index in range(150)]])
+        receipts = self.state / "input_receipts"
+        receipts.mkdir(mode=0o700)
+        for index in range(130):
+            path = receipts / f"unrelated-{index:03}.json"
+            path.write_text(json.dumps(dict(status="submitted", conversation_id="another-conversation",
+                                            agent_id="", attachments=[])), encoding="utf-8")
+            path.chmod(0o600)
+
+        def inspect():
+            result = subprocess.run([str(HGS), "inspect", self.name, "--skip-processes"],
+                                    text=True, capture_output=True, env=self.env, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            body = json.loads(result.stdout)
+            self.assertEqual((body["run_id"], body["conversation_id"]), (self.run, self.conversation))
+            self.assertIn("newest-native-progress", [row.get("message_id")
+                                                    for row in body["provider_messages"]])
+            self.assertIn("Newest person prompt before tool activity.",
+                          [row.get("detail") for row in body["message_events"]])
+            self.assertNotIn("PRIVATE TOOL RESULT", result.stdout)
+            self.assertLessEqual(len(body["provider_messages"]), 100)
+            self.assertLessEqual(len(body["message_events"]), 100)
+            return body
+
+        inspect()
+        self.assertFalse((self.state / "public_history").exists(),
+                         "A recent inspection must not create a historical index")
+        page = self.history()
+        self.assertFalse(page["head"]["complete"])
+        # The attachment source may be complete at once (the locator scopes
+        # the 130 shared receipts out of this conversation) or indexing while
+        # its private discovery builds; the inspect above never waits for it.
+        self.assertIn(page["source_status"]["attachments"], ("indexing", "complete"))
+        progress = page["source_status"]["progress"]
+        self.assertLess(progress["source_bytes"], progress["known_source_bytes"])
+        self.assertLess(progress["receipt_files"], 130)
+        index = next((self.state / "public_history").glob("*.sqlite3"))
+        with closing(sqlite3.connect(index)) as db:
+            before = dict(db.execute("SELECT key,value FROM meta WHERE key LIKE 'offset:%'"))
+            classified = db.execute("SELECT count(*) FROM receipt_seen").fetchone()[0]
+        inspect()
+        with closing(sqlite3.connect(index)) as db:
+            self.assertEqual(dict(db.execute("SELECT key,value FROM meta WHERE key LIKE 'offset:%'")), before)
+            self.assertEqual(db.execute("SELECT count(*) FROM receipt_seen").fetchone()[0], classified)
 
     def complete(self, **updates):
         # Each call has bounded source/reconciliation work. Completion is
@@ -692,6 +751,291 @@ class PublicHistoryContract(unittest.TestCase):
         answered = next(row for row in page["events"] if row["type"] == "QuestionAnswered")
         self.assertIsNone(answered["incoming_seq"])
         self.assertEqual(page["head"]["total_incoming"], 1)
+
+    def receipt(self, request, conversation=None, at=1_700_000_050.0,
+                text="Attached message", attachments=True):
+        directory = self.state / "input_receipts"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        value = dict(request_id=request, status="submitted", name=self.name, run_id=self.run,
+                     conversation_id=conversation or self.conversation, agent_id="",
+                     digest=hashlib.sha256(request.encode()).hexdigest(), first_message=False,
+                     submitted_at=at, text=text, submitted_text=text,
+                     attachments=([dict(name="image.png", mime="image/png", bytes=1,
+                                        reference="[Image #1]", path="/private/fixture/image.png")]
+                                  if attachments else []))
+        path = directory / f"{request}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def receipt_worker(self):
+        result = subprocess.run([str(HGS), "__state", "receipt-index-worker"],
+                                env=self.env, text=True, capture_output=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def indexed_receipts(self):
+        index = next((self.state / "public_history").glob("*.sqlite3"))
+        with closing(sqlite3.connect(index)) as db:
+            rows = {row[0]: row[1] for row in db.execute(
+                "SELECT json_extract(body,'$.message_id'), count(*) FROM messages "
+                "WHERE json_extract(body,'$.source')='hgs_delivery' GROUP BY 1")}
+            classified = db.execute("SELECT count(*) FROM receipt_seen").fetchone()[0]
+        return rows, classified
+
+    def test_canonical_history_imports_only_its_indexed_receipts(self):
+        """The 10k foreign originals never enter the canonical import or receipt_seen."""
+        foreign = self.state / "input_receipts"
+        foreign.mkdir(mode=0o700)
+        foreign_ids = set()
+        for index in range(10_000):
+            identity = str(uuid.uuid4())
+            foreign_ids.add(identity)
+            path = foreign / f"{identity}.json"
+            path.write_text(json.dumps(dict(
+                request_id=identity, status="submitted", name="other/foreign",
+                run_id=str(uuid.uuid4()), conversation_id="foreign-conversation", agent_id="",
+                digest=hashlib.sha256(str(index).encode()).hexdigest(), first_message=False,
+                submitted_at=1_600_000_000.0 + index, text="foreign", submitted_text="foreign",
+                attachments=[])), encoding="utf-8")
+            path.chmod(0o600)
+        matching = [str(uuid.uuid4()) for _ in range(2)]
+        for request in matching:
+            self.receipt(request)
+        self.receipt_worker()
+        page = self.complete()
+        self.assertFalse(page["indexing"])
+        self.assertEqual(page["source_status"]["attachments"], "complete")
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(sorted(rows), sorted(matching))
+        self.assertTrue(all(count == 1 for count in rows.values()))
+        # The locator scopes classification to this conversation: the old
+        # global directory pass would have stored all 10,002 originals here.
+        self.assertEqual(classified, 2)
+        self.assertFalse(foreign_ids & set(rows))
+        self.assertLess(page["source_status"]["progress"]["receipt_files"], 10_000)
+
+    def test_receipt_paging_stays_stable_while_an_original_arrives(self):
+        requests = [str(uuid.uuid4()) for _ in range(70)]
+        for request in requests:
+            self.receipt(request)
+        self.receipt_worker()
+        first = self.history()
+        self.assertFalse(first["head"]["complete"])
+        epoch = first["history_epoch"]
+        added = str(uuid.uuid4())
+        self.receipt(added)
+        self.receipt_worker()
+        page = first
+        for _ in range(20):
+            if page["head"]["complete"]:
+                break
+            page = self.history()
+            self.assertEqual(page["history_epoch"], epoch)
+        self.assertTrue(page["head"]["complete"])
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(sorted(rows), sorted(requests + [added]))
+        self.assertTrue(all(count == 1 for count in rows.values()))
+        self.assertEqual(classified, 71)
+
+    def test_receipt_import_resumes_from_its_stored_frontier(self):
+        requests = [str(uuid.uuid4()) for _ in range(2)]
+        for request in requests:
+            self.receipt(request)
+        self.receipt_worker()
+        self.complete()
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(sorted(rows), sorted(requests))
+        self.assertEqual(classified, 2)
+        added = str(uuid.uuid4())
+        self.receipt(added)
+        self.receipt_worker()
+        self.complete()
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(sorted(rows), sorted(requests + [added]))
+        self.assertTrue(all(count == 1 for count in rows.values()))
+        # The resumed frontier imports exactly the new original once.
+        self.assertEqual(classified, 3)
+
+
+    def receipt_frontier(self):
+        index = next((self.state / "public_history").glob("*.sqlite3"))
+        with closing(sqlite3.connect(index)) as db:
+            cursor = db.execute("SELECT value FROM meta WHERE key='receipt_cursor'").fetchone()[0]
+        body = cursor.split(".")[0]
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+
+    def receipt_locator(self, request):
+        with closing(sqlite3.connect(self.state / "delivery-receipts-v1.sqlite3")) as db:
+            return db.execute("SELECT seq,binding,stamp,change FROM receipt_rows "
+                              "WHERE source='terminal' AND request=?", (request,)).fetchone()
+
+    def assert_receipt_gap(self, page, epoch):
+        self.assertEqual(page["source_status"].get("gap"), "receipt_source_gap")
+        self.assertFalse(page["head"]["complete"])
+        self.assertIsNone(page["head"]["incoming_seq"])
+        self.assertIsNone(page["head"]["total_incoming"])
+        self.assertEqual(page["history_epoch"], epoch)
+
+    def test_deleted_imported_receipt_after_settled_frontier_is_a_gap_across_restart(self):
+        deleted, kept, unknown = [str(uuid.uuid4()) for _ in range(3)]
+        removed = self.receipt(deleted)
+        present = self.receipt(kept, at=1_700_000_051.0)
+        uncertain = self.receipt(unknown, at=1_700_000_052.0)
+        value = json.loads(uncertain.read_text())
+        value.update(status="in_progress", delivery="uncertain")
+        uncertain.write_text(json.dumps(value), encoding="utf-8")
+        present_bytes, uncertain_bytes = present.read_bytes(), uncertain.read_bytes()
+        self.receipt_worker()
+        before = self.complete()
+        epoch = before["history_epoch"]
+        cached = next(row for row in before["events"] if row.get("message_id") == deleted)
+        self.assertNotIn(unknown, [row.get("message_id") for row in before["events"]])
+        frontier = self.receipt_frontier()
+        self.assertEqual(frontier["after"], frontier["upper"], "settled import frontier")
+        locator = self.receipt_locator(deleted)
+        removed.unlink()
+
+        # Both the real discovery worker and every history read run in new
+        # CLI processes: the persisted locator/frontier must carry the gap.
+        self.receipt_worker()
+        after = self.history()
+        self.assert_receipt_gap(after, epoch)
+        self.assertEqual(next(row for row in after["events"] if row.get("message_id") == deleted), cached)
+        missing = self.receipt_locator(deleted)
+        self.assertEqual(missing[:2], locator[:2], "keep sequence and immutable binding")
+        self.assertEqual(missing[2], "gap:missing")
+        self.assertGreater(missing[3], locator[3], "publish the missing original beyond the settled frontier")
+        resumed = self.receipt_frontier()
+        self.assertGreater(resumed["after"], frontier["after"])
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(rows, {deleted: 1, kept: 1})
+        self.assertEqual(classified, 3)
+
+        # A further worker restart is idempotent; an unknown send never
+        # becomes a submitted history row and no original is reconstructed.
+        self.receipt_worker()
+        repeated = self.history()
+        self.assert_receipt_gap(repeated, epoch)
+        self.assertEqual(self.receipt_locator(deleted), missing)
+        self.assertEqual(self.indexed_receipts(), (rows, classified))
+        self.assertFalse(removed.exists())
+        self.assertEqual(present.read_bytes(), present_bytes)
+        self.assertEqual(uncertain.read_bytes(), uncertain_bytes)
+        self.assertEqual({p.name for p in present.parent.glob("*.json")}, {present.name, uncertain.name})
+
+    def test_deleted_imported_receipt_is_disclosed_before_a_frozen_chain_reaches_its_change(self):
+        requests = [str(uuid.uuid4()) for _ in range(70)]
+        for request in requests:
+            self.receipt(request)
+        self.receipt_worker()
+        first = self.history()
+        epoch = first["history_epoch"]
+        frontier = self.receipt_frontier()
+        self.assertLess(frontier["after"], frontier["upper"], "an unfinished bounded import chain")
+        with closing(sqlite3.connect(next((self.state / "public_history").glob("*.sqlite3")))) as db:
+            name = db.execute("SELECT name FROM receipt_seen ORDER BY name LIMIT 1").fetchone()[0]
+        deleted = name.removesuffix(".json")
+        removed = self.state / "input_receipts" / name
+        cached = next(row for row in first["events"] if row.get("message_id") == deleted)
+        removed.unlink()
+        added = str(uuid.uuid4())
+        kept = self.receipt(added, at=1_700_000_060.0)
+        kept_bytes = kept.read_bytes()
+        self.receipt_worker()
+        missing = self.receipt_locator(deleted)
+        self.assertGreater(missing[3], frontier["upper"])
+
+        # The old frozen upper excludes both the new arrival and the missing
+        # original's change. Coverage must disclose the gap on this page,
+        # while the unchanged cursor finishes the original bounded chain.
+        middle = self.history()
+        self.assert_receipt_gap(middle, epoch)
+        drained = self.receipt_frontier()
+        self.assertEqual(drained["upper"], frontier["upper"])
+        self.assertEqual(drained["after"], frontier["upper"])
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(set(rows), set(requests))
+        self.assertNotIn(added, rows)
+        self.assertEqual(classified, 70)
+        self.assertEqual(next(row for row in middle["events"] if row.get("message_id") == deleted), cached)
+
+        after = self.history()
+        self.assert_receipt_gap(after, epoch)
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(set(rows), set(requests + [added]))
+        self.assertTrue(all(count == 1 for count in rows.values()))
+        self.assertEqual(classified, 71)
+        self.assertFalse(removed.exists())
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+
+    def test_a_rebound_receipt_original_is_a_gap_not_an_import(self):
+        request = str(uuid.uuid4())
+        path = self.receipt(request)
+        self.receipt_worker()
+        # The original changes after discovery: the locator still names the
+        # discovered binding, so validation must refuse the new one.
+        value = json.loads(path.read_text())
+        value["digest"] = "changed-after-discovery"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        page = self.history()
+        for _ in range(20):
+            if page["source_status"].get("gap") == "receipt_source_gap":
+                break
+            page = self.history()
+            self.assertFalse(page["source_status"]["attachments"] == "indexing")
+        self.assertEqual(page["source_status"]["gap"], "receipt_source_gap")
+        self.assertFalse(page["head"]["complete"])
+        rows, classified = self.indexed_receipts()
+        self.assertNotIn(request, rows)
+        self.assertEqual(classified, 0)
+
+
+    def test_v1_receipt_index_migrates_through_the_real_worker(self):
+        path = self.state / "delivery-receipts-v1.sqlite3"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript("""
+                CREATE TABLE receipt_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE receipt_sources(source TEXT PRIMARY KEY,stamp TEXT NOT NULL DEFAULT '',
+                    complete INTEGER NOT NULL DEFAULT 0,indexed INTEGER NOT NULL DEFAULT 0,
+                    errors INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE receipt_rows(seq INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,
+                    request TEXT NOT NULL,name TEXT NOT NULL,run TEXT NOT NULL,conversation TEXT NOT NULL,
+                    agent TEXT NOT NULL,first_message INTEGER NOT NULL,at REAL NOT NULL,
+                    files INTEGER NOT NULL,binding TEXT NOT NULL,UNIQUE(source,request));
+                CREATE INDEX receipt_exact ON receipt_rows(source,name,run,conversation,at DESC,request DESC);
+                CREATE INDEX receipt_scope ON receipt_rows(source,agent,conversation,at DESC,request DESC);
+                CREATE INDEX receipt_initial ON receipt_rows(source,agent,run,conversation,first_message,at DESC,request DESC);
+                CREATE INDEX receipt_file_scope ON receipt_rows(source,agent,conversation,at DESC,request DESC) WHERE files=1;
+                CREATE INDEX receipt_file_initial ON receipt_rows(source,agent,run,conversation,first_message,at DESC,request DESC) WHERE files=1;
+                CREATE TABLE receipt_errors(source TEXT NOT NULL,name TEXT NOT NULL,reason TEXT NOT NULL,
+                    PRIMARY KEY(source,name));
+                CREATE TRIGGER receipt_row_count AFTER INSERT ON receipt_rows
+                    BEGIN UPDATE receipt_sources SET indexed=indexed+1 WHERE source=NEW.source; END;
+                CREATE TRIGGER receipt_error_count AFTER INSERT ON receipt_errors
+                    BEGIN UPDATE receipt_sources SET errors=errors+1 WHERE source=NEW.source; END;
+                CREATE TRIGGER receipt_error_clear AFTER DELETE ON receipt_errors
+                    BEGIN UPDATE receipt_sources SET errors=MAX(0,errors-1) WHERE source=OLD.source; END;
+                INSERT INTO receipt_meta VALUES('epoch','v1-epoch'),('cursor_secret','v1-secret');
+                INSERT INTO receipt_sources(source,complete,indexed) VALUES('terminal',1,0);
+            """)
+        path.chmod(0o600)
+        self.receipt_worker()
+        with closing(sqlite3.connect(path)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(receipt_rows)")}
+            self.assertIn("stamp", columns)
+            self.assertIn("change", columns)
+            indexes = db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN "
+                                 "('receipt_change','receipt_change_scope','receipt_change_initial')").fetchone()[0]
+            self.assertEqual(indexes, 3)
+            self.assertEqual(db.execute("SELECT value FROM receipt_meta WHERE key='change_seq'").fetchone()[0], "0")
+        request = str(uuid.uuid4())
+        self.receipt(request)
+        self.receipt_worker()
+        self.complete()
+        rows, classified = self.indexed_receipts()
+        self.assertEqual(rows.get(request), 1)
+        self.assertEqual(classified, 1)
+
 
 
 if __name__ == "__main__":

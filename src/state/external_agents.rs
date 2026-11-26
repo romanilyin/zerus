@@ -1,16 +1,24 @@
-//! Agent CLIs invoked by another provider inherit the HGS run token. Their
+//! Nested agent CLIs and native Codex children inherit the HGS run token. Their
 //! SessionStart must never rebind the parent conversation.
 use super::*;
 use std::io::{BufRead, BufReader};
 
 #[derive(Clone, Copy)]
 struct Caller {
+    pid: u32,
     provider: &'static str,
     headless: bool,
 }
 
-fn native_caller(argv: &[String]) -> Option<Caller> {
+fn native_caller(pid: u32, argv: &[String]) -> Option<Caller> {
     let executable = crate::platform::program_name(Path::new(argv.first()?))?;
+    // Qwen Code runs as Node.js with its package's entry script, after any
+    // Node.js options of its own (`--expose-gc`).
+    if executable.trim_end_matches(".exe") == "node"
+        && argv.iter().skip(1).any(|arg| arg.replace('\\', "/").contains("/@qwen-code/qwen-code/"))
+    {
+        return Some(Caller { pid, provider: "qwen", headless: false });
+    }
     // macOS framework builds run python3 scripts as .../Python.app/Contents/MacOS/Python.
     let offset = if executable == "node" || executable.to_ascii_lowercase().starts_with("python") { 1 } else { 0 };
     let name = crate::platform::program_name(Path::new(argv.get(offset)?))?;
@@ -35,14 +43,14 @@ fn native_caller(argv: &[String]) -> Option<Caller> {
                 "--full-auto"].contains(&arg.as_str()) { break false; }
         } else { break ["exec", "e", "review", "app-server"].contains(&arg.as_str()); }
     };
-    Some(Caller { provider, headless })
+    Some(Caller { pid, provider, headless })
 }
 
 fn ancestry(root: u32, mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, Vec<String>)>) -> Option<Caller> {
     let mut caller = None;
     for _ in 0..64 {
         let (parent, argv) = read(pid)?;
-        if caller.is_none() { caller = native_caller(&argv); }
+        if caller.is_none() { caller = native_caller(pid, &argv); }
         if pid == root { return caller; }
         if parent == pid || parent <= 1 { return None; }
         pid = parent;
@@ -52,24 +60,47 @@ fn ancestry(root: u32, mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, V
 
 fn caller(record: &Value) -> Option<Caller> {
     if !process_alive(record) { return None; }
-    ancestry(record["pid"].as_u64()? as u32, crate::platform::parent_process_id(), crate::platform::parent_and_argv)
+    ancestry(u32::try_from(record["pid"].as_u64()?).ok()?, crate::platform::parent_process_id(), crate::platform::parent_and_argv)
+}
+
+pub(super) fn main_codex_hook(record: &Value) -> bool {
+    // A nested interactive Codex may inherit the token and open files, but it
+    // cannot speak for the original supervised process's clear transition.
+    caller(record).is_some_and(|source| source.provider == "codex" && !source.headless
+        && record["pid"].as_u64() == Some(u64::from(source.pid)))
 }
 
 // An inherited HGS token is not proof that a new same-provider conversation
 // belongs to the interactive parent. Codex records its headless entry point in
 // the rollout header; /new and /clear still use the interactive source.
-fn codex_exec(event: &Value) -> bool {
+fn codex_metadata(event: &Value) -> Option<Value> {
     let path = Path::new(string(event, "transcript_path"));
-    if !path.is_absolute() { return false; }
-    let Ok(file) = std::fs::File::open(path) else { return false; };
+    if !path.is_absolute() { return None; }
+    let file = std::fs::File::open(path).ok()?;
     let mut line = String::new();
-    if BufReader::new(file.take(256 * 1024)).read_line(&mut line).is_err() { return false; }
-    let Ok(meta) = serde_json::from_str::<Value>(&line) else { return false; };
-    meta["type"] == "session_meta" && meta["payload"]["id"] == event["session_id"]
-        && meta["payload"]["source"] == "exec"
+    BufReader::new(file.take(256 * 1024)).read_line(&mut line).ok()?;
+    if !line.ends_with('\n') { return None; }
+    let meta: Value = serde_json::from_str(&line).ok()?;
+    (meta["type"] == "session_meta")
+        .then(|| meta["payload"].clone())
+}
+
+fn codex_subagent(meta: &Value) -> bool {
+    meta["source"].get("subagent").is_some()
+}
+
+fn codex_parent(meta: &Value, parent: &str) -> bool {
+    let parents: Vec<_> = [meta.get("parent_thread_id"),
+        meta["source"]["subagent"]["thread_spawn"].get("parent_thread_id")]
+        .into_iter().flatten().collect();
+    !parent.is_empty() && !parents.is_empty() && parents.iter().all(|id| id.as_str() == Some(parent))
 }
 
 fn provider(event: &Value) -> Option<&'static str> {
+    // WhiteWh fork: hgs's own translation of a Hermes hook names its session.
+    if !string(event, "hermes_session_id").is_empty() {
+        return Some("hermes");
+    }
     let id = string(event, "session_id");
     if id
         .strip_prefix("session_")
@@ -84,6 +115,12 @@ fn provider(event: &Value) -> Option<&'static str> {
     {
         return Some("codex");
     }
+    // Qwen Code's chat log below its home (`/clear` starts a new session ID
+    // there, after `SessionEnd("clear")`; Qwen Code 0.27.4).
+    let qwen = nonempty_env("QWEN_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".qwen"));
+    if path.is_absolute() && path.starts_with(&qwen) && uuid::Uuid::parse_str(id).is_ok() {
+        return Some("qwen");
+    }
     let claude = nonempty_env("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".claude"));
@@ -96,11 +133,34 @@ fn provider(event: &Value) -> Option<&'static str> {
 /// An unidentified inherited SessionStart cannot replace an established parent.
 /// Keep legacy startup hooks and verified interactive /new and /clear events.
 pub(super) fn main_start(record: &Value, event: &Value) -> bool {
-    if event["session_id"] == record["conversation_id"] { return true; }
+    if codex_metadata(event).as_ref().is_some_and(|meta| meta["id"] != event["session_id"] || codex_subagent(meta))
+        || (record["agent"] == "codex" && record["subagents"].get(string(event, "session_id"))
+            .is_some_and(|child| child.is_object() && child["external"] != true)) {
+        return false;
+    }
+    if event["session_id"] == record["conversation_id"] {
+        return true;
+    }
+    if record["agent"] == "codex"
+        && (codex_tasks::known(record, string(event, "session_id"))
+            || codex_tasks::unresolved(record))
+    {
+        return false;
+    }
     match provider(event).or_else(|| caller(record).map(|source| source.provider)) {
         Some(provider) => provider == string(record, "agent"),
         None => string(record, "conversation_id").is_empty(),
     }
+}
+
+fn original_process(record: &Value, source: Caller) -> Option<Value> {
+    if record["pid"].as_u64() == Some(u64::from(source.pid)) { return None; }
+    let before = subagent_lifecycle::capture(record, source.pid)?;
+    // Fresh kernel ancestry between birth observations; a PID or provider name
+    // from hook JSON can never establish this binding.
+    let again = caller(record)?;
+    if again.pid != source.pid || again.provider != source.provider { return None; }
+    (subagent_lifecycle::capture(record, source.pid)? == before).then_some(before)
 }
 
 /// Return a child-scoped event, without touching parent identity, model, or
@@ -116,23 +176,41 @@ pub(super) fn route(record: &mut Value, event: &Value) -> Option<Value> {
     {
         return None;
     }
+    let metadata = codex_metadata(event);
+    if metadata.as_ref().is_some_and(|meta| meta["id"] != event["session_id"]) { return None; }
+    if metadata.as_ref().is_some_and(|meta| codex_subagent(meta)
+        && !codex_parent(meta, string(record, "conversation_id"))) { return None; }
+    let native = record["agent"] == "codex" && (
+        metadata.as_ref().is_some_and(|meta| codex_subagent(meta)
+            && codex_parent(meta, string(record, "conversation_id")))
+        || record["subagents"].get(sid).is_some_and(|child| child.is_object() && child["external"] != true));
+    // A native child's mismatched or missing parent is never a new root or an
+    // external review. Its native ID also keeps SubagentStart/Stop in one row.
+    if metadata.as_ref().is_some_and(codex_subagent) && !native { return None; }
     let known = record["subagents"].as_object().and_then(|children| {
         children
             .iter()
             .find(|(_, child)| child["external"] == true && child["conversation_id"] == sid)
             .map(|(id, _)| id.clone())
     });
-    let id = if let Some(id) = known {
+    let id = if native {
+        if !record["subagents"].is_object() { record["subagents"] = json!({}); }
+        if !record["subagents"][sid].is_object() {
+            record["subagents"][sid] = json!({"name":format!("codex {}", sid.chars().take(8).collect::<String>()), "started":now()});
+        }
+        sid.to_owned()
+    } else if let Some(id) = known {
         id
     } else {
-        if string(event, "hook_event_name") != "SessionStart" {
+        let native_task = codex_tasks::known(record, sid);
+        if string(event, "hook_event_name") != "SessionStart" && !native_task {
             return None;
         }
         let source = caller(record);
         let agent = provider(event).or_else(|| source.map(|source| source.provider))?;
-        let headless = agent == "codex" && (codex_exec(event)
+        let headless = agent == "codex" && (metadata.as_ref().is_some_and(|meta| meta["source"] == "exec")
             || source.is_some_and(|source| source.provider == "codex" && source.headless));
-        if agent == string(record, "agent") && !headless {
+        if agent == string(record, "agent") && !headless && !native_task {
             return None;
         }
         let id = format!("external:{agent}:{sid}");
@@ -155,7 +233,31 @@ pub(super) fn route(record: &mut Value, event: &Value) -> Option<Value> {
             "started":now(),"transcript":event["transcript_path"],"cwd":event["cwd"],"agent_home":agent_home});
         id
     };
+    let provider = string(&record["subagents"][&id], "provider").to_owned();
+    let starting = event["hook_event_name"] == "SessionStart";
+    let ended = record["subagents"][&id]["state"] == "ended";
+    let previous = record["subagents"][&id].get("original_process");
+    let original = if starting || ended || previous.is_none() {
+        caller(record).filter(|source| source.provider == provider).and_then(|source| original_process(record,source))
+    } else {None};
+    // A fresh native observation can recover mistaken legacy retirement. A
+    // different original still requires SessionStart; never adopt a reused PID.
+    let verified = original.as_ref().is_some_and(|original| starting || previous.is_none() || previous == Some(original));
+    let terminal = ["Stop", "SubagentStop", "SessionEnd", "StopFailure"].contains(&string(event,"hook_event_name"));
+    let ignored = ended && !terminal && !verified;
     let child = &mut record["subagents"][&id];
+    // Explicit retirement of an unbound legacy record was not proof of an
+    // exit. Preserve that route's verified recovery before the journal's
+    // final-child guard; a proven process exit or native completion never
+    // uses this exception; a non-start hook with a mismatching birth refuses.
+    if ended && verified && !terminal && child["completion_source"] == "explicit_retirement" {
+        child["state"] = json!("working");
+        child.as_object_mut().unwrap().remove("completion_source");
+        child.as_object_mut().unwrap().remove("display_state");
+    }
+    if !ignored && (starting || child.get("original_process").is_none()) {
+        if let Some(original) = original { child["original_process"] = original; }
+    }
     for (from, to) in [
         ("cwd", "cwd"),
         ("transcript_path", "transcript"),
@@ -168,6 +270,8 @@ pub(super) fn route(record: &mut Value, event: &Value) -> Option<Value> {
         }
     }
     let mut scoped = event.clone();
+    // Internal result, always overwritten here rather than trusted from input.
+    scoped["hgs_retired_external_hook"] = json!(ignored);
     scoped["agent_id"] = json!(id);
     // Keep the registered label: a native agent_type such as "default" belongs
     // to the foreign harness, not to the parent provider's profile registry.
@@ -189,23 +293,27 @@ mod tests {
         let read = |pid| rows.iter().find(|(id, _)| *id == pid).map(|(_, (parent, argv))|
             (*parent, argv.iter().map(|arg| arg.to_string()).collect()));
         let child = ancestry(20, 50, read).unwrap();
+        assert_eq!(child.pid, 40);
         assert_eq!(child.provider, "codex");
         assert!(child.headless);
         assert!(ancestry(21, 50, read).is_none());
         assert!(ancestry(20, 51, read).is_none());
         let parent = ancestry(20, 20, read).unwrap();
+        assert_eq!(parent.pid, 20);
         assert_eq!(parent.provider, "claude");
         assert!(!parent.headless);
         let wrapper = |pid| Some((if pid == 20 { 1 } else { 20 },
             vec!["node".into(), "/opt/bin/codex.js".into(), "--".into(), "exec".into()]));
-        assert!(!ancestry(20, 30, wrapper).unwrap().headless);
+        let wrapped = ancestry(20, 30, wrapper).unwrap();
+        assert_eq!(wrapped.pid, 30);
+        assert!(!wrapped.headless);
         assert!(ancestry(20, 30, |pid| Some((pid, vec![]))).is_none());
         for (argv, headless) in [
             (vec!["codex", "-m", "exec"], false),
             (vec!["codex", "--no-daemon", "-c", "model=fixture", "exec", "--ephemeral"], true),
             (vec!["node", "/opt/codex.js", "resume", "exec"], false),
         ] {
-            assert_eq!(native_caller(&argv.into_iter().map(str::to_owned).collect::<Vec<_>>()).unwrap().headless, headless);
+            assert_eq!(native_caller(20, &argv.into_iter().map(str::to_owned).collect::<Vec<_>>()).unwrap().headless, headless);
         }
     }
 
@@ -214,7 +322,7 @@ mod tests {
         // macOS ps reports a python3 shebang script under the framework executable.
         let argv = ["/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
             "/opt/bin/claude"].map(str::to_owned);
-        assert_eq!(native_caller(&argv).unwrap().provider, "claude");
+        assert_eq!(native_caller(20, &argv).unwrap().provider, "claude");
     }
 
     #[test]
@@ -262,6 +370,98 @@ mod tests {
         std::fs::write(&path,meta.to_string()+"\n").unwrap();
         let mut fresh=parent.clone();fresh["conversation_id"]=Value::Null;
         assert!(route(&mut fresh,&event).is_none());
+    }
+
+    #[test]
+    fn native_codex_children_keep_the_parent_and_their_native_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        let path = dir.path().join(format!("rollout-{sid}.jsonl"));
+        for (source, announced) in [
+            (json!({"subagent":{"thread_spawn":{"parent_thread_id":parent_id,"depth":1}}}), true),
+            (json!({"subagent":{"other":"guardian"}}), false),
+            (json!({"subagent":"review"}), false),
+        ] {
+            let meta = json!({"type":"session_meta","payload":{"id":sid,"parent_thread_id":parent_id,"source":source}});
+            std::fs::write(&path, meta.to_string()+"\n").unwrap();
+            let mut parent = json!({"agent":"codex","conversation_id":parent_id,"transcript":"parent-rollout",
+                "cwd":"parent-folder","model":"parent-model","effort":"high","prompt":"Parent task",
+                "last_message":"Parent reply","main_done":false,"active_tools":{"parent-tool":{}},
+                "subagents":{}});
+            if announced { parent["subagents"][&sid] = json!({"name":"Reviewer","started":1.0}); }
+            let event = json!({"hook_event_name":"SessionStart","session_id":sid,"transcript_path":path,
+                "cwd":"child-folder","model":"child-model","reasoning_effort":"low"});
+            assert!(!main_start(&parent, &event));
+            let mut record = parent.clone();
+            let scoped = route(&mut record, &event).unwrap();
+            assert_eq!(scoped["agent_id"], sid);
+            if announced { assert_eq!(record["subagents"][&sid]["name"], "Reviewer"); }
+            assert_eq!(record["subagents"][&sid]["model"], "child-model");
+            assert_ne!(record["subagents"][&sid]["external"], true);
+            journal::update_activity(&mut record, &scoped);
+            // Later hooks can omit both agent_id and transcript_path. Keep the
+            // same roster entry that the parent's SubagentStart/Stop uses.
+            for event in [
+                json!({"hook_event_name":"PreToolUse","session_id":sid,"tool_name":"shell","tool_use_id":"child-tool"}),
+                json!({"hook_event_name":"Stop","session_id":sid,"last_assistant_message":"Child result"}),
+            ] {
+                let scoped = route(&mut record, &event).unwrap();
+                assert_eq!(scoped["agent_id"], sid);
+                journal::update_activity(&mut record, &scoped);
+            }
+            assert_eq!(record["subagents"].as_object().unwrap().len(), 1);
+            assert_eq!(record["subagents"][&sid]["state"], "finished");
+            assert_eq!(record["subagents"][&sid]["detail"], "Child result");
+            for key in ["conversation_id","transcript","cwd","model","effort","prompt","last_message","main_done","active_tools"] {
+                assert_eq!(record[key], parent[key], "{key}");
+            }
+            // The parent's next event is still its own work.
+            let event = json!({"hook_event_name":"Stop","session_id":parent_id,"last_assistant_message":"Parent result"});
+            assert!(route(&mut record, &event).is_none());
+            journal::update_activity(&mut record, &event);
+            assert_eq!(record["last_message"], "Parent result");
+        }
+    }
+
+    #[test]
+    fn native_codex_starts_require_parent_proof_and_never_bootstrap_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let path = dir.path().join(format!("rollout-{sid}.jsonl"));
+        let parent = json!({"agent":"codex","conversation_id":"parent","subagents":{}});
+        for payload in [
+            json!({"id":sid,"source":{"subagent":{"other":"guardian"}}}),
+            json!({"id":sid,"parent_thread_id":"unrelated","source":{"subagent":{"other":"guardian"}}}),
+            json!({"id":sid,"parent_thread_id":null,"source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}),
+            json!({"id":sid,"parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"unrelated"}}}}),
+            json!({"id":"wrong","parent_thread_id":"parent","source":{"subagent":{"other":"guardian"}}}),
+        ] {
+            std::fs::write(&path, json!({"type":"session_meta","payload":payload}).to_string()+"\n").unwrap();
+            let event = json!({"hook_event_name":"SessionStart","session_id":sid,"transcript_path":path});
+            let mut record = parent.clone();
+            assert!(route(&mut record, &event).is_none());
+            assert_eq!(record, parent);
+            assert!(!main_start(&record, &event));
+            record["subagents"][&sid] = json!({"name":"Reviewer"});
+            assert!(route(&mut record, &event).is_none());
+            record["conversation_id"] = Value::Null;
+            assert!(route(&mut record, &event).is_none());
+            assert!(!main_start(&record, &event));
+        }
+        // A known child's start stays child-scoped even without its rollout.
+        let mut record = parent.clone();
+        record["subagents"][&sid] = json!({"name":"Reviewer"});
+        assert!(!main_start(&record, &json!({"session_id":sid})));
+        assert_eq!(route(&mut record, &json!({"hook_event_name":"SessionStart","session_id":sid})).unwrap()["agent_id"], sid);
+        // A user fork is an interactive root, despite its parent/fork metadata.
+        for source in ["cli", "vscode"] {
+            let meta = json!({"type":"session_meta","payload":{"id":sid,"parent_thread_id":"parent","forked_from_id":"parent","source":source}});
+            std::fs::write(&path, meta.to_string()+"\n").unwrap();
+            let event = json!({"hook_event_name":"SessionStart","session_id":sid,"transcript_path":path});
+            assert!(route(&mut parent.clone(), &event).is_none());
+            assert!(main_start(&parent, &event));
+        }
     }
     #[test]
     fn mixed_children_keep_parent_binding_model_and_history() {

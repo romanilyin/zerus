@@ -3,27 +3,144 @@
 //! Activity state and handed out as keyed [`Change`]s that a [`Coalescer`]
 //! folds into one [`Batch`] per display frame.
 //!
-//! Pure Rust with no Tauri or async runtime, so it tests fast. See
+//! Pure Rust with no Tauri or async runtime by default, so it tests fast. See
 //! `docs/superpowers/plans/2026-10-28-tauri-client-phase1.md` (Tasks 3 and 4)
 //! and the "Event stream" section of `docs/reference.md`.
 
+pub mod account_actions;
+pub mod account_switch;
 pub mod actions;
+pub mod analytics;
+pub mod approvals;
+pub mod attachments;
+pub mod attention;
+pub mod attention_store;
 pub mod batch;
+pub mod cache;
+pub mod cache_keepalive;
+pub mod catalog_cache;
+pub mod child_environment;
+pub mod claude_app;
+pub mod clear_input;
+#[cfg(windows)]
+mod conpty;
+pub mod content_search;
+pub mod creation;
+pub mod desktop;
 pub mod details;
+pub mod download_cache;
+pub mod drafts;
+pub mod end_action;
+pub mod external_file;
+pub mod file_download;
 pub mod fleet;
+pub mod fork_update;
+pub mod fsx;
+pub mod git;
+pub mod git_status;
+pub mod git_changes;
+pub mod held_input;
+pub mod hgs_settings;
+pub mod host_access;
+pub mod image;
+pub mod input_acknowledgment;
+pub mod input_queue;
+pub mod iron_rules;
+pub mod keep_warm;
+pub mod project_memory;
+pub mod launch;
 pub mod legacy;
+pub mod linux_notify;
+pub mod local_messages;
 pub mod machine;
+pub mod machine_connections;
+pub mod machine_probe;
+pub mod model_servers;
+pub mod model_catalog;
+pub mod macos_notify;
+pub mod maintenance;
+pub mod marks;
+pub mod menubar;
+pub mod mobile;
+pub mod native_notice;
+pub mod next_source;
+pub mod notification_preferences;
+pub mod operation_recovery;
+pub mod optional_questions;
 pub mod organization;
+pub mod parent_change;
+pub mod paths;
+pub mod process_view;
 pub mod processes;
+#[cfg(unix)]
+mod pty;
+pub mod qt_lock;
+pub mod question_routing;
+pub mod questions;
+pub mod quit_journal;
+pub mod quit_origin;
 pub mod readmarks;
 pub mod reads;
+pub mod readsync;
+pub mod recovery_settings;
+pub mod repository;
+pub mod row_preferences;
 pub mod run;
+pub mod send;
+pub mod session_file_reference;
+pub mod session_selector;
+pub mod session_usage;
+pub mod swarm_wake;
+pub mod settings;
 pub mod shell;
+pub mod socraticode;
+pub mod source;
+pub mod speech_settings;
 pub mod state;
 pub mod stream;
+pub mod swarm;
+pub mod task_board;
+pub mod task_cancel;
+pub mod task_details;
+pub mod task_executor;
+pub mod task_feedback;
+pub mod task_settings;
+pub mod task_start;
+pub mod task_view;
 pub mod tasks;
+pub mod tasks_write;
+pub mod team_mutes;
+pub mod team_notices;
+pub mod teams;
+/// WhiteWh fork: upstream's Agent Teams client types, beside the fork's own
+/// teams, for upstream's team engine (compiled, not wired to `hgs team`).
+#[allow(dead_code, unused_imports)]
+pub mod upstream_teams;
+pub mod terminal;
+pub mod terminal_launch;
+pub mod termination_cleanup;
+pub mod text;
+pub mod trayicon;
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod unix_spawn;
+pub mod untracked_shell;
+pub mod updates;
+pub mod video_posters;
 pub mod view;
 pub mod views;
+pub mod private_notices;
+pub mod voice;
+pub mod voice_device;
+pub mod voice_composer;
+pub mod voice_driver;
+pub mod worktree_leftover;
+pub mod worktree_overview;
+pub mod worktree_policy;
+pub mod worktree_programs;
+pub mod worktree_review;
+pub mod worktrees;
+pub mod wsl_mapping;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,16 +151,19 @@ pub use batch::MachineOut;
 pub use batch::OrganizationOut;
 pub use batch::ProcessesOut;
 pub use batch::TasksOut;
-pub use batch::{ActivityOut, Batch, Coalescer, ComputerOut, KeyOut, ReplaceOut, RowOut};
+pub use batch::{ActivityOut, Batch, Coalescer, ComputerOut, KeyOut, ReplaceOut, RetryOut, RowOut};
 pub use fleet::{Fleet, FollowError};
+pub use git::{GitState, GitStatus, GitUpdate};
 pub use machine::{LocalHost, MachineMeta};
 pub use organization::{OrganizationSnapshot, OrganizationState, OrganizationUpdate};
 pub use processes::{ProcessesState, ProcessesUpdate};
 pub use reads::{Read, ReadError};
-pub use run::{run, run_limited, run_with_env, TooLarge};
+pub use run::{run, run_cancellable, run_limited, run_with_env, Stopped, TooLarge};
 pub use state::{ActivityState, CatalogState};
-pub use stream::{StreamEvent, StreamHandle, Timing};
+pub use stream::{RestartDelays, StreamEvent, StreamHandle, Timing};
+pub use swarm::grouping::{GroupOut, GroupingOut, HeaderOut, SyncView};
 pub use tasks::{TasksState, TasksUpdate};
+pub use teams::{TeamAction, TeamCall, TeamOutcome, TeamsFollow, TeamsPoller, TeamsUpdate};
 pub use view::ViewRow;
 pub use zerus_watch_protocol::SessionRef;
 
@@ -91,8 +211,9 @@ pub enum ComputerStatus {
     /// A stream delivered its catalog snapshot.
     Live,
     /// The stream ended, failed or stayed silent; `attempt` counts the failures
-    /// that set the restart delay (5 s, 15 s, 60 s, then 5 min). Its rows stay
-    /// as last known.
+    /// that set the restart delay (by default 1 s, 2 s, 5 s, then every 10 s;
+    /// see [`stream::RestartDelays`]). Its rows stay as last known. The
+    /// scheduled restart itself is reported by [`Change::Retry`].
     Reconnecting { attempt: u32 },
     /// The computer left the fleet or the fleet stopped.
     Ended,
@@ -119,11 +240,66 @@ impl ComputerStatus {
     }
 }
 
+/// One restart wait that a computer's supervisor scheduled after a failure.
+/// `deadline` is the very deadline that ends the supervisor's wait, on this
+/// process's monotonic clock, so it is the actual time of the next automatic
+/// attempt, never a client estimate, and wall-clock jumps cannot move it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NextAttempt {
+    /// Distinct for every wait one supervisor schedules.
+    pub serial: u64,
+    /// The failures that chose this delay.
+    pub attempt: u32,
+    pub delay_ms: u64,
+    pub deadline: std::time::Instant,
+}
+
+impl NextAttempt {
+    /// The milliseconds left at `now`; zero once the deadline passed.
+    pub fn remaining_ms(&self, now: std::time::Instant) -> u64 {
+        u64::try_from(self.deadline.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Where a computer's supervisor stands between connection attempts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Retry {
+    /// No restart is waiting or running: connected, first probe, polled,
+    /// unsupported or stopped.
+    #[default]
+    Idle,
+    /// The supervisor waits for this attempt.
+    Waiting(NextAttempt),
+    /// The attempt that wait `serial` scheduled is running now, ahead of its
+    /// time after a manual reconnect or at its deadline.
+    Attempting { serial: u64, attempt: u32 },
+}
+
+impl Retry {
+    /// The snake_case phase name a [`Batch`] and the service carry.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Waiting(_) => "waiting",
+            Self::Attempting { .. } => "attempting",
+        }
+    }
+}
+
 /// One change of a followed session's Activity.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActivityUpdate {
     /// Events after the previous cursor, oldest first.
     Events { events: Vec<Value>, cursor: i64 },
+    /// One page of rows older than a `before` the view asked for. It never
+    /// moves the resume cursor; `cursor` is the next `before`, `more` says
+    /// older rows remain and `last` ends the read (a page may span frames).
+    Older {
+        events: Vec<Value>,
+        cursor: i64,
+        last: bool,
+        more: bool,
+    },
     /// A new event window that replaces what the view holds (a tail snapshot
     /// after a gap, or a DeepSeek or OpenCode window).
     Replace { events: Vec<Value>, cursor: i64 },
@@ -133,6 +309,13 @@ pub enum ActivityUpdate {
     Event { id: String, rev: u64, event: Value },
     /// The session's latest inspection summary, with provider messages merged.
     State { value: Value, rev: u64 },
+    /// Read transport readiness. This never declares native work finished or
+    /// replaces the last known transcript; a new route resets state revisions.
+    Connection {
+        ready: bool,
+        pending: bool,
+        code: String,
+    },
     /// The subscription ended (the session left the catalog or changed run).
     Ended,
 }
@@ -143,6 +326,11 @@ pub enum ActivityUpdate {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Change {
+    Git {
+        computer: ComputerId,
+        key: String,
+        update: GitUpdate,
+    },
     Upsert {
         computer: ComputerId,
         key: String,
@@ -164,6 +352,10 @@ pub enum Change {
         computer: ComputerId,
         status: ComputerStatus,
     },
+    /// The computer's restart schedule; see [`Retry`]. Sent before the
+    /// `Reconnecting` status it belongs to, when the wait ends and when the
+    /// computer leaves `Reconnecting`.
+    Retry { computer: ComputerId, retry: Retry },
     Activity {
         computer: ComputerId,
         key: String,
@@ -192,20 +384,59 @@ pub enum Change {
         computer: ComputerId,
         update: OrganizationUpdate,
     },
+    /// A Teams view of the computer, keyed as [`teams::model`] says; see [`teams`].
+    /// `payload` is the update's batch payload, computed once by the model
+    /// for its digest (task #9); [`Change::teams`] computes it.
+    Teams {
+        computer: ComputerId,
+        key: String,
+        update: TeamsUpdate,
+        payload: std::sync::Arc<serde_json::Value>,
+    },
+    /// Task 8: the team revisions of the computer's watch stream (its `team`
+    /// topic), or None while it gives none: the Teams poller of the computer
+    /// then polls. It never reaches the webview.
+    TeamHeads {
+        computer: ComputerId,
+        heads: Option<std::sync::Arc<teams::Heads>>,
+    },
+    /// Task #16 of team c536f0e5 (P2.5): rows of the stream's `team.views`
+    /// topic for the computer's Teams poller (never the webview); None when
+    /// the stream stopped giving them, so the poller reads them itself.
+    TeamViews {
+        computer: ComputerId,
+        views: Option<teams::ViewRows>,
+    },
 }
 
 impl Change {
+    /// A Teams change whose payload is computed here.
+    pub fn teams(computer: ComputerId, key: String, update: TeamsUpdate) -> Self {
+        let payload = std::sync::Arc::new(update.payload());
+        Self::Teams {
+            computer,
+            key,
+            update,
+            payload,
+        }
+    }
+
     pub fn computer(&self) -> &ComputerId {
         match self {
             Self::Upsert { computer, .. }
             | Self::Remove { computer, .. }
             | Self::Replace { computer, .. }
             | Self::Computer { computer, .. }
+            | Self::Retry { computer, .. }
             | Self::Activity { computer, .. }
             | Self::Processes { computer, .. }
             | Self::Tasks { computer, .. }
             | Self::Machine { computer, .. }
-            | Self::Organization { computer, .. } => computer,
+            | Self::Organization { computer, .. }
+            | Self::Git { computer, .. }
+            | Self::Teams { computer, .. }
+            | Self::TeamHeads { computer, .. }
+            | Self::TeamViews { computer, .. } => computer,
         }
     }
 }
@@ -246,13 +477,36 @@ fn find_hgs(path: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) 
 #[cfg(test)]
 mod hgs_tests {
     use super::*;
+    use std::path::Path;
 
-    fn folder(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zerus-client-core-{name}-{}", std::process::id()));
+    /// A scratch folder, removed again when the test ends.
+    struct Folder(PathBuf);
+
+    impl std::ops::Deref for Folder {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn folder(name: &str) -> Folder {
+        // Task #418: the scratch root is the crate's own target tree, not the
+        // process-wide temporary folder. Concurrent suites share the isolated
+        // TEMP's parent and a neighbour's run folder can be pruned mid-run;
+        // these tests write a file and then look for it.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("hgs-tests")
+            .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Folder(dir)
     }
 
     #[test]
@@ -262,9 +516,9 @@ mod hgs_tests {
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
         std::fs::write(home.join(".local/bin").join(HGS), b"").unwrap();
         std::fs::write(bin.join(HGS), b"").unwrap();
-        let path = std::env::join_paths([bin.clone()]).unwrap();
+        let path = std::env::join_paths([bin.to_path_buf()]).unwrap();
         assert_eq!(
-            find_hgs(Some(path), Some(home.clone().into())),
+            find_hgs(Some(path), Some(home.to_path_buf().into())),
             Some(bin.join(HGS))
         );
     }
@@ -275,9 +529,9 @@ mod hgs_tests {
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
         std::fs::write(home.join(".local/bin").join(HGS), b"").unwrap();
         let empty = folder("finder-path");
-        let path = std::env::join_paths([empty]).unwrap();
+        let path = std::env::join_paths([empty.to_path_buf()]).unwrap();
         assert_eq!(
-            find_hgs(Some(path), Some(home.clone().into())),
+            find_hgs(Some(path), Some(home.to_path_buf().into())),
             Some(home.join(".local/bin").join(HGS))
         );
     }
@@ -286,8 +540,27 @@ mod hgs_tests {
     fn a_folder_named_hgs_is_not_a_program() {
         let bin = folder("dir-bin");
         std::fs::create_dir_all(bin.join(HGS)).unwrap();
-        let path = std::env::join_paths([bin]).unwrap();
+        let path = std::env::join_paths([bin.to_path_buf()]).unwrap();
         let found = find_hgs(Some(path), None);
         assert!(found.is_none_or(|found| found.is_file()));
     }
+
+    /// Task #418: on Windows the program is `hgs.exe`. A file named `hgs`
+    /// without the extension is not it, whatever PATHEXT says, and the
+    /// extension alone is what makes the file the program.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_program_is_hgs_exe_and_a_bare_hgs_file_is_not() {
+        let bin = folder("bare-name");
+        std::fs::write(bin.join("hgs"), b"").unwrap();
+        let path = std::env::join_paths([bin.to_path_buf()]).unwrap();
+        assert_eq!(find_hgs(Some(path), None), None);
+        std::fs::write(bin.join(HGS), b"").unwrap();
+        let path = std::env::join_paths([bin.to_path_buf()]).unwrap();
+        assert_eq!(find_hgs(Some(path), None), Some(bin.join(HGS)));
+    }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../tests/support/executable.rs"]
+pub(crate) mod test_executable;

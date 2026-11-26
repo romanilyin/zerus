@@ -22,12 +22,12 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{
-        atomic::{AtomicI32, Ordering},
-        Mutex, MutexGuard,
-    },
+    sync::atomic::{AtomicI32, Ordering},
     time::{Duration, Instant},
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod helper_group;
 
 pub fn prepare_environment() {
     let home = env::var("HOME").unwrap_or_default();
@@ -106,7 +106,7 @@ pub fn spawn_ssh(
             set(command, Stdio::piped());
         }
     }
-    let mut child = command.spawn()?;
+    let mut child = zerus_client_core::unix_spawn::spawn(command)?;
     Ok(super::SshChild {
         stdin: child.stdin.take().map(|pipe| Box::new(pipe) as _),
         stdout: child.stdout.take().map(|pipe| Box::new(pipe) as _),
@@ -180,6 +180,33 @@ pub fn verify_private(path: &Path, kind: Private) -> io::Result<bool> {
 pub fn verify_private_file(file: &fs::File) -> io::Result<bool> {
     Ok(private_metadata(&file.metadata()?, Private::File))
 }
+/// Owner-only existing directory, checked through its pinned handle.
+pub fn verify_private_directory(file: &fs::File) -> io::Result<bool> {
+    Ok(private_metadata(&file.metadata()?, Private::Directory))
+}
+/// WhiteWh fork, task 176: why the entry at `path` is not private, in words
+/// a person can act on; None when it is. Reads only.
+pub fn describe_private(path: &Path, kind: Private) -> io::Result<Option<String>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(Some("it is a symbolic link".into()));
+    }
+    match kind {
+        Private::Directory if !metadata.is_dir() => return Ok(Some("it is not a folder".into())),
+        Private::File if !metadata.is_file() => return Ok(Some("it is not a regular file".into())),
+        Private::File if metadata.nlink() != 1 => return Ok(Some(format!("the file has {} links", metadata.nlink()))),
+        _ => {}
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Ok(Some(format!("it is owned by uid {}", metadata.uid())));
+    }
+    let mode = metadata.mode() & 0o7777;
+    Ok((mode & 0o077 != 0).then(|| format!("its mode {mode:04o} gives its group or others access")))
+}
+/// The Unix form of the Windows ancestor check stays owner-only.
+pub fn verify_guarded_directory(file: &fs::File) -> io::Result<bool> {
+    verify_private_directory(file)
+}
 fn private_metadata(metadata: &fs::Metadata, kind: Private) -> bool {
     (match kind {
         Private::Directory => metadata.is_dir(),
@@ -227,14 +254,17 @@ pub fn private_open(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
     options.mode(0o600)
 }
 /// Refuse a symbolic link as the final component and never block on a FIFO.
+/// Sets both custom flags together; separate setters replace, rather than add flags.
 pub fn no_follow(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
 }
 /// Refuse a symbolic link as the final component.
+/// Replaces custom flags. Use `no_follow` when nonblocking mode is also required.
 pub fn refuse_link(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
     options.custom_flags(libc::O_NOFOLLOW)
 }
 /// Never block on a FIFO.
+/// Replaces custom flags. Use `no_follow` when final links must also be refused.
 pub fn never_block(options: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
     options.custom_flags(libc::O_NONBLOCK)
 }
@@ -264,11 +294,11 @@ pub fn agent_command(argv: &[String]) -> io::Result<Command> {
 /// `Command::spawn`. On Windows the child also gets a job of its own that ends
 /// with this process and that nothing it starts can leave (spec D4).
 pub fn spawn(command: &mut Command) -> io::Result<Child> {
-    command.spawn()
+    zerus_client_core::unix_spawn::spawn(command)
 }
 /// `spawn` in a process group of its own (`own_process_group`).
 pub fn spawn_group(command: &mut Command) -> io::Result<Child> {
-    own_process_group(command).spawn()
+    zerus_client_core::unix_spawn::spawn(own_process_group(command))
 }
 /// On macOS std creates a child's pipes with pipe() and marks them close-on-exec
 /// only afterwards, and posix_spawn passes on every descriptor without that flag.
@@ -276,17 +306,33 @@ pub fn spawn_group(command: &mut Command) -> io::Result<Child> {
 /// first child's input or output open until it exits itself, so an exchange that
 /// waits for end of file stalls with it. Threads that spawn at the same time
 /// therefore take turns (`spawn_in_turn`), on every Unix alike.
-static SPAWN: Mutex<()> = Mutex::new(());
 /// The spawn turn: while it is held, no `spawn_in_turn` creates pipes or starts
 /// a child.
-pub fn spawn_turn() -> MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+pub fn spawn_turn() -> zerus_client_core::unix_spawn::Turn {
+    zerus_client_core::unix_spawn::turn()
 }
-/// `Command::spawn` in the spawn turn (`SPAWN`), for every spawn that can run
+/// `Command::spawn` in the shared spawn turn, for every spawn that can run
 /// while another thread of this process spawns.
 pub fn spawn_in_turn(command: &mut Command) -> io::Result<Child> {
     let _turn = spawn_turn();
     command.spawn()
+}
+/// Descriptor creation and spawn share the same turn on macOS, where setting
+/// close-on-exec after socket/pipe creation would otherwise race another spawn.
+/// Preserve the original deadline across turn contention and preparation.
+pub fn spawn_prepared_in_turn_before<T>(
+    until: std::time::Instant,
+    prepare: impl FnOnce(&zerus_client_core::unix_spawn::Turn) -> io::Result<(Command, T)>,
+) -> io::Result<(Child, T)> {
+    let turn = spawn_turn();
+    if std::time::Instant::now() >= until {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let (mut command, resources) = prepare(&turn)?;
+    if std::time::Instant::now() >= until {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok((command.spawn()?, resources))
 }
 /// `Command::status` through `spawn`.
 pub fn status(command: &mut Command) -> io::Result<ExitStatus> {
@@ -303,6 +349,114 @@ pub fn kill_process_group(child: &mut Child) {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
 }
+/// A non-blocking Unix socket, close-on-exec: Linux asks for both in
+/// `socket()`, while Apple's libc has no such flags, so macOS sets them with
+/// `fcntl` under the spawn turn, as the worktree borrower's socket does
+/// (zerus-taljw).
+fn nonblocking_socket() -> io::Result<std::os::unix::net::UnixStream> {
+    zerus_client_core::unix_spawn::nonblocking_stream()
+}
+
+/// The same non-blocking socket for the process-isolated fixtures.
+#[cfg(test)]
+pub(crate) fn test_nonblocking_socket() -> std::os::unix::net::UnixStream {
+    nonblocking_socket().expect("a non-blocking test socket")
+}
+
+/// Whether a non-blocking connect error means a full listen queue: Linux
+/// reports the queue with `EAGAIN`, while BSD/macOS refuses the connection at
+/// once (`ECONNREFUSED`). Both mean the queue is full, and a later refused
+/// connect is a definite "not live" (zerus-taljw).
+#[cfg(test)]
+pub(crate) fn queue_full(code: i32) -> bool {
+    code == libc::EAGAIN
+        || code == libc::EWOULDBLOCK
+        || (cfg!(target_os = "macos") && (code == libc::ECONNREFUSED || code == libc::ECONNRESET))
+}
+
+/// A Unix socket connected within `limit`: a listen queue that stays full must
+/// refuse at the bound instead of blocking the claim that reads it
+/// (zerus-taljw). A blocking connect has no such deadline, so the socket is
+/// connected non-blocking and a full queue is retried until the deadline; the
+/// socket returned is blocking, as `UnixStream::connect` leaves it.
+pub fn connect_unix(path: &Path, limit: Duration) -> io::Result<std::os::unix::net::UnixStream> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let maximum = address.sun_path.len() - 1;
+    if bytes.is_empty() || bytes.len() > maximum || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid unix socket path",
+        ));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            address.sun_path.as_mut_ptr() as *mut u8,
+            bytes.len(),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+    }
+    let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let deadline = Instant::now() + limit;
+    loop {
+        let socket = nonblocking_socket()?;
+        let connected = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                &address as *const _ as *const libc::sockaddr,
+                length,
+            )
+        };
+        if connected == 0 {
+            socket.set_nonblocking(false)?;
+            return Ok(socket);
+        }
+        let error = io::Error::last_os_error();
+        drop(socket);
+        let queued = error.raw_os_error().is_some_and(|code| {
+            code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINPROGRESS
+        });
+        if !queued {
+            return Err(error);
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the unix socket stayed busy",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the unix socket stayed busy",
+            ));
+        }
+        // A full listen queue has no event to wait for: retry until the deadline.
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+pub(crate) fn receive_timeout_result(result: io::Result<()>, apple: bool) -> io::Result<()> {
+    // The supplied timeout is already valid, nonzero and bounded. XNU's
+    // sosetoptlock rejects options with EINVAL after both socket directions
+    // shut down. Reading can then drain queued bytes/EOF without blocking.
+    // Keep the read itself and both absolute deadline checks authoritative.
+    if apple
+        && result
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
+    {
+        Ok(())
+    } else {
+        result
+    }
+}
+
 pub fn process_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -678,172 +832,12 @@ pub fn current_directories() -> std::result::Result<Vec<(u32, PathBuf, String)>,
     Err("Running processes cannot be inspected on this computer".into())
 }
 
-/// Automatic cleanup needs a complete bounded sample of this user's live
-/// processes. A failed cwd/executable read is unknown, never evidence of disuse.
-#[cfg(target_os = "linux")]
+/// Complete bounded native membership sampling. Permission denials remain
+/// explicit data; only the separately confirmed Terminate/Remove path may
+/// ignore them. Other errors are incomplete, never an empty roster.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn worktree_processes(deadline: std::time::Instant) -> std::result::Result<super::WorktreeProcesses, String> {
-    use std::io::Read;
-    let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(2));
-    let uid = unsafe { libc::getuid() };
-    let error = || "Running process coverage is incomplete; review the worktree manually".to_owned();
-    fn read(path: &Path) -> std::io::Result<String> {
-        let mut bytes=Vec::new();
-        fs::File::open(path)?.take(65537).read_to_end(&mut bytes)?;
-        if bytes.len()>65536 { return Err(std::io::Error::other("process metadata exceeds its bound")); }
-        String::from_utf8(bytes).map_err(std::io::Error::other)
-    }
-    fn identity(path: &Path) -> std::io::Result<(String,bool,u32)> {
-        let raw=read(&path.join("stat"))?;
-        let fields:Vec<_>=raw.rsplit_once(") ").ok_or_else(||std::io::Error::other("invalid process identity"))?.1.split_whitespace().collect();
-        let start=fields.get(19).ok_or_else(||std::io::Error::other("invalid process start"))?;
-        let parent=fields.get(1).ok_or_else(||std::io::Error::other("invalid process parent"))?
-            .parse().map_err(std::io::Error::other)?;
-        Ok(((*start).to_owned(),matches!(fields.first(),Some(&"Z"|&"X")),parent))
-    }
-    fn ancestors(deadline: std::time::Instant) -> std::io::Result<std::collections::BTreeMap<u32,String>> {
-        let mut rows=std::collections::BTreeMap::new();
-        let mut pid=std::process::id();
-        while pid!=0 {
-            if rows.len()>=128 || std::time::Instant::now()>=deadline || rows.contains_key(&pid) {
-                return Err(std::io::Error::other("incomplete invocation ancestry"));
-            }
-            let (start,exited,parent)=identity(&PathBuf::from(format!("/proc/{pid}")))?;
-            if exited {return Err(std::io::Error::other("exited invocation ancestor"));}
-            rows.insert(pid,start);pid=parent;
-        }
-        Ok(rows)
-    }
-    let invocation=ancestors(deadline).map_err(|_|error())?;
-    let entries=fs::read_dir("/proc").map_err(|_|error())?;
-    let boot=read(Path::new("/proc/sys/kernel/random/boot_id")).map_err(|_|error())?;
-    let mut rows=super::WorktreeProcesses::default();
-    for (count,entry) in entries.enumerate() {
-        if count>=32768 || std::time::Instant::now()>=deadline { return Err(error()); }
-        let entry=entry.map_err(|_|error())?;
-        let Some(pid)=entry.file_name().to_str().and_then(|s|s.parse::<u32>().ok()) else {continue};
-        let path=entry.path();
-        let status=match read(&path.join("status")) {
-            Ok(status)=>status,
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
-            Err(_)=>return Err(error()),
-        };
-        let uids=status.lines().find_map(|line|line.strip_prefix("Uid:")).ok_or_else(error)?
-            .split_whitespace().map(str::parse::<u32>).collect::<std::result::Result<Vec<_>,_>>().map_err(|_|error())?;
-        if uids.len()!=4 {return Err(error());}
-        if !uids.contains(&uid) {continue;}
-        let before=match identity(&path) {
-            Ok(before)=>before,
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
-            Err(_)=>return Err(error()),
-        };
-        if before.1 {continue;}
-        let cwd=fs::read_link(path.join("cwd"));
-        let image=fs::read_link(path.join("exe"));
-        let after=match identity(&path) {
-            Ok(after)=>after,
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
-            Err(_)=>return Err(error()),
-        };
-        if after.1 {continue;}
-        if before!=after {return Err(error());}
-        let name=read(&path.join("comm")).map(|s|s.trim().to_owned()).unwrap_or_default();
-        // Only access denials on stable, live, fully identified processes are
-        // reviewable. Timeouts, roster/identity errors and other IO errors stay
-        // hard failures. A readable half still protects its actual worktree.
-        let denied = |value: &std::io::Result<PathBuf>| value.as_ref().is_err_and(|e| e.kind()==std::io::ErrorKind::PermissionDenied);
-        let (cwd_denied,image_denied)=(denied(&cwd),denied(&image));
-        if (cwd.is_err() && !cwd_denied) || (image.is_err() && !image_denied) { return Err(error()); }
-        if cwd_denied || image_denied {
-            rows.unreadable.push(super::UnreadableWorktreeProcess {
-                pid, identity:format!("{}:{}",boot.trim(),before.0), command:name.clone(),
-                cwd:cwd_denied, executable:image_denied,
-                invocation_ancestor:invocation.get(&pid)==Some(&before.0),
-            });
-        }
-        if let Ok(cwd)=cwd { rows.paths.push((pid,cwd,name.clone())); }
-        if let Ok(image)=image { rows.paths.push((pid,image,name)); }
-    }
-    if std::time::Instant::now()>=deadline || ancestors(deadline).map_err(|_|error())?!=invocation {return Err(error());}
-    rows.unreadable.sort_by_key(|row|row.pid);
-    Ok(rows)
-}
-
-#[cfg(target_os = "macos")]
-pub fn worktree_processes(deadline: std::time::Instant) -> std::result::Result<super::WorktreeProcesses, String> {
-    use std::os::unix::ffi::OsStrExt;
-    let deadline=deadline.min(std::time::Instant::now()+std::time::Duration::from_secs(2));
-    let uid=unsafe {libc::getuid()};
-    let error=|detail:&str|format!("Running process coverage is incomplete: {detail}; review the worktree manually");
-    fn gone(pid:i32)->bool {
-        (unsafe {libc::kill(pid,0)})<0 && std::io::Error::last_os_error().raw_os_error()==Some(libc::ESRCH)
-    }
-    fn identity(pid:i32)->std::io::Result<libc::proc_bsdinfo> {
-        let mut info:libc::proc_bsdinfo=unsafe {std::mem::zeroed()};
-        let size=std::mem::size_of_val(&info) as libc::c_int;
-        let read=unsafe {libc::proc_pidinfo(pid,libc::PROC_PIDTBSDINFO,0,&mut info as *mut _ as *mut libc::c_void,size)};
-        if read!=size {
-            // libproc can return zero for an exited PID without setting errno.
-            // Only an independent ESRCH probe proves absence; stale errno must
-            // never hide an inaccessible live process from the owned roster.
-            return Err(if gone(pid) {std::io::Error::from_raw_os_error(libc::ESRCH)}
-                else {std::io::Error::other("Owned process metadata is unavailable")});
-        }
-        Ok(info)
-    }
-    // Kernel uid-filtered rosters establish ownership before inspection. A
-    // protected foreign process need not disclose BSD info to this user. Both
-    // effective and real uid are required; an unreadable owned process still
-    // makes the sample incomplete. libproc returns bytes, not a PID count.
-    const PROC_UID_ONLY: u32 = 4;
-    const PROC_RUID_ONLY: u32 = 5;
-    let mut pids=std::collections::BTreeSet::new();
-    for kind in [PROC_UID_ONLY, PROC_RUID_ONLY] {
-        let mut buffer=vec![0 as libc::c_int;32768];
-        let bytes=(buffer.len()*std::mem::size_of::<libc::c_int>()) as libc::c_int;
-        let found=unsafe {libc::proc_listpids(kind,uid,buffer.as_mut_ptr() as *mut libc::c_void,bytes)};
-        if found<=0 || found>=bytes || !(found as usize).is_multiple_of(std::mem::size_of::<libc::c_int>()) {return Err(error("the process list could not be verified"));}
-        pids.extend(buffer.into_iter().take(found as usize/std::mem::size_of::<libc::c_int>()).filter(|pid|*pid>0));
-        if pids.len()>=32768 {return Err(error("the process list exceeded its bound"));}
-    }
-    if !pids.contains(&(std::process::id() as libc::c_int)) {return Err(error("the current process is missing from the list"));}
-    let mut rows=Vec::new();
-    for pid in pids.into_iter().filter(|pid|*pid>0) {
-        if std::time::Instant::now()>=deadline {return Err(error("the process check reached its time limit"));}
-        let before=match identity(pid) {
-            Ok(info)=>info,
-            Err(e) if e.raw_os_error()==Some(libc::ESRCH)=>continue,
-            Err(_)=>return Err(error(&format!("process {pid} could not be identified"))),
-        };
-        if before.pbi_pid!=pid as u32 {return Err(error(&format!("process {pid} returned another identity")));}
-        if (before.pbi_uid!=uid && before.pbi_ruid!=uid) || before.pbi_status==libc::SZOMB {continue;}
-        let mut info:libc::proc_vnodepathinfo=unsafe {std::mem::zeroed()};
-        let size=std::mem::size_of_val(&info) as libc::c_int;
-        let read=unsafe {libc::proc_pidinfo(pid,libc::PROC_PIDVNODEPATHINFO,0,&mut info as *mut _ as *mut libc::c_void,size)};
-        let mut image=[0u8;4096];
-        let length=unsafe {libc::proc_pidpath(pid,image.as_mut_ptr() as *mut libc::c_void,image.len() as u32)};
-        let after=match identity(pid) {
-            Ok(info)=>info,
-            Err(e) if e.raw_os_error()==Some(libc::ESRCH)=>continue,
-            Err(_)=>return Err(error(&format!("process {pid} could not be identified"))),
-        };
-        if after.pbi_status==libc::SZOMB {continue;}
-        if after.pbi_pid!=pid as u32 || (before.pbi_start_tvsec,before.pbi_start_tvusec,before.pbi_uid,before.pbi_ruid)!=(after.pbi_start_tvsec,after.pbi_start_tvusec,after.pbi_uid,after.pbi_ruid) {return Err(error(&format!("process {pid} changed while being checked")));}
-        if read!=size || length<=0 {
-            if gone(pid) {continue;}
-            return Err(error(&format!("process {pid}: {} could not be inspected", if read!=size {"its current folder"} else {"its program"})));
-        }
-        let path=&info.pvi_cdir.vip_path;
-        let bytes=unsafe {std::slice::from_raw_parts(path.as_ptr() as *const u8,std::mem::size_of_val(path))};
-        let end=bytes.iter().position(|b|*b==0).filter(|end|*end>0).ok_or_else(||error(&format!("process {pid} returned an unconfirmed path")))?;
-        let image_end=image.iter().position(|b|*b==0).filter(|end|*end>0).ok_or_else(||error(&format!("process {pid} returned an unconfirmed path")))?;
-        let cwd=PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]));
-        let image=PathBuf::from(std::ffi::OsStr::from_bytes(&image[..image_end]));
-        let name=unsafe {std::slice::from_raw_parts(before.pbi_comm.as_ptr() as *const u8,before.pbi_comm.len())};
-        let name=String::from_utf8_lossy(&name[..name.iter().position(|b|*b==0).unwrap_or(name.len())]).into_owned();
-        rows.push((pid as u32,cwd,name.clone()));rows.push((pid as u32,image,name));
-    }
-    if std::time::Instant::now()>=deadline {return Err(error("the process check reached its time limit"));}
-    Ok(rows.into())
+    super::worktree_membership::sample(deadline)
 }
 
 #[cfg(not(any(target_os = "linux",target_os = "macos")))]
@@ -877,8 +871,16 @@ pub fn open_files(pid: u32) -> std::result::Result<Vec<PathBuf>, RunError> {
     }
 }
 /// Whether `pid` has the file at `path` open; `path` is compared as the kernel names it.
-pub fn holds_open(pid: u32, path: &Path) -> std::result::Result<bool, RunError> {
-    Ok(open_files(pid)?.iter().any(|file| file == path))
+pub fn holds_open(pid: u32, path: &Path) -> std::result::Result<super::OpenFiles, RunError> {
+    #[cfg(test)]
+    if let Some(reason) = super::forced_open_files_unknown() {
+        return Ok(super::OpenFiles::Unknown(reason));
+    }
+    Ok(if open_files(pid)?.iter().any(|file| file == path) {
+        super::OpenFiles::Held
+    } else {
+        super::OpenFiles::NotHeld
+    })
 }
 
 /// A process to stop, pinned to its identity. Linux holds a PID file
@@ -889,6 +891,20 @@ pub struct PinnedProcess {
     birth: String,
     #[cfg(target_os = "linux")]
     handle: fs::File,
+}
+
+/// Pure decoding for one nonblocking poll of an original process pidfd.
+#[cfg(target_os = "linux")]
+fn classify_exit_poll(ready: io::Result<libc::c_int>, events: libc::c_short) -> io::Result<bool> {
+    match (ready?, events) {
+        (0, _) => Ok(false),
+        (1, libc::POLLIN) => Ok(true),
+        (1, mask) if mask == libc::POLLIN | libc::POLLHUP => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unexpected original process exit readiness",
+        )),
+    }
 }
 
 /// A verified process state. Inspection failure is distinct from confirmed exit.
@@ -964,6 +980,28 @@ impl PinnedProcess {
     }
     pub fn alive(&self) -> bool {
         process_identity(self.pid).is_some_and(|p| p.birth == self.birth)
+    }
+    /// Physical completion of this SAME already-held process pidfd, never a
+    /// currentness, signal, child-wait or complete pipe/worker drain witness.
+    /// pin() uses flags0: Linux pidfd_poll waits for the last thread even when
+    /// its leader exits or a surviving nonleader execs into the old struct pid.
+    /// See Linux fs/pidfs.c pidfd_poll and fs/exec.c de_thread (v6.17).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exit_observed(&self) -> io::Result<bool> {
+        let mut item = libc::pollfd {
+            fd: self.handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd borrows this live, original handle.
+        // Exactly one zero-time poll: no retry, reopen, /proc, wait or signal.
+        let ready = unsafe { libc::poll(&mut item, 1, 0) };
+        let result = if ready < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ready)
+        };
+        classify_exit_poll(result, item.revents)
     }
     /// Ask the process to exit (SIGTERM).
     pub fn terminate(&self) -> std::result::Result<(), String> {
@@ -1319,7 +1357,7 @@ pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
             Ok(())
         });
     }
-    command.spawn()
+    zerus_client_core::unix_spawn::spawn(command)
 }
 
 /// Run `command` without input in a process group of its own, collecting at
@@ -1344,14 +1382,77 @@ pub fn run_bounded_stdin(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> std::result::Result<(ExitStatus, Vec<u8>, Vec<u8>), RunError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    helper_group::admit().map_err(RunError::Spawn)?;
+    let turn = spawn_turn_before(deadline, cancelled).map_err(|_| RunError::Stopped)?;
+    run_bounded_with_stdin_in_turn(command, input, limits, deadline, cancelled, turn)
+}
+/// A failed turn reservation proves no child started. Callers may wait
+/// before taking their own write admission; no store lock is held here.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpawnTurnNotStarted {
+    Deadline,
+    Cancelled,
+}
+pub(crate) fn spawn_turn_before(
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> std::result::Result<zerus_client_core::unix_spawn::Turn, SpawnTurnNotStarted> {
+    loop {
+        if cancelled() {
+            return Err(SpawnTurnNotStarted::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(SpawnTurnNotStarted::Deadline);
+        }
+        match zerus_client_core::unix_spawn::try_turn() {
+            Ok(turn) => return Ok(turn),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(
+                Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+        }
+    }
+}
+/// Run with a turn already reserved. The caller starts its execution clock
+/// after obtaining that turn and retains its own admission until this returns.
+pub(crate) fn run_bounded_in_turn(
+    command: &mut Command,
+    limits: [usize; 2],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    turn: zerus_client_core::unix_spawn::Turn,
+) -> std::result::Result<(ExitStatus, Vec<u8>, Vec<u8>), RunError> {
+    run_bounded_with_stdin_in_turn(command, Stdio::null(), limits, deadline, cancelled, turn)
+}
+
+fn run_bounded_with_stdin_in_turn(
+    command: &mut Command,
+    input: Stdio,
+    limits: [usize; 2],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    turn: zerus_client_core::unix_spawn::Turn,
+) -> std::result::Result<(ExitStatus, Vec<u8>, Vec<u8>), RunError> {
     command
         .process_group(0)
         .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(RunError::Spawn)?;
+    let mut child = {
+        let _turn = turn;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        helper_group::admit().map_err(RunError::Spawn)?;
+        // The turn, policy query or cancellation check can consume time.
+        if cancelled() || Instant::now() >= deadline {
+            return Err(RunError::Stopped);
+        }
+        command.spawn().map_err(RunError::Spawn)?
+    };
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut group = helper_group::Group::new(&mut child);
     for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
         // Both pipes must be drained while the child runs, including large outputs.
         unsafe {
@@ -1364,6 +1465,7 @@ pub fn run_bounded_stdin(
     }
     let mut out = Vec::new();
     let mut err = Vec::new();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut status = None;
     let result = loop {
         let mut eof = true;
@@ -1396,12 +1498,21 @@ pub fn run_bounded_stdin(
         if out.len() > limits[0] || err.len() > limits[1] {
             break Err(RunError::TooLarge);
         }
-        if status.is_none() {
-            status = child.try_wait().map_err(RunError::Io)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        match group.exited() {
+            Ok(Some(_)) if eof => break group.finish().map_err(RunError::Io),
+            Err(error) => break Err(RunError::Io(error)),
+            _ => {}
         }
-        if let Some(status) = status {
-            if eof {
-                break Ok(status);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if status.is_none() {
+                status = child.try_wait().map_err(RunError::Io)?;
+            }
+            if let Some(status) = status {
+                if eof {
+                    break Ok(status);
+                }
             }
         }
         if cancelled() || Instant::now() >= deadline {
@@ -1409,15 +1520,22 @@ pub fn run_bounded_stdin(
         }
         std::thread::sleep(Duration::from_millis(3));
     };
-    if !result.as_ref().is_ok_and(ExitStatus::success) {
-        // A hook or filter can outlive the child. Stop the whole operation on
-        // timeout instead of leaving it writing after an error was reported.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if result.is_err() {
+        let _ = group.stop();
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        if !result.as_ref().is_ok_and(ExitStatus::success) {
+            // A hook or filter can outlive the child. Stop the whole operation on
+            // timeout instead of leaving it writing after an error was reported.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     result.map(|status| (status, out, err))
 }
 
@@ -1434,7 +1552,7 @@ pub fn output_until(
     command.stdout(Stdio::from(stdout.try_clone().map_err(RunError::Io)?));
     command.stderr(Stdio::from(stderr.try_clone().map_err(RunError::Io)?));
     command.stdin(Stdio::null());
-    let mut child = command.spawn().map_err(RunError::Spawn)?;
+    let mut child = zerus_client_core::unix_spawn::spawn(command).map_err(RunError::Spawn)?;
     let deadline = Instant::now() + duration;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(RunError::Io)? {
@@ -1671,6 +1789,17 @@ extern "C" fn forward_signal(signal: libc::c_int) {
 }
 /// Keep terminal restoration in normal Rust control flow even on SIGINT/TERM/HUP.
 pub fn wait_interactive(command: &mut Command) -> Result<i32> {
+    wait_interactive_from(command, None)
+}
+/// Preserve interactive signal/exit handling while replaying a checked input
+/// file; the forwarding guard never rewrites the original answer bytes.
+pub fn wait_interactive_with_input(command: &mut Command, input: fs::File) -> Result<i32> {
+    wait_interactive_from(command, Some(input))
+}
+fn wait_interactive_from(command: &mut Command, input: Option<fs::File>) -> Result<i32> {
+    if let Some(input) = input {
+        command.stdin(input);
+    }
     struct Handlers(Vec<(i32, libc::sighandler_t)>);
     impl Drop for Handlers {
         fn drop(&mut self) {
@@ -1693,7 +1822,7 @@ pub fn wait_interactive(command: &mut Command) -> Result<i32> {
             })
             .collect(),
     );
-    let mut child = command.spawn().map_err(|e| {
+    let mut child = zerus_client_core::unix_spawn::spawn(command).map_err(|e| {
         Error::new(
             127,
             format!("{}: {e}", command.get_program().to_string_lossy()),
@@ -1841,7 +1970,8 @@ pub fn paste(config: &Config, session: &str, pane: &str, client: &str) -> Result
                     .reopen()
                     .ok()
                     .and_then(|file| {
-                        super::ssh()
+                        let remote = crate::remote_shell::hgs(config, who, &["clip"]).ok()?;
+                        crate::ssh_bytes::command(&remote).ok()?
                             .args(crate::machines::ssh_options(config, who))
                             .args([
                                 "-o",
@@ -1849,7 +1979,7 @@ pub fn paste(config: &Config, session: &str, pane: &str, client: &str) -> Result
                                 "-o",
                                 "ConnectTimeout=3",
                                 who,
-                                "~/.local/bin/hgs clip",
+                                &remote,
                             ])
                             .stdout(file)
                             .stderr(Stdio::null())
@@ -1968,6 +2098,150 @@ pub(crate) fn write_script(path: &Path, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// A listener that never accepts, with a queue of `backlog` entries.
+    fn full_unix_listener(path: &Path, backlog: libc::c_int) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(
+            bytes.len() < address.sun_path.len(),
+            "test socket path too long"
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                address.sun_path.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            )
+        };
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+        }
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let bound = unsafe {
+            libc::bind(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                &address as *const _ as *const libc::sockaddr,
+                length,
+            )
+        };
+        assert_eq!(bound, 0, "bind: {}", io::Error::last_os_error());
+        let listening = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&fd), backlog) };
+        assert_eq!(listening, 0, "listen: {}", io::Error::last_os_error());
+        fd
+    }
+
+    #[test]
+    fn a_unix_socket_connects_within_the_bound_and_stays_usable() {
+        use std::io::{Read, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("plain.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let accept = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            peer.read_exact(&mut byte).unwrap();
+            peer.write_all(&[byte[0] + 1]).unwrap();
+        });
+        let started = Instant::now();
+        let mut socket = connect_unix(&path, Duration::from_secs(2)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        socket.write_all(b"x").unwrap();
+        let mut answer = [0u8; 1];
+        socket.read_exact(&mut answer).unwrap();
+        assert_eq!(answer, [b'y']);
+        accept.join().unwrap();
+    }
+
+    /// Connections queued until a nonblocking connect finds the queue full.
+    fn fill_unix_queue(path: &Path) -> Vec<std::os::unix::net::UnixStream> {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                address.sun_path.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            )
+        };
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+        }
+        let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let mut held = Vec::new();
+        loop {
+            let socket = nonblocking_socket().expect("a non-blocking socket");
+            let connected = unsafe {
+                libc::connect(
+                    socket.as_raw_fd(),
+                    &address as *const _ as *const libc::sockaddr,
+                    length,
+                )
+            };
+            if connected == 0 {
+                held.push(socket);
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            drop(socket);
+            if error.raw_os_error().is_some_and(queue_full) {
+                break;
+            }
+            panic!("filling the listen queue: {error}");
+        }
+        held
+    }
+
+    #[test]
+    fn a_full_unix_listen_queue_refuses_within_the_bound() {
+        // zerus-taljw: a blocking connect waits for a free queue slot forever;
+        // the claim that connects must refuse at its bound instead.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("full.sock");
+        let listener = full_unix_listener(&path, 1);
+        let fill = fill_unix_queue(&path);
+        let (sent, received) = std::sync::mpsc::channel();
+        let requested = path.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(connect_unix(&requested, Duration::from_millis(300)));
+        });
+        let started = Instant::now();
+        match received.recv_timeout(Duration::from_secs(5)) {
+            Ok(Err(error)) => {
+                // Linux waits for a free slot until the deadline; macOS
+                // refuses a connect on a full queue at once. Both are a
+                // bounded refusal, never a connect.
+                #[cfg(target_os = "macos")]
+                let refused = matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                );
+                #[cfg(not(target_os = "macos"))]
+                let refused =
+                    matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock);
+                assert!(refused, "{error}");
+            }
+            Ok(Ok(_)) => panic!("a full listen queue must not connect"),
+            Err(_) => panic!("connect did not respect its bound"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(fill);
+        drop(listener);
+    }
     use super::*;
 
     /// N33: a child started while the stdin pipe is being written never
@@ -2204,10 +2478,10 @@ mod tests {
         let path = folder.join("held");
         let file = fs::File::create(&path).unwrap();
         let own = std::process::id();
-        assert!(holds_open(own, &path).unwrap());
+        assert_eq!(holds_open(own, &path).unwrap(), crate::platform::OpenFiles::Held);
         assert!(open_files(own).unwrap().contains(&path));
         drop(file);
-        assert!(!holds_open(own, &path).unwrap());
+        assert_eq!(holds_open(own, &path).unwrap(), crate::platform::OpenFiles::NotHeld);
 
         let mut child = Command::new("sleep")
             .arg("30")
@@ -2233,6 +2507,53 @@ mod tests {
             .iter()
             .any(|(pid, cwd, name)| *pid == child.id() && *cwd == folder && name == "sleep"));
         assert!(directories.iter().all(|(pid, _, _)| *pid != own));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn physical_exit_poll_accepts_only_exact_documented_readiness() {
+        for events in [
+            0,
+            libc::POLLIN,
+            libc::POLLHUP,
+            libc::POLLERR,
+            libc::POLLNVAL,
+        ] {
+            assert!(!classify_exit_poll(Ok(0), events).unwrap());
+        }
+        for events in [libc::POLLIN, libc::POLLIN | libc::POLLHUP] {
+            assert!(classify_exit_poll(Ok(1), events).unwrap());
+        }
+        for events in [
+            0,
+            libc::POLLHUP,
+            libc::POLLRDNORM,
+            libc::POLLIN | libc::POLLRDNORM,
+            libc::POLLERR,
+            libc::POLLNVAL,
+            libc::POLLPRI,
+            libc::POLLOUT,
+            libc::POLLIN | libc::POLLERR,
+            libc::POLLIN | libc::POLLNVAL,
+            libc::POLLIN | libc::POLLPRI,
+            libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        ] {
+            assert!(
+                classify_exit_poll(Ok(1), events).is_err(),
+                "mask {events:#x}"
+            );
+        }
+        for count in [-2, -1, 2, 3] {
+            assert!(
+                classify_exit_poll(Ok(count), libc::POLLIN).is_err(),
+                "count {count}"
+            );
+        }
+        for errno in [libc::EINTR, libc::EBADF, libc::EINVAL, libc::EIO] {
+            let error = classify_exit_poll(Err(io::Error::from_raw_os_error(errno)), libc::POLLIN)
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
     }
 
     #[test]
@@ -2346,6 +2667,18 @@ mod tests {
         assert!(status.success());assert_eq!(out,b"literal \x00\xff\n");assert!(err.is_empty());
         assert!(matches!(run_bounded_stdin(&mut Command::new("cat"),make(),[2,64],
             Instant::now()+Duration::from_secs(5),&||false),Err(RunError::TooLarge)));
+    }
+
+    #[test]
+    fn bounded_reserved_turn_uses_null_stdin() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let turn = spawn_turn_before(deadline, &|| false).unwrap();
+        let (status, out, err) = run_bounded_in_turn(
+            &mut Command::new("cat"), [16, 16], deadline, &|| false, turn,
+        ).unwrap();
+        assert!(status.success());
+        assert!(out.is_empty());
+        assert!(err.is_empty());
     }
 
     #[test]
@@ -2567,3 +2900,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod spawn_turn_tests;

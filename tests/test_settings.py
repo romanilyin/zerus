@@ -278,8 +278,12 @@ class SessionSettings(test_effort.EffortTransport):
         (self.root/'set-kimi').touch();redraw('K3 thinking: high');(self.root/'set-kimi').unlink()
         rows=['─'*96,' This session has been idle for 2h and is ~217k tokens.',' ↑↓ navigate · Enter select · Esc cancel','',
               ' Cache expired — the next message re-sends the entire history at full price.']
-        rows+=['  '+('❯' if i==0 else ' ')+' '+label for i,label in
-               enumerate(['Compact and continue','Start a new session','Continue as-is',"Don't ask me again"])]
+        labels=['Compact and continue','Start a new session','Continue as-is',"Don't ask me again"]
+        descriptions=['one-time compact cost · cheapest way to keep this topic',
+                      'zero context cost · best for a new task','full history kept · highest cost per turn','']
+        rows+=['  '+('❯' if i==0 else ' ')+' '+label+
+               (' '*(max(map(len,labels))-len(label)+4)+descriptions[i] if descriptions[i] else '')
+               for i,label in enumerate(labels)]
         rows+=['','─'*96,' Ask When Needed  K3 thinking: high /fixture',' context: 22% (217k/1M)']
         # The status line keeps the prompt's rows, so the current effort is known.
         (self.root/'screen').write_text('\x1b[2J\x1b[17;1H'+'\r\n'.join(rows));redraw('Cache expired')
@@ -331,7 +335,7 @@ class SessionSettings(test_effort.EffortTransport):
         record=json.loads(self.record_path.read_text())
         self.assertFalse(record.get('input_pending_at'));self.assertIn('settings_unconfirmed_at',record)
         info=self.inspect();self.assertFalse(info['first_message_can_send'])
-        self.assertIn('did not react',info['first_message_reason'])
+        self.assertIn('has not shown the last model',info['first_message_reason'])
         self.assertEqual(self.received(),b'/model')
 
     def test_pending_settings_apply_before_ready_message(self):

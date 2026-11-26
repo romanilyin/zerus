@@ -11,9 +11,15 @@ use crate::reads::READ_LIMIT;
 use crate::run::run_limited;
 use crate::ComputerId;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// Incremental listing decode for the future raw source adapter. The existing
+/// GUI runner and polling schedule retain their current behavior.
+pub mod listing;
+/// Ephemeral private staging for the future raw legacy source adapter.
+pub mod spool;
 
 /// How often a computer's listing is read.
 pub const LISTING: Duration = Duration::from_secs(60);
@@ -44,7 +50,10 @@ impl Read {
     /// The `hgs` arguments after the computer.
     pub fn args(&self) -> Vec<String> {
         match self {
-            Self::Listing => vec!["ls".into(), "--json".into()],
+            // Task 235: this computer's own sessions without the archive
+            // pass, as the watch stream lists them; an older hgs ignores
+            // flags it does not know.
+            Self::Listing => vec!["ls".into(), "--json".into(), "--local".into(), "--no-archives".into()],
             Self::Activity { name, after, .. } => vec![
                 "inspect".into(),
                 name.clone(),
@@ -83,6 +92,34 @@ impl Read {
 /// Runs one read with `hgs` on `computer`: the reply's JSON, or why there is
 /// none.
 pub fn run(hgs: &Path, computer: &ComputerId, read: &Read) -> Result<Value, String> {
+    run_with(computer, read, |invocation| {
+        run_limited(hgs, invocation, &[], READ_LIMIT)
+            .map_err(|error| format!("the reply passed {} bytes", error.cap))
+    })
+}
+
+pub(crate) fn run_accounted(
+    hgs: &Path,
+    computer: &ComputerId,
+    read: &Read,
+    stop: &std::sync::atomic::AtomicBool,
+    resources: std::sync::Arc<dyn Send + Sync>,
+) -> Result<Value, String> {
+    run_with(computer, read, |invocation| {
+        crate::run::run_accounted(hgs, invocation, &[], READ_LIMIT, stop, resources.clone())
+            .map_err(|error| match error {
+                crate::run::Stopped::Cancelled => "cancelled".into(),
+                crate::run::Stopped::TooLarge(error) => {
+                    format!("the reply passed {} bytes", error.cap)
+                }
+            })
+    })
+}
+fn run_with(
+    computer: &ComputerId,
+    read: &Read,
+    run: impl FnOnce(&Invocation) -> Result<Exit, String>,
+) -> Result<Value, String> {
     let mut args: Vec<String> = computer
         .alias()
         .map(|alias| format!("@{alias}"))
@@ -95,7 +132,7 @@ pub fn run(hgs: &Path, computer: &ComputerId, read: &Read) -> Result<Value, Stri
         timeout: read.timeout(computer),
         request_id: None,
     };
-    match run_limited(hgs, &invocation, &[], READ_LIMIT) {
+    match run(&invocation) {
         Ok(Exit::Code {
             code: 0, stdout, ..
         }) => serde_json::from_slice(&stdout).map_err(|error| format!("invalid reply: {error}")),
@@ -106,7 +143,7 @@ pub fn run(hgs: &Path, computer: &ComputerId, read: &Read) -> Result<Value, Stri
         Ok(Exit::TimedOut) => Err("hgs did not answer in time".into()),
         Ok(Exit::StartFailed(error)) => Err(error),
         Ok(Exit::WriteFailed) => Err("hgs did not take the request".into()),
-        Err(too_large) => Err(format!("the reply passed {} bytes", too_large.cap)),
+        Err(error) => Err(error),
     }
 }
 
@@ -150,6 +187,8 @@ pub struct Schedule {
     every: Intervals,
     due: BTreeMap<Slot, Instant>,
     running: BTreeMap<Slot, ()>,
+    started: BTreeMap<Slot, Instant>,
+    refreshes: BTreeSet<Slot>,
     /// Consecutive failed listings; the status's attempt.
     failures: u32,
     /// A listing succeeded since polling started.
@@ -164,6 +203,31 @@ pub struct Follows<'a> {
 }
 
 impl Schedule {
+    /// Raw-source resnapshots share the listing slot and a minimum one-second
+    /// start gap across generations. The GUI's offline refresh is unchanged.
+    pub(crate) fn refresh_listing_bounded(&mut self, now: Instant) {
+        let slot = Slot::Listing;
+        let Some(started) = self.started.get(&slot).copied() else {
+            return;
+        };
+        self.refreshes.insert(slot.clone());
+        if !self.running.contains_key(&slot) {
+            self.due
+                .insert(slot, now.max(started + Duration::from_secs(1)));
+        }
+    }
+    /// Retry an offline listing through its existing single-flight schedule.
+    pub(crate) fn refresh_listing(&mut self, now: Instant) {
+        if !self.running.contains_key(&Slot::Listing) {
+            self.due.insert(Slot::Listing, now);
+        }
+    }
+
+    /// The last listing failed and no scheduled/manual retry owns its slot.
+    pub(crate) fn listing_retryable(&self) -> bool {
+        self.failures > 0 && !self.running.contains_key(&Slot::Listing)
+    }
+
     pub fn new(every: Intervals) -> Self {
         Self {
             every,
@@ -191,6 +255,8 @@ impl Schedule {
         }));
         let slots: Vec<Slot> = wanted.iter().map(Read::slot).collect();
         self.due.retain(|slot, _| slots.contains(slot));
+        self.started.retain(|slot, _| slots.contains(slot));
+        self.refreshes.retain(|slot| slots.contains(slot));
         let mut reads = Vec::new();
         for read in wanted {
             let slot = read.slot();
@@ -199,6 +265,8 @@ impl Schedule {
             }
             let at = *self.due.entry(slot.clone()).or_insert(now);
             if at <= now {
+                self.started.insert(slot.clone(), now);
+                self.refreshes.remove(&slot);
                 self.running.insert(slot, ());
                 reads.push(read);
             }
@@ -216,7 +284,27 @@ impl Schedule {
             Read::Activity { .. } => self.every.activity,
             Read::Processes { .. } => self.every.processes,
         };
-        self.due.insert(slot, now + every);
+        let due = if self.refreshes.contains(&slot) {
+            now.max(self.started.get(&slot).copied().unwrap_or(now) + Duration::from_secs(1))
+        } else {
+            now + every
+        };
+        self.due.insert(slot, due);
+    }
+
+    /// A one-shot processes read, including while polling an older CLI. Keep
+    /// one in flight and a one-second minimum gap; repeated requests coalesce.
+    pub fn refresh_processes(&mut self, key: &str, now: Instant) -> bool {
+        let slot = Slot::Processes(key.into());
+        let Some(started) = self.started.get(&slot).copied() else {
+            return false;
+        };
+        self.refreshes.insert(slot.clone());
+        if !self.running.contains_key(&slot) {
+            self.due
+                .insert(slot, now.max(started + Duration::from_secs(1)));
+        }
+        true
     }
 
     /// When the next read not in flight is due.
@@ -252,7 +340,166 @@ impl Schedule {
 mod tests {
     use super::*;
 
+    #[test]
+    fn raw_listing_resnapshots_keep_a_gap_across_generations() {
+        let now = Instant::now();
+        let mut schedule = Schedule::default();
+        let follows = Follows {
+            activity: &[],
+            processes: &[],
+        };
+        schedule.due(now, &follows);
+        schedule.done(&Read::Listing, now);
+        schedule.refresh_listing_bounded(now);
+        schedule.refresh_listing_bounded(now + Duration::from_millis(10));
+        assert!(schedule
+            .due(now + Duration::from_millis(999), &follows)
+            .is_empty());
+        assert_eq!(
+            schedule.due(now + Duration::from_secs(1), &follows),
+            [Read::Listing]
+        );
+        schedule.refresh_listing_bounded(now + Duration::from_secs(1));
+        schedule.done(&Read::Listing, now + Duration::from_secs(1));
+        assert!(schedule
+            .due(now + Duration::from_millis(1999), &follows)
+            .is_empty());
+        assert_eq!(
+            schedule.due(now + Duration::from_secs(2), &follows),
+            [Read::Listing]
+        );
+    }
+
+    #[test]
+    fn raw_listing_startup_delay_does_not_restart_the_admission_gap() {
+        let admitted = Instant::now();
+        let mut schedule = Schedule::default();
+        let follows = Follows {
+            activity: &[],
+            processes: &[],
+        };
+        assert_eq!(schedule.due(admitted, &follows), [Read::Listing]);
+        schedule.refresh_listing_bounded(admitted);
+        assert!(schedule
+            .due(admitted + Duration::from_millis(999), &follows)
+            .is_empty());
+
+        // Startup/completion can take longer than the minimum admission gap.
+        // A pending refresh stays single-flight, then is due without a new gap.
+        let completed = admitted + Duration::from_millis(1500);
+        assert!(schedule.due(completed, &follows).is_empty());
+        schedule.done(&Read::Listing, completed);
+        assert_eq!(schedule.due(completed, &follows), [Read::Listing]);
+
+        // The next gap starts at that second admission, not its completion.
+        let refreshed = completed + Duration::from_millis(10);
+        schedule.done(&Read::Listing, refreshed);
+        schedule.refresh_listing_bounded(refreshed);
+        assert!(schedule
+            .due(completed + Duration::from_millis(999), &follows)
+            .is_empty());
+        assert_eq!(
+            schedule.due(completed + Duration::from_secs(1), &follows),
+            [Read::Listing]
+        );
+    }
+
+    #[test]
+    fn an_offline_listing_retry_uses_the_existing_single_flight_slot() {
+        let now = Instant::now();
+        let mut schedule = Schedule::default();
+        let follows = Follows {
+            activity: &[],
+            processes: &[],
+        };
+        assert_eq!(schedule.due(now, &follows), [Read::Listing]);
+        schedule.listed(false);
+        assert!(
+            !schedule.listing_retryable(),
+            "a running listing owns its retry"
+        );
+        schedule.refresh_listing(now);
+        schedule.done(&Read::Listing, now);
+        assert!(schedule.listing_retryable());
+        assert!(
+            schedule.due(now, &follows).is_empty(),
+            "no extra read while pending"
+        );
+        schedule.refresh_listing(now);
+        schedule.refresh_listing(now);
+        assert_eq!(schedule.due(now, &follows), [Read::Listing]);
+        assert!(!schedule.listing_retryable());
+        assert!(schedule.due(now, &follows).is_empty());
+        schedule.done(&Read::Listing, now);
+        schedule.listed(true);
+        assert!(
+            !schedule.listing_retryable(),
+            "a healthy source needs no retry"
+        );
+    }
+
     const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn a_process_refresh_is_one_bounded_read_after_the_gap() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(Intervals::default());
+        let followed = [("run:r".into(), "codex/p/t".into())];
+        let follows = Follows {
+            activity: &[],
+            processes: &followed,
+        };
+        let first = schedule.due(start, &follows);
+        let read = first
+            .iter()
+            .find(|read| matches!(read, Read::Processes { .. }))
+            .unwrap();
+        for _ in 0..2 {
+            assert!(schedule.refresh_processes("run:r", start));
+        }
+        schedule.done(read, start + Duration::from_millis(100));
+        assert!(schedule
+            .due(start + Duration::from_millis(999), &follows)
+            .is_empty());
+        let refreshed = schedule.due(start + SECOND, &follows);
+        assert_eq!(refreshed.len(), 1);
+        schedule.done(&refreshed[0], start + SECOND);
+        assert!(schedule.due(start + SECOND * 2, &follows).is_empty());
+        assert!(!schedule.refresh_processes("missing", start));
+    }
+
+    #[test]
+    fn an_idle_process_refresh_waits_for_the_original_read_gap() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(Intervals::default());
+        let followed = [("run:r".into(), "codex/p/t".into())];
+        let follows = Follows {
+            activity: &[],
+            processes: &followed,
+        };
+        let first = schedule.due(start, &follows);
+        let read = first
+            .iter()
+            .find(|read| matches!(read, Read::Processes { .. }))
+            .unwrap();
+        schedule.done(read, start + Duration::from_millis(100));
+        for _ in 0..2 {
+            assert!(schedule.refresh_processes("run:r", start + Duration::from_millis(100)));
+        }
+        assert!(schedule
+            .due(start + Duration::from_millis(999), &follows)
+            .is_empty());
+        let refreshed = schedule.due(start + SECOND, &follows);
+        assert_eq!(refreshed.len(), 1);
+        assert!(matches!(refreshed[0], Read::Processes { .. }));
+        schedule.done(&refreshed[0], start + SECOND);
+        assert!(schedule.refresh_processes("run:r", start + SECOND * 4));
+        assert_eq!(
+            schedule.due(start + SECOND * 4, &follows).len(),
+            1,
+            "an idle read past the gap refreshes immediately"
+        );
+    }
 
     #[test]
     fn reads_follow_the_qt_cadence_with_one_in_flight_each() {
@@ -328,7 +575,7 @@ mod tests {
             processes.args(),
             ["inspect", "codex/p/t", "--after", &i64::MAX.to_string()]
         );
-        assert_eq!(Read::Listing.args(), ["ls", "--json"]);
+        assert_eq!(Read::Listing.args(), ["ls", "--json", "--local", "--no-archives"]);
         let peer = ComputerId::from("studio");
         assert_eq!(activity.timeout(&peer), Duration::from_secs(15));
         assert_eq!(

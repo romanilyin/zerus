@@ -1,0 +1,30 @@
+[package]
+name = "zerus-lore-bin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+description = "The lore binary, built from the pinned github.com/WhiteWh/CodeLore dependency: the one source of lore"
+publish = false
+
+[[bin]]
+name = "lore"
+path = "src/main.rs"
+
+[features]
+# Build with candle's CUDA backend (CodeLore's feature of the same name).
+cuda = ["zerus-lore/cuda"]
+
+[dependencies]
+# The one source of lore is CodeLore. To change lore: commit there, then move this
+# rev (and this package's Cargo.lock) to the new commit; see docs/lore.md.
+# The default features carry `atlas`, so the plain build answers `lore atlas`.
+zerus-lore = { package = "codelore", git = "https://github.com/WhiteWh/CodeLore", rev = "9de6304d4d14675c26edeb6d8f91b338f3b54409" }
+
+[target.'cfg(windows)'.dependencies]
+# `directml` embeds on any DirectX 12 GPU through ONNX Runtime's DirectML provider;
+# on Windows every build carries it, other platforms keep the plain dependency above.
+zerus-lore = { package = "codelore", git = "https://github.com/WhiteWh/CodeLore", rev = "9de6304d4d14675c26edeb6d8f91b338f3b54409", features = ["directml"] }
+
+[dev-dependencies]
+sha2 = "0.10"

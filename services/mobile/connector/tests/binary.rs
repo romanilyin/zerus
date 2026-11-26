@@ -275,6 +275,12 @@ fn version_and_help() {
         stdout.starts_with("usage: zerus-mobile-connector"),
         "{stdout}"
     );
+    // Clients offer Stop from this line alone, so it is advertised only where
+    // Stop can work (zerus-7rkq9).
+    assert_eq!(
+        stdout.contains("Workspace stop ABI: service-preflight-v1"),
+        cfg!(any(target_os = "linux", windows))
+    );
 }
 
 /// Unsafe state is refused with the fixed line and never repaired.
@@ -432,6 +438,10 @@ fn check_creates_nothing_and_reports_a_new_state_directory() {
     let (code, report) = check(&scratch, &config);
     assert_eq!(code, 0, "{report}");
     assert_eq!(report["ok"], true);
+    assert_eq!(
+        report["capabilities"]["workspace_stop"] == "service-preflight-v1",
+        cfg!(any(target_os = "linux", windows))
+    );
     assert_eq!(report["configuration"]["valid"], true);
     assert_eq!(report["configuration"]["findings"], json!([]));
     assert_eq!(report["state"]["directory"], "absent");
